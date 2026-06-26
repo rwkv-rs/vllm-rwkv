@@ -1216,6 +1216,11 @@ class Worker(WorkerBase):
             )
 
         self.weight_transfer_engine.finish_weight_update()
+        model_runner = getattr(self, "model_runner", None)
+        model_state = getattr(model_runner, "model_state", None)
+        reset_state = getattr(model_state, "reset_after_weight_update", None)
+        if callable(reset_state):
+            reset_state()
         self._weight_update_active = False
 
     def shutdown(self) -> None:
