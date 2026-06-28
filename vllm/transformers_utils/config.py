@@ -1052,6 +1052,12 @@ def try_get_generation_config(
     config_format: str | ConfigFormat = "auto",
     hf_token: bool | str | None = None,
 ) -> GenerationConfig | None:
+    from vllm.transformers_utils.configs.rwkv7 import build_rwkv7_config_from_pth
+
+    rwkv7_config = build_rwkv7_config_from_pth(model)
+    if rwkv7_config is not None:
+        return GenerationConfig.from_model_config(rwkv7_config)
+
     try:
         return GenerationConfig.from_pretrained(
             model,
