@@ -617,18 +617,19 @@ class ChatCompletionRequest(OpenAIBaseModel):
             min_p = default_sampling_params.get(
                 "min_p", self._DEFAULT_SAMPLING_PARAMS["min_p"]
             )
+        stop = self.stop
+        if not stop and "stop" not in self.model_fields_set:
+            stop = default_sampling_params.get("stop", stop)
+        if isinstance(stop, list):
+            stop = list(stop)
 
-        # Merge server-default stop_token_ids (e.g., model-specific tokens
-        # like </call> for gpt-oss) with any request-specified ones
         stop_token_ids = self.stop_token_ids
-        default_stop_ids = default_sampling_params.get("stop_token_ids")
-        if default_stop_ids:
-            if not stop_token_ids:
-                stop_token_ids = list(default_stop_ids)
-            else:
-                stop_token_ids = list(
-                    dict.fromkeys([*stop_token_ids, *default_stop_ids])
-                )
+        if not stop_token_ids and "stop_token_ids" not in self.model_fields_set:
+            stop_token_ids = default_sampling_params.get(
+                "stop_token_ids", stop_token_ids
+            )
+        if isinstance(stop_token_ids, list):
+            stop_token_ids = list(stop_token_ids)
 
         prompt_logprobs = self.prompt_logprobs
         if prompt_logprobs is None and self.echo:
@@ -681,7 +682,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             top_k=top_k,
             min_p=min_p,
             seed=self.seed,
-            stop=self.stop,
+            stop=stop,
             stop_token_ids=stop_token_ids,
             logprobs=self.top_logprobs if self.logprobs else None,
             prompt_logprobs=prompt_logprobs,
