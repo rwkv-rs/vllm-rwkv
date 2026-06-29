@@ -1,0 +1,68 @@
+name: Rebase RWKV on upstream vLLM
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * *"
+      timezone: "America/Chicago"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rebase-rwkv
+  cancel-in-progress: false
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out rwkv
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: rwkv
+          fetch-depth: 0
+
+      - name: Rebase rwkv on upstream/main
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream https://github.com/vllm-project/vllm.git
+          else
+            git remote add upstream https://github.com/vllm-project/vllm.git
+          fi
+
+          git fetch origin rwkv
+          git fetch upstream main
+
+          old_head="$(git rev-parse refs/remotes/origin/rwkv)"
+          git switch --force-create rwkv refs/remotes/origin/rwkv
+
+          rwkv_commit_count="$(git rev-list --count refs/remotes/upstream/main..HEAD)"
+          if [[ "$rwkv_commit_count" == "0" ]]; then
+            echo "rwkv has no commits ahead of upstream/main; refusing to overwrite it with plain upstream."
+            exit 1
+          fi
+
+          echo "Replaying $rwkv_commit_count rwkv commits on top of upstream/main."
+          git rebase refs/remotes/upstream/main
+
+          post_rebase_commit_count="$(git rev-list --count refs/remotes/upstream/main..HEAD)"
+          if [[ "$post_rebase_commit_count" == "0" ]]; then
+            echo "Rebase removed every rwkv commit; refusing to push."
+            exit 1
+          fi
+
+          if [[ "$(git rev-parse HEAD)" == "$old_head" ]]; then
+            echo "rwkv is already based on the latest upstream/main."
+            exit 0
+          fi
+
+          git push --force-with-lease=refs/heads/rwkv:"$old_head" origin HEAD:rwkv
