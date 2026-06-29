@@ -838,6 +838,34 @@ def test_rwkv7_online_weight_update_cpu_copies_pending_tensors(monkeypatch):
     assert captured["emb.weight"].item() == 1.0
 
 
+def test_rwkv7_online_weight_update_cuda_stages_pending_tensors_on_device(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for CUDA staging")
+
+    model = _new_rwkv7_for_weight_tests()
+    model.raw_weight_names = {"emb.weight"}
+    source = torch.tensor([1.0], device="cuda")
+    captured = {}
+
+    def fake_preprocess(self, z):
+        captured.update(z)
+        self.z = z
+
+    monkeypatch.setattr(RWKV7ForCausalLM, "_preprocess_weights", fake_preprocess)
+
+    model.start_weight_update()
+    model.load_weights([("emb.weight", source)])
+    pending = model._pending_weight_update["emb.weight"]
+    source.fill_(99.0)
+
+    assert pending.device.type == "cuda"
+    assert pending.data_ptr() != source.data_ptr()
+
+    model.finish_weight_update()
+
+    assert captured["emb.weight"].item() == 1.0
+
+
 def test_rwkv7_abort_weight_update_clears_pending_buffer():
     model = _new_rwkv7_for_weight_tests()
     model.raw_weight_names = {"emb.weight"}
