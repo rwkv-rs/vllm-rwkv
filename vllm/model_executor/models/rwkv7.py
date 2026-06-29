@@ -341,7 +341,8 @@ class RWKV7ForCausalLM(nn.Module):
             loaded_names = set()
             for name, weight in weights:
                 loaded_names.add(name)
-                pending[name] = weight.detach().cpu().clone()
+                detached = weight.detach()
+                pending[name] = detached.clone() if detached.is_cuda else detached.cpu().clone()
             return loaded_names
 
         z = {name: weight.detach().cpu() for name, weight in weights}
