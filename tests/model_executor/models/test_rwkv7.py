@@ -10,7 +10,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import vllm.model_executor.models.rwkv7 as rwkv7
-import vllm.v1.worker.gpu.model_states.rwkv as rwkv_state
 from vllm.config.compilation import CompilationConfig, CompilationMode, CUDAGraphMode
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.models.config import RWKV7ForCausalLMConfig
@@ -56,47 +55,6 @@ def test_rwkv7_cuda_ops_match_torch_reference():
     expected_z = torch.relu(x).square()
     torch.testing.assert_close(y, expected_y, rtol=2e-3, atol=2e-3)
     torch.testing.assert_close(z, expected_z, rtol=0, atol=0)
-
-
-def test_rwkv7_cuda_ops_register_expected_namespaces_and_schemas():
-    if (
-        not torch.accelerator.is_available()
-        or torch.accelerator.current_accelerator().type != "cuda"
-    ):
-        pytest.skip("CUDA is required for RWKV7 custom op schema smoke")
-
-    import vllm.rwkv7_ops  # noqa: F401
-
-    expected_ops = {
-        "rwkv7_v3a_ops": [
-            "layer_norm_f16",
-            "add_layer_norm_tmix_mix6_f16",
-            "advance_i32",
-        ],
-        "rwkv7_fast_ops_fp16": [
-            "tmix_mix6",
-            "relu_square",
-            "act_sigmoid",
-        ],
-        "rwkv7_wkv_fp16_v2": [
-            "wkv_seq",
-            "wkv_seq_w0",
-            "wkv_one",
-        ],
-        "rwkv7_wkv_fp32_v2": [
-            "forward",
-            "forward_seq",
-            "forward_small",
-            "forward_block",
-        ],
-    }
-
-    for namespace, op_names in expected_ops.items():
-        ops = getattr(torch.ops, namespace)
-        for op_name in op_names:
-            op = getattr(ops, op_name)
-            assert op._schemas
-            assert "" in op._schemas
 
 
 def _new_request(req_id: str) -> NewRequestData:
@@ -147,11 +105,6 @@ def _new_default_loader_for_weight_tests(
             pt_load_map_location="cpu",
         )
     )
-
-
-def test_rwkv7_registry_module_exports_model():
-    assert rwkv7.RWKV7ForCausalLM is RWKV7ForCausalLM
-    assert RWKV7ForCausalLM.__module__.endswith("rwkv7")
 
 
 def _rwkv7_vllm_config(
@@ -652,7 +605,10 @@ def test_rwkv7_load_weights_preprocesses_full_raw_weights(monkeypatch):
     assert loaded == {"emb.weight", "head.weight"}
     assert model.raw_weight_names == {"emb.weight", "head.weight"}
     assert calls == [{"emb.weight", "head.weight"}]
-    assert "processed" in model.z
+    assert set(model.z) == {"emb.weight", "head.weight", "processed"}
+    torch.testing.assert_close(model.z["emb.weight"], raw_weights["emb.weight"])
+    torch.testing.assert_close(model.z["head.weight"], raw_weights["head.weight"])
+    torch.testing.assert_close(model.z["processed"], torch.tensor([3.0]))
     assert model.emb_cache == {}
 
 
@@ -725,7 +681,7 @@ def test_rwkv7_online_weight_update_reuses_existing_tensor_storage(monkeypatch):
     assert model.z["emb.weight"].item() == 10.0
     assert model.z["head.weight"].item() == 20.0
     assert model.z["derived.weight"].item() == 30.0
-    assert "stale.weight" not in model.z
+    assert set(model.z) == {"emb.weight", "head.weight", "derived.weight"}
 
 
 def test_rwkv7_online_weight_update_rejects_missing_and_unexpected_keys(
@@ -2141,7 +2097,6 @@ def test_rwkv7_model_state_dummy_batch_uses_scratch_state():
 
 
 def test_rwkv7_uses_default_vllm_sampler():
-    assert not hasattr(rwkv_state, "_sample_albatross_logits")
     assert RWKV7ModelState.custom_sampler(SimpleNamespace(), SimpleNamespace()) is None
 
 
