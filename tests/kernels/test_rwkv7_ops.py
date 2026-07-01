@@ -530,22 +530,18 @@ FAST_RETURNING_CASES = [
 
 RETURNING_CASES = V3A_RETURNING_CASES + FAST_RETURNING_CASES
 
-VOID_SCHEMA_OPS = {
-    "rwkv7_v3a_ops": ["advance_i32"],
-    "rwkv7_wkv_fp16_v2": ["wkv_seq", "wkv_seq_w0", "wkv_one", "wkv_one_w0"],
-    "rwkv7_wkv_fp32_v2": ["forward", "forward_seq", "forward_small", "forward_block"],
-}
-
-
 @pytest.fixture(scope="module", autouse=True)
 def rwkv7_ops_registered() -> None:
     _rwkv7_import_or_skip()
 
 
 @pytest.mark.parametrize("case", RETURNING_CASES, ids=lambda c: c.name)
-def test_rwkv7_returning_ops_have_registered_schema(case: OpCase) -> None:
-    schema = _op(case.name)._schemas[""]
-    assert "-> Tensor" in str(schema)
+def test_rwkv7_returning_ops_schema_matches_meta_contract(case: OpCase) -> None:
+    torch.library.opcheck(
+        _op(case.name),
+        case.args("meta"),
+        test_utils=("test_schema",),
+    )
 
 
 @pytest.mark.parametrize("case", RETURNING_CASES, ids=lambda c: c.name)
@@ -569,13 +565,6 @@ def test_rwkv7_returning_ops_opcheck_faketensor(case: OpCase) -> None:
         case.args("meta"),
         test_utils=("test_faketensor",),
     )
-
-
-def test_rwkv7_void_ops_have_schema_evidence() -> None:
-    for namespace, op_names in VOID_SCHEMA_OPS.items():
-        ops = getattr(torch.ops, namespace)
-        for op_name in op_names:
-            assert getattr(ops, op_name)._schemas[""]
 
 
 def test_rwkv7_advance_i32_schema_opcheck() -> None:
