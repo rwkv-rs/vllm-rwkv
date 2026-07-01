@@ -8,6 +8,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import urlparse
 
 from benchmarks.rwkv7 import benchmark_faster3a as bench
 
@@ -32,6 +33,23 @@ def _config(
     )
 
 
+def _command_options(command: list[str]) -> dict[str, str | bool]:
+    options: dict[str, str | bool] = {}
+    index = 0
+    while index < len(command):
+        item = command[index]
+        if not item.startswith("--"):
+            index += 1
+            continue
+        if index + 1 < len(command) and not command[index + 1].startswith("--"):
+            options[item] = command[index + 1]
+            index += 2
+        else:
+            options[item] = True
+            index += 1
+    return options
+
+
 def test_report_blocks_without_runtime_paths_and_records_provenance(
     tmp_path: Path,
 ) -> None:
@@ -50,13 +68,17 @@ def test_report_blocks_without_runtime_paths_and_records_provenance(
     assert report["source"]["albatross_repo"] == bench.ALBATROSS_REPO
     assert report["source"]["albatross_commit"] == bench.ALBATROSS_COMMIT
     assert report["source"]["albatross_impl"] == bench.ALBATROSS_IMPL
-    assert report["source"]["albatross_path"].endswith(
-        f"missing-albatross/{bench.ALBATROSS_IMPL}"
+    assert Path(report["source"]["albatross_path"]) == (
+        tmp_path / "missing-albatross" / bench.ALBATROSS_IMPL
     )
-    assert {item["target_path"] for item in report["source"]["contracts"]} >= {
-        "vllm/model_executor/models/rwkv7.py",
-        "csrc/libtorch_stable/rwkv7/rwkv7_v3a_ops.cu",
-    }
+    assert report["source"]["contracts"] == [
+        {
+            "source_path": entry.source_path,
+            "target_path": entry.target_path,
+            "correspondence": entry.correspondence,
+        }
+        for entry in bench.SOURCE_PROVENANCE
+    ]
     blocker_codes = {
         blocker["code"]
         for blocker in report["checks"]["model_only_steady_decode"]["blockers"]
@@ -97,7 +119,7 @@ def test_report_evaluates_passing_measurements() -> None:
         cuda_available=False,
     )
 
-    assert report["overall_status"] in {"blocked", "passed"}
+    assert report["overall_status"] == "passed"
     assert report["checks"]["model_only_steady_decode"]["status"] == "passed"
     assert report["checks"]["runner_steady_decode"]["status"] == "passed"
     assert report["checks"]["state_movement"]["status"] == "passed"
@@ -207,8 +229,12 @@ def test_cli_writes_albatross_model_only_measurement_json(
         sys.executable,
         str(impl_dir / "rwkv7_fast_v3a.py"),
     ]
-    assert "--cases" in cmd
-    assert "2x4" in cmd
+    assert _command_options(cmd) == {
+        "--model": str(checkpoint_path),
+        "--warmup": "3",
+        "--iters": "7",
+        "--cases": "2x4",
+    }
     assert calls[0][1]["cwd"] == impl_dir
 
 
@@ -357,7 +383,12 @@ def test_vllm_model_only_timer_includes_logits_for_albatross_parity(
         iters=1,
     )
 
-    assert ("compute_logits", (2, 1)) in model.calls
+    assert model.calls == [
+        ("zero_state", 2),
+        ("embed", (2, 1)),
+        ("forward_from_x", (2, 1), "fake-path"),
+        ("compute_logits", (2, 1)),
+    ]
     assert parsed["output"] == "logits"
     assert parsed["logits_included"] is True
     assert parsed["tokens_per_s"] == 2000.0
@@ -465,7 +496,10 @@ def test_vllm_single_process_distributed_init_uses_canonical_entrypoints(
     assert calls[0][1]["rank"] == 0
     assert calls[0][1]["local_rank"] == 0
     assert calls[0][1]["backend"] == "nccl"
-    assert calls[0][1]["distributed_init_method"].startswith("tcp://127.0.0.1:")
+    distributed_init = urlparse(calls[0][1]["distributed_init_method"])
+    assert distributed_init.scheme == "tcp"
+    assert distributed_init.hostname == "127.0.0.1"
+    assert isinstance(distributed_init.port, int)
     assert calls[1] == ("ensure", (1, 1), {"backend": "nccl"})
 
 
@@ -762,8 +796,12 @@ def test_cli_merges_vllm_runner_measurement_with_model_only_json(
     assert report["checks"]["runner_steady_decode"]["status"] == "passed"
     assert report["checks"]["state_movement"]["status"] == "passed"
     runner_metrics = report["checks"]["runner_steady_decode"]["metrics"]
-    assert runner_metrics["runner_tokens_per_s"] == 91.0
-    assert "runner_to_albatross_model_only_ratio" not in runner_metrics
+    assert runner_metrics == {
+        "runner_tokens_per_s": 91.0,
+        "runner_measurement_mode": "worker_execute_model",
+        "runner_internal_timing_target": "worker.execute_model",
+        "runner_timing_clock": "cuda_event",
+    }
 
 
 def test_runner_check_does_not_compare_worker_timing_to_logits_baseline() -> None:
@@ -794,12 +832,12 @@ def test_runner_check_does_not_compare_worker_timing_to_logits_baseline() -> Non
     runner_check = report["checks"]["runner_steady_decode"]
     assert runner_check["status"] == "passed"
     assert runner_check["thresholds"] == {"min_runner_tokens_per_s": 1.0}
-    assert runner_check["metrics"]["runner_tokens_per_s"] == 1.0
-    assert (
-        runner_check["metrics"]["runner_internal_timing_target"]
-        == "worker.execute_model"
-    )
-    assert "runner_to_albatross_model_only_ratio" not in runner_check["metrics"]
+    assert runner_check["metrics"] == {
+        "runner_tokens_per_s": 1.0,
+        "runner_measurement_mode": "worker_execute_model",
+        "runner_internal_timing_target": "worker.execute_model",
+        "runner_timing_clock": None,
+    }
 
 
 def test_cli_writes_blocked_vllm_runner_json_without_fake_tokens(
@@ -862,7 +900,18 @@ def test_cli_writes_blocked_vllm_runner_json_without_fake_tokens(
     measurement = json.loads(output_path.read_text(encoding="utf-8"))
     runner = measurement["runner_steady_decode"]
     assert rc == 0
-    assert "runner_tokens_per_s" not in runner
+    assert set(runner) == {
+        "runner_batch_size",
+        "runner_prompt_len",
+        "runner_decode_tokens",
+        "runner_warmup",
+        "runner_iters",
+        "runner_measurement_mode",
+        "runner_internal_timing_target",
+        "runner_timing_clock",
+        "runner_collective_rpc_serialization",
+        "blockers",
+    }
     assert runner["runner_measurement_mode"] == "worker_execute_model"
     assert runner["runner_batch_size"] == 1
     assert runner["runner_prompt_len"] == 4
@@ -930,8 +979,19 @@ def test_internal_runner_timing_syncs_once_around_decode_loop(monkeypatch) -> No
     assert len(result["iteration_durations_s"]) == 1
     assert result["timing_clock"] == "wall_clock"
     assert sync_calls == [1] * 13
-    assert [call[0] for call in worker.calls].count("execute") == 6
-    assert [call[0] for call in worker.calls].count("sample") == 5
+    assert [call[0] for call in worker.calls] == [
+        "execute",
+        "sample",
+        "execute",
+        "sample",
+        "execute",
+        "sample",
+        "execute",
+        "sample",
+        "execute",
+        "sample",
+        "execute",
+    ]
 
 
 def test_internal_runner_uses_cuda_event_timing_when_available(monkeypatch) -> None:
@@ -986,8 +1046,19 @@ def test_internal_runner_uses_cuda_event_timing_when_available(monkeypatch) -> N
     assert end_event.records == 4
     assert end_event.synchronizes == 4
     assert sync_calls == [1] * 5
-    assert [call[0] for call in worker.calls].count("execute") == 6
-    assert [call[0] for call in worker.calls].count("sample") == 5
+    assert [call[0] for call in worker.calls] == [
+        "execute",
+        "sample",
+        "execute",
+        "sample",
+        "execute",
+        "sample",
+        "execute",
+        "sample",
+        "execute",
+        "sample",
+        "execute",
+    ]
 
 
 def test_report_blocks_when_runner_measurement_is_missing() -> None:
@@ -1136,8 +1207,11 @@ def test_cli_writes_structured_blocked_json(tmp_path: Path) -> None:
     assert rc == 2
     assert report["benchmark"] == "rwkv7_faster3a"
     assert report["overall_status"] == "blocked"
-    assert "model_only_steady_decode" in report["checks"]
-    assert "runner_steady_decode" in report["checks"]
+    assert set(report["checks"]) == {
+        "model_only_steady_decode",
+        "runner_steady_decode",
+        "state_movement",
+    }
 
 
 def test_script_entrypoint_writes_structured_blocked_json(tmp_path: Path) -> None:
