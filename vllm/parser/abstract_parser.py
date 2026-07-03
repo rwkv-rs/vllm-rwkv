@@ -915,17 +915,22 @@ class DelegatingParser(Parser):
 
         if finished:
             delta_message = self.finalize_generation(delta_message, request, state)
-            delta_message = self._flush_engine_parsers(delta_message)
+            delta_message = self._flush_streaming_parsers(delta_message)
 
         return delta_message
 
-    def _flush_engine_parsers(
+    def _flush_streaming_parsers(
         self, delta_message: DeltaMessage | None
     ) -> DeltaMessage | None:
-        """Flush buffered state from engine-based parsers at stream end."""
+        """Flush buffered streaming state from parsers at stream end.
+
+        Any parser exposing ``finish_streaming`` is flushed, whether its
+        buffering lives in a parser engine or in the parser itself.
+        """
         reasoning_ended = self._stream_state.reasoning_ended
         for parser in (self._reasoning_parser, self._tool_parser):
-            if not getattr(parser, "engine_based_streaming", False):
+            finish = getattr(parser, "finish_streaming", None)
+            if finish is None:
                 continue
             # When reasoning has ended and we transitioned to the tool
             # phase, the reasoning parser's engine may still have buffered
@@ -933,9 +938,6 @@ class DelegatingParser(Parser):
             # skip_tool_parsing=True.  Flushing that would leak spurious
             # content (e.g. a stray '"'), so skip it.
             if parser is self._reasoning_parser and reasoning_ended:
-                continue
-            finish = getattr(parser, "finish_streaming", None)
-            if finish is None:
                 continue
             flush_delta = finish()
             if flush_delta is None:

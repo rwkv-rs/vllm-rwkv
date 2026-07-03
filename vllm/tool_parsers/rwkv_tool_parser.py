@@ -53,6 +53,7 @@ class RWKVToolParser(ToolParser):
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
         super().__init__(tokenizer, tools)
         self._sent_content_idx = 0
+        self._current_text = ""
 
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest
@@ -291,6 +292,7 @@ class RWKVToolParser(ToolParser):
         del previous_text, delta_text, previous_token_ids, current_token_ids
         del delta_token_ids, request
 
+        self._current_text = current_text
         content = self._extract_content_delta(current_text)
         tool_deltas: list[DeltaToolCall] = []
 
@@ -322,3 +324,30 @@ class RWKVToolParser(ToolParser):
         if content or tool_deltas:
             return DeltaMessage(content=content, tool_calls=tool_deltas)
         return None
+
+    def finish_streaming(self) -> DeltaMessage | None:
+        """Flush withheld text when the stream ends.
+
+        Streaming holds back everything from the first tool-call marker so
+        that a valid tool call is never leaked as content. At stream end,
+        mirror the non-streaming ``extract_tool_calls``: without any valid
+        tool call the full text is content; with one, everything before the
+        first valid match is content.
+        """
+        current_text = self._current_text
+        if self.prev_tool_call_arr:
+            matches = self._iter_tool_call_matches(current_text)
+            if not matches:
+                # A later malformed payload emptied the matches; the
+                # already-streamed tool call cannot be reconciled with the
+                # final text, so flush nothing rather than repeat the
+                # tool-call markup as content.
+                return None
+            flush_end = matches[0].start
+        else:
+            flush_end = len(current_text)
+        pending = current_text[self._sent_content_idx : flush_end]
+        if not pending:
+            return None
+        self._sent_content_idx = flush_end
+        return DeltaMessage(content=pending)

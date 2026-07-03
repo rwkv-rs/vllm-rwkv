@@ -9,7 +9,9 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionToolsParam,
 )
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+from vllm.parser.abstract_parser import DelegatingParser
 from vllm.tool_parsers import ToolParser, ToolParserManager
+from vllm.tool_parsers.rwkv_tool_parser import RWKVToolParser
 
 
 class FakeTokenizer:
@@ -92,6 +94,23 @@ def _content_and_tool_deltas(
         "".join(delta.content or "" for delta in deltas),
         [tool_call for delta in deltas for tool_call in (delta.tool_calls or [])],
     )
+
+
+def _stream_to_end(
+    parser: ToolParser,
+    text: str,
+    request: ChatCompletionRequest,
+    chunk_size: int = 7,
+) -> list[DeltaMessage]:
+    deltas = _stream(parser, text, request, chunk_size)
+    flush_delta = parser.finish_streaming()
+    if flush_delta is not None:
+        deltas.append(flush_delta)
+    return deltas
+
+
+class _RWKVDelegatingParser(DelegatingParser):
+    tool_parser_cls = RWKVToolParser
 
 
 def test_rwkv_tool_parser_keeps_non_tool_output_as_content() -> None:
@@ -351,6 +370,190 @@ def test_rwkv_tool_parser_streams_bash_fence_as_content() -> None:
     parser = _parser(tools)
 
     deltas = _stream(parser, text, _request(tools), chunk_size=4)
+
+    content, tool_deltas = _content_and_tool_deltas(deltas)
+    assert content == text
+    assert tool_deltas == []
+
+
+def test_rwkv_tool_parser_streams_malformed_tool_call_as_content() -> None:
+    tools = [_tool("get_weather")]
+    text = (
+        "Checking.\n"
+        "**Tool Call:**\n"
+        "```json\n"
+        '{ "name": "get_weather", "arguments": {"city": "Paris" }\n'
+        "```"
+    )
+    parser = _parser(tools)
+
+    deltas = _stream_to_end(parser, text, _request(tools), chunk_size=5)
+
+    content, tool_deltas = _content_and_tool_deltas(deltas)
+    assert content == text
+    assert tool_deltas == []
+
+
+def test_rwkv_tool_parser_streams_unknown_tool_call_as_content() -> None:
+    tools = [_tool("get_weather")]
+    text = "Checking.\n" + _tool_call("unknown_weather", {"city": "Paris"})
+    parser = _parser(tools)
+
+    deltas = _stream_to_end(parser, text, _request(tools), chunk_size=5)
+
+    content, tool_deltas = _content_and_tool_deltas(deltas)
+    assert content == text
+    assert tool_deltas == []
+
+
+def test_rwkv_tool_parser_streams_truncated_tool_call_as_content() -> None:
+    # Generation cut off (e.g. by max_tokens) before the fence closes.
+    tools = [_tool("get_weather")]
+    text = (
+        "Checking.\n"
+        "**Tool Call:**\n"
+        "```json\n"
+        '{"name": "get_weather", "arguments": {"city":'
+    )
+    parser = _parser(tools)
+
+    deltas = _stream_to_end(parser, text, _request(tools), chunk_size=5)
+
+    content, tool_deltas = _content_and_tool_deltas(deltas)
+    assert content == text
+    assert tool_deltas == []
+
+
+def test_rwkv_tool_parser_streams_json_fence_example_as_content() -> None:
+    # A plain ```json fence that is not a tool call must not swallow the
+    # text that follows it.
+    tools = [_tool("get_weather")]
+    text = 'Example response:\n```json\n{"city": "Paris"}\n```\nNo tool needed.'
+    parser = _parser(tools)
+
+    deltas = _stream_to_end(parser, text, _request(tools), chunk_size=5)
+
+    content, tool_deltas = _content_and_tool_deltas(deltas)
+    assert content == text
+    assert tool_deltas == []
+
+
+def test_rwkv_tool_parser_flushes_partial_marker_at_stream_end() -> None:
+    text = "All done **Tool"
+    parser = _parser()
+
+    deltas = _stream_to_end(parser, text, _request(), chunk_size=4)
+
+    content, tool_deltas = _content_and_tool_deltas(deltas)
+    assert content == text
+    assert tool_deltas == []
+
+
+def test_rwkv_tool_parser_finish_streaming_after_tool_call_returns_none() -> None:
+    # Once a valid tool call was streamed, text from the tool call onward
+    # stays dropped, matching the non-streaming extract_tool_calls behavior.
+    tools = [_tool("get_weather")]
+    text = "Checking.\n" + _tool_call("get_weather", {"city": "Paris"}) + "\nDone."
+    parser = _parser(tools)
+
+    deltas = _stream(parser, text, _request(tools), chunk_size=5)
+
+    content, tool_deltas = _content_and_tool_deltas(deltas)
+    assert content == "Checking.\n"
+    assert len(tool_deltas) == 1
+    assert parser.finish_streaming() is None
+
+
+def test_rwkv_tool_parser_finish_streaming_before_any_delta_returns_none() -> None:
+    assert _parser().finish_streaming() is None
+
+
+def test_rwkv_tool_parser_flushes_example_fence_before_tool_call() -> None:
+    # Content withheld for an example fence that precedes a valid tool call
+    # is flushed at stream end: like extract_tool_calls, everything before
+    # the first valid match is content.
+    tools = [_tool("get_weather")]
+    text = 'Intro\n```json\n{"note": "example"}\n```\nmid text\n' + _tool_call(
+        "get_weather", {"city": "Paris"}
+    )
+    parser = _parser(tools)
+
+    deltas = _stream_to_end(parser, text, _request(tools), chunk_size=5)
+
+    content, tool_deltas = _content_and_tool_deltas(deltas)
+    assert content == text[: text.index("**Tool Call:**")]
+    assert len(tool_deltas) == 1
+    assert tool_deltas[0].function is not None
+    assert tool_deltas[0].function.name == "get_weather"
+
+
+def test_rwkv_tool_parser_no_flush_after_tool_call_with_later_malformed_fence() -> None:
+    # A later malformed payload retroactively empties
+    # _iter_tool_call_matches, so the already-streamed tool call cannot be
+    # reconciled with the final text (non-streaming would report no tool
+    # calls at all); keep the emitted tool call and flush nothing rather
+    # than repeat the tool-call markup as content.
+    tools = [_tool("get_weather")]
+    text = (
+        _tool_call("get_weather", {"city": "Paris"})
+        + "\n**Tool Call:**\n```json\n{ broken\n```"
+    )
+    parser = _parser(tools)
+
+    deltas = _stream(parser, text, _request(tools), chunk_size=5)
+
+    _, tool_deltas = _content_and_tool_deltas(deltas)
+    assert len(tool_deltas) == 1
+    assert parser.finish_streaming() is None
+
+
+def test_rwkv_tool_parser_streams_legacy_unknown_tool_call_as_content() -> None:
+    tools = [_tool("get_weather")]
+    text = "Hi\n<tool_call>\n{'name': 'nope', 'arguments': {'x': 1}}\n"
+    parser = _parser(tools)
+
+    deltas = _stream_to_end(parser, text, _request(tools), chunk_size=5)
+
+    content, tool_deltas = _content_and_tool_deltas(deltas)
+    assert content == text
+    assert tool_deltas == []
+
+
+def test_rwkv_tool_parser_streams_truncated_legacy_tool_call_as_content() -> None:
+    tools = [_tool("read")]
+    text = "Hi\n<tool_call>\n{'name': 'read', 'arguments'"
+    parser = _parser(tools)
+
+    deltas = _stream_to_end(parser, text, _request(tools), chunk_size=5)
+
+    content, tool_deltas = _content_and_tool_deltas(deltas)
+    assert content == text
+    assert tool_deltas == []
+
+
+def test_rwkv_delegating_parser_flushes_withheld_content_at_finish() -> None:
+    tools = [_tool("get_weather")]
+    request = _request(tools)
+    text = "Checking.\n" + _tool_call("unknown_weather", {"city": "Paris"})
+    parser = _RWKVDelegatingParser(FakeTokenizer(), tools=tools)
+
+    deltas: list[DeltaMessage] = []
+    prompt_token_ids: list[int] | None = []
+    for idx in range(0, len(text), 5):
+        delta = parser.parse_delta(
+            text[idx : idx + 5],
+            [],
+            request,
+            prompt_token_ids=prompt_token_ids,
+            finished=False,
+        )
+        prompt_token_ids = None
+        if delta is not None:
+            deltas.append(delta)
+
+    final_delta = parser.parse_delta("", [], request, finished=True)
+    if final_delta is not None:
+        deltas.append(final_delta)
 
     content, tool_deltas = _content_and_tool_deltas(deltas)
     assert content == text
