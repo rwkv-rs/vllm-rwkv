@@ -31,6 +31,8 @@ def test_sampler_warmup_params_for_rapid_sampler() -> None:
 
     assert sampling_params.frequency_penalty == 0.0
     assert sampling_params.min_p == 0.0
+    assert sampling_params.logprobs is None
+    assert sampling_params.prompt_logprobs is None
     assert sampling_params.presence_penalty == 0.5
     assert sampling_params.repetition_penalty == 1.2
 
@@ -40,6 +42,8 @@ def test_sampler_warmup_params_for_native_sampler() -> None:
 
     assert sampling_params.frequency_penalty == 0.5
     assert sampling_params.min_p == 0.1
+    assert sampling_params.logprobs == 5
+    assert sampling_params.prompt_logprobs == 1
 
 
 def _create_fake_logits(batch_size: int, vocab_size: int) -> torch.Tensor:

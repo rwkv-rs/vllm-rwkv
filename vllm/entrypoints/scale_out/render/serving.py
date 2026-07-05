@@ -9,7 +9,6 @@ from vllm.entrypoints.openai.models.serving import (
     OpenAIModelRegistry,
     OpenAIServingModels,
 )
-from vllm.entrypoints.openai.rwkv_defaults import apply_rwkv_default_sampling_params
 from vllm.entrypoints.scale_out.token_in_token_out.mm_serde import encode_mm_kwargs_item
 from vllm.entrypoints.scale_out.token_in_token_out.protocol import (
     GenerateRequest,
@@ -31,6 +30,7 @@ from vllm.renderers.inputs.preprocess import (
     extract_prompt_len,
 )
 from vllm.renderers.online_renderer import OnlineRenderer
+from vllm.tokenizers.rwkv_defaults import apply_rwkv_default_sampling_params
 from vllm.utils import random_uuid
 
 logger = init_logger(__name__)

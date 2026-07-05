@@ -830,11 +830,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         else True
     ),
     # Whether to use the rapid-sampling CUDA top-k / top-p sampler.
-    # Disabled by default; set to 1 to opt in.
+    # Enabled by default; set to 0 to opt out.
     "VLLM_USE_RAPID_SAMPLER": lambda: (
         bool(int(os.environ["VLLM_USE_RAPID_SAMPLER"]))
         if "VLLM_USE_RAPID_SAMPLER" in os.environ
-        else False
+        else True
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),

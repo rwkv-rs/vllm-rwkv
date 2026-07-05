@@ -8,7 +8,7 @@ import math
 from dataclasses import field
 from enum import Enum, IntEnum
 from functools import cached_property
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import msgspec
 from pydantic import BeforeValidator
@@ -161,6 +161,22 @@ class RepetitionDetectionParams:
     detection. Must be >= 2. Example: 3 for detecting a phrase repeated
     3 times. Must be used together with max_pattern_size."""
 
+    mode: Literal["consecutive", "occurrence"] = "consecutive"
+    """Detection mode.
+
+    - "consecutive" detects tail patterns repeated back-to-back.
+    - "occurrence" detects the tail N-gram when it has occurred min_count
+      times anywhere in the output token stream.
+    """
+
+    occurrence_rules: list[tuple[int, int]] | None = None
+    """Optional occurrence-mode rules as ``(ngram_size, min_count)`` pairs.
+
+    This allows shorter N-grams to require higher counts while preserving
+    the stricter long N-gram rule. When set, these rules replace
+    min_pattern_size/max_pattern_size/min_count for occurrence mode.
+    """
+
     def __post_init__(self):
         if (
             self.max_pattern_size < 0
@@ -178,6 +194,24 @@ class RepetitionDetectionParams:
                 "in engine output. If you do not wish to detect repetitive "
                 "patterns, set max_pattern_size to 0."
             )
+        if self.mode not in ("consecutive", "occurrence"):
+            raise ValueError(
+                "mode must be either 'consecutive' or 'occurrence', "
+                f"got {self.mode!r}."
+            )
+        if self.occurrence_rules is not None:
+            if self.mode != "occurrence":
+                raise ValueError("occurrence_rules can only be used with mode='occurrence'.")
+            normalized_rules = []
+            for ngram_size, min_count in self.occurrence_rules:
+                if ngram_size <= 0:
+                    raise ValueError(f"occurrence rule ngram_size must be positive, got {ngram_size}.")
+                if min_count < 2:
+                    raise ValueError(f"occurrence rule min_count must be >= 2, got {min_count}.")
+                normalized_rules.append((int(ngram_size), int(min_count)))
+            if not normalized_rules:
+                raise ValueError("occurrence_rules must contain at least one rule.")
+            self.occurrence_rules = normalized_rules
 
 
 class RequestOutputKind(Enum):
@@ -1141,8 +1175,8 @@ class SamplingParams(
             min_tokens=2,
             logit_bias={0: -1.0, 1: 0.5},
             _bad_words_token_ids=[[0], [1, 2]],
-            logprobs=5,
-            prompt_logprobs=1,
+            logprobs=None if use_rapid_sampler else 5,
+            prompt_logprobs=None if use_rapid_sampler else 1,
         )
 
 

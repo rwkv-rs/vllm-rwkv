@@ -117,7 +117,7 @@ markers = [
 respect-ignore-files = true
 
 [tool.ty.environment]
-python = "./.venv"
+python = "../../../.venv"
 
 [tool.typos.files]
 # these files may be written in non english words
