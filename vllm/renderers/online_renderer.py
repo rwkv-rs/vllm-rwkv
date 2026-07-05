@@ -25,7 +25,7 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
     render_for_completion,
 )
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
-from vllm.entrypoints.openai.rwkv_defaults import resolve_rwkv_tool_parser
+from vllm.tokenizers.rwkv_defaults import resolve_rwkv_tool_parser
 from vllm.entrypoints.serve.utils.error_response import create_error_response
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.inputs import (

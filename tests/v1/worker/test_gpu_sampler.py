@@ -2,10 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from types import SimpleNamespace
 
+import numpy as np
+import pytest
 import torch
 
 from vllm import SamplingParams
+from vllm.v1.worker.gpu.sample import sampler as sampler_module
 from vllm.v1.worker.gpu.sample.sampler import Sampler
+from vllm.v1.worker.gpu.sample.states import SamplingStates
 
 
 def _new_rapid_sampler(
@@ -57,3 +61,220 @@ def test_worker_sampler_seeds_rapid_repetition_penalty_from_prompt():
     assert torch.isclose(rapid_penalties[0, 2], torch.tensor(1.2))
     assert torch.isclose(rapid_penalties[0, 5], torch.tensor(1.2))
     assert torch.count_nonzero(rapid_penalties[0]) == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="UVA tensors require CUDA")
+def test_sampling_states_can_collapse_uniform_rapid_params():
+    states = SamplingStates(max_num_reqs=4, vocab_size=8)
+    for req_idx in range(3):
+        states.add_request(
+            req_idx,
+            SamplingParams(temperature=1.0, top_k=4, top_p=0.28),
+        )
+    states.apply_staged_writes()
+
+    device = states.temperature.gpu.device
+    expanded_idx_mapping = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
+    idx_mapping_np = np.array([0, 1, 2])
+
+    temperatures = states.get_temperatures(
+        expanded_idx_mapping,
+        idx_mapping_np,
+        scalar_if_uniform=True,
+    )
+    top_k, top_p = states.get_top_k_top_p(
+        expanded_idx_mapping,
+        idx_mapping_np,
+        scalar_if_uniform=True,
+    )
+
+    assert temperatures == pytest.approx(1.0)
+    assert top_k == 4
+    assert top_p == pytest.approx(0.28)
+
+    vector_top_k, vector_top_p = states.get_top_k_top_p(
+        expanded_idx_mapping,
+        idx_mapping_np,
+    )
+
+    assert vector_top_k is not None and vector_top_k.shape == (3,)
+    assert vector_top_p is not None and vector_top_p.shape == (3,)
+
+
+def test_rapid_sampler_recomputes_processed_logits_for_logprobs(monkeypatch):
+    sampler = object.__new__(Sampler)
+    sampler.use_rapid = True
+    sampler.use_flashinfer = False
+    sampler.logprobs_mode = "processed_logprobs"
+    sampler.rapid_penalties = None
+
+    class FakeSamplingStates:
+        def get_temperatures(
+            self,
+            expanded_idx_mapping,
+            idx_mapping_np,
+            *,
+            scalar_if_uniform=False,
+        ):
+            assert scalar_if_uniform is True
+            return 1.0
+
+        def get_top_k_top_p(
+            self,
+            expanded_idx_mapping,
+            idx_mapping_np,
+            *,
+            scalar_if_uniform=False,
+        ):
+            assert scalar_if_uniform is True
+            return None, None
+
+        def any_greedy(self, idx_mapping_np):
+            return False
+
+        def any_explicit_seed(self, idx_mapping_np):
+            return False
+
+        def any_min_p(self, idx_mapping_np):
+            return False
+
+    class FakePenaltiesState:
+        def any_frequency_penalty(self, idx_mapping_np):
+            return False
+
+        def use_rapid_penalty(self, idx_mapping_np):
+            return False
+
+    sampler.sampling_states = FakeSamplingStates()
+    sampler.penalties_state = FakePenaltiesState()
+
+    sampling_param_calls = []
+    first_processed_logits = torch.full((1, 4), 1.0)
+    logprob_processed_logits = torch.full((1, 4), 2.0)
+
+    def fake_apply_sampling_params(*args, **kwargs):
+        sampling_param_calls.append(kwargs)
+        return first_processed_logits if len(sampling_param_calls) == 1 else logprob_processed_logits
+
+    sampler.apply_sampling_params = fake_apply_sampling_params
+    monkeypatch.setattr(sampler_module, "rapid_sample_input_supported", lambda logits: True)
+    monkeypatch.setattr(
+        sampler_module,
+        "rapid_sample",
+        lambda logits, top_k, top_p, temperatures: torch.tensor([3]),
+    )
+
+    sampled, processed_logits = sampler.sample(
+        logits=torch.zeros((1, 4)),
+        expanded_idx_mapping=torch.tensor([0]),
+        idx_mapping_np=np.array([0]),
+        pos=torch.tensor([0]),
+        input_ids=torch.tensor([0]),
+        expanded_local_pos=torch.tensor([0]),
+        return_logprobs=True,
+    )
+
+    assert sampled.tolist() == [3]
+    assert processed_logits is logprob_processed_logits
+    assert len(sampling_param_calls) == 2
+    assert sampling_param_calls[0]["skip_top_k_top_p"] is True
+    assert sampling_param_calls[0]["skip_temperature"] is True
+    assert sampling_param_calls[1].get("skip_top_k_top_p", False) is False
+    assert sampling_param_calls[1].get("skip_temperature", False) is False
+
+
+def test_rapid_sampler_default_recomputes_native_logits_when_input_unsupported(
+    monkeypatch,
+):
+    monkeypatch.delenv("VLLM_USE_RAPID_SAMPLER", raising=False)
+
+    sampler = object.__new__(Sampler)
+    sampler.use_rapid = True
+    sampler.use_flashinfer = False
+    sampler.logprobs_mode = "raw_logprobs"
+    sampler.rapid_penalties = None
+    sampler.use_fp64_gumbel = False
+
+    top_k_calls = []
+
+    class FakeSamplingStates:
+        temperature = SimpleNamespace(gpu=torch.tensor([1.0]))
+        seeds = SimpleNamespace(gpu=torch.tensor([0]))
+
+        def get_temperatures(
+            self,
+            expanded_idx_mapping,
+            idx_mapping_np,
+            *,
+            scalar_if_uniform=False,
+        ):
+            assert scalar_if_uniform is True
+            return 1.0
+
+        def get_top_k_top_p(
+            self,
+            expanded_idx_mapping,
+            idx_mapping_np,
+            *,
+            scalar_if_uniform=False,
+        ):
+            top_k_calls.append(scalar_if_uniform)
+            return None, None
+
+        def any_greedy(self, idx_mapping_np):
+            return False
+
+        def any_explicit_seed(self, idx_mapping_np):
+            return False
+
+        def any_min_p(self, idx_mapping_np):
+            return False
+
+    class FakePenaltiesState:
+        def any_frequency_penalty(self, idx_mapping_np):
+            return False
+
+        def use_rapid_penalty(self, idx_mapping_np):
+            return False
+
+    sampler.sampling_states = FakeSamplingStates()
+    sampler.penalties_state = FakePenaltiesState()
+
+    sampling_param_calls = []
+    rapid_processed_logits = torch.full((1, 4), 1.0)
+    native_processed_logits = torch.full((1, 4), 2.0)
+
+    def fake_apply_sampling_params(*args, **kwargs):
+        sampling_param_calls.append(kwargs)
+        return rapid_processed_logits if len(sampling_param_calls) == 1 else native_processed_logits
+
+    sampler.apply_sampling_params = fake_apply_sampling_params
+    monkeypatch.setattr(sampler_module, "rapid_sample_input_supported", lambda logits: False)
+    monkeypatch.setattr(
+        sampler_module,
+        "rapid_sample",
+        lambda *args, **kwargs: pytest.fail("unsupported input should use native"),
+    )
+    monkeypatch.setattr(
+        sampler_module,
+        "gumbel_sample",
+        lambda *args, **kwargs: torch.tensor([2]),
+    )
+
+    sampled, processed_logits = sampler.sample(
+        logits=torch.zeros((1, 4)),
+        expanded_idx_mapping=torch.tensor([0]),
+        idx_mapping_np=np.array([0]),
+        pos=torch.tensor([0]),
+        input_ids=torch.tensor([0]),
+        expanded_local_pos=torch.tensor([0]),
+    )
+
+    assert sampled.tolist() == [2]
+    assert processed_logits is native_processed_logits
+    assert top_k_calls == [True, False]
+    assert len(sampling_param_calls) == 2
+    assert sampling_param_calls[0]["skip_top_k_top_p"] is True
+    assert sampling_param_calls[0]["skip_temperature"] is True
+    assert sampling_param_calls[1].get("skip_top_k_top_p", False) is False
+    assert sampling_param_calls[1].get("skip_temperature", False) is False

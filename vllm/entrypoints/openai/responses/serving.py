@@ -89,7 +89,7 @@ from vllm.entrypoints.openai.responses.utils import (
     extract_function_tool_names,
     extract_tool_types,
 )
-from vllm.entrypoints.openai.rwkv_defaults import (
+from vllm.tokenizers.rwkv_defaults import (
     apply_rwkv_default_sampling_params,
     resolve_rwkv_tool_parser,
 )

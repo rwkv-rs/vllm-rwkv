@@ -16,8 +16,8 @@ from vllm.entrypoints.openai.completion.protocol import (
     CompletionResponseChoice,
 )
 from vllm.entrypoints.openai.engine.protocol import ToolCall
-from vllm.entrypoints.openai.rwkv_defaults import resolve_rwkv_tool_parser
 from vllm.entrypoints.scale_out.token_in_token_out.protocol import GenerateResponse
+from vllm.tokenizers.rwkv_defaults import resolve_rwkv_tool_parser
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.logger import init_logger
 from vllm.parser import Parser, ParserManager

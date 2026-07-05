@@ -5,20 +5,20 @@
 # Adapted from BlinkDL/ChatRWKV tokenizer/rwkv_tokenizer.py.
 
 import ast
-import json
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, overload
 
-import regex as re
 from transformers import BatchEncoding
 from transformers.utils import chat_template_utils as hf_chat_utils
 
+from .rwkv_defaults import (
+    RWKV_NATIVE_CHAT_TEMPLATE as _RWKV_NATIVE_CHAT_TEMPLATE,
+    render_rwkv_chat_template,
+)
 from .protocol import TokenizerLike
 
 _VOCAB_FILE = Path(__file__).parent / "assets" / "rwkv_vocab_v20230424.txt"
-_RWKV_NATIVE_CHAT_TEMPLATE = "{# RWKV native chat template #}"
-_BLANK_LINES_RE = re.compile(r"\n{2,}")
 _RWKV7_VOCAB_SIZE = 65536
 _UNKNOWN_TOKEN_BYTES = "\ufffd".encode()
 
@@ -137,7 +137,7 @@ class RWKVTokenizer(TokenizerLike):
         return self._truncation_side
 
     def num_special_tokens_to_add(self) -> int:
-        return 0
+        return 1
 
     def encode_bytes(self, src: bytes) -> list[int]:
         tokens: list[int] = []
@@ -177,6 +177,8 @@ class RWKVTokenizer(TokenizerLike):
         add_special_tokens: bool = True,
     ) -> list[int]:
         tokens = self.encode_bytes(text.encode("utf-8"))
+        if add_special_tokens:
+            tokens = [self.bos_token_id, *tokens]
         if truncation and max_length is not None:
             if self.truncation_side == "left":
                 tokens = tokens[-max_length:]
@@ -275,202 +277,6 @@ class RWKVTokenizer(TokenizerLike):
             return idx
         return self.token2idx[token.encode("utf-8")]
 
-    @staticmethod
-    def _normalize_message_content(content: Any) -> str:
-        if content is None:
-            text = ""
-        elif isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            parts: list[str] = []
-            for item in content:
-                if isinstance(item, str):
-                    parts.append(item)
-                elif isinstance(item, dict):
-                    if item.get("type") == "text":
-                        parts.append(str(item.get("text", "")))
-                    elif "text" in item:
-                        parts.append(str(item["text"]))
-                else:
-                    parts.append(str(item))
-            text = "\n".join(part for part in parts if part)
-        else:
-            text = str(content)
-
-        text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-        return _BLANK_LINES_RE.sub("\n", text)
-
-    @staticmethod
-    def _json_text(value: Any) -> str:
-        if isinstance(value, str):
-            try:
-                value = json.loads(value)
-            except json.JSONDecodeError:
-                value = RWKVTokenizer._normalize_message_content(value)
-        return json.dumps(value, ensure_ascii=False, indent=2)
-
-    @staticmethod
-    def _json_value(value: Any) -> Any:
-        if isinstance(value, str):
-            try:
-                return json.loads(value)
-            except json.JSONDecodeError:
-                return RWKVTokenizer._normalize_message_content(value)
-        return value
-
-    @staticmethod
-    def _tool_function(tool: Any) -> Any:
-        if isinstance(tool, dict):
-            return tool.get("function", tool)
-        return getattr(tool, "function", tool)
-
-    @staticmethod
-    def _field(value: Any, name: str, default: Any = None) -> Any:
-        if isinstance(value, dict):
-            return value.get(name, default)
-        return getattr(value, name, default)
-
-    @classmethod
-    def _render_tool_definitions(cls, tools: list[dict[str, Any]]) -> list[str]:
-        rendered: list[str] = []
-        for tool in tools:
-            function = cls._tool_function(tool)
-            name = cls._field(function, "name", "")
-            description = cls._field(function, "description", "") or ""
-            parameters = cls._field(function, "parameters", {}) or {}
-            rendered.append(f"### `{name}`")
-            if description:
-                rendered.append(
-                    f"**Description:** {cls._normalize_message_content(description)}"
-                )
-            rendered.append("**Parameters:**")
-            rendered.append("```json")
-            rendered.append(cls._json_text(parameters))
-            rendered.append("```")
-        if rendered:
-            rendered.extend(
-                [
-                    "To call one of these tools, write exactly this format:",
-                    "**Tool Call:**",
-                    "```json",
-                    '{"name": "tool_name", "arguments": {"key": "value"}}',
-                    "```",
-                    "Do not invent tool call IDs or write tool outputs yourself.",
-                ]
-            )
-        return rendered
-
-    @classmethod
-    def _render_tool_chat(
-        cls,
-        messages: list[Any],
-        tools: list[dict[str, Any]],
-        *,
-        add_generation_prompt: bool,
-    ) -> str:
-        lines: list[str] = []
-        pending_system: list[str] = []
-
-        for message in messages:
-            role = cls._field(message, "role", "")
-            content = cls._normalize_message_content(cls._field(message, "content", ""))
-
-            if role == "system":
-                pending_system.append(content)
-                continue
-
-            if pending_system or (tools and not lines):
-                lines.append("### System")
-                lines.extend(item for item in pending_system if item)
-                lines.extend(cls._render_tool_definitions(tools))
-                pending_system.clear()
-
-            if role == "user":
-                lines.extend(["### User", content])
-            elif role == "assistant":
-                lines.append("### Assistant")
-                if content:
-                    lines.append(content)
-                for tool_call in cls._field(message, "tool_calls", []) or []:
-                    function = cls._tool_function(tool_call)
-                    name = cls._field(function, "name", "")
-                    arguments = cls._field(function, "arguments", {}) or {}
-                    payload = {
-                        "name": name,
-                        "arguments": cls._json_value(arguments),
-                    }
-                    lines.extend(
-                        ["**Tool Call:**", "```json", cls._json_text(payload), "```"]
-                    )
-            elif role == "tool":
-                payload = cls._json_value(content)
-                lines.extend(
-                    ["### Tool Output", "```json", cls._json_text(payload), "```"]
-                )
-            else:
-                raise ValueError(f"Unsupported RWKV chat message role: {role!r}")
-
-        if pending_system:
-            lines.append("### System")
-            lines.extend(item for item in pending_system if item)
-            lines.extend(cls._render_tool_definitions(tools))
-
-        if add_generation_prompt:
-            lines.append("### Assistant")
-            lines.append("<think")
-
-        return "\n".join(lines)
-
-    @classmethod
-    def _render_basic_chat(
-        cls,
-        messages: list[Any],
-        *,
-        add_generation_prompt: bool,
-    ) -> str:
-        rendered: list[str] = []
-        for message in messages:
-            role = cls._field(message, "role", "")
-            content = cls._normalize_message_content(cls._field(message, "content", ""))
-            if role == "system":
-                label = "System"
-            elif role == "user":
-                label = "User"
-            elif role == "assistant":
-                label = "Assistant"
-            else:
-                raise ValueError(f"Unsupported RWKV chat message role: {role!r}")
-            rendered.append(f"{label}: {content}" if content else f"{label}:")
-
-        if add_generation_prompt:
-            rendered.append("Assistant: <think")
-
-        return "\n\n".join(rendered)
-
-    @classmethod
-    def _render_native_chat_template(
-        cls,
-        messages: list[Any],
-        tools: list[dict[str, Any]] | None,
-        *,
-        add_generation_prompt: bool,
-    ) -> str:
-        has_tool_history = any(
-            cls._field(message, "role", "") == "tool"
-            or bool(cls._field(message, "tool_calls", None))
-            for message in messages
-        )
-        if tools or has_tool_history:
-            return cls._render_tool_chat(
-                messages,
-                tools or [],
-                add_generation_prompt=add_generation_prompt,
-            )
-        return cls._render_basic_chat(
-            messages,
-            add_generation_prompt=add_generation_prompt,
-        )
-
     def get_chat_template(
         self,
         chat_template: str | None = None,
@@ -493,12 +299,17 @@ class RWKVTokenizer(TokenizerLike):
         if conversation is None:
             raise ValueError("Either 'messages' or 'conversation' must be provided.")
 
+        add_special_tokens = bool(kwargs.pop("add_special_tokens", True))
         template = self.get_chat_template(chat_template, tools=tools)
         if template is not None and template.strip() == _RWKV_NATIVE_CHAT_TEMPLATE:
-            prompt = self._render_native_chat_template(
+            prompt = render_rwkv_chat_template(
                 list(conversation),
                 tools,
                 add_generation_prompt=bool(kwargs.get("add_generation_prompt", False)),
+                rwkv_generation_prompt=kwargs.get(
+                    "rwkv_generation_prompt",
+                    "open_think",
+                ),
             )
         else:
             rendered, _ = hf_chat_utils.render_jinja_template(
@@ -510,5 +321,5 @@ class RWKVTokenizer(TokenizerLike):
             prompt = rendered[0] if rendered else ""
 
         if tokenize:
-            return self.encode(prompt, add_special_tokens=False)
+            return self.encode(prompt, add_special_tokens=add_special_tokens)
         return prompt

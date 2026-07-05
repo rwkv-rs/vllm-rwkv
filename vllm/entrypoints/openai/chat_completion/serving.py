@@ -47,7 +47,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     UsageInfo,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
-from vllm.entrypoints.openai.rwkv_defaults import (
+from vllm.tokenizers.rwkv_defaults import (
     apply_rwkv_default_sampling_params,
     resolve_rwkv_tool_parser,
 )

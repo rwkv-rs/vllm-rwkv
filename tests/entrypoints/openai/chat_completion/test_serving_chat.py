@@ -38,9 +38,9 @@ from vllm.entrypoints.openai.models.serving import (
     OpenAIServingModels,
 )
 from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
-from vllm.entrypoints.openai.rwkv_defaults import (
-    RWKV_DEFAULT_STOP,
+from vllm.tokenizers.rwkv_defaults import (
     RWKV_DEFAULT_STOP_TOKEN_IDS,
+    RWKV_DEFAULT_STOPS,
 )
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import TokensPrompt
@@ -624,7 +624,7 @@ def test_rwkv_serving_chat_defaults_tool_parser_when_auto_tools_enabled():
 
     assert serving_chat.parser_cls is not None
     assert serving_chat.parser_cls.tool_parser_cls.__name__ == "RWKVToolParser"
-    assert serving_chat.default_sampling_params["stop"] == [RWKV_DEFAULT_STOP]
+    assert serving_chat.default_sampling_params["stop"] == list(RWKV_DEFAULT_STOPS)
     assert serving_chat.default_sampling_params["stop_token_ids"] == list(
         RWKV_DEFAULT_STOP_TOKEN_IDS
     )
