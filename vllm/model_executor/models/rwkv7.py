@@ -1897,8 +1897,8 @@ class RWKV7ForCausalLM(nn.Module):
                 return torch.ops.rwkv7_int8_ops.linear_int8_orig_rows_exact_f16(
                     xc, weight, scale, 64, 2, True
                 )
-            # rows > 2: dequant to fp16, then run the original fp16 dispatch
-            w_fp16 = (weight.float() * scale.unsqueeze(1).float()).to(torch.float16)
+            # rows > 2: use vectorized dequant kernel, no intermediate fp32
+            w_fp16 = torch.ops.rwkv7_int8_ops.dequant_int8_to_f16(weight, scale, False)
             if use_orig_linear(group):
                 weight = w_fp16.contiguous()  # [N,K] fp16 orig
             else:
