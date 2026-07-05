@@ -298,6 +298,33 @@ class RWKV7ForCausalLM(nn.Module):
                 return self._tp_slice(value, 1)
         return value
 
+    def _shard_int8_scale_for_tp(self, key: str, scale: torch.Tensor) -> torch.Tensor:
+        """Shard a 1D per-output-row int8 scale to match the weight's dim-0 sharding.
+
+        Mirrors ``_shard_weight_for_tp``: for orig-linear weights whose output dim
+        (dim 0) is sliced across TP ranks (att r/k/v, ffn key), slice the scale on
+        dim 0 the same way; for att ``output.weight`` the weight is sliced on dim 1
+        so the per-output-row scale stays full; for ``head.weight`` use the
+        vocab-parallel slice (handles non-divisible vocab padding).
+        """
+        if getattr(self, "tp_size", 1) == 1:
+            return scale
+        if key == "head.weight":
+            return self._tp_vocab_slice(scale)
+        parts = key.split(".")
+        if len(parts) < 4 or parts[0] != "blocks":
+            return scale
+        submodule = parts[2]
+        name = ".".join(parts[3:])
+        if submodule == "att":
+            if name in {"receptance.weight", "key.weight", "value.weight"}:
+                return self._tp_hidden_slice(scale, 0)
+            # output.weight: weight sharded on dim 1, scale (per-N) stays full
+            return scale
+        if submodule == "ffn" and name == "key.weight":
+            return self._tp_slice(scale, 0)
+        return scale
+
     def _tp_all_reduce(self, value: torch.Tensor) -> torch.Tensor:
         if getattr(self, "tp_size", 1) == 1:
             return value
@@ -437,6 +464,14 @@ class RWKV7ForCausalLM(nn.Module):
             self.z = z
         self.emb_cpu = EMB_DEVICE == "cpu"
         self.emb_cache = {}
+        # INT8: rebuild the int8 weight -> scale lookup from the committed self.z so
+        # it points at the tensors actually stored in self.z (works for both the
+        # initial load path and the reuse_existing_tensors in-place copy path).
+        self.int8_scales = {}
+        if getattr(self, "_is_int8", False):
+            for k, w in self.z.items():
+                if w.dtype == torch.int8 and (k + ".scale") in self.z:
+                    self.int8_scales[id(w)] = self.z[k + ".scale"]
         torch.accelerator.synchronize()
         logger.info("RWKV7 weights are ready L=%d C=%d H=%d N=%d V=%d", L, C, H, N, V)
 
@@ -495,11 +530,57 @@ class RWKV7ForCausalLM(nn.Module):
         ln0_b_src = z["blocks.0.ln0.bias"].squeeze()
         emb_cpu = emb_src if EMB_DEVICE == "cpu" else None
         logger.info("Preprocessing RWKV7 weights with emb=%s", EMB_DEVICE)
+
+        # INT8 offline-quantized model detection + orig-linear weight preprocessing:
+        # replace the fp16 weight of att_c2c/ffn_key/head with its int8 tensor (kept
+        # int8, moved to GPU, NOT transposed), keep the per-row fp16 scale at
+        # z[key + '.scale'], and delete the raw .int8_weight key to save memory.
+        self._is_int8 = any(k.endswith(".int8_weight") for k in z)
+        self.int8_scales: dict[int, torch.Tensor] = {}
+        if self._is_int8:
+            dev = first_device()
+            int8_count = 0
+            for key in list(z.keys()):
+                if not is_orig_linear_weight(key):
+                    continue
+                i8_key = key + ".int8_weight"
+                scale_key = key + ".scale"
+                if i8_key not in z or scale_key not in z:
+                    continue
+                if not self._is_weight_needed_on_rank(key):
+                    z.pop(key, None)
+                    z.pop(i8_key, None)
+                    z.pop(scale_key, None)
+                    continue
+                int8_w = self._shard_weight_for_tp(key, z[i8_key].squeeze())
+                int8_w = int8_w.to(device=dev).contiguous()
+                scale = self._shard_int8_scale_for_tp(key, z[scale_key].squeeze())
+                scale = scale.to(device=dev, dtype=DTYPE).contiguous()
+                z[key] = int8_w
+                z[scale_key] = scale
+                del z[i8_key]
+                int8_count += 1
+                logger.debug(
+                    "RWKV7 int8 weight loaded: %s shape=%s", key, tuple(int8_w.shape)
+                )
+            logger.info(
+                "RWKV7 int8 quantized model detected; %d orig-linear int8 weights",
+                int8_count,
+            )
+
         for key in list(z.keys()):
             if not self._is_weight_needed_on_rank(key):
                 del z[key]
                 continue
             if key == "emb.weight" and emb_cpu is not None:
+                continue
+            # int8 helpers (.scale/.int8_weight) and int8 orig-linear weights are
+            # already on GPU from the int8 pre-pass above; skip fp16 transpose/dtype.
+            if self._is_int8 and (
+                key.endswith(".scale")
+                or key.endswith(".int8_weight")
+                or (is_orig_linear_weight(key) and z[key].dtype == torch.int8)
+            ):
                 continue
             value = z[key].squeeze()
             value = self._shard_weight_for_tp(key, value)
@@ -1778,6 +1859,51 @@ class RWKV7ForCausalLM(nn.Module):
     def linear_orig_layout(
         self, x: torch.Tensor, weight: torch.Tensor, path: PathConfig, group: str
     ) -> torch.Tensor:
+        # INT8 orig-linear weight: rows 1/2 use the int8 exact kernel; rows>2 are
+        # dequantized to fp16 and fall through to the original fp16 dispatch below
+        # (matches Albatross faster3a linear_orig_layout behaviour).
+        if weight.dtype == torch.int8:
+            scale = self.int8_scales[id(weight)]
+            xc = x.contiguous()
+            if path.rows == 1:
+                if group == "ffn_key":
+                    use4 = True if C == 2560 else (C <= 1024)
+                else:
+                    use4 = (group != "att_c2c" or C < 2048)
+                return torch.ops.rwkv7_int8_ops.linear_int8_orig_rows_exact_f16(
+                    xc, weight, scale, 128, 2, use4
+                )
+            if path.rows == 2:
+                if group == "att_c2c":
+                    return torch.ops.rwkv7_int8_ops.linear_int8_orig_rows_exact_f16(
+                        xc, weight, scale, 64, 2, True
+                    )
+                if group == "ffn_key":
+                    if C == 2560:
+                        return torch.ops.rwkv7_int8_ops.linear_int8_orig_rows_exact_f16(
+                            xc, weight, scale, 128, 2, False
+                        )
+                    if C < 4096:
+                        return torch.ops.rwkv7_int8_ops.linear_int8_orig_rows_exact_f16(
+                            xc, weight, scale, 64, 2, True
+                        )
+                    return torch.ops.rwkv7_int8_ops.linear_int8_orig_rows_exact_f16(
+                        xc, weight, scale, 128, 2, False
+                    )
+                if group == "head" and C == 2560:
+                    return torch.ops.rwkv7_int8_ops.linear_int8_orig_rows_exact_f16(
+                        xc, weight, scale, 128, 2, False
+                    )
+                return torch.ops.rwkv7_int8_ops.linear_int8_orig_rows_exact_f16(
+                    xc, weight, scale, 64, 2, True
+                )
+            # rows > 2: dequant to fp16, then run the original fp16 dispatch
+            w_fp16 = (weight.float() * scale.unsqueeze(1).float()).to(torch.float16)
+            if use_orig_linear(group):
+                weight = w_fp16.contiguous()  # [N,K] fp16 orig
+            else:
+                weight = w_fp16.t().contiguous()  # [K,N] fp16 non-orig
+        # original fp16 path is untouched
         if not use_orig_linear(group):
             return self.linear(x, weight)
         if path.rows == 1:

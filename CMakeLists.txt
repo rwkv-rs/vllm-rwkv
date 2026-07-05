@@ -460,7 +460,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       "csrc/libtorch_stable/rwkv7/rwkv7_fast_ops_fp16.cu"
       "csrc/libtorch_stable/rwkv7/rwkv7_v3a_ops.cu"
       "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp16_v2.cu"
-      "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp32_v2.cu")
+      "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp32_v2.cu"
+      "csrc/libtorch_stable/rwkv7/rwkv7_int8_ops.cu")
 
     set(RWKV7_EXT_SRC
       "csrc/libtorch_stable/rwkv7/rwkv7_fast_ops_fp16.cpp"
@@ -468,7 +469,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       "csrc/libtorch_stable/rwkv7/rwkv7_registration.cpp"
       "csrc/libtorch_stable/rwkv7/rwkv7_v3a_ops.cpp"
       "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp16_v2.cpp"
-      "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp32_v2.cpp")
+      "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp32_v2.cpp"
+      "csrc/libtorch_stable/rwkv7/rwkv7_int8_ops.cpp")
 
     set_source_files_properties(${RWKV7_CUDA_SRCS}
       PROPERTIES COMPILE_FLAGS "-std=c++17 -O3 --extra-device-vectorization -Xptxas -O3")
