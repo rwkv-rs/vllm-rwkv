@@ -27,6 +27,15 @@ __constant__ float e2m1_lut[16] = {
    -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f
 };
 
+// E2M1 __half LUT: same values as __half for __hfma2 accumulation
+// FP16 bit patterns: 0=0x0000, 0.5=0x3800, 1.0=0x3C00, 1.5=0x3E00,
+// 2.0=0x4000, 3.0=0x4200, 4.0=0x4400, 6.0=0x4500
+// Negatives: flip sign bit (bit 15)
+__constant__ unsigned short e2m1_raw[16] = {
+    0x0000, 0x3800, 0x3C00, 0x3E00, 0x4000, 0x4200, 0x4400, 0x4500,
+    0x8000, 0xB800, 0xBC00, 0xBE00, 0xC000, 0xC200, 0xC400, 0xC500
+};
+
 __device__ __forceinline__ float warp_sum(float x) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
@@ -520,8 +529,11 @@ at::Tensor linear_nf4_orig_rows_f16_cuda_impl(at::Tensor x, at::Tensor w_nf4, at
 
 constexpr int NF4_CMIX_THREADS = 128;
 constexpr int NF4_CMIX_TILE = 128;
+// Vectorized: each thread reads 4 bytes (uint32 = 8 E2M1 codes = 4 __half2 pairs)
+// Block scale: 1 read covers 8 elements (8 < 16, always same block)
+constexpr int NF4_CMIX_VEC = 8;  // columns per thread
 
-// rows=1: relu^2 activation + sparse mat-vec with NF4 weights
+// rows=1: relu^2 activation + sparse mat-vec with NF4 weights (vectorized)
 __global__ __launch_bounds__(NF4_CMIX_THREADS, 4) void cmix_sparse_spmv_relu_one_nf4_kernel(
     int C,
     const dtype* __restrict__ preact,
@@ -575,27 +587,56 @@ __global__ __launch_bounds__(NF4_CMIX_THREADS, 4) void cmix_sparse_spmv_relu_one
   }
   __syncthreads();
 
-  // NF4 sparse mat-vec: fp32 accumulation for precision
+  // Vectorized NF4 sparse mat-vec: uint32 read = 8 E2M1 codes, __hfma2 accumulation
   const int C2 = C >> 1;
   const int CB = C >> 4;
-  const int col = c_block * (2 * NF4_CMIX_THREADS) + tid * 2;
-  const int col2 = col >> 1;
-  const int colb = col >> 4;
-  float acc0 = 0.0f;
-  float acc1 = 0.0f;
+  const int col = c_block * (NF4_CMIX_VEC * NF4_CMIX_THREADS) + tid * NF4_CMIX_VEC;
+  if (col >= C) return;
+  const int col2 = col >> 1;   // byte offset (4-byte aligned)
+  const int colb = col >> 4;  // block index (8 elements < 16, same block)
+  __half2 acc0, acc1, acc2, acc3;
+  *reinterpret_cast<int*>(&acc0) = 0;
+  *reinterpret_cast<int*>(&acc1) = 0;
+  *reinterpret_cast<int*>(&acc2) = 0;
+  *reinterpret_cast<int*>(&acc3) = 0;
   for (int i = 0; i < nnz_count; ++i) {
     const int actual_f = start_f + nnz_ids[i];
-    const float vs = __half2float(vec_slice[nnz_ids[i]]);
-    const uint8_t packed = w_nf4[static_cast<int64_t>(actual_f) * C2 + col2];
-    const float bs = __half2float(b_scale[static_cast<int64_t>(actual_f) * CB + colb]);
-    acc0 = fmaf(vs, e2m1_lut[packed & 0x0F] * bs, acc0);
-    acc1 = fmaf(vs, e2m1_lut[packed >> 4]     * bs, acc1);
+    const __half2 vs2 = __half2half2(vec_slice[nnz_ids[i]]);
+    // Read 4 bytes = 8 E2M1 codes in one transaction
+    const uint32_t packed4 = *reinterpret_cast<const uint32_t*>(
+        w_nf4 + static_cast<int64_t>(actual_f) * C2 + col2);
+    const uint8_t* pp = reinterpret_cast<const uint8_t*>(&packed4);
+    // 1 block scale read for all 8 elements
+    const __half bs = b_scale[static_cast<int64_t>(actual_f) * CB + colb];
+    // Decode 4 pairs, apply block scale, accumulate with __hfma2
+    acc0 = __hfma2(vs2, __halves2half2(
+        __hmul(__ushort_as_half(e2m1_raw[pp[0] & 0x0F]), bs),
+        __hmul(__ushort_as_half(e2m1_raw[pp[0] >> 4]), bs)), acc0);
+    acc1 = __hfma2(vs2, __halves2half2(
+        __hmul(__ushort_as_half(e2m1_raw[pp[1] & 0x0F]), bs),
+        __hmul(__ushort_as_half(e2m1_raw[pp[1] >> 4]), bs)), acc1);
+    acc2 = __hfma2(vs2, __halves2half2(
+        __hmul(__ushort_as_half(e2m1_raw[pp[2] & 0x0F]), bs),
+        __hmul(__ushort_as_half(e2m1_raw[pp[2] >> 4]), bs)), acc2);
+    acc3 = __hfma2(vs2, __halves2half2(
+        __hmul(__ushort_as_half(e2m1_raw[pp[3] & 0x0F]), bs),
+        __hmul(__ushort_as_half(e2m1_raw[pp[3] >> 4]), bs)), acc3);
   }
-  __half2 hacc = __floats2half2_rn(acc0, acc1);
-  atomicAdd(reinterpret_cast<__half2*>(out + col), hacc);
+  // Bounds-checked atomicAdd
+  if (col + 7 < C) {
+    atomicAdd(reinterpret_cast<__half2*>(out + col), acc0);
+    atomicAdd(reinterpret_cast<__half2*>(out + col + 2), acc1);
+    atomicAdd(reinterpret_cast<__half2*>(out + col + 4), acc2);
+    atomicAdd(reinterpret_cast<__half2*>(out + col + 6), acc3);
+  } else {
+    if (col     < C) atomicAdd(reinterpret_cast<__half2*>(out + col),     acc0);
+    if (col + 2 < C) atomicAdd(reinterpret_cast<__half2*>(out + col + 2), acc1);
+    if (col + 4 < C) atomicAdd(reinterpret_cast<__half2*>(out + col + 4), acc2);
+    if (col + 6 < C) atomicAdd(reinterpret_cast<__half2*>(out + col + 6), acc3);
+  }
 }
 
-// rows=2..19: same as one but with row index
+// rows=2..19: vectorized, same as one but with row index
 __global__ __launch_bounds__(NF4_CMIX_THREADS, 4) void cmix_sparse_spmv_relu_rows_nf4_kernel(
     int C,
     int F,
@@ -654,24 +695,49 @@ __global__ __launch_bounds__(NF4_CMIX_THREADS, 4) void cmix_sparse_spmv_relu_row
 
   const int C2 = C >> 1;
   const int CB = C >> 4;
-  const int col = c_block * (2 * NF4_CMIX_THREADS) + tid * 2;
+  const int col = c_block * (NF4_CMIX_VEC * NF4_CMIX_THREADS) + tid * NF4_CMIX_VEC;
+  if (col >= C) return;
   const int col2 = col >> 1;
   const int colb = col >> 4;
-  float acc0 = 0.0f;
-  float acc1 = 0.0f;
+  __half2 acc0, acc1, acc2, acc3;
+  *reinterpret_cast<int*>(&acc0) = 0;
+  *reinterpret_cast<int*>(&acc1) = 0;
+  *reinterpret_cast<int*>(&acc2) = 0;
+  *reinterpret_cast<int*>(&acc3) = 0;
   for (int i = 0; i < nnz_count; ++i) {
     const int actual_f = start_f + nnz_ids[i];
-    const float vs = __half2float(vec_slice[nnz_ids[i]]);
-    const uint8_t packed = w_nf4[static_cast<int64_t>(actual_f) * C2 + col2];
-    const float bs = __half2float(b_scale[static_cast<int64_t>(actual_f) * CB + colb]);
-    acc0 = fmaf(vs, e2m1_lut[packed & 0x0F] * bs, acc0);
-    acc1 = fmaf(vs, e2m1_lut[packed >> 4]     * bs, acc1);
+    const __half2 vs2 = __half2half2(vec_slice[nnz_ids[i]]);
+    const uint32_t packed4 = *reinterpret_cast<const uint32_t*>(
+        w_nf4 + static_cast<int64_t>(actual_f) * C2 + col2);
+    const uint8_t* pp = reinterpret_cast<const uint8_t*>(&packed4);
+    const __half bs = b_scale[static_cast<int64_t>(actual_f) * CB + colb];
+    acc0 = __hfma2(vs2, __halves2half2(
+        __hmul(__ushort_as_half(e2m1_raw[pp[0] & 0x0F]), bs),
+        __hmul(__ushort_as_half(e2m1_raw[pp[0] >> 4]), bs)), acc0);
+    acc1 = __hfma2(vs2, __halves2half2(
+        __hmul(__ushort_as_half(e2m1_raw[pp[1] & 0x0F]), bs),
+        __hmul(__ushort_as_half(e2m1_raw[pp[1] >> 4]), bs)), acc1);
+    acc2 = __hfma2(vs2, __halves2half2(
+        __hmul(__ushort_as_half(e2m1_raw[pp[2] & 0x0F]), bs),
+        __hmul(__ushort_as_half(e2m1_raw[pp[2] >> 4]), bs)), acc2);
+    acc3 = __hfma2(vs2, __halves2half2(
+        __hmul(__ushort_as_half(e2m1_raw[pp[3] & 0x0F]), bs),
+        __hmul(__ushort_as_half(e2m1_raw[pp[3] >> 4]), bs)), acc3);
   }
-  __half2 hacc = __floats2half2_rn(acc0, acc1);
-  atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C + col), hacc);
+  if (col + 7 < C) {
+    atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C + col), acc0);
+    atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C + col + 2), acc1);
+    atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C + col + 4), acc2);
+    atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C + col + 6), acc3);
+  } else {
+    if (col     < C) atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C + col),     acc0);
+    if (col + 2 < C) atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C + col + 2), acc1);
+    if (col + 4 < C) atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C + col + 4), acc2);
+    if (col + 6 < C) atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C + col + 6), acc3);
+  }
 }
 
-// rows>=8, T=512 tile variant
+// rows>=8, T=512 tile variant (vectorized)
 __global__ __launch_bounds__(256, 2) void cmix_sparse_spmv_relu_rows_t512_nf4_kernel(
     int C,
     int F,
@@ -681,6 +747,7 @@ __global__ __launch_bounds__(256, 2) void cmix_sparse_spmv_relu_rows_t512_nf4_ke
     dtype* __restrict__ out) {
   constexpr int TILE = 512;
   constexpr int THREADS = 256;
+  constexpr int VEC = 8;  // columns per thread
   __shared__ __align__(256) __half vec_slice[TILE];
   __shared__ __align__(256) int nnz_ids[TILE];
   __shared__ int nnz_count;
@@ -741,22 +808,47 @@ __global__ __launch_bounds__(256, 2) void cmix_sparse_spmv_relu_rows_t512_nf4_ke
 
   const int C2 = C >> 1;
   const int CB = C >> 4;
-  const int col = c_block * (2 * THREADS) + tid * 2;
+  const int col = c_block * (VEC * THREADS) + tid * VEC;
+  if (col >= C) return;
   const int col2 = col >> 1;
   const int colb = col >> 4;
-  float acc0 = 0.0f;
-  float acc1 = 0.0f;
+  __half2 acc0, acc1, acc2, acc3;
+  *reinterpret_cast<int*>(&acc0) = 0;
+  *reinterpret_cast<int*>(&acc1) = 0;
+  *reinterpret_cast<int*>(&acc2) = 0;
+  *reinterpret_cast<int*>(&acc3) = 0;
   for (int i = 0; i < nnz_count; ++i) {
     const int local_f = nnz_ids[i];
     const int actual_f = start_f + local_f;
-    const float vs = __half2float(vec_slice[local_f]);
-    const uint8_t packed = w_nf4[static_cast<int64_t>(actual_f) * C2 + col2];
-    const float bs = __half2float(b_scale[static_cast<int64_t>(actual_f) * CB + colb]);
-    acc0 = fmaf(vs, e2m1_lut[packed & 0x0F] * bs, acc0);
-    acc1 = fmaf(vs, e2m1_lut[packed >> 4]     * bs, acc1);
+    const __half2 vs2 = __half2half2(vec_slice[local_f]);
+    const uint32_t packed4 = *reinterpret_cast<const uint32_t*>(
+        w_nf4 + static_cast<int64_t>(actual_f) * C2 + col2);
+    const uint8_t* pp = reinterpret_cast<const uint8_t*>(&packed4);
+    const __half bs = b_scale[static_cast<int64_t>(actual_f) * CB + colb];
+    acc0 = __hfma2(vs2, __halves2half2(
+        __hmul(__ushort_as_half(e2m1_raw[pp[0] & 0x0F]), bs),
+        __hmul(__ushort_as_half(e2m1_raw[pp[0] >> 4]), bs)), acc0);
+    acc1 = __hfma2(vs2, __halves2half2(
+        __hmul(__ushort_as_half(e2m1_raw[pp[1] & 0x0F]), bs),
+        __hmul(__ushort_as_half(e2m1_raw[pp[1] >> 4]), bs)), acc1);
+    acc2 = __hfma2(vs2, __halves2half2(
+        __hmul(__ushort_as_half(e2m1_raw[pp[2] & 0x0F]), bs),
+        __hmul(__ushort_as_half(e2m1_raw[pp[2] >> 4]), bs)), acc2);
+    acc3 = __hfma2(vs2, __halves2half2(
+        __hmul(__ushort_as_half(e2m1_raw[pp[3] & 0x0F]), bs),
+        __hmul(__ushort_as_half(e2m1_raw[pp[3] >> 4]), bs)), acc3);
   }
-  __half2 hacc = __floats2half2_rn(acc0, acc1);
-  atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C + col), hacc);
+  if (col + 7 < C) {
+    atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C + col), acc0);
+    atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C + col + 2), acc1);
+    atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C + col + 4), acc2);
+    atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C + col + 6), acc3);
+  } else {
+    if (col     < C) atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C + col),     acc0);
+    if (col + 2 < C) atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C + col + 2), acc1);
+    if (col + 4 < C) atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C + col + 4), acc2);
+    if (col + 6 < C) atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C + col + 6), acc3);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -767,7 +859,7 @@ at::Tensor cmix_sparse_down_relu_one_nf4_impl(
     int C, int F, at::Tensor preact, at::Tensor w_nf4, at::Tensor b_scale) {
   auto out = at::zeros({1, 1, C}, preact.options());
   auto stream = at::cuda::getCurrentCUDAStream();
-  cmix_sparse_spmv_relu_one_nf4_kernel<<<dim3(F / NF4_CMIX_TILE, C / (2 * NF4_CMIX_THREADS), 1), NF4_CMIX_THREADS, 0, stream>>>(
+  cmix_sparse_spmv_relu_one_nf4_kernel<<<dim3(F / NF4_CMIX_TILE, ceil_div(C, NF4_CMIX_VEC * NF4_CMIX_THREADS), 1), NF4_CMIX_THREADS, 0, stream>>>(
       C,
       reinterpret_cast<const dtype*>(preact.data_ptr()),
       w_nf4.data_ptr<uint8_t>(),
@@ -782,7 +874,7 @@ at::Tensor cmix_sparse_down_relu_rows_nf4_impl(
   const int rows = B * T;
   auto out = at::zeros({B, T, C}, preact.options());
   auto stream = at::cuda::getCurrentCUDAStream();
-  cmix_sparse_spmv_relu_rows_nf4_kernel<<<dim3(F / NF4_CMIX_TILE, C / (2 * NF4_CMIX_THREADS), rows), NF4_CMIX_THREADS, 0, stream>>>(
+  cmix_sparse_spmv_relu_rows_nf4_kernel<<<dim3(F / NF4_CMIX_TILE, ceil_div(C, NF4_CMIX_VEC * NF4_CMIX_THREADS), rows), NF4_CMIX_THREADS, 0, stream>>>(
       C, F,
       reinterpret_cast<const dtype*>(preact.data_ptr()),
       w_nf4.data_ptr<uint8_t>(),
@@ -797,7 +889,7 @@ at::Tensor cmix_sparse_down_relu_rows_t512_nf4_impl(
   const int rows = B * T;
   auto out = at::zeros({B, T, C}, preact.options());
   auto stream = at::cuda::getCurrentCUDAStream();
-  cmix_sparse_spmv_relu_rows_t512_nf4_kernel<<<dim3(F / 512, C / 512, rows), 256, 0, stream>>>(
+  cmix_sparse_spmv_relu_rows_t512_nf4_kernel<<<dim3(F / 512, ceil_div(C, 8 * 256), rows), 256, 0, stream>>>(
       C, F,
       reinterpret_cast<const dtype*>(preact.data_ptr()),
       w_nf4.data_ptr<uint8_t>(),
