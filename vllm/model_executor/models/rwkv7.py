@@ -325,6 +325,30 @@ class RWKV7ForCausalLM(nn.Module):
             return self._tp_slice(scale, 0)
         return scale
 
+    def _shard_nf4_bscale_for_tp(self, key: str, b_scale: torch.Tensor) -> torch.Tensor:
+        """Shard a 2D [N, K/16] NF4 block scale to match the weight's dim-0 sharding.
+
+        Same logic as _shard_int8_scale_for_tp but for 2D block scale: slice on
+        dim 0 for att r/k/v and ffn key; keep full for att output (weight sharded
+        on dim 1, N unchanged); vocab-parallel slice for head.
+        """
+        if getattr(self, "tp_size", 1) == 1:
+            return b_scale
+        if key == "head.weight":
+            return self._tp_vocab_slice(b_scale)
+        parts = key.split(".")
+        if len(parts) < 4 or parts[0] != "blocks":
+            return b_scale
+        submodule = parts[2]
+        name = ".".join(parts[3:])
+        if submodule == "att":
+            if name in {"receptance.weight", "key.weight", "value.weight"}:
+                return self._tp_hidden_slice(b_scale, 0)
+            return b_scale
+        if submodule == "ffn" and name == "key.weight":
+            return self._tp_slice(b_scale, 0)
+        return b_scale
+
     def _tp_all_reduce(self, value: torch.Tensor) -> torch.Tensor:
         if getattr(self, "tp_size", 1) == 1:
             return value
@@ -472,6 +496,12 @@ class RWKV7ForCausalLM(nn.Module):
             for k, w in self.z.items():
                 if w.dtype == torch.int8 and (k + ".scale") in self.z:
                     self.int8_scales[id(w)] = self.z[k + ".scale"]
+        # NF4: rebuild block scale lookup (uint8 weight -> 2D b_scale)
+        self.nf4_block_scales = {}
+        if getattr(self, "_is_nf4", False):
+            for k, w in self.z.items():
+                if w.dtype == torch.uint8 and (k + ".nf4_b_scale") in self.z:
+                    self.nf4_block_scales[id(w)] = self.z[k + ".nf4_b_scale"]
         torch.accelerator.synchronize()
         logger.info("RWKV7 weights are ready L=%d C=%d H=%d N=%d V=%d", L, C, H, N, V)
 
@@ -568,18 +598,59 @@ class RWKV7ForCausalLM(nn.Module):
                 int8_count,
             )
 
+        # NF4 offline-quantized model detection + orig-linear weight preprocessing:
+        # uint8 packed weights [N, K/2] + 2D block scale [N, K/16].
+        self._is_nf4 = any(k.endswith(".nf4_weight") for k in z)
+        self.nf4_block_scales: dict[int, torch.Tensor] = {}
+        if self._is_nf4:
+            dev = first_device()
+            nf4_count = 0
+            for key in list(z.keys()):
+                if not is_orig_linear_weight(key):
+                    continue
+                nf4_key = key + ".nf4_weight"
+                bscale_key = key + ".nf4_b_scale"
+                if nf4_key not in z or bscale_key not in z:
+                    continue
+                if not self._is_weight_needed_on_rank(key):
+                    z.pop(key, None)
+                    z.pop(nf4_key, None)
+                    z.pop(bscale_key, None)
+                    continue
+                nf4_w = self._shard_weight_for_tp(key, z[nf4_key].squeeze())
+                nf4_w = nf4_w.to(device=dev).contiguous()
+                b_scale = self._shard_nf4_bscale_for_tp(key, z[bscale_key].squeeze())
+                b_scale = b_scale.to(device=dev, dtype=DTYPE).contiguous()
+                z[key] = nf4_w
+                z[bscale_key] = b_scale
+                del z[nf4_key]
+                nf4_count += 1
+                logger.debug(
+                    "RWKV7 nf4 weight loaded: %s shape=%s", key, tuple(nf4_w.shape)
+                )
+            logger.info(
+                "RWKV7 nf4 quantized model detected; %d orig-linear nf4 weights",
+                nf4_count,
+            )
+
         for key in list(z.keys()):
             if not self._is_weight_needed_on_rank(key):
                 del z[key]
                 continue
             if key == "emb.weight" and emb_cpu is not None:
                 continue
-            # int8 helpers (.scale/.int8_weight) and int8 orig-linear weights are
-            # already on GPU from the int8 pre-pass above; skip fp16 transpose/dtype.
+            # int8/nf4 helpers and quantized orig-linear weights are already on GPU
+            # from the pre-pass above; skip fp16 transpose/dtype.
             if self._is_int8 and (
                 key.endswith(".scale")
                 or key.endswith(".int8_weight")
                 or (is_orig_linear_weight(key) and z[key].dtype == torch.int8)
+            ):
+                continue
+            if self._is_nf4 and (
+                key.endswith(".nf4_b_scale")
+                or key.endswith(".nf4_weight")
+                or (is_orig_linear_weight(key) and z[key].dtype == torch.uint8)
             ):
                 continue
             value = z[key].squeeze()
@@ -1843,12 +1914,23 @@ class RWKV7ForCausalLM(nn.Module):
         return self._tp_all_reduce(self.linear(k, z[p + "value.weight"]))
 
     def linear(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        if weight.dtype == torch.uint8:
+            b_scale = self.nf4_block_scales.get(id(weight))
+            if b_scale is not None:
+                weight = torch.ops.rwkv7_nf4_ops.dequant_nf4_to_f16(
+                    weight, b_scale, True
+                )
         if x.numel() == x.size(-1) and weight.size(1) % 64 == 0:
             return torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(x.contiguous(), weight)
         return torch.ops.rwkv7_v3a_ops.linear_f16(x.contiguous(), weight)
 
     def linear_head(self, x: torch.Tensor) -> torch.Tensor:
         z = self.z
+        if z["head.weight"].dtype == torch.uint8:
+            rows = x.numel() // C
+            return self.linear_orig_layout(
+                x, z["head.weight"], PathConfig(rows, False, CMIX_DENSE), "head"
+            )
         if not use_orig_linear("head"):
             return self.linear(x, z["head.weight"])
         rows = x.numel() // C
@@ -1859,6 +1941,63 @@ class RWKV7ForCausalLM(nn.Module):
     def linear_orig_layout(
         self, x: torch.Tensor, weight: torch.Tensor, path: PathConfig, group: str
     ) -> torch.Tensor:
+        # NF4 orig-linear weight: rows 1/2 use the nf4 exact kernel; rows 3-12
+        # use the nf4 GEMM kernel; rows>12 are dequantized to fp16 and fall
+        # through to the original fp16 dispatch below (same as int8 strategy).
+        if weight.dtype == torch.uint8:
+            b_scale = self.nf4_block_scales[id(weight)]
+            xc = x.contiguous()
+            if path.rows == 1:
+                if group == "ffn_key":
+                    use4 = True if C == 2560 else (C <= 1024)
+                else:
+                    use4 = (group != "att_c2c" or C < 2048)
+                return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_exact_f16(
+                    xc, weight, b_scale, 128, 2, use4
+                )
+            if path.rows == 2:
+                if group == "att_c2c":
+                    return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_exact_f16(
+                        xc, weight, b_scale, 64, 2, True
+                    )
+                if group == "ffn_key":
+                    if C == 2560:
+                        return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_exact_f16(
+                            xc, weight, b_scale, 128, 2, False
+                        )
+                    if C < 4096:
+                        return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_exact_f16(
+                            xc, weight, b_scale, 64, 2, True
+                        )
+                    return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_exact_f16(
+                        xc, weight, b_scale, 128, 2, False
+                    )
+                if group == "head" and C == 2560:
+                    return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_exact_f16(
+                        xc, weight, b_scale, 128, 2, False
+                    )
+                return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_exact_f16(
+                    xc, weight, b_scale, 64, 2, True
+                )
+            # rows 3-12: use NF4 GEMM kernel
+            if path.rows <= 12:
+                if group == "att_c2c":
+                    if C <= 1024:
+                        return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_f16(
+                            xc, weight, b_scale, 2, 2
+                        )
+                    return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_f16(
+                        xc, weight, b_scale, 3, 2
+                    )
+                return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_f16(
+                    xc, weight, b_scale, 2, 4
+                )
+            # rows > 12: dequant to fp16 and fall through
+            w_fp16 = torch.ops.rwkv7_nf4_ops.dequant_nf4_to_f16(weight, b_scale, False)
+            if use_orig_linear(group):
+                weight = w_fp16.contiguous()
+            else:
+                weight = w_fp16.t().contiguous()
         # INT8 orig-linear weight: rows 1/2 use the int8 exact kernel; rows>2 are
         # dequantized to fp16 and fall through to the original fp16 dispatch below
         # (matches Albatross faster3a linear_orig_layout behaviour).
