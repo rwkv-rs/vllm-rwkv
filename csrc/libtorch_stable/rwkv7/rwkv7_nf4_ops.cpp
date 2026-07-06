@@ -1,0 +1,84 @@
+#include <torch/extension.h>
+#include <vector>
+
+// CUDA kernel declarations (defined in .cu)
+at::Tensor linear_nf4_orig_rows_exact_f16_cuda(
+    at::Tensor x, at::Tensor w_nf4, at::Tensor b_scale, int64_t threads, int64_t out_tile, bool use4);
+at::Tensor linear_nf4_orig_rows_f16_cuda(
+    at::Tensor x, at::Tensor w_nf4, at::Tensor b_scale, int64_t row_tile, int64_t out_tile);
+at::Tensor dequant_nf4_to_f16_cuda(at::Tensor w_nf4, at::Tensor b_scale, bool transpose);
+
+namespace {
+
+void check_nf4_cuda_contig(const torch::Tensor& x, const char* name) {
+  TORCH_CHECK(x.is_cuda(), name, " must be CUDA");
+  TORCH_CHECK(x.is_contiguous(), name, " must be contiguous");
+  TORCH_CHECK(x.scalar_type() == torch::kUInt8, name, " must be uint8");
+}
+
+void check_half_cuda_contig(const torch::Tensor& x, const char* name) {
+  TORCH_CHECK(x.is_cuda(), name, " must be CUDA");
+  TORCH_CHECK(x.is_contiguous(), name, " must be contiguous");
+  TORCH_CHECK(x.scalar_type() == torch::kFloat16, name, " must be fp16");
+}
+
+torch::Tensor linear_nf4_orig_rows_exact_f16(
+    torch::Tensor x, torch::Tensor w_nf4, torch::Tensor b_scale,
+    int64_t threads, int64_t out_tile, bool use4) {
+  check_half_cuda_contig(x, "x");
+  check_nf4_cuda_contig(w_nf4, "w_nf4");
+  check_half_cuda_contig(b_scale, "b_scale");
+  TORCH_CHECK(x.dim() >= 2, "x must have at least 2 dims");
+  TORCH_CHECK(w_nf4.dim() == 2, "w_nf4 must have shape [N, K/2]");
+  TORCH_CHECK(b_scale.dim() == 2, "b_scale must have shape [N, K/16]");
+  const int64_t K = x.size(-1);
+  TORCH_CHECK(w_nf4.size(1) == K / 2, "w_nf4 K/2 mismatch");
+  TORCH_CHECK(b_scale.size(0) == w_nf4.size(0), "b_scale N mismatch");
+  TORCH_CHECK(b_scale.size(1) == K / 16, "b_scale K/16 mismatch");
+  TORCH_CHECK((K % 16) == 0, "K must be divisible by 16");
+  return linear_nf4_orig_rows_exact_f16_cuda(x, w_nf4, b_scale, threads, out_tile, use4);
+}
+
+torch::Tensor linear_nf4_orig_rows_f16(
+    torch::Tensor x, torch::Tensor w_nf4, torch::Tensor b_scale,
+    int64_t row_tile, int64_t out_tile) {
+  check_half_cuda_contig(x, "x");
+  check_nf4_cuda_contig(w_nf4, "w_nf4");
+  check_half_cuda_contig(b_scale, "b_scale");
+  TORCH_CHECK(x.dim() >= 2, "x must have at least 2 dims");
+  TORCH_CHECK(w_nf4.dim() == 2, "w_nf4 must have shape [N, K/2]");
+  TORCH_CHECK(b_scale.dim() == 2, "b_scale must have shape [N, K/16]");
+  const int64_t K = x.size(-1);
+  TORCH_CHECK(w_nf4.size(1) == K / 2, "w_nf4 K/2 mismatch");
+  TORCH_CHECK(b_scale.size(0) == w_nf4.size(0), "b_scale N mismatch");
+  TORCH_CHECK(b_scale.size(1) == K / 16, "b_scale K/16 mismatch");
+  TORCH_CHECK((K % 16) == 0, "K must be divisible by 16");
+  return linear_nf4_orig_rows_f16_cuda(x, w_nf4, b_scale, row_tile, out_tile);
+}
+
+torch::Tensor dequant_nf4_to_f16(torch::Tensor w_nf4, torch::Tensor b_scale, bool transpose) {
+  check_nf4_cuda_contig(w_nf4, "w_nf4");
+  check_half_cuda_contig(b_scale, "b_scale");
+  TORCH_CHECK(w_nf4.dim() == 2, "w_nf4 must have shape [N, K/2]");
+  TORCH_CHECK(b_scale.dim() == 2, "b_scale must have shape [N, K/16]");
+  const int64_t N = w_nf4.size(0);
+  const int64_t K = w_nf4.size(1) * 2;
+  TORCH_CHECK(b_scale.size(0) == N, "b_scale N mismatch");
+  TORCH_CHECK(b_scale.size(1) == K / 16, "b_scale K/16 mismatch");
+  TORCH_CHECK((K % 16) == 0, "K must be divisible by 16");
+  return dequant_nf4_to_f16_cuda(w_nf4, b_scale, transpose);
+}
+
+} // namespace
+
+TORCH_LIBRARY(rwkv7_nf4_ops, m) {
+  m.def("linear_nf4_orig_rows_exact_f16(Tensor x, Tensor w_nf4, Tensor b_scale, int threads, int out_tile, bool use4) -> Tensor");
+  m.def("linear_nf4_orig_rows_f16(Tensor x, Tensor w_nf4, Tensor b_scale, int row_tile, int out_tile) -> Tensor");
+  m.def("dequant_nf4_to_f16(Tensor w_nf4, Tensor b_scale, bool transpose) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(rwkv7_nf4_ops, CUDA, m) {
+  m.impl("linear_nf4_orig_rows_exact_f16", &linear_nf4_orig_rows_exact_f16);
+  m.impl("linear_nf4_orig_rows_f16", &linear_nf4_orig_rows_f16);
+  m.impl("dequant_nf4_to_f16", &dequant_nf4_to_f16);
+}
