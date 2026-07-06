@@ -589,7 +589,10 @@ class RWKV7ModelState(ModelState):
         return mixed_inputs
 
     def postprocess_state(
-        self, idx_mapping: torch.Tensor, num_sampled: torch.Tensor | int
+        self,
+        idx_mapping: torch.Tensor,
+        num_sampled: torch.Tensor | int,
+        num_computed_tokens: torch.Tensor | None = None,
     ) -> None:
         if not self._prefill_decode_rows:
             return
