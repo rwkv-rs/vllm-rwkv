@@ -21,13 +21,25 @@ architectures from sm_50 onwards.
 
 Only "orig-linear" weights are quantized (same set for both modes):
 - `att.receptance.weight`, `att.key.weight`, `att.value.weight`, `att.output.weight`
-- `ffn.key.weight`
+- `ffn.key.weight`, `ffn.value.weight`
 - `head.weight`
 
 The following weights are **not** quantized:
-- `ffn.value.weight` (sparse cmix kernel hardcodes fp16)
 - Low-rank weights (minimal benefit)
 - Embedding / LayerNorm / r_k
+
+### Weight coverage (7.2B model)
+
+| Weight group | Params | Quantized | Coverage |
+|-------------|--------|-----------|----------|
+| att.r/k/v/o.weight | 2,178M | Yes | 30.2% |
+| ffn.key.weight | 938M | Yes | 13.0% |
+| ffn.value.weight | 2,148M | Yes | 29.8% |
+| head.weight | 447M | Yes | 6.2% |
+| Low-rank (w1/w2/a1/a2/g1/g2/v1/v2) | 294M | No | 4.1% |
+| Embedding | 268M | No | 3.7% |
+| LN / r_k | ~1M | No | <0.1% |
+| **Total quantized** | **6,730M** | | **93.2%** |
 
 ## Offline Quantization
 
@@ -98,10 +110,10 @@ Tested on RWKV-7-G1G-7.2B, RTX 5070 Ti Laptop (12GB, sm_120):
 |------|-------------|----------------|-----------|
 | FP16 | ~55 | ~14 GB | 14 GB |
 | INT8 | ~54 | ~9.3 GB | 9.2 GB |
-| NF4 | ~12* | ~7.6 GB | 8.1 GB |
+| NF4 | ~30 | ~6.1 GB | 5.2 GB |
 
-*NF4 decode is slower due to LUT lookup + block scale access overhead.
-NF4 is recommended for VRAM-constrained scenarios where INT8 doesn't fit.
+NF4 now quantizes ffn.value.weight via dedicated cmix_sparse NF4 kernels,
+achieving 93.2% weight coverage (up from 63.4%). VRAM savings: ~64% vs FP16.
 
 ### Standalone kernel performance (M=1, 4096x4096)
 

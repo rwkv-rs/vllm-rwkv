@@ -512,7 +512,341 @@ at::Tensor linear_nf4_orig_rows_f16_cuda_impl(at::Tensor x, at::Tensor w_nf4, at
   return y;
 }
 
+// ═══════════════════════════════════════════════════════════════
+// NF4 cmix_sparse kernels: sparse mat-vec with NF4-quantized value weights
+// Same sparse selection pattern as rwkv7_fast_ops_fp16.cu cmix_sparse_spmv_relu_*
+// Weight: uint8_t [F, C/2] packed, b_scale: __half [F, C/16]
+// ═══════════════════════════════════════════════════════════════
+
+constexpr int NF4_CMIX_THREADS = 128;
+constexpr int NF4_CMIX_TILE = 128;
+
+// rows=1: relu^2 activation + sparse mat-vec with NF4 weights
+__global__ __launch_bounds__(NF4_CMIX_THREADS, 4) void cmix_sparse_spmv_relu_one_nf4_kernel(
+    int C,
+    const dtype* __restrict__ preact,
+    const uint8_t* __restrict__ w_nf4,
+    const dtype* __restrict__ b_scale,
+    dtype* __restrict__ out) {
+  __shared__ __align__(256) __half vec_slice[NF4_CMIX_TILE];
+  __shared__ __align__(256) int nnz_ids[NF4_CMIX_TILE];
+  __shared__ int nnz_count;
+  __shared__ int warp_counts[NF4_CMIX_TILE / 32];
+  __shared__ int warp_prefix[NF4_CMIX_TILE / 32];
+
+  const int f_block = blockIdx.x;
+  const int c_block = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp_id = tid >> 5;
+  const int start_f = f_block * NF4_CMIX_TILE;
+
+  if (tid < NF4_CMIX_TILE) {
+    const float v = fmaxf(__half2float(*reinterpret_cast<const __half*>(preact + start_f + tid)), 0.0f);
+    vec_slice[tid] = __float2half_rn(v * v);
+  }
+  __syncthreads();
+
+  bool nonzero = false;
+  int local_pos = 0;
+  if (tid < NF4_CMIX_TILE) {
+    nonzero = bool(__half_as_ushort(vec_slice[tid]) << 1);
+    const unsigned mask = __ballot_sync(0xffffffffu, nonzero);
+    local_pos = __popc(mask & ((1u << lane) - 1u));
+    if (lane == 0) {
+      warp_counts[warp_id] = __popc(mask);
+    }
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    int s = 0;
+#pragma unroll
+    for (int w = 0; w < NF4_CMIX_TILE / 32; ++w) {
+      warp_prefix[w] = s;
+      s += warp_counts[w];
+    }
+    nnz_count = s;
+  }
+  __syncthreads();
+
+  if (tid < NF4_CMIX_TILE && nonzero) {
+    nnz_ids[warp_prefix[warp_id] + local_pos] = tid;
+  }
+  __syncthreads();
+
+  // NF4 sparse mat-vec: fp32 accumulation for precision
+  const int C2 = C >> 1;
+  const int CB = C >> 4;
+  const int col = c_block * (2 * NF4_CMIX_THREADS) + tid * 2;
+  const int col2 = col >> 1;
+  const int colb = col >> 4;
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
+  for (int i = 0; i < nnz_count; ++i) {
+    const int actual_f = start_f + nnz_ids[i];
+    const float vs = __half2float(vec_slice[nnz_ids[i]]);
+    const uint8_t packed = w_nf4[static_cast<int64_t>(actual_f) * C2 + col2];
+    const float bs = __half2float(b_scale[static_cast<int64_t>(actual_f) * CB + colb]);
+    acc0 = fmaf(vs, e2m1_lut[packed & 0x0F] * bs, acc0);
+    acc1 = fmaf(vs, e2m1_lut[packed >> 4]     * bs, acc1);
+  }
+  __half2 hacc = __floats2half2_rn(acc0, acc1);
+  atomicAdd(reinterpret_cast<__half2*>(out + col), hacc);
+}
+
+// rows=2..19: same as one but with row index
+__global__ __launch_bounds__(NF4_CMIX_THREADS, 4) void cmix_sparse_spmv_relu_rows_nf4_kernel(
+    int C,
+    int F,
+    const dtype* __restrict__ preact,
+    const uint8_t* __restrict__ w_nf4,
+    const dtype* __restrict__ b_scale,
+    dtype* __restrict__ out) {
+  __shared__ __align__(256) __half vec_slice[NF4_CMIX_TILE];
+  __shared__ __align__(256) int nnz_ids[NF4_CMIX_TILE];
+  __shared__ int nnz_count;
+  __shared__ int warp_counts[NF4_CMIX_TILE / 32];
+  __shared__ int warp_prefix[NF4_CMIX_TILE / 32];
+
+  const int f_block = blockIdx.x;
+  const int c_block = blockIdx.y;
+  const int row = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp_id = tid >> 5;
+  const int start_f = f_block * NF4_CMIX_TILE;
+  const dtype* pre_row = preact + static_cast<int64_t>(row) * F;
+
+  if (tid < NF4_CMIX_TILE) {
+    const float v = fmaxf(__half2float(*reinterpret_cast<const __half*>(pre_row + start_f + tid)), 0.0f);
+    vec_slice[tid] = __float2half_rn(v * v);
+  }
+  __syncthreads();
+
+  bool nonzero = false;
+  int local_pos = 0;
+  if (tid < NF4_CMIX_TILE) {
+    nonzero = bool(__half_as_ushort(vec_slice[tid]) << 1);
+    const unsigned mask = __ballot_sync(0xffffffffu, nonzero);
+    local_pos = __popc(mask & ((1u << lane) - 1u));
+    if (lane == 0) {
+      warp_counts[warp_id] = __popc(mask);
+    }
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    int s = 0;
+#pragma unroll
+    for (int w = 0; w < NF4_CMIX_TILE / 32; ++w) {
+      warp_prefix[w] = s;
+      s += warp_counts[w];
+    }
+    nnz_count = s;
+  }
+  __syncthreads();
+
+  if (tid < NF4_CMIX_TILE && nonzero) {
+    nnz_ids[warp_prefix[warp_id] + local_pos] = tid;
+  }
+  __syncthreads();
+
+  const int C2 = C >> 1;
+  const int CB = C >> 4;
+  const int col = c_block * (2 * NF4_CMIX_THREADS) + tid * 2;
+  const int col2 = col >> 1;
+  const int colb = col >> 4;
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
+  for (int i = 0; i < nnz_count; ++i) {
+    const int actual_f = start_f + nnz_ids[i];
+    const float vs = __half2float(vec_slice[nnz_ids[i]]);
+    const uint8_t packed = w_nf4[static_cast<int64_t>(actual_f) * C2 + col2];
+    const float bs = __half2float(b_scale[static_cast<int64_t>(actual_f) * CB + colb]);
+    acc0 = fmaf(vs, e2m1_lut[packed & 0x0F] * bs, acc0);
+    acc1 = fmaf(vs, e2m1_lut[packed >> 4]     * bs, acc1);
+  }
+  __half2 hacc = __floats2half2_rn(acc0, acc1);
+  atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C + col), hacc);
+}
+
+// rows>=8, T=512 tile variant
+__global__ __launch_bounds__(256, 2) void cmix_sparse_spmv_relu_rows_t512_nf4_kernel(
+    int C,
+    int F,
+    const dtype* __restrict__ preact,
+    const uint8_t* __restrict__ w_nf4,
+    const dtype* __restrict__ b_scale,
+    dtype* __restrict__ out) {
+  constexpr int TILE = 512;
+  constexpr int THREADS = 256;
+  __shared__ __align__(256) __half vec_slice[TILE];
+  __shared__ __align__(256) int nnz_ids[TILE];
+  __shared__ int nnz_count;
+  __shared__ int warp_counts[TILE / 32];
+  __shared__ int warp_prefix[TILE / 32];
+
+  const int f_block = blockIdx.x;
+  const int c_block = blockIdx.y;
+  const int row = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp_id = tid >> 5;
+  const int start_f = f_block * TILE;
+  const dtype* pre_row = preact + static_cast<int64_t>(row) * F;
+
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    const int local_f = tid + u * THREADS;
+    const float v = fmaxf(__half2float(*reinterpret_cast<const __half*>(pre_row + start_f + local_f)), 0.0f);
+    vec_slice[local_f] = __float2half_rn(v * v);
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    const int local_f = tid + u * THREADS;
+    const bool nonzero = bool(__half_as_ushort(vec_slice[local_f]) << 1);
+    const unsigned mask = __ballot_sync(0xffffffffu, nonzero);
+    if (lane == 0) {
+      warp_counts[warp_id + u * (THREADS / 32)] = __popc(mask);
+    }
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    int s = 0;
+#pragma unroll
+    for (int w = 0; w < TILE / 32; ++w) {
+      warp_prefix[w] = s;
+      s += warp_counts[w];
+    }
+    nnz_count = s;
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    const int local_f = tid + u * THREADS;
+    const bool nonzero = bool(__half_as_ushort(vec_slice[local_f]) << 1);
+    const unsigned mask = __ballot_sync(0xffffffffu, nonzero);
+    const int local_pos = __popc(mask & ((1u << lane) - 1u));
+    const int group = warp_id + u * (THREADS / 32);
+    if (nonzero) {
+      nnz_ids[warp_prefix[group] + local_pos] = local_f;
+    }
+  }
+  __syncthreads();
+
+  const int C2 = C >> 1;
+  const int CB = C >> 4;
+  const int col = c_block * (2 * THREADS) + tid * 2;
+  const int col2 = col >> 1;
+  const int colb = col >> 4;
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
+  for (int i = 0; i < nnz_count; ++i) {
+    const int local_f = nnz_ids[i];
+    const int actual_f = start_f + local_f;
+    const float vs = __half2float(vec_slice[local_f]);
+    const uint8_t packed = w_nf4[static_cast<int64_t>(actual_f) * C2 + col2];
+    const float bs = __half2float(b_scale[static_cast<int64_t>(actual_f) * CB + colb]);
+    acc0 = fmaf(vs, e2m1_lut[packed & 0x0F] * bs, acc0);
+    acc1 = fmaf(vs, e2m1_lut[packed >> 4]     * bs, acc1);
+  }
+  __half2 hacc = __floats2half2_rn(acc0, acc1);
+  atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C + col), hacc);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// NF4 cmix wrapper functions (internal, in anonymous namespace)
+// ═══════════════════════════════════════════════════════════════
+
+at::Tensor cmix_sparse_down_relu_one_nf4_impl(
+    int C, int F, at::Tensor preact, at::Tensor w_nf4, at::Tensor b_scale) {
+  auto out = at::zeros({1, 1, C}, preact.options());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  cmix_sparse_spmv_relu_one_nf4_kernel<<<dim3(F / NF4_CMIX_TILE, C / (2 * NF4_CMIX_THREADS), 1), NF4_CMIX_THREADS, 0, stream>>>(
+      C,
+      reinterpret_cast<const dtype*>(preact.data_ptr()),
+      w_nf4.data_ptr<uint8_t>(),
+      reinterpret_cast<const dtype*>(b_scale.data_ptr()),
+      reinterpret_cast<dtype*>(out.data_ptr()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+at::Tensor cmix_sparse_down_relu_rows_nf4_impl(
+    int B, int T, int C, int F, at::Tensor preact, at::Tensor w_nf4, at::Tensor b_scale) {
+  const int rows = B * T;
+  auto out = at::zeros({B, T, C}, preact.options());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  cmix_sparse_spmv_relu_rows_nf4_kernel<<<dim3(F / NF4_CMIX_TILE, C / (2 * NF4_CMIX_THREADS), rows), NF4_CMIX_THREADS, 0, stream>>>(
+      C, F,
+      reinterpret_cast<const dtype*>(preact.data_ptr()),
+      w_nf4.data_ptr<uint8_t>(),
+      reinterpret_cast<const dtype*>(b_scale.data_ptr()),
+      reinterpret_cast<dtype*>(out.data_ptr()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+at::Tensor cmix_sparse_down_relu_rows_t512_nf4_impl(
+    int B, int T, int C, int F, at::Tensor preact, at::Tensor w_nf4, at::Tensor b_scale) {
+  const int rows = B * T;
+  auto out = at::zeros({B, T, C}, preact.options());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  cmix_sparse_spmv_relu_rows_t512_nf4_kernel<<<dim3(F / 512, C / 512, rows), 256, 0, stream>>>(
+      C, F,
+      reinterpret_cast<const dtype*>(preact.data_ptr()),
+      w_nf4.data_ptr<uint8_t>(),
+      reinterpret_cast<const dtype*>(b_scale.data_ptr()),
+      reinterpret_cast<dtype*>(out.data_ptr()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
 } // namespace
+
+// ═══════════════════════════════════════════════════════════════
+// NF4 cmix entry points (external, called from .cpp)
+// ═══════════════════════════════════════════════════════════════
+
+at::Tensor cmix_sparse_down_relu_one_nf4_cuda(
+    at::Tensor preact, at::Tensor w_nf4, at::Tensor b_scale, int64_t C, int64_t F) {
+  TORCH_CHECK(preact.is_cuda() && preact.is_contiguous(), "preact must be CUDA contiguous");
+  TORCH_CHECK(w_nf4.is_cuda() && w_nf4.is_contiguous(), "w_nf4 must be CUDA contiguous");
+  TORCH_CHECK(b_scale.is_cuda() && b_scale.is_contiguous(), "b_scale must be CUDA contiguous");
+  TORCH_CHECK(preact.scalar_type() == at::kHalf, "preact must be fp16");
+  TORCH_CHECK(w_nf4.scalar_type() == at::kByte, "w_nf4 must be uint8");
+  TORCH_CHECK(b_scale.scalar_type() == at::kHalf, "b_scale must be fp16");
+  return cmix_sparse_down_relu_one_nf4_impl(static_cast<int>(C), static_cast<int>(F), preact, w_nf4, b_scale);
+}
+
+at::Tensor cmix_sparse_down_relu_rows_nf4_cuda(
+    at::Tensor preact, at::Tensor w_nf4, at::Tensor b_scale,
+    int64_t B, int64_t T, int64_t C, int64_t F) {
+  TORCH_CHECK(preact.is_cuda() && preact.is_contiguous(), "preact must be CUDA contiguous");
+  TORCH_CHECK(w_nf4.is_cuda() && w_nf4.is_contiguous(), "w_nf4 must be CUDA contiguous");
+  TORCH_CHECK(b_scale.is_cuda() && b_scale.is_contiguous(), "b_scale must be CUDA contiguous");
+  TORCH_CHECK(preact.scalar_type() == at::kHalf, "preact must be fp16");
+  TORCH_CHECK(w_nf4.scalar_type() == at::kByte, "w_nf4 must be uint8");
+  TORCH_CHECK(b_scale.scalar_type() == at::kHalf, "b_scale must be fp16");
+  return cmix_sparse_down_relu_rows_nf4_impl(static_cast<int>(B), static_cast<int>(T), static_cast<int>(C), static_cast<int>(F), preact, w_nf4, b_scale);
+}
+
+at::Tensor cmix_sparse_down_relu_rows_t512_nf4_cuda(
+    at::Tensor preact, at::Tensor w_nf4, at::Tensor b_scale,
+    int64_t B, int64_t T, int64_t C, int64_t F) {
+  TORCH_CHECK(preact.is_cuda() && preact.is_contiguous(), "preact must be CUDA contiguous");
+  TORCH_CHECK(w_nf4.is_cuda() && w_nf4.is_contiguous(), "w_nf4 must be CUDA contiguous");
+  TORCH_CHECK(b_scale.is_cuda() && b_scale.is_contiguous(), "b_scale must be CUDA contiguous");
+  TORCH_CHECK(preact.scalar_type() == at::kHalf, "preact must be fp16");
+  TORCH_CHECK(w_nf4.scalar_type() == at::kByte, "w_nf4 must be uint8");
+  TORCH_CHECK(b_scale.scalar_type() == at::kHalf, "b_scale must be fp16");
+  return cmix_sparse_down_relu_rows_t512_nf4_impl(static_cast<int>(B), static_cast<int>(T), static_cast<int>(C), static_cast<int>(F), preact, w_nf4, b_scale);
+}
 
 // ═══════════════════════════════════════════════════════════════
 // C++ entry points (called from .cpp)
