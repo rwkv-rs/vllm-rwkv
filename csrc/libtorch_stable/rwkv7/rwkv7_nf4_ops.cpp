@@ -7,6 +7,14 @@ at::Tensor linear_nf4_orig_rows_exact_f16_cuda(
 at::Tensor linear_nf4_orig_rows_f16_cuda(
     at::Tensor x, at::Tensor w_nf4, at::Tensor b_scale, int64_t row_tile, int64_t out_tile);
 at::Tensor dequant_nf4_to_f16_cuda(at::Tensor w_nf4, at::Tensor b_scale, bool transpose);
+at::Tensor cmix_sparse_down_relu_one_nf4_cuda(
+    at::Tensor preact, at::Tensor w_nf4, at::Tensor b_scale, int64_t C, int64_t F);
+at::Tensor cmix_sparse_down_relu_rows_nf4_cuda(
+    at::Tensor preact, at::Tensor w_nf4, at::Tensor b_scale,
+    int64_t B, int64_t T, int64_t C, int64_t F);
+at::Tensor cmix_sparse_down_relu_rows_t512_nf4_cuda(
+    at::Tensor preact, at::Tensor w_nf4, at::Tensor b_scale,
+    int64_t B, int64_t T, int64_t C, int64_t F);
 
 namespace {
 
@@ -59,8 +67,8 @@ torch::Tensor linear_nf4_orig_rows_f16(
 torch::Tensor dequant_nf4_to_f16(torch::Tensor w_nf4, torch::Tensor b_scale, bool transpose) {
   check_nf4_cuda_contig(w_nf4, "w_nf4");
   check_half_cuda_contig(b_scale, "b_scale");
-  TORCH_CHECK(w_nf4.dim() == 2, "w_nf4 must have shape [N, K/2]");
-  TORCH_CHECK(b_scale.dim() == 2, "b_scale must have shape [N, K/16]");
+  TORCH_CHECK(w_nf4.dim() == 2, "w_nf4 must be shape [N, K/2]");
+  TORCH_CHECK(b_scale.dim() == 2, "b_scale must be shape [N, K/16]");
   const int64_t N = w_nf4.size(0);
   const int64_t K = w_nf4.size(1) * 2;
   TORCH_CHECK(b_scale.size(0) == N, "b_scale N mismatch");
@@ -69,16 +77,49 @@ torch::Tensor dequant_nf4_to_f16(torch::Tensor w_nf4, torch::Tensor b_scale, boo
   return dequant_nf4_to_f16_cuda(w_nf4, b_scale, transpose);
 }
 
+torch::Tensor cmix_sparse_down_relu_one_nf4(
+    torch::Tensor preact, torch::Tensor w_nf4, torch::Tensor b_scale,
+    int64_t C, int64_t F) {
+  check_half_cuda_contig(preact, "preact");
+  check_nf4_cuda_contig(w_nf4, "w_nf4");
+  check_half_cuda_contig(b_scale, "b_scale");
+  return cmix_sparse_down_relu_one_nf4_cuda(preact, w_nf4, b_scale, C, F);
+}
+
+torch::Tensor cmix_sparse_down_relu_rows_nf4(
+    torch::Tensor preact, torch::Tensor w_nf4, torch::Tensor b_scale,
+    int64_t B, int64_t T, int64_t C, int64_t F) {
+  check_half_cuda_contig(preact, "preact");
+  check_nf4_cuda_contig(w_nf4, "w_nf4");
+  check_half_cuda_contig(b_scale, "b_scale");
+  return cmix_sparse_down_relu_rows_nf4_cuda(preact, w_nf4, b_scale, B, T, C, F);
+}
+
+torch::Tensor cmix_sparse_down_relu_rows_t512_nf4(
+    torch::Tensor preact, torch::Tensor w_nf4, torch::Tensor b_scale,
+    int64_t B, int64_t T, int64_t C, int64_t F) {
+  check_half_cuda_contig(preact, "preact");
+  check_nf4_cuda_contig(w_nf4, "w_nf4");
+  check_half_cuda_contig(b_scale, "b_scale");
+  return cmix_sparse_down_relu_rows_t512_nf4_cuda(preact, w_nf4, b_scale, B, T, C, F);
+}
+
 } // namespace
 
 TORCH_LIBRARY(rwkv7_nf4_ops, m) {
   m.def("linear_nf4_orig_rows_exact_f16(Tensor x, Tensor w_nf4, Tensor b_scale, int threads, int out_tile, bool use4) -> Tensor");
   m.def("linear_nf4_orig_rows_f16(Tensor x, Tensor w_nf4, Tensor b_scale, int row_tile, int out_tile) -> Tensor");
   m.def("dequant_nf4_to_f16(Tensor w_nf4, Tensor b_scale, bool transpose) -> Tensor");
+  m.def("cmix_sparse_down_relu_one_nf4(Tensor preact, Tensor w_nf4, Tensor b_scale, int C, int F) -> Tensor");
+  m.def("cmix_sparse_down_relu_rows_nf4(Tensor preact, Tensor w_nf4, Tensor b_scale, int B, int T, int C, int F) -> Tensor");
+  m.def("cmix_sparse_down_relu_rows_t512_nf4(Tensor preact, Tensor w_nf4, Tensor b_scale, int B, int T, int C, int F) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(rwkv7_nf4_ops, CUDA, m) {
   m.impl("linear_nf4_orig_rows_exact_f16", &linear_nf4_orig_rows_exact_f16);
   m.impl("linear_nf4_orig_rows_f16", &linear_nf4_orig_rows_f16);
   m.impl("dequant_nf4_to_f16", &dequant_nf4_to_f16);
+  m.impl("cmix_sparse_down_relu_one_nf4", &cmix_sparse_down_relu_one_nf4);
+  m.impl("cmix_sparse_down_relu_rows_nf4", &cmix_sparse_down_relu_rows_nf4);
+  m.impl("cmix_sparse_down_relu_rows_t512_nf4", &cmix_sparse_down_relu_rows_t512_nf4);
 }

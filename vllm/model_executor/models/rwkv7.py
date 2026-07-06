@@ -1849,8 +1849,10 @@ class RWKV7ForCausalLM(nn.Module):
         z = self.z
         ops = torch.ops.rwkv7_fast_ops_fp16
         B, T, _ = x.shape
+        vw = z[p + "value.weight"]
 
         if path.cmix_mode == CMIX_B1T1_SPARSE:
+            vw_deq = self._dequant_nf4_value(vw)
             return self._tp_all_reduce(
                 ops.cmix_sparse_one(
                     C,
@@ -1859,10 +1861,11 @@ class RWKV7ForCausalLM(nn.Module):
                     shift_state[1],
                     z[p + "x_k"],
                     z[p + "key.weight.fc"],
-                    z[p + "value.weight"],
+                    vw_deq,
                 )
             )
         if path.cmix_mode == CMIX_ROWS2_SPARSE:
+            vw_deq = self._dequant_nf4_value(vw)
             return self._tp_all_reduce(
                 ops.cmix_sparse_rows(
                     B,
@@ -1873,12 +1876,20 @@ class RWKV7ForCausalLM(nn.Module):
                     shift_state[1],
                     z[p + "x_k"],
                     z[p + "key.weight.fc"],
-                    z[p + "value.weight"],
+                    vw_deq,
                 )
             )
 
         mixed = ops.cmix_mix(B, T, C, x.contiguous(), shift_state[1], z[p + "x_k"])
         return self.cmix_from_mixed(mixed, p, path)
+
+    def _dequant_nf4_value(self, vw: torch.Tensor) -> torch.Tensor:
+        """Dequant NF4 value.weight to fp16 for sparse cmix paths."""
+        if vw.dtype == torch.uint8:
+            b_scale = self.nf4_block_scales.get(id(vw))
+            if b_scale is not None:
+                return torch.ops.rwkv7_nf4_ops.dequant_nf4_to_f16(vw, b_scale, False)
+        return vw
 
     def cmix_from_mixed(
         self, mixed: torch.Tensor, p: str, path: PathConfig
@@ -1887,31 +1898,59 @@ class RWKV7ForCausalLM(nn.Module):
         ops = torch.ops.rwkv7_fast_ops_fp16
         B, T, _ = mixed.shape
         hid = self.linear_orig_layout(mixed, z[p + "key.weight"], path, "ffn_key")
+        vw = z[p + "value.weight"]
+        # NF4 value.weight: dispatch to NF4 cmix_sparse kernels
+        if vw.dtype == torch.uint8:
+            b_scale = self.nf4_block_scales[id(vw)]
+            nf4_ops = torch.ops.rwkv7_nf4_ops
+            F = vw.size(0)
+            if path.cmix_mode == CMIX_B1T1_NOFC:
+                return self._tp_all_reduce(
+                    nf4_ops.cmix_sparse_down_relu_one_nf4(
+                        hid.view(-1).contiguous(), vw, b_scale, C, F
+                    )
+                )
+            if path.cmix_mode == CMIX_ROWS2_NOFC:
+                if path.rows >= CMIX_NOFC_T512_MIN_ROWS and C % 512 == 0 and F % 512 == 0:
+                    return self._tp_all_reduce(
+                        nf4_ops.cmix_sparse_down_relu_rows_t512_nf4(
+                            hid.contiguous(), vw, b_scale, B, T, C, F
+                        )
+                    )
+                return self._tp_all_reduce(
+                    nf4_ops.cmix_sparse_down_relu_rows_nf4(
+                        hid.contiguous(), vw, b_scale, B, T, C, F
+                    )
+                )
+            # dense path: dequant + linear
+            k = ops.relu_square(hid.contiguous())
+            return self._tp_all_reduce(self.linear(k, vw))
+        # FP16 value.weight: original path
         if path.cmix_mode == CMIX_B1T1_NOFC:
             return self._tp_all_reduce(
                 ops.cmix_sparse_down_relu_one(
                     C,
-                    z[p + "value.weight"].size(0),
+                    vw.size(0),
                     hid.view(-1).contiguous(),
-                    z[p + "value.weight"],
+                    vw,
                 )
             )
         if path.cmix_mode == CMIX_ROWS2_NOFC:
-            F = z[p + "value.weight"].size(0)
+            F = vw.size(0)
             if path.rows >= CMIX_NOFC_T512_MIN_ROWS and C % 512 == 0 and F % 512 == 0:
                 return self._tp_all_reduce(
                     ops.cmix_sparse_down_relu_rows_t512(
-                        B, T, C, F, hid.contiguous(), z[p + "value.weight"]
+                        B, T, C, F, hid.contiguous(), vw
                     )
                 )
             return self._tp_all_reduce(
                 ops.cmix_sparse_down_relu_rows(
-                    B, T, C, F, hid.contiguous(), z[p + "value.weight"]
+                    B, T, C, F, hid.contiguous(), vw
                 )
             )
 
         k = ops.relu_square(hid.contiguous())
-        return self._tp_all_reduce(self.linear(k, z[p + "value.weight"]))
+        return self._tp_all_reduce(self.linear(k, vw))
 
     def linear(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         if weight.dtype == torch.uint8:
