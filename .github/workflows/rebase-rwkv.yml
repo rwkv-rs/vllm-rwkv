@@ -12,7 +12,7 @@ permissions:
 
 concurrency:
   group: rebase-rwkv
-  cancel-in-progress: false
+  cancel-in-progress: true # was false: a hung run should not block the next
 
 jobs:
   rebase:
@@ -30,7 +30,7 @@ jobs:
         id: rebase
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail # NOT -e: capture the rebase exit code ourselves
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -45,22 +45,58 @@ jobs:
           git fetch upstream main
 
           old_head="$(git rev-parse refs/remotes/origin/rwkv)"
-          git switch --force-create rwkv refs/remotes/origin/rwkv
+          upstream_head="$(git rev-parse refs/remotes/upstream/main)"
+          git switch --force-create rwkv "$old_head"
 
-          rwkv_commit_count="$(git rev-list --count refs/remotes/upstream/main..HEAD)"
-          if [[ "$rwkv_commit_count" == "0" ]]; then
-            echo "rwkv has no commits ahead of upstream/main; refusing to overwrite it with plain upstream."
+          # Nothing to do if rwkv already contains upstream/main. The old
+          # commit-count==0 guard here protected a non-threat: rwkv being a
+          # subset of upstream is a safe no-op, not something to refuse over.
+          if git merge-base --is-ancestor "$upstream_head" HEAD; then
+            echo "rwkv already contains upstream/main ($upstream_head); nothing to rebase."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          rwkv_commit_count="$(git rev-list --count "$upstream_head..HEAD")"
+          echo "Replaying $rwkv_commit_count rwkv commits onto upstream/main ($upstream_head)."
+
+          # Capture the rebase result instead of dying on conflict.
+          set +e
+          git rebase "$upstream_head"
+          rc=$?
+          set -e
+
+          if [[ "$rc" -ne 0 ]]; then
+            conflict_files="$(git diff --name-only --diff-filter=U || true)"
+            git rebase --abort || true
+            {
+              echo "status=conflict"
+              echo "old_head=$old_head"
+              echo "upstream_head=$upstream_head"
+              echo "conflict_files<<EOF"
+              echo "$conflict_files"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            # Surface the conflict in the run summary so it is never silent.
+            {
+              echo "## :rotating_light: Rebase conflict needs a human"
+              echo ""
+              echo "- Previous rwkv head: \`$old_head\`"
+              echo "- Upstream main head: \`$upstream_head\`"
+              echo ""
+              echo "Conflicting files:"
+              echo '```'
+              echo "$conflict_files"
+              echo '```'
+              echo ""
+              echo "Resolve locally with \`git rebase upstream/main\`, then force-push \`rwkv\`."
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
-          echo "Replaying $rwkv_commit_count rwkv commits on top of upstream/main."
-          git rebase refs/remotes/upstream/main
-
-          post_rebase_commit_count="$(git rev-list --count refs/remotes/upstream/main..HEAD)"
-          if [[ "$post_rebase_commit_count" == "0" ]]; then
-            echo "Rebase removed every rwkv commit; refusing to push."
-            exit 1
-          fi
+          # Removed the post_rebase_commit_count==0 guard: a clean fast-forward
+          # where every rwkv patch already landed upstream is a correct result,
+          # not a failure that should block the push.
 
           if [[ "$(git rev-parse HEAD)" == "$old_head" ]]; then
             echo "rwkv is already based on the latest upstream/main."
@@ -69,9 +105,10 @@ jobs:
           fi
 
           {
+            echo "status=clean"
             echo "changed=true"
             echo "old_head=$old_head"
-            echo "upstream_head=$(git rev-parse refs/remotes/upstream/main)"
+            echo "upstream_head=$upstream_head"
             echo "candidate_head=$(git rev-parse HEAD)"
           } >> "$GITHUB_OUTPUT"
 
