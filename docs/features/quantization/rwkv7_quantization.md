@@ -22,7 +22,9 @@ architectures from sm_50 onwards.
 Only "orig-linear" weights are quantized (same set for both modes):
 - `att.receptance.weight`, `att.key.weight`, `att.value.weight`, `att.output.weight`
 - `ffn.key.weight`, `ffn.value.weight`
-- `head.weight`
+
+**Note**: `head.weight` is intentionally **not** quantized - LM head must
+remain FP16/FP32 to preserve precision for reinforcement learning training.
 
 The following weights are **not** quantized:
 - Low-rank weights (minimal benefit)
@@ -35,11 +37,11 @@ The following weights are **not** quantized:
 | att.r/k/v/o.weight | 2,178M | Yes | 30.2% |
 | ffn.key.weight | 938M | Yes | 13.0% |
 | ffn.value.weight | 2,148M | Yes | 29.8% |
-| head.weight | 447M | Yes | 6.2% |
+| head.weight | 268M | **No** | 3.7% |
 | Low-rank (w1/w2/a1/a2/g1/g2/v1/v2) | 294M | No | 4.1% |
 | Embedding | 268M | No | 3.7% |
 | LN / r_k | ~1M | No | <0.1% |
-| **Total quantized** | **6,730M** | | **93.2%** |
+| **Total quantized** | **6,443M** | | **89.5%** |
 
 ## Offline Quantization
 
@@ -113,7 +115,7 @@ Tested on RWKV-7-G1G-7.2B, RTX 5070 Ti Laptop (12GB, sm_120):
 | NF4 | ~30 | ~6.1 GB | 5.2 GB |
 
 NF4 now quantizes ffn.value.weight via dedicated cmix_sparse NF4 kernels,
-achieving 93.2% weight coverage (up from 63.4%). VRAM savings: ~64% vs FP16.
+achieving 89.5% weight coverage (up from 63.4%). VRAM savings: ~56% vs FP16.
 
 ### Standalone kernel performance (M=1, 4096x4096)
 
