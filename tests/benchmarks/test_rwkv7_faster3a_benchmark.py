@@ -10,6 +10,8 @@ from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlparse
 
+import pytest
+
 from benchmarks.rwkv7 import benchmark_faster3a as bench
 
 
@@ -50,10 +52,33 @@ def _command_options(command: list[str]) -> dict[str, str | bool]:
     return options
 
 
+def _state_movement(**overrides: int) -> dict[str, int]:
+    stats = {name: 0 for name in bench.STATE_MOVEMENT_COUNTERS}
+    stats.update(overrides)
+    return stats
+
+
+def _empty_state_movement() -> dict[str, int | None]:
+    return {name: None for name in bench.STATE_MOVEMENT_COUNTERS}
+
+
+def test_git_revision_reads_remote_source_marker(tmp_path: Path) -> None:
+    marker = tmp_path / ".helicopter-source-revision"
+    marker.write_text("abc123-dirty\n", encoding="utf-8")
+
+    assert bench._git_revision(tmp_path) == "abc123-dirty"
+
+
 def test_report_blocks_without_runtime_paths_and_records_provenance(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     repo_root = Path(__file__).resolve().parents[2]
+    monkeypatch.setattr(
+        bench,
+        "_cuda_device_metadata",
+        lambda: {"available": False},
+    )
     report = bench.build_report(
         _config(
             repo_root,
@@ -89,11 +114,19 @@ def test_report_blocks_without_runtime_paths_and_records_provenance(
         "missing_albatross_impl_path",
         "missing_albatross_checkpoint_path",
     }
-    assert report["checks"]["state_movement"]["metrics"] == {
-        "resident_to_decode_copies": None,
-        "decode_compactions": None,
-        "decode_compaction_rows": None,
+    assert report["checks"]["state_movement"]["metrics"] == _empty_state_movement()
+    provenance = report["config"]["provenance"]
+    assert provenance["git_revision"]
+    assert provenance["workload"] == {
+        "batch_size": 16,
+        "prompt_len": 128,
+        "warmup_tokens": 16,
+        "decode_tokens": 128,
+        "runner_prefill_chunk_tokens": bench.DEFAULT_RUNNER_PREFILL_CHUNK_TOKENS,
     }
+    assert provenance["sampling"] == bench.VLLM_RUNNER_SAMPLING
+    assert provenance["cuda"]["available"] is False
+    assert set(provenance["env"]) == set(bench.PROVENANCE_ENV_VARS)
 
 
 def test_report_evaluates_passing_measurements() -> None:
@@ -106,11 +139,7 @@ def test_report_evaluates_passing_measurements() -> None:
         "runner_steady_decode": {
             "runner_tokens_per_s": 91.0,
         },
-        "state_movement": {
-            "resident_to_decode_copies": 0,
-            "decode_compactions": 2,
-            "decode_compaction_rows": 32,
-        },
+        "state_movement": _state_movement(),
     }
 
     report = bench.build_report(
@@ -123,11 +152,7 @@ def test_report_evaluates_passing_measurements() -> None:
     assert report["checks"]["model_only_steady_decode"]["status"] == "passed"
     assert report["checks"]["runner_steady_decode"]["status"] == "passed"
     assert report["checks"]["state_movement"]["status"] == "passed"
-    assert report["checks"]["state_movement"]["metrics"] == {
-        "resident_to_decode_copies": 0,
-        "decode_compactions": 2,
-        "decode_compaction_rows": 32,
-    }
+    assert report["checks"]["state_movement"]["metrics"] == _state_movement()
 
 
 def test_report_blocks_only_missing_vllm_when_albatross_measurement_exists() -> None:
@@ -604,16 +629,26 @@ def test_cli_writes_vllm_runner_measurement_json(
     fake_llm = object()
 
     def fake_create(config):
-        calls.append(("create", config.model))
+        calls.append(("create", config.model, config.decode_tokens))
         return fake_llm
 
-    def fake_time(llm, *, batch_size, prompt_len, decode_tokens, warmup, iters):
+    def fake_time(
+        llm,
+        *,
+        batch_size,
+        prompt_len,
+        prefill_chunk_tokens,
+        decode_tokens,
+        warmup,
+        iters,
+    ):
         calls.append(
             (
                 "time",
                 llm,
                 batch_size,
                 prompt_len,
+                prefill_chunk_tokens,
                 decode_tokens,
                 warmup,
                 iters,
@@ -626,17 +661,21 @@ def test_cli_writes_vllm_runner_measurement_json(
             "p90_ms": 2.4,
             "measurement_mode": "worker_execute_model",
             "internal_timing_target": "worker.execute_model",
+            "execute_model_p50_ms": 0.8,
+            "sample_tokens_p50_ms": 0.2,
+            "decode_step_p50_ms": 1.0,
+            "postprocess_p50_ms": None,
+            "postprocess_timing_available": False,
             "decode_steps": 7,
             "worker_count": 1,
         }
 
     def fake_state_stats(llm):
         calls.append(("state", llm))
-        return {
-            "resident_to_decode_copies": 0,
-            "decode_compactions": 1,
-            "decode_compaction_rows": 2,
-        }
+        return _state_movement(
+            decode_compactions=1,
+            decode_compaction_rows=2,
+        )
 
     monkeypatch.setattr(bench, "_create_vllm_runner_llm", fake_create)
     monkeypatch.setattr(bench, "_time_vllm_runner_steady_decode", fake_time)
@@ -657,6 +696,8 @@ def test_cli_writes_vllm_runner_measurement_json(
             "3",
             "--runner-prompt-len",
             "5",
+            "--runner-prefill-chunk-tokens",
+            "2",
             "--runner-decode-tokens",
             "7",
             "--runner-warmup",
@@ -674,27 +715,41 @@ def test_cli_writes_vllm_runner_measurement_json(
     assert runner["runner_tokens_per_s"] == 91.0
     assert runner["runner_batch_size"] == 3
     assert runner["runner_prompt_len"] == 5
+    assert runner["runner_prefill_chunk_tokens"] == 2
     assert runner["runner_decode_tokens"] == 7
     assert runner["runner_warmup"] == 2
+    assert runner["runner_warmup_mode"] == "same_request_decode_steps"
+    assert runner["runner_warmup_decode_tokens"] == 2
     assert runner["runner_iters"] == 11
     assert runner["runner_p50_ms"] == 2.0
     assert runner["runner_measurement_mode"] == "worker_execute_model"
     assert runner["runner_internal_timing_target"] == "worker.execute_model"
     assert runner["runner_timing_clock"] == "cuda_event"
+    assert runner["runner_execute_model_p50_ms"] == 0.8
+    assert runner["runner_sample_tokens_p50_ms"] == 0.2
+    assert runner["runner_decode_step_p50_ms"] == 1.0
+    assert runner["runner_postprocess_p50_ms"] is None
+    assert runner["runner_postprocess_timing_available"] is False
     assert runner["runner_decode_steps"] == 7
     assert runner["runner_worker_count"] == 1
-    assert measurement["state_movement"] == {
-        "resident_to_decode_copies": 0,
-        "decode_compactions": 1,
-        "decode_compaction_rows": 2,
+    assert measurement["state_movement"] == _state_movement(
+        decode_compactions=1,
+        decode_compaction_rows=2,
+    )
+    assert measurement["config"]["provenance"]["workload"] == {
+        "batch_size": 3,
+        "prompt_len": 5,
+        "warmup_tokens": 16,
+        "decode_tokens": 7,
+        "runner_prefill_chunk_tokens": 2,
     }
     assert (
         measurement["config"]["measurement_source"]
         == "vllm_runner_worker_execute_model"
     )
     assert calls == [
-        ("create", str(model_path)),
-        ("time", fake_llm, 3, 5, 7, 2, 11),
+        ("create", str(model_path), 9),
+        ("time", fake_llm, 3, 5, 2, 7, 2, 11),
         ("state", fake_llm),
     ]
 
@@ -743,11 +798,7 @@ def test_cli_merges_vllm_runner_measurement_with_model_only_json(
     monkeypatch.setattr(
         bench,
         "_extract_runner_state_movement_stats",
-        lambda llm: {
-            "resident_to_decode_copies": 0,
-            "decode_compactions": 2,
-            "decode_compaction_rows": 3,
-        },
+        lambda llm: _state_movement(),
     )
 
     rc = bench.main(
@@ -801,6 +852,11 @@ def test_cli_merges_vllm_runner_measurement_with_model_only_json(
         "runner_measurement_mode": "worker_execute_model",
         "runner_internal_timing_target": "worker.execute_model",
         "runner_timing_clock": "cuda_event",
+        "runner_execute_model_p50_ms": None,
+        "runner_sample_tokens_p50_ms": None,
+        "runner_decode_step_p50_ms": None,
+        "runner_postprocess_p50_ms": None,
+        "runner_postprocess_timing_available": False,
     }
 
 
@@ -816,11 +872,7 @@ def test_runner_check_does_not_compare_worker_timing_to_logits_baseline() -> Non
             "runner_measurement_mode": "worker_execute_model",
             "runner_internal_timing_target": "worker.execute_model",
         },
-        "state_movement": {
-            "resident_to_decode_copies": 0,
-            "decode_compactions": 0,
-            "decode_compaction_rows": 0,
-        },
+        "state_movement": _state_movement(),
     }
 
     report = bench.build_report(
@@ -837,6 +889,11 @@ def test_runner_check_does_not_compare_worker_timing_to_logits_baseline() -> Non
         "runner_measurement_mode": "worker_execute_model",
         "runner_internal_timing_target": "worker.execute_model",
         "runner_timing_clock": None,
+        "runner_execute_model_p50_ms": None,
+        "runner_sample_tokens_p50_ms": None,
+        "runner_decode_step_p50_ms": None,
+        "runner_postprocess_p50_ms": None,
+        "runner_postprocess_timing_available": None,
     }
 
 
@@ -868,11 +925,7 @@ def test_cli_writes_blocked_vllm_runner_json_without_fake_tokens(
     monkeypatch.setattr(
         bench,
         "_extract_runner_state_movement_stats",
-        lambda llm: {
-            "resident_to_decode_copies": 0,
-            "decode_compactions": 0,
-            "decode_compaction_rows": 0,
-        },
+        lambda llm: _state_movement(),
     )
 
     rc = bench.main(
@@ -903,8 +956,11 @@ def test_cli_writes_blocked_vllm_runner_json_without_fake_tokens(
     assert set(runner) == {
         "runner_batch_size",
         "runner_prompt_len",
+        "runner_prefill_chunk_tokens",
         "runner_decode_tokens",
         "runner_warmup",
+        "runner_warmup_mode",
+        "runner_warmup_decode_tokens",
         "runner_iters",
         "runner_measurement_mode",
         "runner_internal_timing_target",
@@ -915,7 +971,10 @@ def test_cli_writes_blocked_vllm_runner_json_without_fake_tokens(
     assert runner["runner_measurement_mode"] == "worker_execute_model"
     assert runner["runner_batch_size"] == 1
     assert runner["runner_prompt_len"] == 4
+    assert runner["runner_prefill_chunk_tokens"] == 4
     assert runner["runner_decode_tokens"] == 2
+    assert runner["runner_warmup_mode"] == "same_request_decode_steps"
+    assert runner["runner_warmup_decode_tokens"] == 0
     assert runner["blockers"] == [
         {
             "code": "missing_internal_runner_decode_samples",
@@ -970,6 +1029,7 @@ def test_internal_runner_timing_syncs_once_around_decode_loop(monkeypatch) -> No
         worker,
         batch_size=2,
         prompt_len=3,
+        prefill_chunk_tokens=2,
         decode_tokens=4,
         iters=1,
         measure=True,
@@ -977,11 +1037,19 @@ def test_internal_runner_timing_syncs_once_around_decode_loop(monkeypatch) -> No
 
     assert result["decode_steps"] == 4
     assert len(result["iteration_durations_s"]) == 1
+    assert len(result["execute_durations_s"]) == 4
+    assert len(result["sample_durations_s"]) == 4
+    assert len(result["decode_step_durations_s"]) == 4
+    assert result["postprocess_durations_s"] == []
+    assert result["postprocess_timing_available"] is False
     assert result["timing_clock"] == "wall_clock"
-    assert sync_calls == [1] * 13
+    assert sync_calls == [1] * 17
+    assert worker.calls[:2] == [
+        ("execute", 4, False),
+        ("execute", 2, False),
+    ]
     assert [call[0] for call in worker.calls] == [
         "execute",
-        "sample",
         "execute",
         "sample",
         "execute",
@@ -991,6 +1059,88 @@ def test_internal_runner_timing_syncs_once_around_decode_loop(monkeypatch) -> No
         "execute",
         "sample",
         "execute",
+        "sample",
+        "execute",
+    ]
+
+
+def test_internal_runner_warmup_uses_same_request_before_timing(monkeypatch) -> None:
+    class FakeEvent:
+        def __init__(self, elapsed_ms: float = 1.0) -> None:
+            self.elapsed_ms = elapsed_ms
+
+        def record(self) -> None:
+            pass
+
+        def synchronize(self) -> None:
+            pass
+
+        def elapsed_time(self, other) -> float:
+            return self.elapsed_ms
+
+    class FakeWorker:
+        def __init__(self) -> None:
+            self.calls: list[Any] = []
+
+        def execute_model(self, scheduler_output):
+            cached = scheduler_output.scheduled_cached_reqs
+            if cached.req_ids:
+                self.calls.append(
+                    (
+                        "execute_cached",
+                        cached.num_computed_tokens[0],
+                        cached.num_output_tokens[0],
+                    )
+                )
+            else:
+                self.calls.append(
+                    (
+                        "execute_new",
+                        scheduler_output.total_num_scheduled_tokens,
+                    )
+                )
+
+        def sample_tokens(self, grammar_output):
+            self.calls.append(("sample", grammar_output))
+
+    monkeypatch.setattr(
+        bench,
+        "_worker_cuda_event_pair",
+        lambda: (FakeEvent(), FakeEvent()),
+    )
+    monkeypatch.setattr(bench, "_worker_cuda_synchronize", lambda: None)
+    worker = FakeWorker()
+
+    result = bench._run_vllm_worker_internal_steady_decode(
+        worker,
+        batch_size=1,
+        prompt_len=3,
+        prefill_chunk_tokens=3,
+        decode_tokens=3,
+        iters=1,
+        measure=True,
+        warmup_decode_tokens=2,
+    )
+
+    assert result["decode_steps"] == 3
+    assert result["warmup_decode_steps"] == 2
+    assert result["iteration_durations_s"] == [0.006]
+    assert result["execute_durations_s"] == [0.001] * 3
+    assert result["sample_durations_s"] == [0.001] * 3
+    assert worker.calls == [
+        ("execute_new", 3),
+        ("sample", None),
+        ("execute_cached", 3, 1),
+        ("sample", None),
+        ("execute_cached", 4, 2),
+        ("sample", None),
+        ("execute_cached", 5, 3),
+        ("sample", None),
+        ("execute_cached", 6, 4),
+        ("sample", None),
+        ("execute_cached", 7, 5),
+        ("sample", None),
+        ("execute_new", 0),
     ]
 
 
@@ -1035,18 +1185,29 @@ def test_internal_runner_uses_cuda_event_timing_when_available(monkeypatch) -> N
         worker,
         batch_size=2,
         prompt_len=3,
+        prefill_chunk_tokens=2,
         decode_tokens=4,
         iters=1,
         measure=True,
     )
 
     assert result["timing_clock"] == "cuda_event"
-    assert result["iteration_durations_s"] == [0.008]
-    assert start_event.records == 4
-    assert end_event.records == 4
-    assert end_event.synchronizes == 4
-    assert sync_calls == [1] * 5
+    assert result["iteration_durations_s"] == [0.016]
+    assert result["execute_durations_s"] == [0.002] * 4
+    assert result["sample_durations_s"] == [0.002] * 4
+    assert result["decode_step_durations_s"] == [0.004] * 4
+    assert result["postprocess_durations_s"] == []
+    assert result["postprocess_timing_available"] is False
+    assert start_event.records == 8
+    assert end_event.records == 8
+    assert end_event.synchronizes == 8
+    assert sync_calls == [1]
+    assert worker.calls[:2] == [
+        ("execute", 4),
+        ("execute", 2),
+    ]
     assert [call[0] for call in worker.calls] == [
+        "execute",
         "execute",
         "sample",
         "execute",
@@ -1061,6 +1222,31 @@ def test_internal_runner_uses_cuda_event_timing_when_available(monkeypatch) -> N
     ]
 
 
+def test_internal_runner_merge_reports_component_timings() -> None:
+    result = bench._merge_worker_internal_runner_results(
+        [
+            {
+                "iteration_durations_s": [0.012],
+                "execute_durations_s": [0.003, 0.004],
+                "sample_durations_s": [0.001, 0.002],
+                "decode_step_durations_s": [0.004, 0.006],
+                "decode_steps": 2,
+                "timing_clock": "cuda_event",
+            }
+        ],
+        batch_size=2,
+        decode_tokens=2,
+        iters=1,
+    )
+
+    assert result["tokens_per_s"] == pytest.approx(333.3333333333333)
+    assert result["execute_model_p50_ms"] == pytest.approx(3.0)
+    assert result["sample_tokens_p50_ms"] == pytest.approx(1.0)
+    assert result["decode_step_p50_ms"] == pytest.approx(4.0)
+    assert result["postprocess_p50_ms"] is None
+    assert result["postprocess_timing_available"] is False
+
+
 def test_report_blocks_when_runner_measurement_is_missing() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     measurements = {
@@ -1068,11 +1254,7 @@ def test_report_blocks_when_runner_measurement_is_missing() -> None:
             "albatross_tokens_per_s": 100.0,
             "vllm_tokens_per_s": 96.0,
         },
-        "state_movement": {
-            "resident_to_decode_copies": 0,
-            "decode_compactions": 0,
-            "decode_compaction_rows": 0,
-        },
+        "state_movement": _state_movement(),
     }
 
     report = bench.build_report(
@@ -1101,22 +1283,22 @@ def test_extract_runner_state_movement_stats_uses_collective_rpc() -> None:
         def collective_rpc(self, method, timeout=None, args=(), kwargs=None):
             self.calls.append((method, timeout, args, kwargs))
             return [
-                {
-                    "resident_to_decode_copies": 1,
-                    "decode_compactions": 2,
-                    "decode_compaction_rows": 3,
-                }
+                _state_movement(
+                    resident_to_decode_copies=1,
+                    decode_compactions=2,
+                    decode_compaction_rows=3,
+                )
             ]
 
     llm = FakeLLM()
 
     stats = bench._extract_runner_state_movement_stats(llm)
 
-    assert stats == {
-        "resident_to_decode_copies": 1,
-        "decode_compactions": 2,
-        "decode_compaction_rows": 3,
-    }
+    assert stats == _state_movement(
+        resident_to_decode_copies=1,
+        decode_compactions=2,
+        decode_compaction_rows=3,
+    )
     assert callable(llm.calls[0][0])
 
 
@@ -1167,11 +1349,7 @@ def test_report_fails_low_model_only_and_resident_decode_copies() -> None:
         "runner_steady_decode": {
             "runner_tokens_per_s": 70.0,
         },
-        "state_movement": {
-            "resident_to_decode_copies": 1,
-            "decode_compactions": 0,
-            "decode_compaction_rows": 0,
-        },
+        "state_movement": _state_movement(resident_to_decode_copies=1),
     }
 
     report = bench.build_report(
@@ -1184,6 +1362,38 @@ def test_report_fails_low_model_only_and_resident_decode_copies() -> None:
     assert report["checks"]["model_only_steady_decode"]["status"] == "failed"
     assert report["checks"]["runner_steady_decode"]["status"] == "passed"
     assert report["checks"]["state_movement"]["status"] == "failed"
+
+
+def test_report_fails_decode_compactions_and_full_row_copies() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    measurements = {
+        "model_only_steady_decode": {
+            "albatross_tokens_per_s": 100.0,
+            "vllm_tokens_per_s": 96.0,
+        },
+        "runner_steady_decode": {
+            "runner_tokens_per_s": 70.0,
+        },
+        "state_movement": _state_movement(
+            decode_compactions=1,
+            decode_full_row_copies=2,
+        ),
+    }
+
+    report = bench.build_report(
+        _config(repo_root),
+        measurements=measurements,
+        cuda_available=True,
+    )
+
+    assert report["checks"]["model_only_steady_decode"]["status"] == "passed"
+    assert report["checks"]["runner_steady_decode"]["status"] == "passed"
+    state_check = report["checks"]["state_movement"]
+    assert state_check["status"] == "failed"
+    assert state_check["errors"] == [
+        "steady decode recurrent-state compactions must remain zero",
+        "steady decode full recurrent-state row copies must remain zero",
+    ]
 
 
 def test_cli_writes_structured_blocked_json(tmp_path: Path) -> None:

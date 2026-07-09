@@ -43,6 +43,29 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _attention_backend_name(backend: object) -> str | None:
+    get_name = getattr(backend, "get_name", None)
+    if get_name is None:
+        return None
+    try:
+        return get_name()
+    except NotImplementedError:
+        return None
+
+
+def _has_flashinfer_attention_backend(runner: "GPUModelRunner") -> bool:
+    for groups in getattr(runner, "attn_groups", []) or ():
+        for group in groups:
+            name = _attention_backend_name(getattr(group, "backend", None))
+            if name is not None and name.startswith("FLASHINFER"):
+                return True
+    return False
+
+
+def _is_flashinfer_backend(backend: object) -> bool:
+    return _attention_backend_name(backend) == "FLASHINFER"
+
+
 def kernel_warmup(worker: "Worker"):
     from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
         minimax_m3_msa_warmup,
@@ -91,18 +114,17 @@ def kernel_warmup(worker: "Worker"):
     # FlashInfer autotune for Hopper (SM 9.0) and Blackwell (SM 10.0) GPUs
     if enable_flashinfer_autotune is False:
         logger.info("Skipping FlashInfer autotune because it is disabled.")
+    elif not _has_flashinfer_attention_backend(worker.model_runner):
+        logger.info(
+            "Skipping FlashInfer autotune because the model has no FlashInfer "
+            "attention backend."
+        )
     elif has_flashinfer() and current_platform.has_device_capability(90):
         flashinfer_autotune(worker.model_runner)
 
     # FlashInfer attention warmup
     # Only warmup if the model has FlashInfer attention groups
     # and is not a pooling model
-    def _is_flashinfer_backend(backend):
-        try:
-            return backend.get_name() == "FLASHINFER"
-        except NotImplementedError:
-            return False
-
     if (
         not worker.model_runner.is_pooling_model
         and worker.model_runner.attn_groups

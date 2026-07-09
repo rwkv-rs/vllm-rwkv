@@ -411,7 +411,11 @@ class Sampler:
                     presence_penalties,
                     repetition_penalties,
                     penalty_decays,
-                ) = self.penalties_state.rapid_penalty_params(expanded_idx_mapping)
+                ) = self.penalties_state.rapid_penalty_params(
+                    expanded_idx_mapping,
+                    idx_mapping_np,
+                    scalar_if_uniform=True,
+                )
                 sampled = rapid_sample(
                     processed_logits,
                     top_k,

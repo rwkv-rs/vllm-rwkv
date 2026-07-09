@@ -830,7 +830,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         else True
     ),
     # Whether to use the rapid-sampling CUDA top-k / top-p sampler.
-    # Enabled by default; set to 0 to opt out.
+    # Enabled by default. If the rapid path is unavailable, fail fast instead
+    # of silently using the native sampler; set to 0 to opt out explicitly.
     "VLLM_USE_RAPID_SAMPLER": lambda: (
         bool(int(os.environ["VLLM_USE_RAPID_SAMPLER"]))
         if "VLLM_USE_RAPID_SAMPLER" in os.environ

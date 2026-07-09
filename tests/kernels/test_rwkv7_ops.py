@@ -369,6 +369,19 @@ FAST_RETURNING_CASES = [
         _same(3, 6),
     ),
     OpCase(
+        "rwkv7_fast_ops_fp16::tmix_mix6_slot",
+        lambda d: (
+            2,
+            3,
+            8,
+            _h(d, (2, 3, 8)),
+            _h(d, (5, 8)),
+            _i32(d, (2,)),
+            *[_h(d, (8,)) for _ in range(6)],
+        ),
+        _same(3, 6),
+    ),
+    OpCase(
         "rwkv7_fast_ops_fp16::tmix_mix6_cfg",
         lambda d: (
             2,
@@ -378,6 +391,35 @@ FAST_RETURNING_CASES = [
             _h(d, (2, 8)),
             *[_h(d, (8,)) for _ in range(6)],
             256,
+        ),
+        _same(3, 6),
+    ),
+    OpCase(
+        "rwkv7_fast_ops_fp16::tmix_mix6_cfg_slot",
+        lambda d: (
+            2,
+            3,
+            8,
+            _h(d, (2, 3, 8)),
+            _h(d, (5, 8)),
+            _i32(d, (2,)),
+            *[_h(d, (8,)) for _ in range(6)],
+            256,
+        ),
+        _same(3, 6),
+    ),
+    OpCase(
+        "rwkv7_fast_ops_fp16::tmix_mix6_varlen",
+        lambda d: (
+            2,
+            5,
+            8,
+            _h(d, (5, 8)),
+            _h(d, (6, 8)),
+            _i32(d, (2,)),
+            *[_h(d, (8,)) for _ in range(6)],
+            _i32(d, (3,)),
+            _i32(d, (5,)),
         ),
         _same(3, 6),
     ),
@@ -513,8 +555,50 @@ FAST_RETURNING_CASES = [
         _same(3),
     ),
     OpCase(
+        "rwkv7_fast_ops_fp16::cmix_mix_slot",
+        lambda d: (
+            2,
+            3,
+            8,
+            _h(d, (2, 3, 8)),
+            _h(d, (5, 8)),
+            _i32(d, (2,)),
+            _h(d, (8,)),
+        ),
+        _same(3),
+    ),
+    OpCase(
         "rwkv7_fast_ops_fp16::cmix_mix_cfg",
         lambda d: (2, 3, 8, _h(d, (2, 3, 8)), _h(d, (2, 8)), _h(d, (8,)), 256),
+        _same(3),
+    ),
+    OpCase(
+        "rwkv7_fast_ops_fp16::cmix_mix_cfg_slot",
+        lambda d: (
+            2,
+            3,
+            8,
+            _h(d, (2, 3, 8)),
+            _h(d, (5, 8)),
+            _i32(d, (2,)),
+            _h(d, (8,)),
+            256,
+        ),
+        _same(3),
+    ),
+    OpCase(
+        "rwkv7_fast_ops_fp16::cmix_mix_varlen",
+        lambda d: (
+            2,
+            5,
+            8,
+            _h(d, (5, 8)),
+            _h(d, (6, 8)),
+            _i32(d, (2,)),
+            _h(d, (8,)),
+            _i32(d, (3,)),
+            _i32(d, (5,)),
+        ),
         _same(3),
     ),
     OpCase("rwkv7_fast_ops_fp16::relu_square", lambda d: (_h(d, (2, 3, 8)),), _same(0)),
@@ -576,6 +660,186 @@ def test_rwkv7_advance_i32_schema_opcheck() -> None:
     )
 
 
+def test_rwkv7_advance_i32_slots_schema_opcheck() -> None:
+    torch.library.opcheck(
+        torch.ops.rwkv7_v3a_ops.advance_i32_slots,
+        (_i32("cuda", (6,)), torch.tensor([3, 0], device="cuda", dtype=torch.int32), 3),
+        test_utils=("test_schema",),
+    )
+
+
+def test_rwkv7_advance_i32_varlen_schema_opcheck() -> None:
+    torch.library.opcheck(
+        torch.ops.rwkv7_v3a_ops.advance_i32_varlen,
+        (
+            _i32("cuda", (6,)),
+            torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32),
+            torch.tensor([3, 0], device="cuda", dtype=torch.int32),
+        ),
+        test_utils=("test_schema",),
+    )
+
+
+def test_rwkv7_advance_i32_varlen_updates_only_mapped_slots() -> None:
+    elapsed = torch.tensor([10, 20, 30, 40], device="cuda", dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32)
+    slot_indices = torch.tensor([3, 0], device="cuda", dtype=torch.int32)
+
+    torch.ops.rwkv7_v3a_ops.advance_i32_varlen(
+        elapsed, query_start_loc, slot_indices
+    )
+
+    assert elapsed.cpu().tolist() == [13, 20, 30, 42]
+
+
+@pytest.mark.parametrize(
+    "op_name,args",
+    [
+        (
+            "rwkv7_wkv_fp16_v2::wkv_seq_slot",
+            lambda: (
+                2,
+                1,
+                64,
+                1,
+                _h("cuda", (5, 1, 64, 64)),
+                *[_h("cuda", (2, 1, 64)) for _ in range(6)],
+                _h("cuda", (2, 1, 64)),
+                torch.tensor([3, 0], device="cuda", dtype=torch.int32),
+                _i32("cuda", (5,)),
+            ),
+        ),
+        (
+            "rwkv7_wkv_fp16_v2::wkv_seq_w0_slot",
+            lambda: (
+                2,
+                1,
+                64,
+                1,
+                _h("cuda", (5, 1, 64, 64)),
+                _h("cuda", (2, 1, 64)),
+                _h("cuda", (2, 1, 64)),
+                _h("cuda", (64,)),
+                *[_h("cuda", (2, 1, 64)) for _ in range(4)],
+                _h("cuda", (2, 1, 64)),
+                torch.tensor([3, 0], device="cuda", dtype=torch.int32),
+                _i32("cuda", (5,)),
+            ),
+        ),
+        (
+            "rwkv7_wkv_fp16_v2::wkv_seq_varlen",
+            lambda: (
+                2,
+                5,
+                3,
+                64,
+                1,
+                torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32),
+                torch.tensor([3, 0], device="cuda", dtype=torch.int32),
+                _h("cuda", (5, 1, 64, 64)),
+                *[_h("cuda", (5, 64)) for _ in range(6)],
+                _h("cuda", (5, 64)),
+                _i32("cuda", (5,)),
+            ),
+        ),
+        (
+            "rwkv7_wkv_fp16_v2::wkv_seq_w0_varlen",
+            lambda: (
+                2,
+                5,
+                3,
+                64,
+                1,
+                torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32),
+                torch.tensor([3, 0], device="cuda", dtype=torch.int32),
+                _h("cuda", (5, 1, 64, 64)),
+                _h("cuda", (5, 64)),
+                _h("cuda", (5, 64)),
+                _h("cuda", (64,)),
+                *[_h("cuda", (5, 64)) for _ in range(4)],
+                _h("cuda", (5, 64)),
+                _i32("cuda", (5,)),
+            ),
+        ),
+        (
+            "rwkv7_wkv_fp32_v2::forward_slot",
+            lambda: (
+                2,
+                1,
+                64,
+                1,
+                torch.empty((5, 1, 64, 64), device="cuda", dtype=torch.float32),
+                *[_h("cuda", (2, 1, 64)) for _ in range(6)],
+                _h("cuda", (2, 1, 64)),
+                torch.tensor([3, 0], device="cuda", dtype=torch.int32),
+            ),
+        ),
+        (
+            "rwkv7_wkv_fp32_v2::forward_varlen",
+            lambda: (
+                2,
+                5,
+                3,
+                64,
+                1,
+                torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32),
+                torch.tensor([3, 0], device="cuda", dtype=torch.int32),
+                torch.empty((5, 1, 64, 64), device="cuda", dtype=torch.float32),
+                *[_h("cuda", (5, 64)) for _ in range(6)],
+                _h("cuda", (5, 64)),
+            ),
+        ),
+        (
+            "rwkv7_wkv_fp32_v2::forward_seq_varlen",
+            lambda: (
+                2,
+                5,
+                3,
+                64,
+                1,
+                torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32),
+                torch.tensor([3, 0], device="cuda", dtype=torch.int32),
+                torch.empty((5, 1, 64, 64), device="cuda", dtype=torch.float32),
+                *[_h("cuda", (5, 64)) for _ in range(6)],
+                _h("cuda", (5, 64)),
+            ),
+        ),
+        (
+            "rwkv7_wkv_fp32_v2::forward_small_varlen",
+            lambda: (
+                2,
+                5,
+                3,
+                64,
+                1,
+                torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32),
+                torch.tensor([3, 0], device="cuda", dtype=torch.int32),
+                torch.empty((5, 1, 64, 64), device="cuda", dtype=torch.float32),
+                *[_h("cuda", (5, 64)) for _ in range(6)],
+                _h("cuda", (5, 64)),
+            ),
+        ),
+        (
+            "rwkv7_wkv_fp32_v2::forward_block_varlen",
+            lambda: (
+                2,
+                5,
+                3,
+                64,
+                1,
+                torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32),
+                torch.tensor([3, 0], device="cuda", dtype=torch.int32),
+                torch.empty((5, 1, 64, 64), device="cuda", dtype=torch.float32),
+                *[_h("cuda", (5, 64)) for _ in range(6)],
+                _h("cuda", (5, 64)),
+            ),
+        ),
+    ],
+)
+def test_rwkv7_wkv_slot_schema_opcheck(op_name, args) -> None:
+    torch.library.opcheck(_op(op_name), args(), test_utils=("test_schema",))
+
+
 @pytest.mark.parametrize("use_cfg", [False, True])
 def test_rwkv7_tmix_mix6_batched_shift_state_matches_reference(
     use_cfg: bool,
@@ -611,6 +875,111 @@ def test_rwkv7_tmix_mix6_batched_shift_state_matches_reference(
 
 
 @pytest.mark.parametrize("use_cfg", [False, True])
+def test_rwkv7_tmix_mix6_slot_matches_scattered_reference(use_cfg: bool) -> None:
+    torch.manual_seed(2)
+    device = "cuda"
+    batch, seq_len, hidden, slots = 3, 4, 64, 6
+    slot_indices = torch.tensor([4, 1, 5], device=device, dtype=torch.int32)
+    x = torch.randn((batch, seq_len, hidden), device=device, dtype=torch.float16)
+    shift_state = torch.randn((slots, hidden), device=device, dtype=torch.float16)
+    x_r, x_w, x_k, x_v, x_a, x_g = (
+        torch.randn((hidden,), device=device, dtype=torch.float16) for _ in range(6)
+    )
+    initial_shift_state = shift_state.clone()
+
+    op = (
+        torch.ops.rwkv7_fast_ops_fp16.tmix_mix6_cfg_slot
+        if use_cfg
+        else torch.ops.rwkv7_fast_ops_fp16.tmix_mix6_slot
+    )
+    args = (
+        batch,
+        seq_len,
+        hidden,
+        x,
+        shift_state,
+        slot_indices,
+        x_r,
+        x_w,
+        x_k,
+        x_v,
+        x_a,
+        x_g,
+    )
+    outputs = op(*args, 128) if use_cfg else op(*args)
+
+    prev = torch.cat((initial_shift_state[slot_indices.long(), None, :], x[:, :-1, :]), dim=1)
+    delta = prev.float() - x.float()
+    for output, mix_weight in zip(
+        outputs,
+        (x_r, x_w, x_k, x_v, x_a, x_g),
+        strict=True,
+    ):
+        expected = (x.float() + delta * mix_weight.float()).to(torch.float16)
+        torch.testing.assert_close(output, expected, atol=1e-3, rtol=1e-3)
+    expected_state = initial_shift_state.clone()
+    expected_state[slot_indices.long()] = x[:, -1, :]
+    torch.testing.assert_close(shift_state, expected_state, atol=0, rtol=0)
+
+
+def test_rwkv7_tmix_mix6_varlen_matches_scattered_reference() -> None:
+    torch.manual_seed(4)
+    device = "cuda"
+    lengths = [2, 4, 1]
+    batch, total_tokens, hidden, slots = len(lengths), sum(lengths), 64, 7
+    query_start_loc = torch.tensor([0, 2, 6, 7], device=device, dtype=torch.int32)
+    req_id = torch.tensor([0, 0, 1, 1, 1, 1, 2], device=device, dtype=torch.int32)
+    slot_indices = torch.tensor([4, 1, 5], device=device, dtype=torch.int32)
+    x = torch.randn((total_tokens, hidden), device=device, dtype=torch.float16)
+    shift_state = torch.randn((slots, hidden), device=device, dtype=torch.float16)
+    x_r, x_w, x_k, x_v, x_a, x_g = (
+        torch.randn((hidden,), device=device, dtype=torch.float16) for _ in range(6)
+    )
+    initial_shift_state = shift_state.clone()
+
+    outputs = torch.ops.rwkv7_fast_ops_fp16.tmix_mix6_varlen(
+        batch,
+        total_tokens,
+        hidden,
+        x,
+        shift_state,
+        slot_indices,
+        x_r,
+        x_w,
+        x_k,
+        x_v,
+        x_a,
+        x_g,
+        query_start_loc,
+        req_id,
+    )
+
+    prev_parts = []
+    for local_req, length in enumerate(lengths):
+        start = int(query_start_loc[local_req].item())
+        end = int(query_start_loc[local_req + 1].item())
+        slot = int(slot_indices[local_req].item())
+        prev_parts.append(
+            torch.cat((initial_shift_state[slot : slot + 1], x[start : end - 1]))
+        )
+        assert end - start == length
+    prev = torch.cat(prev_parts, dim=0)
+    delta = prev.float() - x.float()
+    for output, mix_weight in zip(
+        outputs,
+        (x_r, x_w, x_k, x_v, x_a, x_g),
+        strict=True,
+    ):
+        expected = (x.float() + delta * mix_weight.float()).to(torch.float16)
+        torch.testing.assert_close(output, expected, atol=1e-3, rtol=1e-3)
+    expected_state = initial_shift_state.clone()
+    for local_req, slot in enumerate(slot_indices.long().tolist()):
+        end = int(query_start_loc[local_req + 1].item())
+        expected_state[slot] = x[end - 1]
+    torch.testing.assert_close(shift_state, expected_state, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("use_cfg", [False, True])
 def test_rwkv7_cmix_mix_batched_shift_state_matches_reference(
     use_cfg: bool,
 ) -> None:
@@ -634,3 +1003,76 @@ def test_rwkv7_cmix_mix_batched_shift_state_matches_reference(
     expected = (x.float() + (prev.float() - x.float()) * x_k.float()).to(torch.float16)
     torch.testing.assert_close(output, expected, atol=1e-3, rtol=1e-3)
     torch.testing.assert_close(shift_state, x[:, -1, :], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("use_cfg", [False, True])
+def test_rwkv7_cmix_mix_slot_matches_scattered_reference(use_cfg: bool) -> None:
+    torch.manual_seed(3)
+    device = "cuda"
+    batch, seq_len, hidden, slots = 3, 4, 64, 6
+    slot_indices = torch.tensor([4, 1, 5], device=device, dtype=torch.int32)
+    x = torch.randn((batch, seq_len, hidden), device=device, dtype=torch.float16)
+    shift_state = torch.randn((slots, hidden), device=device, dtype=torch.float16)
+    x_k = torch.randn((hidden,), device=device, dtype=torch.float16)
+    initial_shift_state = shift_state.clone()
+
+    op = (
+        torch.ops.rwkv7_fast_ops_fp16.cmix_mix_cfg_slot
+        if use_cfg
+        else torch.ops.rwkv7_fast_ops_fp16.cmix_mix_slot
+    )
+    args = (batch, seq_len, hidden, x, shift_state, slot_indices, x_k)
+    output = op(*args, 128) if use_cfg else op(*args)
+
+    prev = torch.cat((initial_shift_state[slot_indices.long(), None, :], x[:, :-1, :]), dim=1)
+    expected = (x.float() + (prev.float() - x.float()) * x_k.float()).to(torch.float16)
+    torch.testing.assert_close(output, expected, atol=1e-3, rtol=1e-3)
+    expected_state = initial_shift_state.clone()
+    expected_state[slot_indices.long()] = x[:, -1, :]
+    torch.testing.assert_close(shift_state, expected_state, atol=0, rtol=0)
+
+
+def test_rwkv7_cmix_mix_varlen_matches_scattered_reference() -> None:
+    torch.manual_seed(5)
+    device = "cuda"
+    lengths = [2, 4, 1]
+    batch, total_tokens, hidden, slots = len(lengths), sum(lengths), 64, 7
+    query_start_loc = torch.tensor([0, 2, 6, 7], device=device, dtype=torch.int32)
+    req_id = torch.tensor([0, 0, 1, 1, 1, 1, 2], device=device, dtype=torch.int32)
+    slot_indices = torch.tensor([4, 1, 5], device=device, dtype=torch.int32)
+    x = torch.randn((total_tokens, hidden), device=device, dtype=torch.float16)
+    shift_state = torch.randn((slots, hidden), device=device, dtype=torch.float16)
+    x_k = torch.randn((hidden,), device=device, dtype=torch.float16)
+    initial_shift_state = shift_state.clone()
+
+    output = torch.ops.rwkv7_fast_ops_fp16.cmix_mix_varlen(
+        batch,
+        total_tokens,
+        hidden,
+        x,
+        shift_state,
+        slot_indices,
+        x_k,
+        query_start_loc,
+        req_id,
+    )
+
+    prev_parts = []
+    for local_req, length in enumerate(lengths):
+        start = int(query_start_loc[local_req].item())
+        end = int(query_start_loc[local_req + 1].item())
+        slot = int(slot_indices[local_req].item())
+        prev_parts.append(
+            torch.cat((initial_shift_state[slot : slot + 1], x[start : end - 1]))
+        )
+        assert end - start == length
+    prev = torch.cat(prev_parts, dim=0)
+    expected = (x.float() + (prev.float() - x.float()) * x_k.float()).to(
+        torch.float16
+    )
+    torch.testing.assert_close(output, expected, atol=1e-3, rtol=1e-3)
+    expected_state = initial_shift_state.clone()
+    for local_req, slot in enumerate(slot_indices.long().tolist()):
+        end = int(query_start_loc[local_req + 1].item())
+        expected_state[slot] = x[end - 1]
+    torch.testing.assert_close(shift_state, expected_state, atol=0, rtol=0)

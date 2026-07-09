@@ -155,10 +155,12 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
                                            // avoids another copying operation
         float* __restrict__ penalties,     // (B, V), can set some to -INF for
                                            // masking
-        int* __restrict__ outputs,         // (B,)
-        RAND* __restrict__ states,         // random state, typedef
-                                           // curandStatePhilox4_32_10_t RAND;
-        float* __restrict__ probs,         // probs (in L2 cache)
+        const int* __restrict__ penalty_indices,  // optional (B,), maps batch
+                                                  // row to penalties row
+        int* __restrict__ outputs,                // (B,)
+        RAND* __restrict__ states,                // random state, typedef
+                                    // curandStatePhilox4_32_10_t RAND;
+        float* __restrict__ probs,  // probs (in L2 cache)
         const float presence_penalty, const float repetition_penalty,
         const float penalty_decay, const float log2_inv_temp, const int top_k,
         const float top_p) {
@@ -177,10 +179,11 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
   float4 l4, p4;
 
   logits += (b * T + (T - 1)) * V;  // B T V
-  penalties += b * V;               // B V
-  outputs += b;                     // B
-  states += b;                      // B
-  probs += (b * T + (T - 1)) * V;   // B T V
+  const int penalty_row = penalty_indices == nullptr ? b : penalty_indices[b];
+  penalties += penalty_row * V;    // penalty rows V
+  outputs += b;                    // B
+  states += b;                     // B
+  probs += (b * T + (T - 1)) * V;  // B T V
 
   float maxu = -INFINITY;
   for (int i = t; i < V4; i += d) {
@@ -495,8 +498,94 @@ at::Tensor batch_sampling_repetition_temperature_topk_topp(
 
   batch_sampling_repetition_temperature_topk_topp_kernel<<<B, 1024, 0,
                                                            stream>>>(
-      B, T, V, (float*)logits.data_ptr(), (float*)penalties.data_ptr(),
+      B, T, V, (float*)logits.data_ptr(), (float*)penalties.data_ptr(), nullptr,
       (int*)out.data_ptr(), (RAND*)states.data_ptr(), (float*)probs.data_ptr(),
+      (float)presence_penalty, (float)repetition_penalty, (float)penalty_decay,
+      (float)log2e_inv_temp, (int)top_k, (float)top_p);
+  return out;
+}
+
+at::Tensor batch_sampling_repetition_temperature_topk_topp_indexed(
+    at::Tensor& logits, at::Tensor& penalties, at::Tensor& penalty_indices,
+    at::Tensor& states, double presence_penalty, double repetition_penalty,
+    double penalty_decay, double temperature, int64_t top_k, double top_p) {
+  int B, T, V;
+  if (logits.dtype() != at::kFloat) {
+    throw std::invalid_argument(
+        "Logits tensor must be of type float32 (FP32), got " +
+        std::string(logits.dtype().name()) + " !\n");
+  }
+  if (penalties.dtype() != at::kFloat) {
+    throw std::invalid_argument(
+        "Penalties tensor must be of type float32 (FP32), got " +
+        std::string(penalties.dtype().name()) + " !\n");
+  }
+  if (penalty_indices.dtype() != at::kInt) {
+    throw std::invalid_argument(
+        "Penalty indices tensor must be of type int32, got " +
+        std::string(penalty_indices.dtype().name()) + " !\n");
+  }
+  V = logits.size(-1);
+  B = (logits.dim() == 3) ? logits.size(0)
+                          : (logits.dim() == 2 ? logits.size(0) : 1);
+  T = (logits.dim() == 3) ? logits.size(1) : 1;
+  if (!(V > 0 && V <= 1048576 && V % 4 == 0)) {
+    throw std::invalid_argument(
+        "Vocabulary size must be multiple of 4, and no larger than 1048576, "
+        "got " +
+        std::to_string(V) + " !\n");
+  }
+  if (!(B > 0 && T > 0)) {
+    throw std::invalid_argument(
+        "B and T must be positive, got B=" + std::to_string(B) +
+        ", T=" + std::to_string(T) + " !\n");
+  }
+  if (!(penalties.dim() == 2 && penalties.size(1) == V)) {
+    throw std::invalid_argument(
+        "Penalties tensor must have shape (rows, V), got dim=" +
+        std::to_string(penalties.dim()) +
+        " and V=" + std::to_string(penalties.size(-1)) + " !\n");
+  }
+  if (!(penalty_indices.dim() == 1 && penalty_indices.size(0) == B &&
+        penalty_indices.is_contiguous())) {
+    throw std::invalid_argument(
+        "Penalty indices tensor must be contiguous with shape (B,), got dim=" +
+        std::to_string(penalty_indices.dim()) +
+        " and rows=" + std::to_string(penalty_indices.size(0)) + " !\n");
+  }
+  if (!(temperature >= 0.001 && temperature <= 1000)) {
+    throw std::invalid_argument("Temperature outside range, got " +
+                                std::to_string(temperature) +
+                                ", expect [0.001, 1000]!\n");
+  }
+  if (top_k <= 0 || top_k > V) top_k = V;
+  if (top_p < 0 || top_p > 1) top_p = 1;
+  if (top_p == 0) {
+    top_k = 1;
+    top_p = 1;
+  }
+  double log2e_inv_temp = M_LOG2E / temperature;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto probs = at::empty(
+      {B, V}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
+  if (B * V * 4 <= 4194304) {
+    cudaStreamAttrValue stream_attribute;
+    stream_attribute.accessPolicyWindow.base_ptr = probs.data_ptr();
+    stream_attribute.accessPolicyWindow.num_bytes = B * V * 4;
+    stream_attribute.accessPolicyWindow.hitRatio = 1;
+    stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+    stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+    cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow,
+                           &stream_attribute);
+  }
+  auto out =
+      at::empty({B}, at::TensorOptions().dtype(at::kInt).device(at::kCUDA));
+
+  batch_sampling_repetition_temperature_topk_topp_kernel<<<B, 1024, 0,
+                                                           stream>>>(
+      B, T, V, (float*)logits.data_ptr(), (float*)penalties.data_ptr(),
+      (int*)penalty_indices.data_ptr(), (int*)out.data_ptr(),
+      (RAND*)states.data_ptr(), (float*)probs.data_ptr(),
       (float)presence_penalty, (float)repetition_penalty, (float)penalty_decay,
       (float)log2e_inv_temp, (int)top_k, (float)top_p);
   return out;

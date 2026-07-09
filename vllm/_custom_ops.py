@@ -366,6 +366,24 @@ def _rwkv7_tmix_mix6_fake(
     return [_rwkv7_empty_like(x) for _ in range(6)]
 
 
+@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_mix6_slot")
+def _rwkv7_tmix_mix6_slot_fake(
+    B: int,
+    T: int,
+    C: int,
+    x: torch.Tensor,
+    shift_state: torch.Tensor,
+    slot_indices: torch.Tensor,
+    x_r: torch.Tensor,
+    x_w: torch.Tensor,
+    x_k: torch.Tensor,
+    x_v: torch.Tensor,
+    x_a: torch.Tensor,
+    x_g: torch.Tensor,
+) -> list[torch.Tensor]:
+    return [_rwkv7_empty_like(x) for _ in range(6)]
+
+
 @_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_mix6_cfg")
 def _rwkv7_tmix_mix6_cfg_fake(
     B: int,
@@ -380,6 +398,45 @@ def _rwkv7_tmix_mix6_cfg_fake(
     x_a: torch.Tensor,
     x_g: torch.Tensor,
     threads: int,
+) -> list[torch.Tensor]:
+    return [_rwkv7_empty_like(x) for _ in range(6)]
+
+
+@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_mix6_cfg_slot")
+def _rwkv7_tmix_mix6_cfg_slot_fake(
+    B: int,
+    T: int,
+    C: int,
+    x: torch.Tensor,
+    shift_state: torch.Tensor,
+    slot_indices: torch.Tensor,
+    x_r: torch.Tensor,
+    x_w: torch.Tensor,
+    x_k: torch.Tensor,
+    x_v: torch.Tensor,
+    x_a: torch.Tensor,
+    x_g: torch.Tensor,
+    threads: int,
+) -> list[torch.Tensor]:
+    return [_rwkv7_empty_like(x) for _ in range(6)]
+
+
+@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_mix6_varlen")
+def _rwkv7_tmix_mix6_varlen_fake(
+    B: int,
+    total_tokens: int,
+    C: int,
+    x: torch.Tensor,
+    shift_state: torch.Tensor,
+    slot_indices: torch.Tensor,
+    x_r: torch.Tensor,
+    x_w: torch.Tensor,
+    x_k: torch.Tensor,
+    x_v: torch.Tensor,
+    x_a: torch.Tensor,
+    x_g: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    req_id: torch.Tensor,
 ) -> list[torch.Tensor]:
     return [_rwkv7_empty_like(x) for _ in range(6)]
 
@@ -530,6 +587,19 @@ def _rwkv7_cmix_mix_fake(
     return _rwkv7_empty_like(x)
 
 
+@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_mix_slot")
+def _rwkv7_cmix_mix_slot_fake(
+    B: int,
+    T: int,
+    C: int,
+    x: torch.Tensor,
+    shift_state: torch.Tensor,
+    slot_indices: torch.Tensor,
+    x_k: torch.Tensor,
+) -> torch.Tensor:
+    return _rwkv7_empty_like(x)
+
+
 @_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_mix_cfg")
 def _rwkv7_cmix_mix_cfg_fake(
     B: int,
@@ -539,6 +609,35 @@ def _rwkv7_cmix_mix_cfg_fake(
     shift_state: torch.Tensor,
     x_k: torch.Tensor,
     threads: int,
+) -> torch.Tensor:
+    return _rwkv7_empty_like(x)
+
+
+@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_mix_cfg_slot")
+def _rwkv7_cmix_mix_cfg_slot_fake(
+    B: int,
+    T: int,
+    C: int,
+    x: torch.Tensor,
+    shift_state: torch.Tensor,
+    slot_indices: torch.Tensor,
+    x_k: torch.Tensor,
+    threads: int,
+) -> torch.Tensor:
+    return _rwkv7_empty_like(x)
+
+
+@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_mix_varlen")
+def _rwkv7_cmix_mix_varlen_fake(
+    B: int,
+    total_tokens: int,
+    C: int,
+    x: torch.Tensor,
+    shift_state: torch.Tensor,
+    slot_indices: torch.Tensor,
+    x_k: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    req_id: torch.Tensor,
 ) -> torch.Tensor:
     return _rwkv7_empty_like(x)
 
@@ -553,6 +652,43 @@ def _rwkv7_unary_fake(x: torch.Tensor) -> torch.Tensor:
 @_register_fake_if_exists("rwkv7_fast_ops_fp16::add_vec")
 def _rwkv7_add_vec_fake(C: int, x: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
     return _rwkv7_empty_like(x)
+
+
+@_register_fake_if_exists("rwkv7_v3a_ops::advance_i32")
+@_register_fake_if_exists("rwkv7_v3a_ops::advance_i32_slots")
+@_register_fake_if_exists("rwkv7_v3a_ops::advance_i32_varlen")
+def _rwkv7_advance_i32_fake(*args) -> None:
+    return None
+
+
+@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq")
+@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_slot")
+@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_w0")
+@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_w0_slot")
+@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_varlen")
+@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_w0_varlen")
+@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_one")
+@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_one_slot")
+@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_one_w0")
+@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_one_w0_slot")
+def _rwkv7_wkv_fp16_fake(*args) -> None:
+    return None
+
+
+@_register_fake_if_exists("rwkv7_wkv_fp32_v2::forward")
+@_register_fake_if_exists("rwkv7_wkv_fp32_v2::forward_slot")
+@_register_fake_if_exists("rwkv7_wkv_fp32_v2::forward_seq")
+@_register_fake_if_exists("rwkv7_wkv_fp32_v2::forward_seq_slot")
+@_register_fake_if_exists("rwkv7_wkv_fp32_v2::forward_small")
+@_register_fake_if_exists("rwkv7_wkv_fp32_v2::forward_small_slot")
+@_register_fake_if_exists("rwkv7_wkv_fp32_v2::forward_block")
+@_register_fake_if_exists("rwkv7_wkv_fp32_v2::forward_block_slot")
+@_register_fake_if_exists("rwkv7_wkv_fp32_v2::forward_varlen")
+@_register_fake_if_exists("rwkv7_wkv_fp32_v2::forward_seq_varlen")
+@_register_fake_if_exists("rwkv7_wkv_fp32_v2::forward_small_varlen")
+@_register_fake_if_exists("rwkv7_wkv_fp32_v2::forward_block_varlen")
+def _rwkv7_wkv_fp32_fake(*args) -> None:
+    return None
 
 
 # scaled_fp4_quant functional + out variant for torch.compile buffer management

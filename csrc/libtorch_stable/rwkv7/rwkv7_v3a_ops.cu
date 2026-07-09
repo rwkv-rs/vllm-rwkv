@@ -139,6 +139,24 @@ __global__ void advance_i32_kernel(int* __restrict__ x, int amount, int64_t n) {
   }
 }
 
+__global__ void advance_i32_slots_kernel(
+    int* __restrict__ x, const int* __restrict__ slot_indices, int amount,
+    int64_t n) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) {
+    x[slot_indices[i]] += amount;
+  }
+}
+
+__global__ void advance_i32_varlen_kernel(
+    int* __restrict__ x, const int* __restrict__ query_start_loc,
+    const int* __restrict__ slot_indices, int64_t n) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) {
+    x[slot_indices[i]] += query_start_loc[i + 1] - query_start_loc[i];
+  }
+}
+
 template <int ChunkK, int Warps>
 __global__ __launch_bounds__(128, 2) void linear_f16_m1_splitk_partial_kernel(
     int K, int N, const dtype* __restrict__ x, const dtype* __restrict__ weight,
@@ -2231,6 +2249,32 @@ void advance_i32_cuda(at::Tensor x, int64_t amount) {
   advance_i32_kernel<<<static_cast<int>(ceil_div(n, threads)), threads, 0,
                        stream>>>(x.data_ptr<int>(), static_cast<int>(amount),
                                  n);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void advance_i32_slots_cuda(at::Tensor x, at::Tensor slot_indices,
+                            int64_t amount) {
+  TORCH_CHECK(amount >= INT_MIN && amount <= INT_MAX,
+              "advance_i32_slots amount out of int range");
+  constexpr int threads = 256;
+  const int64_t n = slot_indices.numel();
+  auto stream = at::cuda::getCurrentCUDAStream();
+  advance_i32_slots_kernel<<<static_cast<int>(ceil_div(n, threads)), threads, 0,
+                             stream>>>(
+      x.data_ptr<int>(), slot_indices.data_ptr<int>(), static_cast<int>(amount),
+      n);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void advance_i32_varlen_cuda(at::Tensor x, at::Tensor query_start_loc,
+                             at::Tensor slot_indices) {
+  constexpr int threads = 256;
+  const int64_t n = slot_indices.numel();
+  auto stream = at::cuda::getCurrentCUDAStream();
+  advance_i32_varlen_kernel<<<static_cast<int>(ceil_div(n, threads)), threads,
+                              0, stream>>>(
+      x.data_ptr<int>(), query_start_loc.data_ptr<int>(),
+      slot_indices.data_ptr<int>(), n);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

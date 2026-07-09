@@ -8,6 +8,7 @@ import torch
 
 from vllm import SamplingParams
 from vllm.v1.worker.gpu.sample import sampler as sampler_module
+from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.states import SamplingStates
 
@@ -99,6 +100,76 @@ def test_sampling_states_can_collapse_uniform_rapid_params():
 
     assert vector_top_k is not None and vector_top_k.shape == (3,)
     assert vector_top_p is not None and vector_top_p.shape == (3,)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="UVA tensors require CUDA")
+def test_penalties_state_can_collapse_uniform_rapid_params():
+    req_states = SimpleNamespace(
+        max_num_reqs=4,
+        vocab_size=8,
+        device=torch.device("cuda"),
+    )
+    state = PenaltiesState(req_states)
+    state.presence_penalty.np[:3] = 0.2
+    state.repetition_penalty.np[:3] = 1.1
+    state.penalty_decay.np[:3] = 0.95
+    state.presence_penalty.copy_to_uva()
+    state.repetition_penalty.copy_to_uva()
+    state.penalty_decay.copy_to_uva()
+
+    device = state.presence_penalty.gpu.device
+    expanded_idx_mapping = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
+    idx_mapping_np = np.array([0, 1, 2])
+
+    presence, repetition, decay = state.rapid_penalty_params(
+        expanded_idx_mapping,
+        idx_mapping_np,
+        scalar_if_uniform=True,
+    )
+
+    assert presence == pytest.approx(0.2)
+    assert repetition == pytest.approx(1.1)
+    assert decay == pytest.approx(0.95)
+
+    vector_presence, vector_repetition, vector_decay = state.rapid_penalty_params(
+        expanded_idx_mapping,
+        idx_mapping_np,
+    )
+
+    assert vector_presence.shape == (3,)
+    assert vector_repetition.shape == (3,)
+    assert vector_decay.shape == (3,)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="UVA tensors require CUDA")
+def test_penalties_state_keeps_mixed_rapid_params_as_vectors():
+    req_states = SimpleNamespace(
+        max_num_reqs=4,
+        vocab_size=8,
+        device=torch.device("cuda"),
+    )
+    state = PenaltiesState(req_states)
+    state.presence_penalty.np[:2] = [0.2, 0.3]
+    state.repetition_penalty.np[:2] = 1.1
+    state.penalty_decay.np[:2] = 0.95
+    state.presence_penalty.copy_to_uva()
+    state.repetition_penalty.copy_to_uva()
+    state.penalty_decay.copy_to_uva()
+
+    device = state.presence_penalty.gpu.device
+    expanded_idx_mapping = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    idx_mapping_np = np.array([0, 1])
+
+    presence, repetition, decay = state.rapid_penalty_params(
+        expanded_idx_mapping,
+        idx_mapping_np,
+        scalar_if_uniform=True,
+    )
+
+    assert isinstance(presence, torch.Tensor)
+    assert isinstance(repetition, torch.Tensor)
+    assert isinstance(decay, torch.Tensor)
+    assert presence.shape == (2,)
 
 
 def test_rapid_sampler_recomputes_processed_logits_for_logprobs(monkeypatch):

@@ -22,6 +22,39 @@ logger = init_logger(__name__)
 
 _RAPID_SAMPLER_MODULE = None
 _RAPID_SAMPLER_STATES: dict[tuple[int, int], torch.Tensor] = {}
+_RAPID_PENALTY_INDEX_STATS = {
+    "indexed_calls": 0,
+    "indexed_rows": 0,
+    "indexed_vocab_elements": 0,
+    "wrapper_gather_scatter_calls": 0,
+    "wrapper_gather_scatter_elements": 0,
+}
+
+
+def reset_rapid_penalty_index_stats() -> None:
+    for key in _RAPID_PENALTY_INDEX_STATS:
+        _RAPID_PENALTY_INDEX_STATS[key] = 0
+
+
+def get_rapid_penalty_index_stats() -> dict[str, int]:
+    return dict(_RAPID_PENALTY_INDEX_STATS)
+
+
+def _record_rapid_penalty_index_stats(
+    *,
+    rows: int,
+    vocab_size: int,
+    wrapper_gather_scatter: bool,
+) -> None:
+    elements = rows * vocab_size
+    _RAPID_PENALTY_INDEX_STATS["indexed_calls"] += 1
+    _RAPID_PENALTY_INDEX_STATS["indexed_rows"] += rows
+    _RAPID_PENALTY_INDEX_STATS["indexed_vocab_elements"] += elements
+    if wrapper_gather_scatter:
+        _RAPID_PENALTY_INDEX_STATS["wrapper_gather_scatter_calls"] += 1
+        _RAPID_PENALTY_INDEX_STATS["wrapper_gather_scatter_elements"] += (
+            2 * elements
+        )
 
 
 def flashinfer_sampler_supported() -> bool:
@@ -87,17 +120,10 @@ def rapid_sampler_supported() -> bool:
             if capability is None
             else f"unsupported compute capability {capability.as_version_str()}"
         )
-        if envs.is_set("VLLM_USE_RAPID_SAMPLER"):
-            raise RuntimeError(
-                "Rapid top-p/top-k sampling unavailable: "
-                f"{unsupported_reason}. Set VLLM_USE_RAPID_SAMPLER=0 to disable it."
-            )
-        logger.warning_once(
-            "Rapid top-p/top-k sampling unavailable: %s; falling back. "
-            "Set VLLM_USE_RAPID_SAMPLER=0 to silence.",
-            unsupported_reason,
+        raise RuntimeError(
+            "Rapid top-p/top-k sampling unavailable: "
+            f"{unsupported_reason}. Set VLLM_USE_RAPID_SAMPLER=0 to disable it."
         )
-        return False
 
     logger.info_once("Using rapid-sampling for top-p & top-k sampling.")
     return True
@@ -245,22 +271,18 @@ class TopKTopPSampler(nn.Module):
         scalar_top_k = _rapid_scalar(k, logits.shape[-1])
         scalar_top_p = _rapid_scalar(p, 1.0)
         if scalar_top_k is None or scalar_top_p is None:
-            logger.debug_once(
+            raise RuntimeError(
                 "rapid-sampling without penalties only supports uniform scalar "
-                "temperature/top_k/top_p. Falling back to the native sampler "
-                "for mixed per-request parameters."
+                "top_k/top_p. Refusing to use the native sampler fallback; "
+                "set VLLM_USE_RAPID_SAMPLER=0 to opt out explicitly."
             )
-            return self.forward_native(logits, generators, k, p)
         if not rapid_sample_input_supported(logits):
             message = (
                 "rapid-sampling requires CUDA float32 logits with vocab size "
                 "in (0, 1048576] and divisible by 4. Set "
                 "VLLM_USE_RAPID_SAMPLER=0 to use another sampler."
             )
-            if envs.is_set("VLLM_USE_RAPID_SAMPLER"):
-                raise RuntimeError(message)
-            logger.debug_once("%s Falling back to the native sampler.", message)
-            return self.forward_native(logits, generators, k, p)
+            raise RuntimeError(message)
         assert self.logprobs_mode not in ("processed_logits", "processed_logprobs"), (
             "rapid-sampling does not support returning logits/logprobs"
         )
@@ -702,6 +724,29 @@ def rapid_sample(
             penalty_indices = _rapid_vector(
                 penalty_indices, batch_size, 0, torch.int32, logits.device
             )
+            indexed_sampler = getattr(
+                module,
+                "batch_sampling_repetition_temperature_topk_topp_indexed",
+                None,
+            )
+            _record_rapid_penalty_index_stats(
+                rows=batch_size,
+                vocab_size=vocab_size,
+                wrapper_gather_scatter=indexed_sampler is None,
+            )
+            if indexed_sampler is not None:
+                return indexed_sampler(
+                    logits,
+                    penalties,
+                    penalty_indices,
+                    states,
+                    float(scalar_presence_penalty),
+                    float(scalar_repetition_penalty),
+                    float(scalar_penalty_decay),
+                    float(scalar_temperature),
+                    int(scalar_top_k),
+                    float(scalar_top_p),
+                ).view(-1)
             penalty_rows = penalty_indices.to(dtype=torch.long)
             penalties_for_batch = penalties.index_select(0, penalty_rows).contiguous()
         else:

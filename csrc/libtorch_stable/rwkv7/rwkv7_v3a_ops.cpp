@@ -114,6 +114,10 @@ std::vector<torch::Tensor> add_layer_norm_tmix_mix6_f16_scalar_stats_cuda(
     torch::Tensor x_w, torch::Tensor x_k, torch::Tensor x_v, torch::Tensor x_a,
     torch::Tensor x_g, double eps);
 void advance_i32_cuda(torch::Tensor x, int64_t amount);
+void advance_i32_slots_cuda(torch::Tensor x, torch::Tensor slot_indices,
+                            int64_t amount);
+void advance_i32_varlen_cuda(torch::Tensor x, torch::Tensor query_start_loc,
+                             torch::Tensor slot_indices);
 
 namespace {
 
@@ -740,6 +744,28 @@ void advance_i32(torch::Tensor x, int64_t amount) {
   advance_i32_cuda(x, amount);
 }
 
+void advance_i32_slots(torch::Tensor x, torch::Tensor slot_indices,
+                       int64_t amount) {
+  check_i32_cuda_contig(x, "x");
+  check_i32_cuda_contig(slot_indices, "slot_indices");
+  TORCH_CHECK(x.dim() == 1, "x must have shape [slots]");
+  TORCH_CHECK(slot_indices.dim() == 1, "slot_indices must have shape [B]");
+  advance_i32_slots_cuda(x, slot_indices, amount);
+}
+
+void advance_i32_varlen(torch::Tensor x, torch::Tensor query_start_loc,
+                        torch::Tensor slot_indices) {
+  check_i32_cuda_contig(x, "x");
+  check_i32_cuda_contig(query_start_loc, "query_start_loc");
+  check_i32_cuda_contig(slot_indices, "slot_indices");
+  TORCH_CHECK(x.dim() == 1, "x must have shape [slots]");
+  TORCH_CHECK(slot_indices.dim() == 1, "slot_indices must have shape [B]");
+  TORCH_CHECK(query_start_loc.dim() == 1 &&
+                  query_start_loc.size(0) == slot_indices.size(0) + 1,
+              "query_start_loc must have shape [B+1]");
+  advance_i32_varlen_cuda(x, query_start_loc, slot_indices);
+}
+
 }  // namespace
 
 TORCH_LIBRARY(rwkv7_v3a_ops, m) {
@@ -837,6 +863,10 @@ TORCH_LIBRARY(rwkv7_v3a_ops, m) {
       "Tensor(a!) shift_state, Tensor weight, Tensor bias, Tensor x_k, float "
       "eps=" RWKV7_LAYER_NORM_EPS_SCHEMA ") -> Tensor[]");
   m.def("advance_i32(Tensor(a!) x, int amount) -> ()");
+  m.def("advance_i32_slots(Tensor(a!) x, Tensor slot_indices, int amount) -> ()");
+  m.def(
+      "advance_i32_varlen(Tensor(a!) x, Tensor query_start_loc, Tensor "
+      "slot_indices) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(rwkv7_v3a_ops, CUDA, m) {
@@ -878,4 +908,6 @@ TORCH_LIBRARY_IMPL(rwkv7_v3a_ops, CUDA, m) {
   m.impl("add_layer_norm_cmix_mix_f16_scalar_stats",
          &add_layer_norm_cmix_mix_f16_scalar_stats);
   m.impl("advance_i32", &advance_i32);
+  m.impl("advance_i32_slots", &advance_i32_slots);
+  m.impl("advance_i32_varlen", &advance_i32_varlen);
 }
