@@ -1980,11 +1980,7 @@ class RWKV7ForCausalLM(nn.Module):
 
     def linear_head(self, x: torch.Tensor) -> torch.Tensor:
         z = self.z
-        if z["head.weight"].dtype == torch.uint8:
-            rows = x.numel() // C
-            return self.linear_orig_layout(
-                x, z["head.weight"], PathConfig(rows, False, CMIX_DENSE), "head"
-            )
+        # head.weight never quantized: LM head must stay FP16 for RL training stability
         if not use_orig_linear("head"):
             return self.linear(x, z["head.weight"])
         rows = x.numel() // C
