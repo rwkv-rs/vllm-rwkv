@@ -56,9 +56,9 @@ def test_rwkv7_wkv_mode_defaults_to_fp16() -> None:
         assert envs.environment_variables["VLLM_RWKV7_WKV_MODE"]() == "fp16"
 
 
-def test_rwkv7_emb_device_defaults_to_gpu() -> None:
+def test_rwkv7_emb_device_defaults_to_cpu() -> None:
     with patch.dict(os.environ, {}, clear=True):
-        assert envs.environment_variables["VLLM_RWKV7_EMB_DEVICE"]() == "gpu"
+        assert envs.environment_variables["VLLM_RWKV7_EMB_DEVICE"]() == "cpu"
 
 
 def test_rwkv7_skips_v2_kernel_warmup_by_default() -> None:

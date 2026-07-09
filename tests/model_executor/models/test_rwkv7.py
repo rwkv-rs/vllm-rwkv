@@ -490,7 +490,7 @@ def test_rwkv7_dummy_inputs_decode_capture_advertises_compact_rows():
     assert inputs["query_start_loc"].tolist() == [0, 1, 2, 3]
     assert inputs["rwkv_decode_batch_size"] == 3
     assert inputs["rwkv_decode_rows"] == [0, 1, 2]
-    assert inputs["rwkv_decode_token_positions"].tolist() == [0, 1, 2]
+    assert inputs["rwkv_decode_token_positions"] == [0, 1, 2]
 
 
 def test_rwkv7_dummy_inputs_decode_capture_uses_persistent_state_buffers():
@@ -517,11 +517,8 @@ def test_rwkv7_dummy_inputs_decode_capture_uses_persistent_state_buffers():
     assert inputs["elapsed"] is state.elapsed
     assert inputs["rwkv_decode_batch_size"] == 3
     assert inputs["rwkv_decode_rows"] == [0, 1, 2]
-    assert inputs["rwkv_decode_token_positions"].tolist() == [0, 1, 2]
-    assert inputs["rwkv_decode_token_positions"].data_ptr() == (
-        state.decode_token_positions.data_ptr()
-    )
-    assert inputs["slot_indices"].data_ptr() == state.decode_slot_indices.data_ptr()
+    assert inputs["rwkv_decode_token_positions"] == [0, 1, 2]
+    assert inputs["slot_indices"] is None
 
 
 def test_rwkv7_embed_uses_cached_device_buffer_during_cuda_graph_capture(
@@ -1394,21 +1391,23 @@ def test_rwkv7_model_state_sort_keeps_one_token_prefill_after_decode():
     assert sorted_req_ids == ["req-0", "req-1", "req-2"]
 
 
-def test_rwkv7_model_state_reports_current_decode_context_size_not_capacity():
+def test_rwkv7_model_state_uses_contiguous_decode_path_for_prefix_rows():
     state = _new_rwkv7_model_state(max_num_reqs=4)
     state.add_request(0, _new_request("req-0"))
+    state.add_request(1, _new_request("req-1"))
     input_batch = SimpleNamespace(
-        idx_mapping_np=np.array([0], dtype=np.int32),
-        num_reqs=1,
-        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
-        is_prefilling_np=np.array([False], dtype=np.bool_),
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+        num_reqs=2,
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
 
     inputs = state.prepare_inputs(input_batch, req_states=None)
 
-    assert inputs["rwkv_decode_batch_size"] == 1
-    assert inputs["rwkv_decode_rows"] == [0]
-    assert inputs["rwkv_decode_token_positions"].tolist() == [0]
+    assert inputs["rwkv_decode_batch_size"] == 2
+    assert inputs["rwkv_decode_rows"] == [0, 1]
+    assert inputs["rwkv_decode_token_positions"] == [0, 1]
+    assert inputs["slot_indices"] is None
 
 
 def test_rwkv7_model_state_keeps_steady_decode_slot_after_row_removal():

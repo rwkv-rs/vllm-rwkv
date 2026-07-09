@@ -167,6 +167,7 @@ class BenchmarkConfig:
     runner_prefill_chunk_tokens: int = DEFAULT_RUNNER_PREFILL_CHUNK_TOKENS
     runner_enforce_eager: bool = False
     runner_disable_rapid_sampler: bool = False
+    runner_cudagraph_capture_sizes: tuple[int, ...] | None = None
 
     @property
     def albatross_impl_dir(self) -> Path | None:
@@ -280,6 +281,11 @@ def _benchmark_provenance(config: BenchmarkConfig) -> dict[str, Any]:
             "runner_prefill_chunk_tokens": config.runner_prefill_chunk_tokens,
             "runner_enforce_eager": config.runner_enforce_eager,
             "runner_disable_rapid_sampler": config.runner_disable_rapid_sampler,
+            "runner_cudagraph_capture_sizes": (
+                list(config.runner_cudagraph_capture_sizes)
+                if config.runner_cudagraph_capture_sizes is not None
+                else None
+            ),
         },
         "sampling": dict(VLLM_RUNNER_SAMPLING),
     }
@@ -783,9 +789,16 @@ def _phase_throughput_summary(
     unit_tokens: list[int],
 ) -> dict[str, Any]:
     total_duration_s = sum(iteration_durations_s)
-    peak_tokens_per_s = None
+    peak_iteration_tokens_per_s = None
+    if iteration_durations_s:
+        iteration_tokens = total_tokens // len(iteration_durations_s)
+        peak_iteration_tokens_per_s = max(
+            _tokens_per_second(iteration_tokens, duration_s)
+            for duration_s in iteration_durations_s
+        )
+    peak_unit_tokens_per_s = None
     if unit_durations_s:
-        peak_tokens_per_s = max(
+        peak_unit_tokens_per_s = max(
             _tokens_per_second(tokens, duration_s)
             for tokens, duration_s in zip(unit_tokens, unit_durations_s)
         )
@@ -793,7 +806,9 @@ def _phase_throughput_summary(
     unit_summary = _duration_ms_summary(unit_durations_s)
     return {
         "avg_tokens_per_s": _tokens_per_second(total_tokens, total_duration_s),
-        "peak_tokens_per_s": peak_tokens_per_s,
+        "peak_tokens_per_s": peak_iteration_tokens_per_s,
+        "peak_iteration_tokens_per_s": peak_iteration_tokens_per_s,
+        "peak_unit_tokens_per_s": peak_unit_tokens_per_s,
         "total_tokens": total_tokens,
         "total_duration_ms": total_duration_s * 1000.0,
         **summary,
@@ -1017,6 +1032,17 @@ def _create_vllm_runner_llm(config: BenchmarkConfig) -> Any:
         config.batch_size * prefill_chunk_tokens,
         config.batch_size,
     )
+    llm_kwargs: dict[str, Any] = {}
+    if (
+        not config.runner_enforce_eager
+        and config.runner_cudagraph_capture_sizes is not None
+    ):
+        capture_sizes = list(config.runner_cudagraph_capture_sizes)
+        if not capture_sizes or any(size <= 0 for size in capture_sizes):
+            raise ValueError("runner cudagraph capture sizes must be positive")
+        llm_kwargs["compilation_config"] = {
+            "cudagraph_capture_sizes": capture_sizes,
+        }
     return LLM(
         model=_required_vllm_runner_model(config),
         skip_tokenizer_init=True,
@@ -1029,6 +1055,7 @@ def _create_vllm_runner_llm(config: BenchmarkConfig) -> Any:
         enable_chunked_prefill=True,
         enforce_eager=config.runner_enforce_eager,
         disable_log_stats=True,
+        **llm_kwargs,
     )
 
 
@@ -1469,6 +1496,7 @@ def _run_vllm_worker_internal_prefill(
     batch_size: int,
     prompt_len: int,
     prefill_chunk_tokens: int,
+    warmup: int,
     iters: int,
 ) -> dict[str, Any]:
     if not callable(getattr(worker, "execute_model", None)):
@@ -1483,6 +1511,8 @@ def _run_vllm_worker_internal_prefill(
         )
     if prefill_chunk_tokens <= 0:
         raise ValueError("runner prefill chunk tokens must be positive")
+    if warmup < 0:
+        raise ValueError("runner warmup must be non-negative")
     prefill_chunk_tokens = min(prefill_chunk_tokens, prompt_len)
 
     from vllm import SamplingParams
@@ -1501,8 +1531,31 @@ def _run_vllm_worker_internal_prefill(
     unit_durations_s: list[float] = []
     unit_tokens: list[int] = []
 
+    for warmup_iteration in range(warmup):
+        req_ids = [
+            f"{prefix}-warmup-{warmup_iteration}-{idx}"
+            for idx in range(batch_size)
+        ]
+        _worker_execute_prefill_chunks(
+            worker,
+            req_ids=req_ids,
+            prompt_token_ids=_worker_prompt_token_ids(batch_size, prompt_len),
+            sampling_params=sampling_params,
+            prompt_len=prompt_len,
+            prefill_chunk_tokens=prefill_chunk_tokens,
+            cuda_events=cuda_events,
+            measure=False,
+        )
+        _worker_finish_execute_without_sampling(worker)
+        worker.execute_model(_worker_empty_scheduler_output(set(req_ids)))
+    if warmup:
+        _worker_cuda_synchronize()
+
     for iteration in range(iters):
-        req_ids = [f"{prefix}-{iteration}-{idx}" for idx in range(batch_size)]
+        req_ids = [
+            f"{prefix}-measure-{iteration}-{idx}"
+            for idx in range(batch_size)
+        ]
         chunk_durations_s, chunk_token_counts = _worker_execute_prefill_chunks(
             worker,
             req_ids=req_ids,
@@ -1527,6 +1580,7 @@ def _run_vllm_worker_internal_prefill(
         "unit_durations_s": unit_durations_s,
         "unit_tokens": unit_tokens,
         "tokens": batch_size * prompt_len * iters,
+        "warmup_iterations": warmup,
         "worker_count": 1,
     }
 
@@ -1947,6 +2001,8 @@ def _merge_worker_internal_phase_results(
             "worker_count": worker_count,
         }
     )
+    if "warmup_iterations" in first_result:
+        summary["warmup_iterations"] = first_result["warmup_iterations"]
     sample_durations = [
         float(value)
         for result in normalized_results
@@ -2016,6 +2072,7 @@ def _time_vllm_runner_prefill_phase(
     batch_size: int,
     prompt_len: int,
     prefill_chunk_tokens: int,
+    warmup: int,
     iters: int,
 ) -> dict[str, Any]:
     collective_rpc = getattr(llm, "collective_rpc", None)
@@ -2027,7 +2084,7 @@ def _time_vllm_runner_prefill_phase(
     _reset_runner_state_movement_stats(llm)
     results = collective_rpc(
         _run_vllm_worker_internal_prefill,
-        args=(batch_size, prompt_len, prefill_chunk_tokens, iters),
+        args=(batch_size, prompt_len, prefill_chunk_tokens, warmup, iters),
     )
     return _merge_worker_internal_phase_results(
         list(results),
@@ -2229,6 +2286,8 @@ def _runner_phase_metrics(
     }
     if warmup is not None:
         metrics["warmup_decode_tokens"] = warmup
+    if "warmup_iterations" in parsed:
+        metrics["warmup_iterations"] = parsed["warmup_iterations"]
     if include_sampling is not None:
         metrics["sampling_included"] = include_sampling
         metrics["sampling_mode"] = "sample_tokens" if include_sampling else "skip"
@@ -2239,6 +2298,10 @@ def _runner_phase_metrics(
         {
             "avg_tokens_per_s": parsed["avg_tokens_per_s"],
             "peak_tokens_per_s": parsed["peak_tokens_per_s"],
+            "peak_iteration_tokens_per_s": parsed.get(
+                "peak_iteration_tokens_per_s"
+            ),
+            "peak_unit_tokens_per_s": parsed.get("peak_unit_tokens_per_s"),
             "total_tokens": parsed["total_tokens"],
             "total_duration_ms": parsed["total_duration_ms"],
             "p10_ms": parsed["p10_ms"],
@@ -2269,12 +2332,14 @@ def generate_vllm_runner_pd_single_measurement(
     case_name = _format_bxt_case(batch_size, seq_len)
     if phase == "prefill":
         case_prefill_chunk_tokens = min(prefill_chunk_tokens, seq_len)
+        capture_size = max(batch_size * case_prefill_chunk_tokens, batch_size)
         runner_config = replace(
             config,
             batch_size=batch_size,
             prompt_len=seq_len,
             decode_tokens=1,
             runner_prefill_chunk_tokens=case_prefill_chunk_tokens,
+            runner_cudagraph_capture_sizes=(capture_size,),
         )
         llm = _create_vllm_runner_llm(runner_config)
         try:
@@ -2283,6 +2348,7 @@ def generate_vllm_runner_pd_single_measurement(
                 batch_size=batch_size,
                 prompt_len=seq_len,
                 prefill_chunk_tokens=case_prefill_chunk_tokens,
+                warmup=warmup,
                 iters=iters,
             )
             state_movement = _extract_runner_state_movement_stats(llm)
@@ -2297,12 +2363,15 @@ def generate_vllm_runner_pd_single_measurement(
             parsed=parsed,
         )
     elif phase == "decode":
+        case_prefill_chunk_tokens = min(prefill_chunk_tokens, decode_prompt_len)
+        capture_size = max(batch_size * case_prefill_chunk_tokens, batch_size)
         runner_config = replace(
             config,
             batch_size=batch_size,
             prompt_len=decode_prompt_len,
             decode_tokens=seq_len + warmup,
-            runner_prefill_chunk_tokens=min(prefill_chunk_tokens, decode_prompt_len),
+            runner_prefill_chunk_tokens=case_prefill_chunk_tokens,
+            runner_cudagraph_capture_sizes=(capture_size,),
         )
         llm = _create_vllm_runner_llm(runner_config)
         try:
@@ -2310,7 +2379,7 @@ def generate_vllm_runner_pd_single_measurement(
                 llm,
                 batch_size=batch_size,
                 prompt_len=decode_prompt_len,
-                prefill_chunk_tokens=min(prefill_chunk_tokens, decode_prompt_len),
+                prefill_chunk_tokens=case_prefill_chunk_tokens,
                 decode_tokens=seq_len,
                 warmup=warmup,
                 iters=iters,
@@ -2323,7 +2392,7 @@ def generate_vllm_runner_pd_single_measurement(
             batch_size=batch_size,
             seq_len=seq_len,
             phase="decode",
-            prefill_chunk_tokens=min(prefill_chunk_tokens, decode_prompt_len),
+            prefill_chunk_tokens=case_prefill_chunk_tokens,
             warmup=warmup,
             iters=iters,
             include_sampling=include_sampling,
@@ -2342,7 +2411,7 @@ def generate_vllm_runner_pd_single_measurement(
             "repo_root": str(config.repo_root),
             "model": config.model,
             "measurement_source": "vllm_runner_prefill_decode_single",
-            "provenance": _benchmark_provenance(config),
+            "provenance": _benchmark_provenance(runner_config),
         },
     }
 
@@ -2370,7 +2439,7 @@ def _run_vllm_runner_pd_case_subprocess(
             phase,
             "--runner-pd-single-case",
             _format_bxt_case(*case),
-            "--runner-prefill-chunk-tokens",
+            "--runner-pd-prefill-chunk-tokens",
             str(prefill_chunk_tokens),
             "--runner-pd-decode-prompt-len",
             str(decode_prompt_len),
@@ -2435,6 +2504,7 @@ def generate_vllm_runner_pd_measurement(
     prefill_metrics: dict[str, Any] = {}
     decode_metrics: dict[str, Any] = {}
     state_movement_by_case: dict[str, Any] = {}
+    case_provenance_by_case: dict[str, Any] = {}
 
     for batch_size, seq_len in prefill_cases:
         case = _format_bxt_case(batch_size, seq_len)
@@ -2451,6 +2521,9 @@ def generate_vllm_runner_pd_measurement(
         )
         prefill_metrics[case] = measurement["metrics"]
         state_movement_by_case[f"prefill:{case}"] = measurement["state_movement"]
+        case_provenance_by_case[f"prefill:{case}"] = measurement.get(
+            "config", {}
+        ).get("provenance")
 
     for batch_size, decode_tokens in decode_cases:
         case = _format_bxt_case(batch_size, decode_tokens)
@@ -2466,6 +2539,9 @@ def generate_vllm_runner_pd_measurement(
         )
         decode_metrics[case] = measurement["metrics"]
         state_movement_by_case[f"decode:{case}"] = measurement["state_movement"]
+        case_provenance_by_case[f"decode:{case}"] = measurement.get(
+            "config", {}
+        ).get("provenance")
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -2487,6 +2563,7 @@ def generate_vllm_runner_pd_measurement(
             ],
             "runner_pd_decode_prompt_len": decode_prompt_len,
             "runner_pd_include_sampling": include_sampling,
+            "case_provenance_by_case": case_provenance_by_case,
             "provenance": _benchmark_provenance(config),
         },
     }
@@ -2911,6 +2988,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--runner-pd-prefill-chunk-tokens",
+        type=int,
+        help=(
+            "Maximum prompt tokens scheduled per request for split prefill "
+            "measurements. Defaults to the largest prefill case T so Albatross "
+            "B1T1024/B32T32 comparisons measure full-case prefill."
+        ),
+    )
+    parser.add_argument(
         "--runner-pd-decode-cases",
         default=DEFAULT_RUNNER_PD_DECODE_CASES,
         help="Comma-separated BxT decode cases for --measure-vllm-runner-pd.",
@@ -3020,6 +3106,11 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError(
                 "--runner-pd-single-phase and --runner-pd-single-case are required"
             )
+        pd_prefill_chunk_tokens = (
+            args.runner_pd_prefill_chunk_tokens
+            if args.runner_pd_prefill_chunk_tokens is not None
+            else args.runner_prefill_chunk_tokens
+        )
         measurement = generate_vllm_runner_pd_single_measurement(
             config,
             phase=args.runner_pd_single_phase,
@@ -3027,7 +3118,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.runner_pd_single_case,
                 "runner pd single case",
             ),
-            prefill_chunk_tokens=args.runner_prefill_chunk_tokens,
+            prefill_chunk_tokens=pd_prefill_chunk_tokens,
             decode_prompt_len=args.runner_pd_decode_prompt_len,
             warmup=args.runner_warmup,
             iters=args.runner_iters,
@@ -3036,17 +3127,23 @@ def main(argv: list[str] | None = None) -> int:
         _write_report(measurement, args.measurement_output)
         return 0
     if args.measure_vllm_runner_pd:
+        prefill_cases = _parse_bxt_cases(
+            args.runner_pd_prefill_cases,
+            "runner prefill cases",
+        )
+        pd_prefill_chunk_tokens = (
+            args.runner_pd_prefill_chunk_tokens
+            if args.runner_pd_prefill_chunk_tokens is not None
+            else max(seq_len for _batch_size, seq_len in prefill_cases)
+        )
         measurement = generate_vllm_runner_pd_measurement(
             config,
-            prefill_cases=_parse_bxt_cases(
-                args.runner_pd_prefill_cases,
-                "runner prefill cases",
-            ),
+            prefill_cases=prefill_cases,
             decode_cases=_parse_bxt_cases(
                 args.runner_pd_decode_cases,
                 "runner decode cases",
             ),
-            prefill_chunk_tokens=args.runner_prefill_chunk_tokens,
+            prefill_chunk_tokens=pd_prefill_chunk_tokens,
             decode_prompt_len=args.runner_pd_decode_prompt_len,
             warmup=args.runner_warmup,
             iters=args.runner_iters,

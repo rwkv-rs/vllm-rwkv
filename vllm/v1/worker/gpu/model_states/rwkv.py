@@ -151,6 +151,19 @@ class RWKV7ModelState(ModelState):
             return 0
         return len(decode_rows)
 
+    @staticmethod
+    def _is_contiguous_decode_context(
+        decode_rows: list[int],
+        decode_token_positions: list[int],
+    ) -> bool:
+        if not decode_rows:
+            return False
+        decode_len = len(decode_rows)
+        if decode_rows != list(range(decode_len)):
+            return False
+        start = decode_token_positions[0]
+        return decode_token_positions == list(range(start, start + decode_len))
+
     def reset_state_movement_stats(self) -> None:
         self._state_movement_stats = {
             "resident_to_decode_copies": 0,
@@ -631,7 +644,11 @@ class RWKV7ModelState(ModelState):
         decode_token_positions = [
             start for _batch_idx, _req_slot, _row, start in decode_entries
         ]
-        if decode_entries:
+        use_contiguous_decode = self._is_contiguous_decode_context(
+            source_decode_rows,
+            decode_token_positions,
+        )
+        if decode_entries and not use_contiguous_decode:
             decode_len = len(decode_entries)
             self.decode_slot_indices[:decode_len].copy_(
                 torch.tensor(
@@ -649,6 +666,9 @@ class RWKV7ModelState(ModelState):
             )
             slot_indices = self.decode_slot_indices[:decode_len]
             decode_token_position_tensor = self.decode_token_positions[:decode_len]
+        elif decode_entries:
+            slot_indices = None
+            decode_token_position_tensor = decode_token_positions
         else:
             slot_indices = None
             decode_token_position_tensor = None
@@ -860,26 +880,14 @@ class RWKV7ModelState(ModelState):
             "elapsed": self.elapsed,
         }
         if num_tokens == num_reqs:
-            self.decode_slot_indices[:num_reqs].copy_(
-                self.execution_idx_mapping[:num_reqs]
-            )
-            self.decode_token_positions[:num_reqs].copy_(
-                torch.arange(
-                    num_reqs,
-                    dtype=torch.long,
-                    device=self.device,
-                )
-            )
             return {
                 "query_start_loc": query_start_loc,
                 "idx_mapping": idx_mapping,
                 **state_tensors,
                 "rwkv_decode_batch_size": num_reqs,
                 "rwkv_decode_rows": list(range(num_reqs)),
-                "rwkv_decode_token_positions": self.decode_token_positions[
-                    :num_reqs
-                ],
-                "slot_indices": self.decode_slot_indices[:num_reqs],
+                "rwkv_decode_token_positions": list(range(num_reqs)),
+                "slot_indices": None,
             }
         return {
             "query_start_loc": query_start_loc,

@@ -7,7 +7,7 @@ import sys
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 from urllib.parse import urlparse
 
@@ -57,6 +57,24 @@ def _state_movement(**overrides: int) -> dict[str, int]:
     stats = {name: 0 for name in bench.STATE_MOVEMENT_COUNTERS}
     stats.update(overrides)
     return stats
+
+
+def _phase_result(tokens: int = 1024) -> dict[str, Any]:
+    return {
+        "avg_tokens_per_s": 1.0,
+        "peak_tokens_per_s": 1.0,
+        "peak_iteration_tokens_per_s": 1.0,
+        "peak_unit_tokens_per_s": 1.0,
+        "total_tokens": tokens,
+        "total_duration_ms": 1.0,
+        "p10_ms": 1.0,
+        "p50_ms": 1.0,
+        "p90_ms": 1.0,
+        "unit_p10_ms": 1.0,
+        "unit_p50_ms": 1.0,
+        "unit_p90_ms": 1.0,
+        "worker_count": 1,
+    }
 
 
 def _empty_state_movement() -> dict[str, int | None]:
@@ -126,6 +144,7 @@ def test_report_blocks_without_runtime_paths_and_records_provenance(
         "runner_prefill_chunk_tokens": bench.DEFAULT_RUNNER_PREFILL_CHUNK_TOKENS,
         "runner_enforce_eager": False,
         "runner_disable_rapid_sampler": False,
+        "runner_cudagraph_capture_sizes": None,
     }
     assert provenance["sampling"] == bench.VLLM_RUNNER_SAMPLING
     assert provenance["cuda"]["available"] is False
@@ -747,6 +766,7 @@ def test_cli_writes_vllm_runner_measurement_json(
         "runner_prefill_chunk_tokens": 2,
         "runner_enforce_eager": False,
         "runner_disable_rapid_sampler": False,
+        "runner_cudagraph_capture_sizes": None,
     }
     assert (
         measurement["config"]["measurement_source"]
@@ -846,6 +866,290 @@ def test_cli_writes_split_runner_prefill_decode_measurement_json(
             True,
         )
     ]
+
+
+def test_cli_split_runner_defaults_to_albatross_pd_cases(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    model_path = tmp_path / "rwkv7-g1d-0.1b-20260129-ctx8192.pth"
+    model_path.write_bytes(b"")
+    output_path = tmp_path / "runner-pd-defaults.json"
+    calls: list[Any] = []
+
+    def fake_generate(
+        config,
+        *,
+        prefill_cases,
+        decode_cases,
+        prefill_chunk_tokens,
+        decode_prompt_len,
+        warmup,
+        iters,
+        include_sampling,
+    ):
+        calls.append(
+            (
+                prefill_cases,
+                decode_cases,
+                prefill_chunk_tokens,
+                decode_prompt_len,
+                include_sampling,
+            )
+        )
+        return {
+            "schema_version": bench.SCHEMA_VERSION,
+            "benchmark": bench.BENCHMARK_NAME,
+            "runner_prefill": {},
+            "runner_decode": {},
+        }
+
+    monkeypatch.setattr(bench, "generate_vllm_runner_pd_measurement", fake_generate)
+
+    rc = bench.main(
+        [
+            "--repo-root",
+            str(repo_root),
+            "--model",
+            str(model_path),
+            "--measure-vllm-runner-pd",
+            "--measurement-output",
+            str(output_path),
+        ]
+    )
+
+    assert rc == 0
+    assert calls == [
+        (
+            [(1, 1024), (32, 32)],
+            [(1024, 1)],
+            1024,
+            1,
+            False,
+        )
+    ]
+
+
+def test_cli_split_runner_single_uses_pd_prefill_chunk_tokens(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    model_path = tmp_path / "rwkv7-g1d-0.1b-20260129-ctx8192.pth"
+    model_path.write_bytes(b"")
+    output_path = tmp_path / "runner-pd-single.json"
+    calls: list[Any] = []
+
+    def fake_generate(
+        config,
+        *,
+        phase,
+        case,
+        prefill_chunk_tokens,
+        decode_prompt_len,
+        warmup,
+        iters,
+        include_sampling,
+    ):
+        calls.append(
+            (
+                phase,
+                case,
+                prefill_chunk_tokens,
+                decode_prompt_len,
+                warmup,
+                iters,
+                include_sampling,
+            )
+        )
+        return {
+            "schema_version": bench.SCHEMA_VERSION,
+            "benchmark": bench.BENCHMARK_NAME,
+            "phase": phase,
+            "case": bench._format_bxt_case(*case),
+            "metrics": {},
+        }
+
+    monkeypatch.setattr(
+        bench,
+        "generate_vllm_runner_pd_single_measurement",
+        fake_generate,
+    )
+
+    rc = bench.main(
+        [
+            "--repo-root",
+            str(repo_root),
+            "--model",
+            str(model_path),
+            "--measure-vllm-runner-pd-single",
+            "--runner-pd-single-phase",
+            "prefill",
+            "--runner-pd-single-case",
+            "1x1024",
+            "--runner-pd-prefill-chunk-tokens",
+            "1024",
+            "--runner-pd-decode-prompt-len",
+            "1",
+            "--runner-warmup",
+            "3",
+            "--runner-iters",
+            "10",
+            "--measurement-output",
+            str(output_path),
+        ]
+    )
+
+    assert rc == 0
+    assert calls == [("prefill", (1, 1024), 1024, 1, 3, 10, False)]
+
+
+def test_create_vllm_runner_llm_passes_configured_cudagraph_sizes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    model_path = tmp_path / "rwkv7-g1d-0.1b-20260129-ctx8192.pth"
+    model_path.write_bytes(b"")
+    captured: dict[str, Any] = {}
+
+    class FakeLLM:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    fake_vllm = ModuleType("vllm")
+    fake_vllm.__path__ = []
+    fake_vllm.LLM = FakeLLM
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setitem(sys.modules, "vllm.rwkv7_ops", ModuleType("vllm.rwkv7_ops"))
+
+    config = replace(
+        _config(tmp_path, model=str(model_path)),
+        batch_size=1024,
+        prompt_len=1,
+        decode_tokens=4,
+        runner_prefill_chunk_tokens=1,
+        runner_cudagraph_capture_sizes=(1024,),
+    )
+
+    bench._create_vllm_runner_llm(config)
+
+    assert captured["max_num_seqs"] == 1024
+    assert captured["max_num_batched_tokens"] == 1024
+    assert captured["compilation_config"] == {
+        "cudagraph_capture_sizes": [1024],
+    }
+
+
+def test_create_vllm_runner_llm_does_not_graph_capture_eager_path(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    model_path = tmp_path / "rwkv7-g1d-0.1b-20260129-ctx8192.pth"
+    model_path.write_bytes(b"")
+    captured: dict[str, Any] = {}
+
+    class FakeLLM:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    fake_vllm = ModuleType("vllm")
+    fake_vllm.__path__ = []
+    fake_vllm.LLM = FakeLLM
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setitem(sys.modules, "vllm.rwkv7_ops", ModuleType("vllm.rwkv7_ops"))
+
+    config = replace(
+        _config(tmp_path, model=str(model_path)),
+        runner_enforce_eager=True,
+        runner_cudagraph_capture_sizes=(1024,),
+    )
+
+    bench._create_vllm_runner_llm(config)
+
+    assert "compilation_config" not in captured
+
+
+def test_runner_pd_single_uses_exact_cudagraph_capture_size(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    created_configs: list[bench.BenchmarkConfig] = []
+
+    monkeypatch.setattr(
+        bench,
+        "_create_vllm_runner_llm",
+        lambda config: created_configs.append(config) or object(),
+    )
+    monkeypatch.setattr(
+        bench,
+        "_time_vllm_runner_decode_phase",
+        lambda llm, **kwargs: _phase_result(tokens=1024),
+    )
+    monkeypatch.setattr(
+        bench,
+        "_extract_runner_state_movement_stats",
+        lambda llm: _state_movement(),
+    )
+    monkeypatch.setattr(bench, "_shutdown_vllm_runner_llm", lambda llm: None)
+
+    measurement = bench.generate_vllm_runner_pd_single_measurement(
+        _config(tmp_path, model="/tmp/model.pth"),
+        phase="decode",
+        case=(1024, 1),
+        prefill_chunk_tokens=1024,
+        decode_prompt_len=1,
+        warmup=3,
+        iters=5,
+        include_sampling=False,
+    )
+
+    assert created_configs[0].runner_cudagraph_capture_sizes == (1024,)
+    workload = measurement["config"]["provenance"]["workload"]
+    assert workload["runner_cudagraph_capture_sizes"] == [1024]
+
+
+def test_runner_pd_aggregate_records_case_provenance(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    def fake_case(config, *, phase, case, prefill_chunk_tokens, **kwargs):
+        batch_size, _seq_len = case
+        capture_size = max(batch_size * prefill_chunk_tokens, batch_size)
+        return {
+            "schema_version": bench.SCHEMA_VERSION,
+            "benchmark": bench.BENCHMARK_NAME,
+            "metrics": _phase_result(tokens=capture_size),
+            "state_movement": _state_movement(),
+            "config": {
+                "provenance": {
+                    "workload": {
+                        "runner_cudagraph_capture_sizes": [capture_size],
+                    }
+                }
+            },
+        }
+
+    monkeypatch.setattr(bench, "_run_vllm_runner_pd_case_subprocess", fake_case)
+
+    measurement = bench.generate_vllm_runner_pd_measurement(
+        _config(tmp_path, model="/tmp/model.pth"),
+        prefill_cases=[(1, 8)],
+        decode_cases=[(4, 1)],
+        prefill_chunk_tokens=8,
+        decode_prompt_len=1,
+        warmup=2,
+        iters=3,
+        include_sampling=False,
+    )
+
+    provenance = measurement["config"]["case_provenance_by_case"]
+    assert provenance["prefill:1x8"]["workload"][
+        "runner_cudagraph_capture_sizes"
+    ] == [8]
+    assert provenance["decode:4x1"]["workload"][
+        "runner_cudagraph_capture_sizes"
+    ] == [4]
 
 
 def test_cli_merges_vllm_runner_measurement_with_model_only_json(
@@ -1248,6 +1552,8 @@ def test_phase_throughput_summary_reports_average_and_peak() -> None:
 
     assert summary["avg_tokens_per_s"] == pytest.approx(1000.0)
     assert summary["peak_tokens_per_s"] == pytest.approx(2000.0)
+    assert summary["peak_iteration_tokens_per_s"] == pytest.approx(2000.0)
+    assert summary["peak_unit_tokens_per_s"] == pytest.approx(2000.0)
     assert summary["total_duration_ms"] == pytest.approx(40.0)
     assert summary["p50_ms"] == pytest.approx(10.0)
     assert summary["unit_p50_ms"] == pytest.approx(10.0)
@@ -1318,6 +1624,73 @@ def test_internal_runner_decode_only_excludes_sampling_by_default(monkeypatch) -
         ("execute", 0, 0, [], True),
     ]
     assert all(len(call[3]) == 2 for call in worker.calls[1:4])
+
+
+def test_internal_runner_prefill_warmup_is_unmeasured(monkeypatch) -> None:
+    class FakeEvent:
+        def record(self) -> None:
+            pass
+
+        def synchronize(self) -> None:
+            pass
+
+        def elapsed_time(self, other) -> float:
+            return 1.0
+
+    class FakeWorker:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Any, ...]] = []
+
+        def execute_model(self, scheduler_output):
+            self.calls.append(
+                (
+                    "execute",
+                    scheduler_output.total_num_scheduled_tokens,
+                    len(scheduler_output.scheduled_new_reqs),
+                    list(scheduler_output.scheduled_cached_reqs.req_ids),
+                    bool(scheduler_output.finished_req_ids),
+                )
+            )
+
+        def sample_tokens(self, grammar_output):
+            self.calls.append(("sample", grammar_output))
+
+    sync_calls: list[Any] = []
+    monkeypatch.setattr(
+        bench,
+        "_worker_cuda_event_pair",
+        lambda: (FakeEvent(), FakeEvent()),
+    )
+    monkeypatch.setattr(
+        bench,
+        "_worker_cuda_synchronize",
+        lambda: sync_calls.append(1),
+    )
+    worker = FakeWorker()
+
+    result = bench._run_vllm_worker_internal_prefill(
+        worker,
+        batch_size=2,
+        prompt_len=4,
+        prefill_chunk_tokens=4,
+        warmup=1,
+        iters=2,
+    )
+
+    assert result["tokens"] == 16
+    assert result["warmup_iterations"] == 1
+    assert result["iteration_durations_s"] == [0.001, 0.001]
+    assert result["unit_durations_s"] == [0.001, 0.001]
+    assert result["unit_tokens"] == [8, 8]
+    assert sync_calls == [1]
+    assert worker.calls == [
+        ("execute", 8, 2, [], False),
+        ("execute", 0, 0, [], True),
+        ("execute", 8, 2, [], False),
+        ("execute", 0, 0, [], True),
+        ("execute", 8, 2, [], False),
+        ("execute", 0, 0, [], True),
+    ]
 
 
 def test_runner_pd_subprocess_skips_generic_warmup_without_slow_path_flags(
