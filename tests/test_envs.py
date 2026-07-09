@@ -40,6 +40,7 @@ def test_rwkv7_runtime_environment_variables_are_registered() -> None:
     rwkv7_env = {
         "VLLM_RWKV7_WKV_MODE": "fp32io16",
         "VLLM_RWKV7_EMB_DEVICE": "cuda",
+        "VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP": "0",
     }
 
     with patch.dict(os.environ, rwkv7_env, clear=True):
@@ -47,6 +48,7 @@ def test_rwkv7_runtime_environment_variables_are_registered() -> None:
 
         assert envs.VLLM_RWKV7_WKV_MODE == "fp32io16"
         assert envs.VLLM_RWKV7_EMB_DEVICE == "cuda"
+        assert envs.VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP is False
 
 
 def test_rwkv7_wkv_mode_defaults_to_fp16() -> None:
@@ -57,6 +59,11 @@ def test_rwkv7_wkv_mode_defaults_to_fp16() -> None:
 def test_rwkv7_emb_device_defaults_to_gpu() -> None:
     with patch.dict(os.environ, {}, clear=True):
         assert envs.environment_variables["VLLM_RWKV7_EMB_DEVICE"]() == "gpu"
+
+
+def test_rwkv7_skips_v2_kernel_warmup_by_default() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        assert envs.environment_variables["VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP"]() is True
 
 
 def test_rwkv7_model_is_not_a_registered_runtime_environment_variable() -> None:

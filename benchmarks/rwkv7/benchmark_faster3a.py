@@ -12,11 +12,13 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+import gc
 import json
 import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -39,6 +41,8 @@ VLLM_RUNNER_MODE = "worker_execute_model"
 VLLM_RUNNER_TIMING_TARGET = "worker.execute_model"
 VLLM_RUNNER_TIMING_CLOCK = "cuda_event"
 DEFAULT_RUNNER_PREFILL_CHUNK_TOKENS = 16
+DEFAULT_RUNNER_PD_PREFILL_CASES = "1x1024,32x32"
+DEFAULT_RUNNER_PD_DECODE_CASES = "1024x1"
 VLLM_RUNNER_SAMPLING = {
     "temperature": 1.0,
     "top_p": 1.0,
@@ -58,6 +62,9 @@ STATE_MOVEMENT_COUNTERS = (
     "prefill_ranges",
     "prefill_groups",
     "prefill_group_model_calls",
+    "prefill_varlen_batches",
+    "prefill_varlen_tokens",
+    "prefill_varlen_model_calls",
     "prefill_fallback_ranges",
     "prefill_fallback_model_calls",
 )
@@ -72,6 +79,7 @@ PROVENANCE_ENV_VARS = (
     "VLLM_USE_V2_MODEL_RUNNER",
     "VLLM_ALLOW_INSECURE_SERIALIZATION",
     "VLLM_RWKV7_SLOT_MAPPED_STATE",
+    "VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP",
 )
 ACCEPTANCE_THRESHOLDS = {
     "model_only_steady_decode": {
@@ -157,6 +165,8 @@ class BenchmarkConfig:
     warmup_tokens: int
     decode_tokens: int
     runner_prefill_chunk_tokens: int = DEFAULT_RUNNER_PREFILL_CHUNK_TOKENS
+    runner_enforce_eager: bool = False
+    runner_disable_rapid_sampler: bool = False
 
     @property
     def albatross_impl_dir(self) -> Path | None:
@@ -268,6 +278,8 @@ def _benchmark_provenance(config: BenchmarkConfig) -> dict[str, Any]:
             "warmup_tokens": config.warmup_tokens,
             "decode_tokens": config.decode_tokens,
             "runner_prefill_chunk_tokens": config.runner_prefill_chunk_tokens,
+            "runner_enforce_eager": config.runner_enforce_eager,
+            "runner_disable_rapid_sampler": config.runner_disable_rapid_sampler,
         },
         "sampling": dict(VLLM_RUNNER_SAMPLING),
     }
@@ -468,6 +480,22 @@ def _parse_bxt_case(case: str, label: str) -> tuple[int, int]:
 
 def _parse_albatross_case(case: str) -> tuple[int, int]:
     return _parse_bxt_case(case, "albatross case")
+
+
+def _parse_bxt_cases(cases: str, label: str) -> list[tuple[int, int]]:
+    parsed: list[tuple[int, int]] = []
+    for item in cases.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        parsed.append(_parse_bxt_case(item, label))
+    if not parsed:
+        raise ValueError(f"{label} must include at least one BxT case")
+    return parsed
+
+
+def _format_bxt_case(batch_size: int, seq_len: int) -> str:
+    return f"{batch_size}x{seq_len}"
 
 
 def _parse_albatross_csv(
@@ -727,6 +755,54 @@ def _percentile(values: list[float], quantile: float) -> float:
     return ordered[index]
 
 
+def _duration_ms_summary(durations_s: list[float]) -> dict[str, float | None]:
+    if not durations_s:
+        return {
+            "p10_ms": None,
+            "p50_ms": None,
+            "p90_ms": None,
+        }
+    return {
+        "p10_ms": _percentile(durations_s, 0.1) * 1000.0,
+        "p50_ms": _percentile(durations_s, 0.5) * 1000.0,
+        "p90_ms": _percentile(durations_s, 0.9) * 1000.0,
+    }
+
+
+def _tokens_per_second(tokens: int, duration_s: float) -> float:
+    if duration_s <= 0.0:
+        return float("inf")
+    return float(tokens) / duration_s
+
+
+def _phase_throughput_summary(
+    *,
+    total_tokens: int,
+    iteration_durations_s: list[float],
+    unit_durations_s: list[float],
+    unit_tokens: list[int],
+) -> dict[str, Any]:
+    total_duration_s = sum(iteration_durations_s)
+    peak_tokens_per_s = None
+    if unit_durations_s:
+        peak_tokens_per_s = max(
+            _tokens_per_second(tokens, duration_s)
+            for tokens, duration_s in zip(unit_tokens, unit_durations_s)
+        )
+    summary = _duration_ms_summary(iteration_durations_s)
+    unit_summary = _duration_ms_summary(unit_durations_s)
+    return {
+        "avg_tokens_per_s": _tokens_per_second(total_tokens, total_duration_s),
+        "peak_tokens_per_s": peak_tokens_per_s,
+        "total_tokens": total_tokens,
+        "total_duration_ms": total_duration_s * 1000.0,
+        **summary,
+        "unit_p10_ms": unit_summary["p10_ms"],
+        "unit_p50_ms": unit_summary["p50_ms"],
+        "unit_p90_ms": unit_summary["p90_ms"],
+    }
+
+
 def _time_vllm_model_only_steady_decode(
     model: Any,
     *,
@@ -926,6 +1002,9 @@ def _runner_prefill_chunk_tokens(config: BenchmarkConfig) -> int:
 def _create_vllm_runner_llm(config: BenchmarkConfig) -> Any:
     os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "1")
+    os.environ.setdefault("VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP", "1")
+    if config.runner_disable_rapid_sampler:
+        os.environ["VLLM_USE_RAPID_SAMPLER"] = "0"
 
     import vllm.rwkv7_ops  # noqa: F401
 
@@ -948,6 +1027,7 @@ def _create_vllm_runner_llm(config: BenchmarkConfig) -> Any:
         max_num_batched_tokens=max_num_batched_tokens,
         long_prefill_token_threshold=prefill_chunk_tokens,
         enable_chunked_prefill=True,
+        enforce_eager=config.runner_enforce_eager,
         disable_log_stats=True,
     )
 
@@ -1209,6 +1289,45 @@ def _worker_new_request_scheduler_output(
     )
 
 
+def _worker_add_decode_requests_scheduler_output(
+    *,
+    req_ids: list[str],
+    prompt_token_ids: list[list[int]],
+    sampling_params: Any,
+    prompt_len: int,
+) -> Any:
+    from vllm.v1.core.sched.output import (
+        CachedRequestData,
+        NewRequestData,
+        SchedulerOutput,
+    )
+
+    return SchedulerOutput(
+        scheduled_new_reqs=[
+            NewRequestData(
+                req_id=req_id,
+                prompt_token_ids=prompt_ids,
+                mm_features=[],
+                sampling_params=sampling_params,
+                pooling_params=None,
+                block_ids=(),
+                num_computed_tokens=prompt_len,
+                lora_request=None,
+                prefill_token_ids=prompt_ids,
+            )
+            for req_id, prompt_ids in zip(req_ids, prompt_token_ids)
+        ],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={},
+        total_num_scheduled_tokens=0,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+
+
 def _worker_cached_prefill_scheduler_output(
     *,
     req_ids: list[str],
@@ -1276,6 +1395,259 @@ def _worker_internal_runner_blocker(code: str, message: str) -> dict[str, Any]:
     }
 
 
+def _worker_prompt_token_ids(batch_size: int, prompt_len: int) -> list[list[int]]:
+    return [
+        [(idx + position) % 1024 for position in range(prompt_len)]
+        for idx in range(batch_size)
+    ]
+
+
+def _worker_execute_prefill_chunks(
+    worker: Any,
+    *,
+    req_ids: list[str],
+    prompt_token_ids: list[list[int]],
+    sampling_params: Any,
+    prompt_len: int,
+    prefill_chunk_tokens: int,
+    cuda_events: tuple[Any, Any] | None = None,
+    measure: bool = False,
+) -> tuple[list[float], list[int]]:
+    first_chunk_tokens = min(prefill_chunk_tokens, prompt_len)
+    prefill_output = _worker_new_request_scheduler_output(
+        req_ids=req_ids,
+        prompt_token_ids=prompt_token_ids,
+        sampling_params=sampling_params,
+        num_scheduled_tokens=first_chunk_tokens,
+    )
+    chunk_durations_s: list[float] = []
+    chunk_token_counts: list[int] = []
+    if measure:
+        chunk_durations_s.append(
+            _worker_time_execute_model(worker, prefill_output, cuda_events)
+        )
+        chunk_token_counts.append(len(req_ids) * first_chunk_tokens)
+    else:
+        worker.execute_model(prefill_output)
+    num_prefill_tokens = first_chunk_tokens
+    while num_prefill_tokens < prompt_len:
+        chunk_tokens = min(prefill_chunk_tokens, prompt_len - num_prefill_tokens)
+        prefill_output = _worker_cached_prefill_scheduler_output(
+            req_ids=req_ids,
+            num_computed_tokens=num_prefill_tokens,
+            num_scheduled_tokens=chunk_tokens,
+        )
+        if measure:
+            chunk_durations_s.append(
+                _worker_time_execute_model(worker, prefill_output, cuda_events)
+            )
+            chunk_token_counts.append(len(req_ids) * chunk_tokens)
+        else:
+            worker.execute_model(prefill_output)
+        num_prefill_tokens += chunk_tokens
+    return chunk_durations_s, chunk_token_counts
+
+
+def _worker_finish_execute_without_sampling(worker: Any) -> None:
+    model_runner = getattr(worker, "model_runner", None)
+    execute_model_state = getattr(model_runner, "execute_model_state", None)
+    if execute_model_state is None:
+        return
+    input_batch = getattr(execute_model_state, "input_batch", None)
+    model_state = getattr(model_runner, "model_state", None)
+    postprocess_state = getattr(model_state, "postprocess_state", None)
+    if input_batch is not None and callable(postprocess_state):
+        req_states = getattr(model_runner, "req_states", None)
+        num_computed_tokens = getattr(req_states, "num_computed_tokens", None)
+        num_computed_gpu = getattr(num_computed_tokens, "gpu", None)
+        postprocess_state(input_batch.idx_mapping, 0, num_computed_gpu)
+    model_runner.execute_model_state = None
+
+
+def _run_vllm_worker_internal_prefill(
+    worker: Any,
+    batch_size: int,
+    prompt_len: int,
+    prefill_chunk_tokens: int,
+    iters: int,
+) -> dict[str, Any]:
+    if not callable(getattr(worker, "execute_model", None)):
+        return _worker_internal_runner_blocker(
+            "missing_worker_execute_model",
+            "The vLLM worker does not expose execute_model().",
+        )
+    if not callable(getattr(worker, "sample_tokens", None)):
+        return _worker_internal_runner_blocker(
+            "missing_worker_sample_tokens",
+            "The vLLM worker does not expose sample_tokens().",
+        )
+    if prefill_chunk_tokens <= 0:
+        raise ValueError("runner prefill chunk tokens must be positive")
+    prefill_chunk_tokens = min(prefill_chunk_tokens, prompt_len)
+
+    from vllm import SamplingParams
+
+    sampling_params = SamplingParams(
+        max_tokens=1,
+        temperature=VLLM_RUNNER_SAMPLING["temperature"],
+        top_p=VLLM_RUNNER_SAMPLING["top_p"],
+        ignore_eos=VLLM_RUNNER_SAMPLING["ignore_eos"],
+        detokenize=VLLM_RUNNER_SAMPLING["detokenize"],
+    )
+    prefix = f"rwkv7-prefill-{id(worker)}-{time.perf_counter_ns()}"
+    cuda_events = _worker_cuda_event_pair()
+    timing_clock = "cuda_event" if cuda_events is not None else "wall_clock"
+    iteration_durations_s: list[float] = []
+    unit_durations_s: list[float] = []
+    unit_tokens: list[int] = []
+
+    for iteration in range(iters):
+        req_ids = [f"{prefix}-{iteration}-{idx}" for idx in range(batch_size)]
+        chunk_durations_s, chunk_token_counts = _worker_execute_prefill_chunks(
+            worker,
+            req_ids=req_ids,
+            prompt_token_ids=_worker_prompt_token_ids(batch_size, prompt_len),
+            sampling_params=sampling_params,
+            prompt_len=prompt_len,
+            prefill_chunk_tokens=prefill_chunk_tokens,
+            cuda_events=cuda_events,
+            measure=True,
+        )
+        iteration_durations_s.append(sum(chunk_durations_s))
+        unit_durations_s.extend(chunk_durations_s)
+        unit_tokens.extend(chunk_token_counts)
+        _worker_finish_execute_without_sampling(worker)
+        worker.execute_model(_worker_empty_scheduler_output(set(req_ids)))
+
+    return {
+        "measurement_mode": VLLM_RUNNER_MODE,
+        "internal_timing_target": "worker.execute_model.prefill",
+        "timing_clock": timing_clock,
+        "iteration_durations_s": iteration_durations_s,
+        "unit_durations_s": unit_durations_s,
+        "unit_tokens": unit_tokens,
+        "tokens": batch_size * prompt_len * iters,
+        "worker_count": 1,
+    }
+
+
+def _run_vllm_worker_internal_decode_only(
+    worker: Any,
+    batch_size: int,
+    prompt_len: int,
+    prefill_chunk_tokens: int,
+    decode_tokens: int,
+    warmup_decode_tokens: int,
+    iters: int,
+    include_sampling: bool,
+) -> dict[str, Any]:
+    if not callable(getattr(worker, "execute_model", None)):
+        return _worker_internal_runner_blocker(
+            "missing_worker_execute_model",
+            "The vLLM worker does not expose execute_model().",
+        )
+    if not callable(getattr(worker, "sample_tokens", None)):
+        return _worker_internal_runner_blocker(
+            "missing_worker_sample_tokens",
+            "The vLLM worker does not expose sample_tokens().",
+        )
+    if prefill_chunk_tokens <= 0:
+        raise ValueError("runner prefill chunk tokens must be positive")
+    if prompt_len <= 0:
+        raise ValueError("runner decode prompt len must be positive")
+    if decode_tokens <= 0:
+        raise ValueError("runner decode tokens must be positive")
+    if warmup_decode_tokens < 0:
+        raise ValueError("runner decode warmup tokens must be non-negative")
+
+    from vllm import SamplingParams
+
+    scheduled_decode_tokens = decode_tokens + warmup_decode_tokens
+    sampling_params = SamplingParams(
+        max_tokens=scheduled_decode_tokens,
+        temperature=VLLM_RUNNER_SAMPLING["temperature"],
+        top_p=VLLM_RUNNER_SAMPLING["top_p"],
+        ignore_eos=VLLM_RUNNER_SAMPLING["ignore_eos"],
+        detokenize=VLLM_RUNNER_SAMPLING["detokenize"],
+    )
+    prefix = f"rwkv7-decode-{id(worker)}-{time.perf_counter_ns()}"
+    cuda_events = _worker_cuda_event_pair()
+    timing_clock = "cuda_event" if cuda_events is not None else "wall_clock"
+    iteration_durations_s: list[float] = []
+    unit_durations_s: list[float] = []
+    unit_tokens: list[int] = []
+    sample_durations_s: list[float] = []
+
+    for iteration in range(iters):
+        req_ids = [f"{prefix}-{iteration}-{idx}" for idx in range(batch_size)]
+        worker.execute_model(
+            _worker_add_decode_requests_scheduler_output(
+                req_ids=req_ids,
+                prompt_token_ids=_worker_prompt_token_ids(batch_size, prompt_len),
+                sampling_params=sampling_params,
+                prompt_len=prompt_len,
+            )
+        )
+        _worker_finish_execute_without_sampling(worker)
+        _worker_cuda_synchronize()
+
+        for step in range(warmup_decode_tokens):
+            worker.execute_model(
+                _worker_cached_decode_scheduler_output(
+                    req_ids=req_ids,
+                    prompt_len=prompt_len,
+                    step=step,
+                )
+            )
+            _worker_finish_execute_without_sampling(worker)
+        if warmup_decode_tokens:
+            _worker_cuda_synchronize()
+
+        iteration_duration_s = 0.0
+        for step in range(warmup_decode_tokens, scheduled_decode_tokens):
+            decode_output = _worker_cached_decode_scheduler_output(
+                req_ids=req_ids,
+                prompt_len=prompt_len,
+                step=step,
+            )
+            execute_duration_s = _worker_time_execute_model(
+                worker,
+                decode_output,
+                cuda_events,
+            )
+            iteration_duration_s += execute_duration_s
+            unit_durations_s.append(execute_duration_s)
+            unit_tokens.append(batch_size)
+            if include_sampling:
+                sample_duration_s = _worker_time_sample_tokens(
+                    worker,
+                    None,
+                    cuda_events,
+                )
+                iteration_duration_s += sample_duration_s
+                sample_durations_s.append(sample_duration_s)
+            else:
+                _worker_finish_execute_without_sampling(worker)
+        iteration_durations_s.append(iteration_duration_s)
+        worker.execute_model(_worker_empty_scheduler_output(set(req_ids)))
+
+    return {
+        "measurement_mode": VLLM_RUNNER_MODE,
+        "internal_timing_target": (
+            "worker.execute_model+sample_tokens.decode"
+            if include_sampling
+            else "worker.execute_model.decode"
+        ),
+        "timing_clock": timing_clock,
+        "iteration_durations_s": iteration_durations_s,
+        "unit_durations_s": unit_durations_s,
+        "unit_tokens": unit_tokens,
+        "sample_durations_s": sample_durations_s,
+        "tokens": batch_size * decode_tokens * iters,
+        "worker_count": 1,
+    }
+
+
 def _run_vllm_worker_internal_steady_decode(
     worker: Any,
     batch_size: int,
@@ -1324,29 +1696,15 @@ def _run_vllm_worker_internal_steady_decode(
 
     for iteration in range(iters):
         req_ids = [f"{prefix}-{iteration}-{idx}" for idx in range(batch_size)]
-        prompt_token_ids = [
-            [(idx + position) % 1024 for position in range(prompt_len)]
-            for idx in range(batch_size)
-        ]
-        first_chunk_tokens = min(prefill_chunk_tokens, prompt_len)
-        prefill_output = _worker_new_request_scheduler_output(
+        _worker_execute_prefill_chunks(
+            worker,
             req_ids=req_ids,
-            prompt_token_ids=prompt_token_ids,
+            prompt_token_ids=_worker_prompt_token_ids(batch_size, prompt_len),
             sampling_params=sampling_params,
-            num_scheduled_tokens=first_chunk_tokens,
+            prompt_len=prompt_len,
+            prefill_chunk_tokens=prefill_chunk_tokens,
+            measure=False,
         )
-        worker.execute_model(prefill_output)
-        num_prefill_tokens = first_chunk_tokens
-        while num_prefill_tokens < prompt_len:
-            chunk_tokens = min(prefill_chunk_tokens, prompt_len - num_prefill_tokens)
-            worker.execute_model(
-                _worker_cached_prefill_scheduler_output(
-                    req_ids=req_ids,
-                    num_computed_tokens=num_prefill_tokens,
-                    num_scheduled_tokens=chunk_tokens,
-                )
-            )
-            num_prefill_tokens += chunk_tokens
         worker.sample_tokens(None)
         _worker_cuda_synchronize()
 
@@ -1507,6 +1865,99 @@ def _merge_worker_internal_runner_results(
     }
 
 
+def _merge_worker_internal_phase_results(
+    worker_results: list[Any],
+    *,
+    total_tokens: int,
+    expected_iterations: int,
+) -> dict[str, Any]:
+    if not worker_results:
+        return _worker_internal_runner_blocker(
+            "missing_internal_runner_worker_results",
+            "No vLLM worker returned internal runner timing results.",
+        )
+    blockers = [
+        blocker
+        for result in worker_results
+        if isinstance(result, dict)
+        for blocker in result.get("blockers", [])
+    ]
+    if blockers:
+        return {
+            "measurement_mode": VLLM_RUNNER_MODE,
+            "internal_timing_target": VLLM_RUNNER_TIMING_TARGET,
+            "blockers": blockers,
+        }
+    normalized_results = [
+        result for result in worker_results if isinstance(result, dict)
+    ]
+    if len(normalized_results) != len(worker_results):
+        return _worker_internal_runner_blocker(
+            "invalid_internal_runner_worker_result",
+            "A vLLM worker returned a non-dict internal runner timing result.",
+        )
+
+    per_worker_iterations = [
+        [float(value) for value in result.get("iteration_durations_s", [])]
+        for result in normalized_results
+    ]
+    if any(len(values) != expected_iterations for values in per_worker_iterations):
+        return _worker_internal_runner_blocker(
+            "missing_internal_runner_phase_samples",
+            "No complete internal worker phase timing samples were recorded.",
+        )
+    iteration_durations_s = [
+        max(worker_values[index] for worker_values in per_worker_iterations)
+        for index in range(expected_iterations)
+    ]
+
+    unit_durations_s: list[float] = []
+    unit_tokens: list[int] = []
+    worker_count = len(normalized_results)
+    max_unit_count = max(
+        len(result.get("unit_durations_s", [])) for result in normalized_results
+    )
+    for index in range(max_unit_count):
+        worker_unit_durations: list[float] = []
+        worker_unit_tokens: list[int] = []
+        for result in normalized_results:
+            durations = result.get("unit_durations_s", [])
+            tokens = result.get("unit_tokens", [])
+            if index < len(durations):
+                worker_unit_durations.append(float(durations[index]))
+                worker_unit_tokens.append(int(tokens[index]))
+        if worker_unit_durations:
+            unit_durations_s.append(max(worker_unit_durations))
+            unit_tokens.append(sum(worker_unit_tokens) // max(1, worker_count))
+
+    summary = _phase_throughput_summary(
+        total_tokens=total_tokens,
+        iteration_durations_s=iteration_durations_s,
+        unit_durations_s=unit_durations_s,
+        unit_tokens=unit_tokens,
+    )
+    first_result = normalized_results[0]
+    summary.update(
+        {
+            "measurement_mode": first_result.get("measurement_mode", VLLM_RUNNER_MODE),
+            "internal_timing_target": first_result.get(
+                "internal_timing_target", VLLM_RUNNER_TIMING_TARGET
+            ),
+            "timing_clock": first_result.get("timing_clock", VLLM_RUNNER_TIMING_CLOCK),
+            "worker_count": worker_count,
+        }
+    )
+    sample_durations = [
+        float(value)
+        for result in normalized_results
+        for value in result.get("sample_durations_s", [])
+    ]
+    if sample_durations:
+        sample_summary = _duration_ms_summary(sample_durations)
+        summary["sample_tokens_p50_ms"] = sample_summary["p50_ms"]
+    return summary
+
+
 def _time_vllm_runner_steady_decode(
     llm: Any,
     *,
@@ -1559,11 +2010,88 @@ def _time_vllm_runner_steady_decode(
     )
 
 
+def _time_vllm_runner_prefill_phase(
+    llm: Any,
+    *,
+    batch_size: int,
+    prompt_len: int,
+    prefill_chunk_tokens: int,
+    iters: int,
+) -> dict[str, Any]:
+    collective_rpc = getattr(llm, "collective_rpc", None)
+    if not callable(collective_rpc):
+        return _worker_internal_runner_blocker(
+            "missing_collective_rpc",
+            "The vLLM LLM object does not expose collective_rpc().",
+        )
+    _reset_runner_state_movement_stats(llm)
+    results = collective_rpc(
+        _run_vllm_worker_internal_prefill,
+        args=(batch_size, prompt_len, prefill_chunk_tokens, iters),
+    )
+    return _merge_worker_internal_phase_results(
+        list(results),
+        total_tokens=batch_size * prompt_len * iters,
+        expected_iterations=iters,
+    )
+
+
+def _time_vllm_runner_decode_phase(
+    llm: Any,
+    *,
+    batch_size: int,
+    prompt_len: int,
+    prefill_chunk_tokens: int,
+    decode_tokens: int,
+    warmup: int,
+    iters: int,
+    include_sampling: bool,
+) -> dict[str, Any]:
+    collective_rpc = getattr(llm, "collective_rpc", None)
+    if not callable(collective_rpc):
+        return _worker_internal_runner_blocker(
+            "missing_collective_rpc",
+            "The vLLM LLM object does not expose collective_rpc().",
+        )
+    _reset_runner_state_movement_stats(llm)
+    results = collective_rpc(
+        _run_vllm_worker_internal_decode_only,
+        args=(
+            batch_size,
+            prompt_len,
+            prefill_chunk_tokens,
+            decode_tokens,
+            warmup,
+            iters,
+            include_sampling,
+        ),
+    )
+    return _merge_worker_internal_phase_results(
+        list(results),
+        total_tokens=batch_size * decode_tokens * iters,
+        expected_iterations=iters,
+    )
+
+
 def _shutdown_vllm_runner_llm(llm: Any) -> None:
     engine = getattr(llm, "llm_engine", None)
     shutdown = getattr(engine, "shutdown", None)
+    if not callable(shutdown):
+        engine_core = getattr(engine, "engine_core", None)
+        shutdown = getattr(engine_core, "shutdown", None)
     if callable(shutdown):
-        shutdown()
+        try:
+            shutdown(timeout=30)
+        except TypeError:
+            shutdown()
+    try:
+        llm.llm_engine = None
+    except Exception:
+        pass
+    gc.collect()
+    if _cuda_available():
+        cuda = _cuda_module()
+        cuda.empty_cache()
 
 
 def generate_vllm_runner_measurement(
@@ -1672,6 +2200,294 @@ def generate_vllm_runner_measurement(
             "model": config.model,
             "measurement_source": f"vllm_runner_{VLLM_RUNNER_MODE}",
             "provenance": _benchmark_provenance(runner_config),
+        },
+    }
+
+
+def _runner_phase_metrics(
+    *,
+    batch_size: int,
+    seq_len: int,
+    phase: str,
+    prefill_chunk_tokens: int,
+    iters: int,
+    parsed: dict[str, Any],
+    warmup: int | None = None,
+    include_sampling: bool | None = None,
+) -> dict[str, Any]:
+    metrics: dict[str, Any] = {
+        "case": _format_bxt_case(batch_size, seq_len),
+        "phase": phase,
+        "batch_size": batch_size,
+        "seq_len": seq_len,
+        "prefill_chunk_tokens": prefill_chunk_tokens,
+        "iters": iters,
+        "measurement_mode": parsed.get("measurement_mode", VLLM_RUNNER_MODE),
+        "internal_timing_target": parsed.get("internal_timing_target"),
+        "timing_clock": parsed.get("timing_clock", VLLM_RUNNER_TIMING_CLOCK),
+        "worker_count": parsed.get("worker_count"),
+    }
+    if warmup is not None:
+        metrics["warmup_decode_tokens"] = warmup
+    if include_sampling is not None:
+        metrics["sampling_included"] = include_sampling
+        metrics["sampling_mode"] = "sample_tokens" if include_sampling else "skip"
+    if "blockers" in parsed:
+        metrics["blockers"] = parsed["blockers"]
+        return metrics
+    metrics.update(
+        {
+            "avg_tokens_per_s": parsed["avg_tokens_per_s"],
+            "peak_tokens_per_s": parsed["peak_tokens_per_s"],
+            "total_tokens": parsed["total_tokens"],
+            "total_duration_ms": parsed["total_duration_ms"],
+            "p10_ms": parsed["p10_ms"],
+            "p50_ms": parsed["p50_ms"],
+            "p90_ms": parsed["p90_ms"],
+            "unit_p10_ms": parsed["unit_p10_ms"],
+            "unit_p50_ms": parsed["unit_p50_ms"],
+            "unit_p90_ms": parsed["unit_p90_ms"],
+        }
+    )
+    if "sample_tokens_p50_ms" in parsed:
+        metrics["sample_tokens_p50_ms"] = parsed["sample_tokens_p50_ms"]
+    return metrics
+
+
+def generate_vllm_runner_pd_single_measurement(
+    config: BenchmarkConfig,
+    *,
+    phase: str,
+    case: tuple[int, int],
+    prefill_chunk_tokens: int,
+    decode_prompt_len: int,
+    warmup: int,
+    iters: int,
+    include_sampling: bool,
+) -> dict[str, Any]:
+    batch_size, seq_len = case
+    case_name = _format_bxt_case(batch_size, seq_len)
+    if phase == "prefill":
+        case_prefill_chunk_tokens = min(prefill_chunk_tokens, seq_len)
+        runner_config = replace(
+            config,
+            batch_size=batch_size,
+            prompt_len=seq_len,
+            decode_tokens=1,
+            runner_prefill_chunk_tokens=case_prefill_chunk_tokens,
+        )
+        llm = _create_vllm_runner_llm(runner_config)
+        try:
+            parsed = _time_vllm_runner_prefill_phase(
+                llm,
+                batch_size=batch_size,
+                prompt_len=seq_len,
+                prefill_chunk_tokens=case_prefill_chunk_tokens,
+                iters=iters,
+            )
+            state_movement = _extract_runner_state_movement_stats(llm)
+        finally:
+            _shutdown_vllm_runner_llm(llm)
+        metrics = _runner_phase_metrics(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            phase="prefill",
+            prefill_chunk_tokens=case_prefill_chunk_tokens,
+            iters=iters,
+            parsed=parsed,
+        )
+    elif phase == "decode":
+        runner_config = replace(
+            config,
+            batch_size=batch_size,
+            prompt_len=decode_prompt_len,
+            decode_tokens=seq_len + warmup,
+            runner_prefill_chunk_tokens=min(prefill_chunk_tokens, decode_prompt_len),
+        )
+        llm = _create_vllm_runner_llm(runner_config)
+        try:
+            parsed = _time_vllm_runner_decode_phase(
+                llm,
+                batch_size=batch_size,
+                prompt_len=decode_prompt_len,
+                prefill_chunk_tokens=min(prefill_chunk_tokens, decode_prompt_len),
+                decode_tokens=seq_len,
+                warmup=warmup,
+                iters=iters,
+                include_sampling=include_sampling,
+            )
+            state_movement = _extract_runner_state_movement_stats(llm)
+        finally:
+            _shutdown_vllm_runner_llm(llm)
+        metrics = _runner_phase_metrics(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            phase="decode",
+            prefill_chunk_tokens=min(prefill_chunk_tokens, decode_prompt_len),
+            warmup=warmup,
+            iters=iters,
+            include_sampling=include_sampling,
+            parsed=parsed,
+        )
+    else:
+        raise ValueError(f"unsupported runner pd phase: {phase}")
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "benchmark": BENCHMARK_NAME,
+        "phase": phase,
+        "case": case_name,
+        "metrics": metrics,
+        "state_movement": state_movement,
+        "config": {
+            "repo_root": str(config.repo_root),
+            "model": config.model,
+            "measurement_source": "vllm_runner_prefill_decode_single",
+            "provenance": _benchmark_provenance(config),
+        },
+    }
+
+
+def _run_vllm_runner_pd_case_subprocess(
+    config: BenchmarkConfig,
+    *,
+    phase: str,
+    case: tuple[int, int],
+    prefill_chunk_tokens: int,
+    decode_prompt_len: int,
+    warmup: int,
+    iters: int,
+    include_sampling: bool,
+) -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="rwkv7-runner-pd-") as tmpdir:
+        output_path = Path(tmpdir) / "measurement.json"
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--repo-root",
+            str(config.repo_root),
+            "--measure-vllm-runner-pd-single",
+            "--runner-pd-single-phase",
+            phase,
+            "--runner-pd-single-case",
+            _format_bxt_case(*case),
+            "--runner-prefill-chunk-tokens",
+            str(prefill_chunk_tokens),
+            "--runner-pd-decode-prompt-len",
+            str(decode_prompt_len),
+            "--runner-warmup",
+            str(warmup),
+            "--runner-iters",
+            str(iters),
+            "--measurement-output",
+            str(output_path),
+        ]
+        if config.runner_enforce_eager:
+            command.append("--runner-enforce-eager")
+        if config.runner_disable_rapid_sampler:
+            command.append("--runner-disable-rapid-sampler")
+        if config.model is not None:
+            command.extend(["--model", config.model])
+        if include_sampling:
+            command.append("--runner-pd-include-sampling")
+        env = os.environ.copy()
+        if config.runner_disable_rapid_sampler:
+            env["VLLM_USE_RAPID_SAMPLER"] = "0"
+        env["VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP"] = "1"
+        result = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            env=env,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                "vLLM runner PD subprocess failed for "
+                f"{phase}:{_format_bxt_case(*case)} with exit code "
+                f"{result.returncode}"
+            )
+        with output_path.open(encoding="utf-8") as measurement_file:
+            measurement = json.load(measurement_file)
+    if not isinstance(measurement, dict):
+        raise ValueError("vLLM runner PD subprocess did not emit a JSON object")
+    return measurement
+
+
+def generate_vllm_runner_pd_measurement(
+    config: BenchmarkConfig,
+    *,
+    prefill_cases: list[tuple[int, int]],
+    decode_cases: list[tuple[int, int]],
+    prefill_chunk_tokens: int,
+    decode_prompt_len: int,
+    warmup: int,
+    iters: int,
+    include_sampling: bool,
+) -> dict[str, Any]:
+    if prefill_chunk_tokens <= 0:
+        raise ValueError("runner prefill chunk tokens must be positive")
+    if decode_prompt_len <= 0:
+        raise ValueError("runner decode prompt len must be positive")
+    if warmup < 0:
+        raise ValueError("runner warmup must be non-negative")
+    if iters <= 0:
+        raise ValueError("runner iters must be positive")
+
+    prefill_metrics: dict[str, Any] = {}
+    decode_metrics: dict[str, Any] = {}
+    state_movement_by_case: dict[str, Any] = {}
+
+    for batch_size, seq_len in prefill_cases:
+        case = _format_bxt_case(batch_size, seq_len)
+        case_prefill_chunk_tokens = min(prefill_chunk_tokens, seq_len)
+        measurement = _run_vllm_runner_pd_case_subprocess(
+            config,
+            phase="prefill",
+            case=(batch_size, seq_len),
+            prefill_chunk_tokens=case_prefill_chunk_tokens,
+            decode_prompt_len=decode_prompt_len,
+            warmup=warmup,
+            iters=iters,
+            include_sampling=include_sampling,
+        )
+        prefill_metrics[case] = measurement["metrics"]
+        state_movement_by_case[f"prefill:{case}"] = measurement["state_movement"]
+
+    for batch_size, decode_tokens in decode_cases:
+        case = _format_bxt_case(batch_size, decode_tokens)
+        measurement = _run_vllm_runner_pd_case_subprocess(
+            config,
+            phase="decode",
+            case=(batch_size, decode_tokens),
+            prefill_chunk_tokens=min(prefill_chunk_tokens, decode_prompt_len),
+            warmup=warmup,
+            iters=iters,
+            include_sampling=include_sampling,
+            decode_prompt_len=decode_prompt_len,
+        )
+        decode_metrics[case] = measurement["metrics"]
+        state_movement_by_case[f"decode:{case}"] = measurement["state_movement"]
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "benchmark": BENCHMARK_NAME,
+        "runner_prefill": prefill_metrics,
+        "runner_decode": decode_metrics,
+        "state_movement_by_case": state_movement_by_case,
+        "config": {
+            "repo_root": str(config.repo_root),
+            "model": config.model,
+            "measurement_source": "vllm_runner_prefill_decode",
+            "runner_pd_prefill_cases": [
+                _format_bxt_case(batch_size, seq_len)
+                for batch_size, seq_len in prefill_cases
+            ],
+            "runner_pd_decode_cases": [
+                _format_bxt_case(batch_size, seq_len)
+                for batch_size, seq_len in decode_cases
+            ],
+            "runner_pd_decode_prompt_len": decode_prompt_len,
+            "runner_pd_include_sampling": include_sampling,
+            "provenance": _benchmark_provenance(config),
         },
     }
 
@@ -1936,6 +2752,8 @@ def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
         warmup_tokens=args.warmup_tokens,
         decode_tokens=args.decode_tokens,
         runner_prefill_chunk_tokens=args.runner_prefill_chunk_tokens,
+        runner_enforce_eager=args.runner_enforce_eager,
+        runner_disable_rapid_sampler=args.runner_disable_rapid_sampler,
     )
 
 
@@ -1974,6 +2792,28 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--measure-vllm-runner",
         action="store_true",
         help="Run the vLLM offline LLM.generate runner steady decode benchmark.",
+    )
+    parser.add_argument(
+        "--measure-vllm-runner-pd",
+        action="store_true",
+        help=(
+            "Run split vLLM runner prefill/decode execute_model throughput "
+            "benchmarks."
+        ),
+    )
+    parser.add_argument(
+        "--measure-vllm-runner-pd-single",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--runner-pd-single-phase",
+        choices=("prefill", "decode"),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--runner-pd-single-case",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--albatross-case",
@@ -2033,6 +2873,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--runner-enforce-eager",
+        action="store_true",
+        help="Disable vLLM CUDA graph capture for runner measurements.",
+    )
+    parser.add_argument(
+        "--runner-disable-rapid-sampler",
+        action="store_true",
+        help="Disable rapid sampler allocation for runner measurements.",
+    )
+    parser.add_argument(
         "--runner-decode-tokens",
         type=int,
         default=128,
@@ -2054,6 +2904,29 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Timed iterations for vLLM runner steady decode.",
     )
     parser.add_argument(
+        "--runner-pd-prefill-cases",
+        default=DEFAULT_RUNNER_PD_PREFILL_CASES,
+        help=(
+            "Comma-separated BxT prefill cases for --measure-vllm-runner-pd."
+        ),
+    )
+    parser.add_argument(
+        "--runner-pd-decode-cases",
+        default=DEFAULT_RUNNER_PD_DECODE_CASES,
+        help="Comma-separated BxT decode cases for --measure-vllm-runner-pd.",
+    )
+    parser.add_argument(
+        "--runner-pd-decode-prompt-len",
+        type=int,
+        default=1,
+        help="Prompt length used to initialize state before decode-only timing.",
+    )
+    parser.add_argument(
+        "--runner-pd-include-sampling",
+        action="store_true",
+        help="Include sample_tokens in decode phase timing.",
+    )
+    parser.add_argument(
         "--measurement-output",
         type=Path,
         help="Write generated measurement JSON for a measurement mode.",
@@ -2068,6 +2941,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         args.measure_albatross_model_only,
         args.measure_vllm_model_only,
         args.measure_vllm_runner,
+        args.measure_vllm_runner_pd,
+        args.measure_vllm_runner_pd_single,
     ]
     if sum(bool(mode) for mode in measurement_modes) > 1:
         parser.error("choose only one measurement mode")
@@ -2138,6 +3013,45 @@ def main(argv: list[str] | None = None) -> int:
                 existing_measurements,
                 measurement,
             )
+        _write_report(measurement, args.measurement_output)
+        return 0
+    if args.measure_vllm_runner_pd_single:
+        if args.runner_pd_single_phase is None or args.runner_pd_single_case is None:
+            raise ValueError(
+                "--runner-pd-single-phase and --runner-pd-single-case are required"
+            )
+        measurement = generate_vllm_runner_pd_single_measurement(
+            config,
+            phase=args.runner_pd_single_phase,
+            case=_parse_bxt_case(
+                args.runner_pd_single_case,
+                "runner pd single case",
+            ),
+            prefill_chunk_tokens=args.runner_prefill_chunk_tokens,
+            decode_prompt_len=args.runner_pd_decode_prompt_len,
+            warmup=args.runner_warmup,
+            iters=args.runner_iters,
+            include_sampling=args.runner_pd_include_sampling,
+        )
+        _write_report(measurement, args.measurement_output)
+        return 0
+    if args.measure_vllm_runner_pd:
+        measurement = generate_vllm_runner_pd_measurement(
+            config,
+            prefill_cases=_parse_bxt_cases(
+                args.runner_pd_prefill_cases,
+                "runner prefill cases",
+            ),
+            decode_cases=_parse_bxt_cases(
+                args.runner_pd_decode_cases,
+                "runner decode cases",
+            ),
+            prefill_chunk_tokens=args.runner_prefill_chunk_tokens,
+            decode_prompt_len=args.runner_pd_decode_prompt_len,
+            warmup=args.runner_warmup,
+            iters=args.runner_iters,
+            include_sampling=args.runner_pd_include_sampling,
+        )
         _write_report(measurement, args.measurement_output)
         return 0
 

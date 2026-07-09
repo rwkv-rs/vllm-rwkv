@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -123,6 +124,8 @@ def test_report_blocks_without_runtime_paths_and_records_provenance(
         "warmup_tokens": 16,
         "decode_tokens": 128,
         "runner_prefill_chunk_tokens": bench.DEFAULT_RUNNER_PREFILL_CHUNK_TOKENS,
+        "runner_enforce_eager": False,
+        "runner_disable_rapid_sampler": False,
     }
     assert provenance["sampling"] == bench.VLLM_RUNNER_SAMPLING
     assert provenance["cuda"]["available"] is False
@@ -742,6 +745,8 @@ def test_cli_writes_vllm_runner_measurement_json(
         "warmup_tokens": 16,
         "decode_tokens": 7,
         "runner_prefill_chunk_tokens": 2,
+        "runner_enforce_eager": False,
+        "runner_disable_rapid_sampler": False,
     }
     assert (
         measurement["config"]["measurement_source"]
@@ -751,6 +756,95 @@ def test_cli_writes_vllm_runner_measurement_json(
         ("create", str(model_path), 9),
         ("time", fake_llm, 3, 5, 2, 7, 2, 11),
         ("state", fake_llm),
+    ]
+
+
+def test_cli_writes_split_runner_prefill_decode_measurement_json(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    model_path = tmp_path / "rwkv7-g1d-0.1b-20260129-ctx8192.pth"
+    model_path.write_bytes(b"")
+    output_path = tmp_path / "runner-pd.json"
+    calls: list[Any] = []
+
+    def fake_generate(
+        config,
+        *,
+        prefill_cases,
+        decode_cases,
+        prefill_chunk_tokens,
+        decode_prompt_len,
+        warmup,
+        iters,
+        include_sampling,
+    ):
+        calls.append(
+            (
+                config.model,
+                prefill_cases,
+                decode_cases,
+                prefill_chunk_tokens,
+                decode_prompt_len,
+                warmup,
+                iters,
+                include_sampling,
+            )
+        )
+        return {
+            "schema_version": bench.SCHEMA_VERSION,
+            "benchmark": bench.BENCHMARK_NAME,
+            "runner_prefill": {
+                "1x8": {"avg_tokens_per_s": 100.0, "peak_tokens_per_s": 120.0}
+            },
+            "runner_decode": {
+                "4x1": {"avg_tokens_per_s": 90.0, "peak_tokens_per_s": 95.0}
+            },
+        }
+
+    monkeypatch.setattr(bench, "generate_vllm_runner_pd_measurement", fake_generate)
+
+    rc = bench.main(
+        [
+            "--repo-root",
+            str(repo_root),
+            "--model",
+            str(model_path),
+            "--measure-vllm-runner-pd",
+            "--runner-pd-prefill-cases",
+            "1x8,2x4",
+            "--runner-pd-decode-cases",
+            "4x1",
+            "--runner-prefill-chunk-tokens",
+            "8",
+            "--runner-pd-decode-prompt-len",
+            "3",
+            "--runner-warmup",
+            "2",
+            "--runner-iters",
+            "5",
+            "--runner-pd-include-sampling",
+            "--measurement-output",
+            str(output_path),
+        ]
+    )
+
+    measurement = json.loads(output_path.read_text(encoding="utf-8"))
+    assert rc == 0
+    assert measurement["runner_prefill"]["1x8"]["peak_tokens_per_s"] == 120.0
+    assert measurement["runner_decode"]["4x1"]["avg_tokens_per_s"] == 90.0
+    assert calls == [
+        (
+            str(model_path),
+            [(1, 8), (2, 4)],
+            [(4, 1)],
+            8,
+            3,
+            2,
+            5,
+            True,
+        )
     ]
 
 
@@ -1142,6 +1236,284 @@ def test_internal_runner_warmup_uses_same_request_before_timing(monkeypatch) -> 
         ("sample", None),
         ("execute_new", 0),
     ]
+
+
+def test_phase_throughput_summary_reports_average_and_peak() -> None:
+    summary = bench._phase_throughput_summary(
+        total_tokens=40,
+        iteration_durations_s=[0.010, 0.030],
+        unit_durations_s=[0.010, 0.020, 0.010],
+        unit_tokens=[10, 10, 20],
+    )
+
+    assert summary["avg_tokens_per_s"] == pytest.approx(1000.0)
+    assert summary["peak_tokens_per_s"] == pytest.approx(2000.0)
+    assert summary["total_duration_ms"] == pytest.approx(40.0)
+    assert summary["p50_ms"] == pytest.approx(10.0)
+    assert summary["unit_p50_ms"] == pytest.approx(10.0)
+
+
+def test_internal_runner_decode_only_excludes_sampling_by_default(monkeypatch) -> None:
+    class FakeEvent:
+        def __init__(self, elapsed_ms: float = 1.0) -> None:
+            self.elapsed_ms = elapsed_ms
+
+        def record(self) -> None:
+            pass
+
+        def synchronize(self) -> None:
+            pass
+
+        def elapsed_time(self, other) -> float:
+            return self.elapsed_ms
+
+    class FakeWorker:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Any, ...]] = []
+
+        def execute_model(self, scheduler_output):
+            self.calls.append(
+                (
+                    "execute",
+                    scheduler_output.total_num_scheduled_tokens,
+                    len(scheduler_output.scheduled_new_reqs),
+                    list(scheduler_output.scheduled_cached_reqs.req_ids),
+                    bool(scheduler_output.finished_req_ids),
+                )
+            )
+
+        def sample_tokens(self, grammar_output):
+            self.calls.append(("sample", grammar_output))
+
+    monkeypatch.setattr(
+        bench,
+        "_worker_cuda_event_pair",
+        lambda: (FakeEvent(), FakeEvent()),
+    )
+    monkeypatch.setattr(bench, "_worker_cuda_synchronize", lambda: None)
+    worker = FakeWorker()
+
+    result = bench._run_vllm_worker_internal_decode_only(
+        worker,
+        batch_size=2,
+        prompt_len=1,
+        prefill_chunk_tokens=1,
+        decode_tokens=2,
+        warmup_decode_tokens=1,
+        iters=1,
+        include_sampling=False,
+    )
+
+    assert result["tokens"] == 4
+    assert result["iteration_durations_s"] == [0.002]
+    assert result["unit_durations_s"] == [0.001, 0.001]
+    assert result["unit_tokens"] == [2, 2]
+    assert result["sample_durations_s"] == []
+    assert result["internal_timing_target"] == "worker.execute_model.decode"
+    assert worker.calls == [
+        ("execute", 0, 2, [], False),
+        ("execute", 2, 0, worker.calls[1][3], False),
+        ("execute", 2, 0, worker.calls[2][3], False),
+        ("execute", 2, 0, worker.calls[3][3], False),
+        ("execute", 0, 0, [], True),
+    ]
+    assert all(len(call[3]) == 2 for call in worker.calls[1:4])
+
+
+def test_runner_pd_subprocess_skips_generic_warmup_without_slow_path_flags(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    model_path = tmp_path / "rwkv7-g1d-0.1b-20260129-ctx8192.pth"
+    model_path.write_bytes(b"")
+    calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def fake_run(command, *, cwd, env, check):
+        calls.append((command, env))
+        options = _command_options(command)
+        output_path = Path(options["--measurement-output"])
+        output_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": bench.SCHEMA_VERSION,
+                    "benchmark": bench.BENCHMARK_NAME,
+                    "metrics": {},
+                    "state_movement": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.delenv("VLLM_USE_RAPID_SAMPLER", raising=False)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    measurement = bench._run_vllm_runner_pd_case_subprocess(
+        _config(repo_root, model=str(model_path)),
+        phase="decode",
+        case=(4, 1),
+        prefill_chunk_tokens=1,
+        decode_prompt_len=1,
+        warmup=0,
+        iters=1,
+        include_sampling=False,
+    )
+
+    assert measurement["benchmark"] == bench.BENCHMARK_NAME
+    command, env = calls[0]
+    options = _command_options(command)
+    assert "--runner-enforce-eager" not in options
+    assert "--runner-disable-rapid-sampler" not in options
+    assert "VLLM_USE_RAPID_SAMPLER" not in env
+    assert env["VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP"] == "1"
+
+
+def test_runner_pd_subprocess_honors_explicit_slow_path_flags(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    model_path = tmp_path / "rwkv7-g1d-0.1b-20260129-ctx8192.pth"
+    model_path.write_bytes(b"")
+    calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def fake_run(command, *, cwd, env, check):
+        calls.append((command, env))
+        options = _command_options(command)
+        output_path = Path(options["--measurement-output"])
+        output_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": bench.SCHEMA_VERSION,
+                    "benchmark": bench.BENCHMARK_NAME,
+                    "metrics": {},
+                    "state_movement": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    config = replace(
+        _config(repo_root, model=str(model_path)),
+        runner_enforce_eager=True,
+        runner_disable_rapid_sampler=True,
+    )
+
+    bench._run_vllm_runner_pd_case_subprocess(
+        config,
+        phase="decode",
+        case=(4, 1),
+        prefill_chunk_tokens=1,
+        decode_prompt_len=1,
+        warmup=0,
+        iters=1,
+        include_sampling=False,
+    )
+
+    command, env = calls[0]
+    options = _command_options(command)
+    assert options["--runner-enforce-eager"] is True
+    assert options["--runner-disable-rapid-sampler"] is True
+    assert env["VLLM_USE_RAPID_SAMPLER"] == "0"
+    assert env["VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP"] == "1"
+
+
+def test_v2_kernel_warmup_skip_only_applies_to_rwkv7(monkeypatch) -> None:
+    import vllm.envs as envs
+    from vllm.v1.worker.gpu.warmup import should_skip_v2_kernel_warmup
+
+    class RWKV7ModelState:
+        pass
+
+    class DefaultModelState:
+        pass
+
+    monkeypatch.setitem(
+        envs.environment_variables,
+        "VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP",
+        lambda: True,
+    )
+    assert should_skip_v2_kernel_warmup(
+        SimpleNamespace(model_state=RWKV7ModelState())
+    )
+    assert not should_skip_v2_kernel_warmup(
+        SimpleNamespace(model_state=DefaultModelState())
+    )
+
+    monkeypatch.setitem(
+        envs.environment_variables,
+        "VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP",
+        lambda: False,
+    )
+    assert not should_skip_v2_kernel_warmup(
+        SimpleNamespace(model_state=RWKV7ModelState())
+    )
+
+
+def test_finish_execute_without_sampling_postprocesses_rwkv_state() -> None:
+    calls: list[tuple[Any, int, Any]] = []
+
+    class FakeInputBatch:
+        idx_mapping = "idx"
+
+    class FakeExecuteModelState:
+        input_batch = FakeInputBatch()
+
+    class FakeModelState:
+        def postprocess_state(
+            self, idx_mapping: Any, num_sampled: int, num_computed_tokens: Any
+        ) -> None:
+            calls.append((idx_mapping, num_sampled, num_computed_tokens))
+
+    class FakeNumComputedTokens:
+        gpu = "num_computed_gpu"
+
+    class FakeReqStates:
+        num_computed_tokens = FakeNumComputedTokens()
+
+    class FakeModelRunner:
+        def __init__(self) -> None:
+            self.execute_model_state = FakeExecuteModelState()
+            self.model_state = FakeModelState()
+            self.req_states = FakeReqStates()
+
+    class FakeWorker:
+        def __init__(self) -> None:
+            self.model_runner = FakeModelRunner()
+
+    worker = FakeWorker()
+
+    bench._worker_finish_execute_without_sampling(worker)
+
+    assert calls == [("idx", 0, "num_computed_gpu")]
+    assert worker.model_runner.execute_model_state is None
+
+
+def test_shutdown_vllm_runner_llm_uses_engine_core_shutdown(monkeypatch) -> None:
+    calls: list[float | None] = []
+
+    class FakeEngineCore:
+        def shutdown(self, timeout: float | None = None) -> None:
+            calls.append(timeout)
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.engine_core = FakeEngineCore()
+
+    class FakeLLM:
+        def __init__(self) -> None:
+            self.llm_engine = FakeEngine()
+
+    monkeypatch.setattr(bench, "_cuda_available", lambda: False)
+    llm = FakeLLM()
+
+    bench._shutdown_vllm_runner_llm(llm)
+
+    assert calls == [30]
+    assert llm.llm_engine is None
 
 
 def test_internal_runner_uses_cuda_event_timing_when_available(monkeypatch) -> None:

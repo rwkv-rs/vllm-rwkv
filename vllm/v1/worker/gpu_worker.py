@@ -84,7 +84,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from ...model_executor.model_loader import TensorizerLoader
-from .gpu.warmup import warmup_kernels
+from .gpu.warmup import should_skip_v2_kernel_warmup, warmup_kernels
 from .utils import request_memory
 
 logger = init_logger(__name__)
@@ -846,7 +846,14 @@ class Worker(WorkerBase):
 
         if self.use_v2_model_runner:
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
-            warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+            if should_skip_v2_kernel_warmup(self.model_runner):
+                logger.info(
+                    "Skipping V2 kernel warmup for RWKV7. Set "
+                    "VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP=0 to force the generic "
+                    "vLLM warmup path."
+                )
+            else:
+                warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
         elif get_pp_group().is_last_rank:
             # V1: Warm up sampler and preallocate memory buffer for logits and other
             # sampling related tensors of max possible shape to avoid memory
