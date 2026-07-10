@@ -957,6 +957,9 @@ class VllmConfig:
         if self.performance_mode != "balanced":
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
 
+        from vllm.build_profile import validate_build_profile_capabilities
+
+        validate_build_profile_capabilities(self)
         self.try_verify_and_update_config()
 
         if self.model_config is not None:

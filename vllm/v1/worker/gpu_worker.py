@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm.build_profile import get_build_profile_metadata
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode
 from vllm.device_allocator import get_mem_allocator_instance
@@ -50,7 +51,6 @@ from vllm.distributed.weight_transfer import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
-from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.multimodal.video import (
     PYNVVIDEOCODEC_CUDA_CONTEXT_BYTES,
     PYNVVIDEOCODEC_DECODER_GPU_MEMORY_BYTES,
@@ -86,6 +86,14 @@ from vllm.v1.worker.workspace import init_workspace_manager
 from ...model_executor.model_loader import TensorizerLoader
 from .gpu.warmup import should_skip_v2_kernel_warmup, warmup_kernels
 from .utils import request_memory
+
+if get_build_profile_metadata().profile == "rwkv":
+
+    def kernel_warmup(worker: "Worker") -> None:
+        """Skip attention/MoE kernel warmups omitted by the RWKV artifact."""
+
+else:
+    from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 
 logger = init_logger(__name__)
 
@@ -853,7 +861,9 @@ class Worker(WorkerBase):
                     "vLLM warmup path."
                 )
             else:
-                warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+                warmup_kernels(
+                    self.model_runner, self.execute_model, self.sample_tokens
+                )
         elif get_pp_group().is_last_rank:
             # V1: Warm up sampler and preallocate memory buffer for logits and other
             # sampling related tensors of max possible shape to avoid memory
