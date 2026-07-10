@@ -101,7 +101,7 @@ def test_rwkv_environment_metadata_records_resolved_defaults(monkeypatch) -> Non
     assert all(value is None for value in raw_env.values())
     assert env["VLLM_RWKV7_WKV_MODE"] == "fp16"
     assert env["VLLM_RWKV7_EMB_DEVICE"] == "gpu"
-    assert env["VLLM_RWKV7_ORIG_LINEAR_GROUPS"] == "att_c2c,ffn_key,head"
+    assert env["VLLM_RWKV7_ORIG_LINEAR_GROUPS"] == "none"
     assert env["VLLM_RWKV7_SLOT_MAPPED_STATE"] == "1"
 
 
@@ -118,7 +118,7 @@ def test_rwkv_environment_metadata_preserves_explicit_values(monkeypatch) -> Non
     assert raw_env["VLLM_RWKV7_WKV_MODE"] == "fp32io16"
     assert env["VLLM_RWKV7_EMB_DEVICE"] == "cpu"
     assert raw_env["VLLM_RWKV7_EMB_DEVICE"] == "cpu"
-    assert env["VLLM_RWKV7_ORIG_LINEAR_GROUPS"] == "att_c2c,ffn_key,head"
+    assert env["VLLM_RWKV7_ORIG_LINEAR_GROUPS"] == "none"
     assert raw_env["VLLM_RWKV7_ORIG_LINEAR_GROUPS"] is None
 
 
