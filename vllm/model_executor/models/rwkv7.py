@@ -33,7 +33,7 @@ EMB_DEVICE = envs.VLLM_RWKV7_EMB_DEVICE
 RKV_MODE = envs.VLLM_RWKV7_RKV_MODE
 CMIX_SPARSE = envs.VLLM_RWKV7_CMIX_SPARSE
 LOWRANK_WEIGHT = envs.VLLM_RWKV7_LOW_RANK_WEIGHT
-ORIG_LINEAR_GROUPS = {"att_c2c", "ffn_key", "head"}
+ORIG_LINEAR_GROUP_NAMES = frozenset({"att_c2c", "ffn_key", "head"})
 LOWRANK_SUFFIXES = (
     "att.w1",
     "att.w2",
@@ -56,6 +56,25 @@ CMIX_ROWS2_SPARSE = "rows2_sparse"
 CMIX_B1T1_NOFC = "b1t1_nofc"
 CMIX_ROWS2_NOFC = "rows2_nofc"
 CMIX_DENSE = "dense"
+
+
+def parse_orig_linear_groups(text: str) -> set[str]:
+    groups = {item.strip() for item in text.replace(",", " ").split()}
+    groups.discard("")
+    if groups == {"none"}:
+        return set()
+    invalid = groups - ORIG_LINEAR_GROUP_NAMES
+    if invalid or "none" in groups:
+        allowed = ", ".join(("none", *sorted(ORIG_LINEAR_GROUP_NAMES)))
+        invalid_text = ", ".join(sorted(invalid or {"none"}))
+        raise ValueError(
+            "VLLM_RWKV7_ORIG_LINEAR_GROUPS contains invalid group(s) "
+            f"{invalid_text!r}. Expected one of: {allowed}."
+        )
+    return groups
+
+
+ORIG_LINEAR_GROUPS = parse_orig_linear_groups(envs.VLLM_RWKV7_ORIG_LINEAR_GROUPS)
 
 
 def first_device() -> torch.device:

@@ -75,6 +75,7 @@ PROVENANCE_ENV_VARS = (
     "VLLM_RWKV7_RKV_MODE",
     "VLLM_RWKV7_CMIX_SPARSE",
     "VLLM_RWKV7_LOW_RANK_WEIGHT",
+    "VLLM_RWKV7_ORIG_LINEAR_GROUPS",
     "VLLM_USE_RAPID_SAMPLER",
     "VLLM_USE_V2_MODEL_RUNNER",
     "VLLM_ALLOW_INSECURE_SERIALIZATION",
@@ -168,6 +169,7 @@ class BenchmarkConfig:
     runner_enforce_eager: bool = False
     runner_disable_rapid_sampler: bool = False
     runner_cudagraph_capture_sizes: tuple[int, ...] | None = None
+    albatross_orig_linear_groups: str | None = None
 
     @property
     def albatross_impl_dir(self) -> Path | None:
@@ -210,8 +212,9 @@ def _source_metadata(config: BenchmarkConfig) -> dict[str, Any]:
     return {
         "albatross_repo": ALBATROSS_REPO,
         "albatross_commit": ALBATROSS_COMMIT,
-        "albatross_impl": ALBATROSS_IMPL,
+        "albatross_impl": config.albatross_impl,
         "albatross_path": str(impl_dir) if impl_dir is not None else None,
+        "albatross_orig_linear_groups": config.albatross_orig_linear_groups,
         "contracts": [
             {
                 "source_path": entry.source_path,
@@ -602,6 +605,13 @@ def generate_albatross_model_only_measurement(
         "--cases",
         f"{batch_size}x{seq_len}",
     ]
+    if config.albatross_orig_linear_groups:
+        command.extend(
+            [
+                "--orig-linear-groups",
+                config.albatross_orig_linear_groups,
+            ]
+        )
     result = subprocess.run(
         command,
         cwd=script.parent,
@@ -1901,15 +1911,20 @@ def _merge_worker_internal_runner_results(
     sample_durations_s = merged_durations["sample_durations_s"]
     decode_step_durations_s = merged_durations["decode_step_durations_s"]
     p50_s = _percentile(iteration_durations_s, 0.5)
+    execute_p50_s = _percentile(execute_durations_s, 0.5)
+    sample_p50_s = _percentile(sample_durations_s, 0.5)
+    decode_step_p50_s = _percentile(decode_step_durations_s, 0.5)
     return {
         "tokens_per_s": (batch_size * decode_tokens) / p50_s,
         "p10_ms": _percentile(iteration_durations_s, 0.1) * 1000.0,
         "p50_ms": p50_s * 1000.0,
         "p90_ms": _percentile(iteration_durations_s, 0.9) * 1000.0,
-        "execute_model_p50_ms": _percentile(execute_durations_s, 0.5) * 1000.0,
-        "sample_tokens_p50_ms": _percentile(sample_durations_s, 0.5) * 1000.0,
-        "decode_step_p50_ms": _percentile(decode_step_durations_s, 0.5)
-        * 1000.0,
+        "execute_model_p50_ms": execute_p50_s * 1000.0,
+        "execute_model_p50_tokens_per_s": batch_size / execute_p50_s,
+        "sample_tokens_p50_ms": sample_p50_s * 1000.0,
+        "sample_tokens_p50_tokens_per_s": batch_size / sample_p50_s,
+        "decode_step_p50_ms": decode_step_p50_s * 1000.0,
+        "decode_step_p50_tokens_per_s": batch_size / decode_step_p50_s,
         "postprocess_p50_ms": None,
         "postprocess_timing_available": False,
         "measurement_mode": VLLM_RUNNER_MODE,
@@ -2233,10 +2248,19 @@ def generate_vllm_runner_measurement(
                 "runner_execute_model_p50_ms": parsed.get(
                     "execute_model_p50_ms"
                 ),
+                "runner_execute_model_p50_tokens_per_s": parsed.get(
+                    "execute_model_p50_tokens_per_s"
+                ),
                 "runner_sample_tokens_p50_ms": parsed.get(
                     "sample_tokens_p50_ms"
                 ),
+                "runner_sample_tokens_p50_tokens_per_s": parsed.get(
+                    "sample_tokens_p50_tokens_per_s"
+                ),
                 "runner_decode_step_p50_ms": parsed.get("decode_step_p50_ms"),
+                "runner_decode_step_p50_tokens_per_s": parsed.get(
+                    "decode_step_p50_tokens_per_s"
+                ),
                 "runner_postprocess_p50_ms": parsed.get("postprocess_p50_ms"),
                 "runner_postprocess_timing_available": parsed.get(
                     "postprocess_timing_available",
@@ -2604,8 +2628,11 @@ def _evaluate_runner(
         "runner_internal_timing_target": None,
         "runner_timing_clock": None,
         "runner_execute_model_p50_ms": None,
+        "runner_execute_model_p50_tokens_per_s": None,
         "runner_sample_tokens_p50_ms": None,
+        "runner_sample_tokens_p50_tokens_per_s": None,
         "runner_decode_step_p50_ms": None,
+        "runner_decode_step_p50_tokens_per_s": None,
         "runner_postprocess_p50_ms": None,
         "runner_postprocess_timing_available": None,
     }
@@ -2651,11 +2678,20 @@ def _evaluate_runner(
             "runner_execute_model_p50_ms": raw_metrics.get(
                 "runner_execute_model_p50_ms"
             ),
+            "runner_execute_model_p50_tokens_per_s": raw_metrics.get(
+                "runner_execute_model_p50_tokens_per_s"
+            ),
             "runner_sample_tokens_p50_ms": raw_metrics.get(
                 "runner_sample_tokens_p50_ms"
             ),
+            "runner_sample_tokens_p50_tokens_per_s": raw_metrics.get(
+                "runner_sample_tokens_p50_tokens_per_s"
+            ),
             "runner_decode_step_p50_ms": raw_metrics.get(
                 "runner_decode_step_p50_ms"
+            ),
+            "runner_decode_step_p50_tokens_per_s": raw_metrics.get(
+                "runner_decode_step_p50_tokens_per_s"
             ),
             "runner_postprocess_p50_ms": raw_metrics.get(
                 "runner_postprocess_p50_ms"
@@ -2832,6 +2868,11 @@ def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
         runner_prefill_chunk_tokens=args.runner_prefill_chunk_tokens,
         runner_enforce_eager=args.runner_enforce_eager,
         runner_disable_rapid_sampler=args.runner_disable_rapid_sampler,
+        albatross_orig_linear_groups=(
+            args.albatross_orig_linear_groups
+            or os.environ.get("ALBATROSS_ORIG_LINEAR_GROUPS")
+            or None
+        ),
     )
 
 
@@ -2847,6 +2888,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=ALBATROSS_IMPL,
     )
     parser.add_argument("--albatross-checkpoint")
+    parser.add_argument("--albatross-orig-linear-groups")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--prompt-len", type=int, default=128)
     parser.add_argument("--warmup-tokens", type=int, default=16)

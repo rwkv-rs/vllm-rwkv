@@ -468,6 +468,32 @@ def test_rwkv7_config_rejects_invalid_albatross_knob(monkeypatch):
         RWKV7ForCausalLMConfig.verify_and_update_config(vllm_config)
 
 
+def test_rwkv7_config_rejects_invalid_orig_linear_group(monkeypatch):
+    import vllm.model_executor.models.config as model_config
+
+    monkeypatch.setattr(
+        model_config.envs, "VLLM_RWKV7_ORIG_LINEAR_GROUPS", "none,head"
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(enforce_eager=False),
+        compilation_config=CompilationConfig(),
+    )
+
+    with pytest.raises(ValueError, match="VLLM_RWKV7_ORIG_LINEAR_GROUPS"):
+        RWKV7ForCausalLMConfig.verify_and_update_config(vllm_config)
+
+
+def test_rwkv7_parse_orig_linear_groups():
+    assert rwkv7.parse_orig_linear_groups("none") == set()
+    assert rwkv7.parse_orig_linear_groups("att_c2c, ffn_key head") == {
+        "att_c2c",
+        "ffn_key",
+        "head",
+    }
+    with pytest.raises(ValueError, match="VLLM_RWKV7_ORIG_LINEAR_GROUPS"):
+        rwkv7.parse_orig_linear_groups("bad")
+
+
 def test_rwkv7_select_path_treats_batched_rkv_as_enabled(monkeypatch):
     monkeypatch.setattr(rwkv7, "RKV_MODE", "batched")
     monkeypatch.setattr(rwkv7, "ORIG_LINEAR_GROUPS", set())

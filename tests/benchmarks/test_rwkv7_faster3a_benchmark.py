@@ -255,6 +255,8 @@ def test_cli_writes_albatross_model_only_measurement_json(
             "3",
             "--albatross-iters",
             "7",
+            "--albatross-orig-linear-groups",
+            "att_c2c,head",
             "--measurement-output",
             str(output_path),
         ]
@@ -281,6 +283,7 @@ def test_cli_writes_albatross_model_only_measurement_json(
         "--warmup": "3",
         "--iters": "7",
         "--cases": "2x4",
+        "--orig-linear-groups": "att_c2c,head",
     }
     assert calls[0][1]["cwd"] == impl_dir
 
@@ -684,8 +687,11 @@ def test_cli_writes_vllm_runner_measurement_json(
             "measurement_mode": "worker_execute_model",
             "internal_timing_target": "worker.execute_model",
             "execute_model_p50_ms": 0.8,
+            "execute_model_p50_tokens_per_s": 3750.0,
             "sample_tokens_p50_ms": 0.2,
+            "sample_tokens_p50_tokens_per_s": 15000.0,
             "decode_step_p50_ms": 1.0,
+            "decode_step_p50_tokens_per_s": 3000.0,
             "postprocess_p50_ms": None,
             "postprocess_timing_available": False,
             "decode_steps": 7,
@@ -748,8 +754,11 @@ def test_cli_writes_vllm_runner_measurement_json(
     assert runner["runner_internal_timing_target"] == "worker.execute_model"
     assert runner["runner_timing_clock"] == "cuda_event"
     assert runner["runner_execute_model_p50_ms"] == 0.8
+    assert runner["runner_execute_model_p50_tokens_per_s"] == 3750.0
     assert runner["runner_sample_tokens_p50_ms"] == 0.2
+    assert runner["runner_sample_tokens_p50_tokens_per_s"] == 15000.0
     assert runner["runner_decode_step_p50_ms"] == 1.0
+    assert runner["runner_decode_step_p50_tokens_per_s"] == 3000.0
     assert runner["runner_postprocess_p50_ms"] is None
     assert runner["runner_postprocess_timing_available"] is False
     assert runner["runner_decode_steps"] == 7
@@ -1251,8 +1260,11 @@ def test_cli_merges_vllm_runner_measurement_with_model_only_json(
         "runner_internal_timing_target": "worker.execute_model",
         "runner_timing_clock": "cuda_event",
         "runner_execute_model_p50_ms": None,
+        "runner_execute_model_p50_tokens_per_s": None,
         "runner_sample_tokens_p50_ms": None,
+        "runner_sample_tokens_p50_tokens_per_s": None,
         "runner_decode_step_p50_ms": None,
+        "runner_decode_step_p50_tokens_per_s": None,
         "runner_postprocess_p50_ms": None,
         "runner_postprocess_timing_available": False,
     }
@@ -1288,8 +1300,11 @@ def test_runner_check_does_not_compare_worker_timing_to_logits_baseline() -> Non
         "runner_internal_timing_target": "worker.execute_model",
         "runner_timing_clock": None,
         "runner_execute_model_p50_ms": None,
+        "runner_execute_model_p50_tokens_per_s": None,
         "runner_sample_tokens_p50_ms": None,
+        "runner_sample_tokens_p50_tokens_per_s": None,
         "runner_decode_step_p50_ms": None,
+        "runner_decode_step_p50_tokens_per_s": None,
         "runner_postprocess_p50_ms": None,
         "runner_postprocess_timing_available": None,
     }
@@ -1986,8 +2001,13 @@ def test_internal_runner_merge_reports_component_timings() -> None:
 
     assert result["tokens_per_s"] == pytest.approx(333.3333333333333)
     assert result["execute_model_p50_ms"] == pytest.approx(3.0)
+    assert result["execute_model_p50_tokens_per_s"] == pytest.approx(
+        666.6666666666666
+    )
     assert result["sample_tokens_p50_ms"] == pytest.approx(1.0)
+    assert result["sample_tokens_p50_tokens_per_s"] == pytest.approx(2000.0)
     assert result["decode_step_p50_ms"] == pytest.approx(4.0)
+    assert result["decode_step_p50_tokens_per_s"] == pytest.approx(500.0)
     assert result["postprocess_p50_ms"] is None
     assert result["postprocess_timing_available"] is False
 

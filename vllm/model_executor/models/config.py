@@ -607,6 +607,27 @@ class MambaModelConfig(VerifyAndUpdateConfig):
 class RWKV7ForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        orig_linear_groups = {
+            item.strip()
+            for item in envs.VLLM_RWKV7_ORIG_LINEAR_GROUPS.replace(",", " ").split()
+        }
+        orig_linear_groups.discard("")
+        valid_orig_linear_groups = {"att_c2c", "ffn_key", "head"}
+        if orig_linear_groups != {"none"}:
+            invalid_orig_linear_groups = (
+                orig_linear_groups - valid_orig_linear_groups
+            )
+            if invalid_orig_linear_groups or "none" in orig_linear_groups:
+                allowed_values = ", ".join(
+                    ("none", *sorted(valid_orig_linear_groups))
+                )
+                invalid_values = ", ".join(
+                    sorted(invalid_orig_linear_groups or {"none"})
+                )
+                raise ValueError(
+                    "VLLM_RWKV7_ORIG_LINEAR_GROUPS contains invalid group(s) "
+                    f"{invalid_values!r}. Expected one of: {allowed_values}."
+                )
         rwkv_knobs = {
             "VLLM_RWKV7_WKV_MODE": (
                 envs.VLLM_RWKV7_WKV_MODE,
