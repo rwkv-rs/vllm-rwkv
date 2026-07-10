@@ -1622,20 +1622,35 @@ class RWKV7ForCausalLM(nn.Module):
                 slot_indices=slot_indices,
             )
             pre_mix = None
-            if (
-                slot_indices is None
-                and T == 1
-                and path.cmix_mode not in (CMIX_B1T1_SPARSE, CMIX_ROWS2_SPARSE)
+            if T == 1 and (
+                slot_indices is not None
+                or path.cmix_mode not in (CMIX_B1T1_SPARSE, CMIX_ROWS2_SPARSE)
             ):
-                x, mixed = torch.ops.rwkv7_v3a_ops.add_layer_norm_cmix_mix_f16(
-                    x.contiguous(),
-                    xx.contiguous(),
-                    state[0][local_layer][1],
-                    z[p + "ln2.weight"],
-                    z[p + "ln2.bias"],
-                    z[p + "ffn.x_k"],
-                )
-                xx = self.cmix_from_mixed(mixed, p + "ffn.", path)
+                if slot_indices is None:
+                    x, mixed = torch.ops.rwkv7_v3a_ops.add_layer_norm_cmix_mix_f16(
+                        x.contiguous(),
+                        xx.contiguous(),
+                        state[0][local_layer][1],
+                        z[p + "ln2.weight"],
+                        z[p + "ln2.bias"],
+                        z[p + "ffn.x_k"],
+                    )
+                    cmix_path = path
+                else:
+                    (
+                        x,
+                        mixed,
+                    ) = torch.ops.rwkv7_v3a_ops.add_layer_norm_cmix_mix_f16_slots(
+                        x.contiguous(),
+                        xx.contiguous(),
+                        state[0][local_layer][1],
+                        z[p + "ln2.weight"],
+                        z[p + "ln2.bias"],
+                        z[p + "ffn.x_k"],
+                        slot_indices,
+                    )
+                    cmix_path = slot_mixed_cmix_path(path)
+                xx = self.cmix_from_mixed(mixed, p + "ffn.", cmix_path)
             else:
                 x, xx = self.add_ln(x, xx, z[p + "ln2.weight"], z[p + "ln2.bias"])
                 xx = self.cmix(
@@ -1647,20 +1662,38 @@ class RWKV7ForCausalLM(nn.Module):
                 )
             if layer + 1 < end_layer:
                 p_next = f"blocks.{layer + 1}."
-                if LN1_TMIX_FUSE and slot_indices is None and B == 1 and T == 1:
-                    outs = torch.ops.rwkv7_v3a_ops.add_layer_norm_tmix_mix6_f16(
-                        x.contiguous(),
-                        xx.contiguous(),
-                        state[0][local_layer + 1][0],
-                        z[p_next + "ln1.weight"],
-                        z[p_next + "ln1.bias"],
-                        z[p_next + "att.x_r"],
-                        z[p_next + "att.x_w"],
-                        z[p_next + "att.x_k"],
-                        z[p_next + "att.x_v"],
-                        z[p_next + "att.x_a"],
-                        z[p_next + "att.x_g"],
-                    )
+                if LN1_TMIX_FUSE and T == 1:
+                    if slot_indices is None:
+                        outs = torch.ops.rwkv7_v3a_ops.add_layer_norm_tmix_mix6_f16(
+                            x.contiguous(),
+                            xx.contiguous(),
+                            state[0][local_layer + 1][0],
+                            z[p_next + "ln1.weight"],
+                            z[p_next + "ln1.bias"],
+                            z[p_next + "att.x_r"],
+                            z[p_next + "att.x_w"],
+                            z[p_next + "att.x_k"],
+                            z[p_next + "att.x_v"],
+                            z[p_next + "att.x_a"],
+                            z[p_next + "att.x_g"],
+                        )
+                    else:
+                        outs = (
+                            torch.ops.rwkv7_v3a_ops.add_layer_norm_tmix_mix6_f16_slots(
+                                x.contiguous(),
+                                xx.contiguous(),
+                                state[0][local_layer + 1][0],
+                                z[p_next + "ln1.weight"],
+                                z[p_next + "ln1.bias"],
+                                z[p_next + "att.x_r"],
+                                z[p_next + "att.x_w"],
+                                z[p_next + "att.x_k"],
+                                z[p_next + "att.x_v"],
+                                z[p_next + "att.x_a"],
+                                z[p_next + "att.x_g"],
+                                slot_indices,
+                            )
+                        )
                     x, pre_mix = outs[0], outs[1:]
                     xx = x
                 else:
@@ -2118,8 +2151,6 @@ class RWKV7ForCausalLM(nn.Module):
         ops = torch.ops.rwkv7_fast_ops_fp16
         B, T, _ = x.shape
         if pre_mix is not None:
-            if slot_indices is not None:
-                raise RuntimeError("slot-indexed decode cannot consume pre_mix")
             xr, xw, xk, xv, xa, xg = pre_mix
         elif slot_indices is not None:
             xr, xw, xk, xv, xa, xg = ops.tmix_mix6_slot(

@@ -297,6 +297,20 @@ def _rwkv7_add_layer_norm_cmix_mix_f16_fake(
     return [_rwkv7_empty_like(x), _rwkv7_empty_like(x)]
 
 
+@_register_fake_if_exists("rwkv7_v3a_ops::add_layer_norm_cmix_mix_f16_slots")
+def _rwkv7_add_layer_norm_cmix_mix_f16_slots_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    shift_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    x_k: torch.Tensor,
+    slot_indices: torch.Tensor,
+    eps: float = 1e-5,
+) -> list[torch.Tensor]:
+    return [_rwkv7_empty_like(x), _rwkv7_empty_like(x)]
+
+
 @_register_fake_if_exists("rwkv7_v3a_ops::add_layer_norm_cmix_mix_f16_cfg")
 def _rwkv7_add_layer_norm_cmix_mix_f16_cfg_fake(
     x: torch.Tensor,
@@ -325,6 +339,25 @@ def _rwkv7_add_layer_norm_tmix_mix6_f16_fake(
     x_v: torch.Tensor,
     x_a: torch.Tensor,
     x_g: torch.Tensor,
+    eps: float = 1e-5,
+) -> list[torch.Tensor]:
+    return [_rwkv7_empty_like(x) for _ in range(7)]
+
+
+@_register_fake_if_exists("rwkv7_v3a_ops::add_layer_norm_tmix_mix6_f16_slots")
+def _rwkv7_add_layer_norm_tmix_mix6_f16_slots_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    shift_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    x_r: torch.Tensor,
+    x_w: torch.Tensor,
+    x_k: torch.Tensor,
+    x_v: torch.Tensor,
+    x_a: torch.Tensor,
+    x_g: torch.Tensor,
+    slot_indices: torch.Tensor,
     eps: float = 1e-5,
 ) -> list[torch.Tensor]:
     return [_rwkv7_empty_like(x) for _ in range(7)]

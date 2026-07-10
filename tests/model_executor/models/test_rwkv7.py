@@ -168,6 +168,204 @@ def test_rwkv7_forward_tokens_keeps_slot_selected_cmix_path(monkeypatch):
     assert seen[0][0] != rwkv7.CMIX_DENSE
 
 
+def test_rwkv7_forward_layer_range_uses_slot_fused_cmix(monkeypatch):
+    monkeypatch.setattr(rwkv7, "C", 4)
+    calls: list[Any] = []
+
+    def fused_cmix(x, residual, shift_state, weight, bias, x_k, slot_indices):
+        calls.append(("fused_cmix", shift_state.shape, slot_indices.tolist()))
+        return x + residual, torch.ones_like(x)
+
+    def advance_slots(elapsed, slot_indices, amount):
+        calls.append(("advance", slot_indices.tolist(), amount))
+
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "add_layer_norm_cmix_mix_f16_slots",
+        fused_cmix,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "advance_i32_slots",
+        advance_slots,
+        raising=False,
+    )
+
+    model = _new_rwkv7_forward_test_model()
+    model.start_layer = 0
+    model.end_layer = 1
+    model.z = {
+        "blocks.0.ln1.weight": torch.empty(4),
+        "blocks.0.ln1.bias": torch.empty(4),
+        "blocks.0.ln2.weight": torch.empty(4),
+        "blocks.0.ln2.bias": torch.empty(4),
+        "blocks.0.ffn.x_k": torch.empty(4),
+    }
+    model.ln = lambda x, weight, bias: x
+    model.add = lambda x, y: x + y
+
+    def tmix(layer, x, shift_state, wkv_state, elapsed_t, v_first, *args, **kwargs):
+        return x, v_first
+
+    def cmix_from_mixed(mixed, p, path):
+        calls.append(("cmix_path", path.cmix_mode))
+        return mixed
+
+    model.tmix = tmix
+    model.cmix_from_mixed = cmix_from_mixed
+    slot_indices = torch.tensor([3, 1], dtype=torch.int32)
+    state = [
+        torch.zeros((1, 2, 6, 4)),
+        torch.empty((1,)),
+        torch.zeros((6,), dtype=torch.int32),
+    ]
+
+    RWKV7ForCausalLM.forward_layer_range(
+        model,
+        torch.zeros((2, 1, 4)),
+        state,
+        rwkv7.PathConfig(2, False, rwkv7.CMIX_ROWS2_SPARSE),
+        v_first=None,
+        final=False,
+        all_logits=False,
+        slot_indices=slot_indices,
+    )
+
+    assert calls == [
+        ("fused_cmix", torch.Size([6, 4]), [3, 1]),
+        ("cmix_path", rwkv7.CMIX_ROWS2_NOFC),
+        ("advance", [3, 1], 1),
+    ]
+
+
+def test_rwkv7_forward_layer_range_uses_slot_fused_tmix_for_batched_decode(
+    monkeypatch,
+):
+    monkeypatch.setattr(rwkv7, "C", 4)
+    calls: list[Any] = []
+
+    def fused_cmix(x, residual, shift_state, weight, bias, x_k, slot_indices):
+        calls.append(("fused_cmix", slot_indices.tolist()))
+        return x + residual, torch.ones_like(x)
+
+    def fused_tmix(
+        x,
+        residual,
+        shift_state,
+        weight,
+        bias,
+        x_r,
+        x_w,
+        x_k,
+        x_v,
+        x_a,
+        x_g,
+        slot_indices,
+    ):
+        calls.append(("fused_tmix", x.shape[0], slot_indices.tolist()))
+        mixed = tuple(torch.full_like(x, fill_value=float(i)) for i in range(6))
+        return (x + residual, *mixed)
+
+    def advance_slots(elapsed, slot_indices, amount):
+        calls.append(("advance", slot_indices.tolist(), amount))
+
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "add_layer_norm_cmix_mix_f16_slots",
+        fused_cmix,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "add_layer_norm_tmix_mix6_f16_slots",
+        fused_tmix,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "advance_i32_slots",
+        advance_slots,
+        raising=False,
+    )
+
+    model = _new_rwkv7_forward_test_model()
+    model.start_layer = 0
+    model.end_layer = 2
+    model.z = {}
+    for layer in range(2):
+        model.z.update(
+            {
+                f"blocks.{layer}.ln1.weight": torch.empty(4),
+                f"blocks.{layer}.ln1.bias": torch.empty(4),
+                f"blocks.{layer}.ln2.weight": torch.empty(4),
+                f"blocks.{layer}.ln2.bias": torch.empty(4),
+                f"blocks.{layer}.ffn.x_k": torch.empty(4),
+                f"blocks.{layer}.att.x_r": torch.empty(4),
+                f"blocks.{layer}.att.x_w": torch.empty(4),
+                f"blocks.{layer}.att.x_k": torch.empty(4),
+                f"blocks.{layer}.att.x_v": torch.empty(4),
+                f"blocks.{layer}.att.x_a": torch.empty(4),
+                f"blocks.{layer}.att.x_g": torch.empty(4),
+            }
+        )
+    model.ln = lambda x, weight, bias: x
+    model.add = lambda x, y: x + y
+
+    def add_ln(x, residual, weight, bias):
+        calls.append(("split_add_ln", x.shape[0]))
+        return x + residual, x + residual
+
+    def tmix(
+        layer,
+        x,
+        shift_state,
+        wkv_state,
+        elapsed_t,
+        v_first,
+        p,
+        path,
+        pre_mix=None,
+        *,
+        slot_indices=None,
+    ):
+        calls.append(("tmix", layer, pre_mix is not None, slot_indices.tolist()))
+        return x, v_first
+
+    def cmix_from_mixed(mixed, p, path):
+        return mixed
+
+    model.add_ln = add_ln
+    model.tmix = tmix
+    model.cmix_from_mixed = cmix_from_mixed
+    slot_indices = torch.tensor([3, 1], dtype=torch.int32)
+    state = [
+        torch.zeros((2, 2, 6, 4)),
+        torch.empty((2,)),
+        torch.zeros((6,), dtype=torch.int32),
+    ]
+
+    RWKV7ForCausalLM.forward_layer_range(
+        model,
+        torch.zeros((2, 1, 4)),
+        state,
+        rwkv7.PathConfig(2, False, rwkv7.CMIX_ROWS2_SPARSE),
+        v_first=None,
+        final=False,
+        all_logits=False,
+        slot_indices=slot_indices,
+    )
+
+    assert calls == [
+        ("tmix", 0, False, [3, 1]),
+        ("fused_cmix", [3, 1]),
+        ("fused_tmix", 2, [3, 1]),
+        ("tmix", 1, True, [3, 1]),
+        ("fused_cmix", [3, 1]),
+        ("advance", [3, 1], 1),
+    ]
+
+
 def _zero_state_movement_stats(**overrides: int) -> dict[str, int]:
     stats = {
         "resident_to_decode_copies": 0,

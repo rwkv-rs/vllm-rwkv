@@ -289,6 +289,19 @@ V3A_RETURNING_CASES = [
         _same(0, 2),
     ),
     OpCase(
+        "rwkv7_v3a_ops::add_layer_norm_cmix_mix_f16_slots",
+        lambda d: (
+            _h(d, (2, 1, 8)),
+            _h(d, (2, 1, 8)),
+            _h(d, (4, 8)),
+            _h(d, (8,)),
+            _h(d, (8,)),
+            _h(d, (8,)),
+            _i32(d, (2,)),
+        ),
+        _same(0, 2),
+    ),
+    OpCase(
         "rwkv7_v3a_ops::add_layer_norm_tmix_mix6_f16",
         lambda d: (
             _h(d, (2, 1, 8)),
@@ -297,6 +310,19 @@ V3A_RETURNING_CASES = [
             _h(d, (8,)),
             _h(d, (8,)),
             *[_h(d, (8,)) for _ in range(6)],
+        ),
+        _same(0, 7),
+    ),
+    OpCase(
+        "rwkv7_v3a_ops::add_layer_norm_tmix_mix6_f16_slots",
+        lambda d: (
+            _h(d, (2, 1, 8)),
+            _h(d, (2, 1, 8)),
+            _h(d, (4, 8)),
+            _h(d, (8,)),
+            _h(d, (8,)),
+            *[_h(d, (8,)) for _ in range(6)],
+            _i32(d, (2,)),
         ),
         _same(0, 7),
     ),
@@ -838,6 +864,76 @@ def test_rwkv7_advance_i32_varlen_updates_only_mapped_slots() -> None:
 )
 def test_rwkv7_wkv_slot_schema_opcheck(op_name, args) -> None:
     torch.library.opcheck(_op(op_name), args(), test_utils=("test_schema",))
+
+
+@pytest.mark.parametrize("hidden", [64, 4096])
+def test_rwkv7_add_layer_norm_cmix_mix_slot_matches_scattered_reference(
+    hidden: int,
+) -> None:
+    torch.manual_seed(6)
+    device = "cuda"
+    batch, slots = 3, 6
+    eps = 1e-5
+    slot_indices = torch.tensor([4, 1, 5], device=device, dtype=torch.int32)
+    x = torch.randn((batch, 1, hidden), device=device, dtype=torch.float16)
+    residual = torch.randn_like(x)
+    shift_state = torch.randn((slots, hidden), device=device, dtype=torch.float16)
+    weight = torch.randn((hidden,), device=device, dtype=torch.float16)
+    bias = torch.randn((hidden,), device=device, dtype=torch.float16)
+    x_k = torch.randn((hidden,), device=device, dtype=torch.float16)
+    initial_shift_state = shift_state.clone()
+    compact_shift_state = initial_shift_state[slot_indices.long()].clone()
+
+    ref_x_out, ref_mixed = torch.ops.rwkv7_v3a_ops.add_layer_norm_cmix_mix_f16(
+        x, residual, compact_shift_state, weight, bias, x_k, eps
+    )
+
+    x_out, mixed = torch.ops.rwkv7_v3a_ops.add_layer_norm_cmix_mix_f16_slots(
+        x, residual, shift_state, weight, bias, x_k, slot_indices, eps
+    )
+
+    expected_shift_state = initial_shift_state.clone()
+    expected_shift_state[slot_indices.long()] = compact_shift_state
+
+    torch.testing.assert_close(x_out, ref_x_out, atol=0, rtol=0)
+    torch.testing.assert_close(mixed, ref_mixed, atol=0, rtol=0)
+    torch.testing.assert_close(shift_state, expected_shift_state, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("hidden", [64, 4096])
+def test_rwkv7_add_layer_norm_tmix_mix6_slot_matches_scattered_reference(
+    hidden: int,
+) -> None:
+    torch.manual_seed(7)
+    device = "cuda"
+    batch, slots = 3, 6
+    eps = 1e-5
+    slot_indices = torch.tensor([4, 1, 5], device=device, dtype=torch.int32)
+    x = torch.randn((batch, 1, hidden), device=device, dtype=torch.float16)
+    residual = torch.randn_like(x)
+    shift_state = torch.randn((slots, hidden), device=device, dtype=torch.float16)
+    weight = torch.randn((hidden,), device=device, dtype=torch.float16)
+    bias = torch.randn((hidden,), device=device, dtype=torch.float16)
+    mix_weights = [
+        torch.randn((hidden,), device=device, dtype=torch.float16) for _ in range(6)
+    ]
+    initial_shift_state = shift_state.clone()
+    compact_shift_state = initial_shift_state[slot_indices.long()].clone()
+
+    ref_outputs = torch.ops.rwkv7_v3a_ops.add_layer_norm_tmix_mix6_f16(
+        x, residual, compact_shift_state, weight, bias, *mix_weights, eps
+    )
+
+    outputs = torch.ops.rwkv7_v3a_ops.add_layer_norm_tmix_mix6_f16_slots(
+        x, residual, shift_state, weight, bias, *mix_weights, slot_indices, eps
+    )
+
+    expected_shift_state = initial_shift_state.clone()
+    expected_shift_state[slot_indices.long()] = compact_shift_state
+
+    for output, ref_output in zip(outputs, ref_outputs, strict=True):
+        torch.testing.assert_close(output, ref_output, atol=0, rtol=0)
+    torch.testing.assert_close(shift_state, expected_shift_state, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("use_cfg", [False, True])
