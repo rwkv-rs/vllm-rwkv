@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import os
 import subprocess
 import sys
 from contextlib import nullcontext
@@ -293,6 +294,16 @@ def test_cli_writes_albatross_model_only_measurement_json(
             "3",
             "--albatross-iters",
             "7",
+            "--albatross-wkv",
+            "fp16",
+            "--albatross-emb",
+            "cpu",
+            "--albatross-batched-rkv",
+            "off",
+            "--albatross-cmix-sparse",
+            "no-fc",
+            "--albatross-lowrank-weight",
+            "both",
             "--albatross-orig-linear-groups",
             "att_c2c,head",
             "--measurement-output",
@@ -311,6 +322,12 @@ def test_cli_writes_albatross_model_only_measurement_json(
     assert model_only["albatross_p50_ms"] == 2.5
     assert model_only["albatross_label"] == "rwkv7_fast_v3a"
     assert measurement["config"]["measurement_source"] == "albatross_subprocess"
+    assert measurement["config"]["albatross_wkv"] == "fp16"
+    assert measurement["config"]["albatross_emb"] == "cpu"
+    assert measurement["config"]["albatross_batched_rkv"] == "off"
+    assert measurement["config"]["albatross_cmix_sparse"] == "no-fc"
+    assert measurement["config"]["albatross_lowrank_weight"] == "both"
+    assert measurement["config"]["albatross_orig_linear_groups"] == "att_c2c,head"
     cmd = calls[0][0][0]
     assert cmd[:2] == [
         sys.executable,
@@ -318,6 +335,11 @@ def test_cli_writes_albatross_model_only_measurement_json(
     ]
     assert _command_options(cmd) == {
         "--model": str(checkpoint_path),
+        "--wkv": "fp16",
+        "--emb": "cpu",
+        "--batched-rkv": "off",
+        "--cmix-sparse": "no-fc",
+        "--lowrank-weight": "both",
         "--warmup": "3",
         "--iters": "7",
         "--cases": "2x4",
@@ -1229,12 +1251,14 @@ def test_create_vllm_runner_llm_passes_configured_cudagraph_sizes(
     class FakeLLM:
         def __init__(self, **kwargs: Any) -> None:
             captured.update(kwargs)
+            captured["model_env_during_init"] = os.environ.get("VLLM_RWKV7_MODEL")
 
     fake_vllm = ModuleType("vllm")
     fake_vllm.__path__ = []
     fake_vllm.LLM = FakeLLM
     monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
     monkeypatch.setitem(sys.modules, "vllm.rwkv7_ops", ModuleType("vllm.rwkv7_ops"))
+    monkeypatch.setenv("VLLM_RWKV7_MODEL", str(model_path))
 
     config = replace(
         _config(tmp_path, model=str(model_path)),
@@ -1252,6 +1276,8 @@ def test_create_vllm_runner_llm_passes_configured_cudagraph_sizes(
     assert captured["compilation_config"] == {
         "cudagraph_capture_sizes": [1024],
     }
+    assert captured["model_env_during_init"] is None
+    assert os.environ["VLLM_RWKV7_MODEL"] == str(model_path)
 
 
 def test_create_vllm_runner_llm_does_not_graph_capture_eager_path(

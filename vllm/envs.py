@@ -127,6 +127,7 @@ if TYPE_CHECKING:
     VLLM_RWKV7_CMIX_SPARSE: str = "no-fc"
     VLLM_RWKV7_LOW_RANK_WEIGHT: str = "both"
     VLLM_RWKV7_ORIG_LINEAR_GROUPS: str = "att_c2c,ffn_key,head"
+    VLLM_RWKV7_SLOT_MAPPED_STATE: bool = True
     VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP: bool = True
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
@@ -1169,6 +1170,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_RWKV7_ORIG_LINEAR_GROUPS": lambda: os.getenv(
         "VLLM_RWKV7_ORIG_LINEAR_GROUPS", "att_c2c,ffn_key,head"
+    ),
+    "VLLM_RWKV7_SLOT_MAPPED_STATE": lambda: bool(
+        int(os.getenv("VLLM_RWKV7_SLOT_MAPPED_STATE", "1"))
     ),
     "VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP": lambda: bool(
         int(os.getenv("VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP", "1"))

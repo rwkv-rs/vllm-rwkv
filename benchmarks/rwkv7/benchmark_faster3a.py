@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -94,6 +95,15 @@ PROVENANCE_ENV_DEFAULTS = {
     "VLLM_ALLOW_INSECURE_SERIALIZATION": "1",
     "VLLM_RWKV7_SLOT_MAPPED_STATE": "1",
     "VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP": "1",
+}
+BENCHMARK_ONLY_VLLM_ENV_VARS = ("VLLM_RWKV7_MODEL",)
+ALBATROSS_DEFAULTS = {
+    "wkv": "fp16",
+    "emb": "cpu",
+    "batched_rkv": "off",
+    "cmix_sparse": "no-fc",
+    "lowrank_weight": "both",
+    "orig_linear_groups": "att_c2c,ffn_key,head",
 }
 ACCEPTANCE_THRESHOLDS = {
     "model_only_steady_decode": {
@@ -182,7 +192,12 @@ class BenchmarkConfig:
     runner_enforce_eager: bool = False
     runner_disable_rapid_sampler: bool = False
     runner_cudagraph_capture_sizes: tuple[int, ...] | None = None
-    albatross_orig_linear_groups: str | None = None
+    albatross_wkv: str = ALBATROSS_DEFAULTS["wkv"]
+    albatross_emb: str = ALBATROSS_DEFAULTS["emb"]
+    albatross_batched_rkv: str = ALBATROSS_DEFAULTS["batched_rkv"]
+    albatross_cmix_sparse: str = ALBATROSS_DEFAULTS["cmix_sparse"]
+    albatross_lowrank_weight: str = ALBATROSS_DEFAULTS["lowrank_weight"]
+    albatross_orig_linear_groups: str = ALBATROSS_DEFAULTS["orig_linear_groups"]
 
     @property
     def albatross_impl_dir(self) -> Path | None:
@@ -227,6 +242,11 @@ def _source_metadata(config: BenchmarkConfig) -> dict[str, Any]:
         "albatross_commit": ALBATROSS_COMMIT,
         "albatross_impl": config.albatross_impl,
         "albatross_path": str(impl_dir) if impl_dir is not None else None,
+        "albatross_wkv": config.albatross_wkv,
+        "albatross_emb": config.albatross_emb,
+        "albatross_batched_rkv": config.albatross_batched_rkv,
+        "albatross_cmix_sparse": config.albatross_cmix_sparse,
+        "albatross_lowrank_weight": config.albatross_lowrank_weight,
         "albatross_orig_linear_groups": config.albatross_orig_linear_groups,
         "contracts": [
             {
@@ -290,6 +310,19 @@ def _rwkv_environment_metadata() -> dict[str, str | None]:
         name: raw[name] if raw[name] is not None else PROVENANCE_ENV_DEFAULTS.get(name)
         for name in PROVENANCE_ENV_VARS
     }
+
+
+@contextmanager
+def _without_benchmark_only_vllm_env_vars():
+    saved = {
+        name: os.environ.pop(name)
+        for name in BENCHMARK_ONLY_VLLM_ENV_VARS
+        if name in os.environ
+    }
+    try:
+        yield
+    finally:
+        os.environ.update(saved)
 
 
 def _benchmark_provenance(config: BenchmarkConfig) -> dict[str, Any]:
@@ -622,6 +655,16 @@ def generate_albatross_model_only_measurement(
         str(script),
         "--model",
         str(checkpoint),
+        "--wkv",
+        config.albatross_wkv,
+        "--emb",
+        config.albatross_emb,
+        "--batched-rkv",
+        config.albatross_batched_rkv,
+        "--cmix-sparse",
+        config.albatross_cmix_sparse,
+        "--lowrank-weight",
+        config.albatross_lowrank_weight,
         "--warmup",
         str(warmup),
         "--iters",
@@ -629,13 +672,12 @@ def generate_albatross_model_only_measurement(
         "--cases",
         f"{batch_size}x{seq_len}",
     ]
-    if config.albatross_orig_linear_groups:
-        command.extend(
-            [
-                "--orig-linear-groups",
-                config.albatross_orig_linear_groups,
-            ]
-        )
+    command.extend(
+        [
+            "--orig-linear-groups",
+            config.albatross_orig_linear_groups,
+        ]
+    )
     result = subprocess.run(
         command,
         cwd=script.parent,
@@ -677,6 +719,12 @@ def generate_albatross_model_only_measurement(
             ),
             "albatross_impl": config.albatross_impl,
             "albatross_checkpoint": str(checkpoint),
+            "albatross_wkv": config.albatross_wkv,
+            "albatross_emb": config.albatross_emb,
+            "albatross_batched_rkv": config.albatross_batched_rkv,
+            "albatross_cmix_sparse": config.albatross_cmix_sparse,
+            "albatross_lowrank_weight": config.albatross_lowrank_weight,
+            "albatross_orig_linear_groups": config.albatross_orig_linear_groups,
             "albatross_command": command,
             "measurement_source": "albatross_subprocess",
         },
@@ -1077,20 +1125,21 @@ def _create_vllm_runner_llm(config: BenchmarkConfig) -> Any:
         llm_kwargs["compilation_config"] = {
             "cudagraph_capture_sizes": capture_sizes,
         }
-    return LLM(
-        model=_required_vllm_runner_model(config),
-        skip_tokenizer_init=True,
-        tensor_parallel_size=1,
-        pipeline_parallel_size=1,
-        max_model_len=max_model_len,
-        max_num_seqs=max_num_seqs,
-        max_num_batched_tokens=max_num_batched_tokens,
-        long_prefill_token_threshold=prefill_chunk_tokens,
-        enable_chunked_prefill=True,
-        enforce_eager=config.runner_enforce_eager,
-        disable_log_stats=True,
-        **llm_kwargs,
-    )
+    with _without_benchmark_only_vllm_env_vars():
+        return LLM(
+            model=_required_vllm_runner_model(config),
+            skip_tokenizer_init=True,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            max_model_len=max_model_len,
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=max_num_batched_tokens,
+            long_prefill_token_threshold=prefill_chunk_tokens,
+            enable_chunked_prefill=True,
+            enforce_eager=config.runner_enforce_eager,
+            disable_log_stats=True,
+            **llm_kwargs,
+        )
 
 
 def _synchronize_cuda_if_available() -> None:
@@ -2892,10 +2941,25 @@ def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
         runner_prefill_chunk_tokens=args.runner_prefill_chunk_tokens,
         runner_enforce_eager=args.runner_enforce_eager,
         runner_disable_rapid_sampler=args.runner_disable_rapid_sampler,
+        albatross_wkv=args.albatross_wkv
+        or os.environ.get("ALBATROSS_WKV")
+        or ALBATROSS_DEFAULTS["wkv"],
+        albatross_emb=args.albatross_emb
+        or os.environ.get("ALBATROSS_EMB")
+        or ALBATROSS_DEFAULTS["emb"],
+        albatross_batched_rkv=args.albatross_batched_rkv
+        or os.environ.get("ALBATROSS_BATCHED_RKV")
+        or ALBATROSS_DEFAULTS["batched_rkv"],
+        albatross_cmix_sparse=args.albatross_cmix_sparse
+        or os.environ.get("ALBATROSS_CMIX_SPARSE")
+        or ALBATROSS_DEFAULTS["cmix_sparse"],
+        albatross_lowrank_weight=args.albatross_lowrank_weight
+        or os.environ.get("ALBATROSS_LOWRANK_WEIGHT")
+        or ALBATROSS_DEFAULTS["lowrank_weight"],
         albatross_orig_linear_groups=(
             args.albatross_orig_linear_groups
             or os.environ.get("ALBATROSS_ORIG_LINEAR_GROUPS")
-            or None
+            or ALBATROSS_DEFAULTS["orig_linear_groups"]
         ),
     )
 
@@ -2912,6 +2976,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=ALBATROSS_IMPL,
     )
     parser.add_argument("--albatross-checkpoint")
+    parser.add_argument("--albatross-wkv", choices=("fp16", "fp32io16"))
+    parser.add_argument("--albatross-emb", choices=("gpu", "cpu"))
+    parser.add_argument("--albatross-batched-rkv", choices=("auto", "on", "off"))
+    parser.add_argument("--albatross-cmix-sparse", choices=("auto", "no-fc", "off"))
+    parser.add_argument("--albatross-lowrank-weight", choices=("orig", "transpose", "both"))
     parser.add_argument("--albatross-orig-linear-groups")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--prompt-len", type=int, default=128)

@@ -40,6 +40,7 @@ def test_rwkv7_runtime_environment_variables_are_registered() -> None:
     rwkv7_env = {
         "VLLM_RWKV7_WKV_MODE": "fp32io16",
         "VLLM_RWKV7_EMB_DEVICE": "cuda",
+        "VLLM_RWKV7_SLOT_MAPPED_STATE": "0",
         "VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP": "0",
     }
 
@@ -48,6 +49,7 @@ def test_rwkv7_runtime_environment_variables_are_registered() -> None:
 
         assert envs.VLLM_RWKV7_WKV_MODE == "fp32io16"
         assert envs.VLLM_RWKV7_EMB_DEVICE == "cuda"
+        assert envs.VLLM_RWKV7_SLOT_MAPPED_STATE is False
         assert envs.VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP is False
 
 
