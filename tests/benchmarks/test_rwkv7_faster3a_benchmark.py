@@ -940,6 +940,172 @@ def test_cli_split_runner_defaults_to_albatross_pd_cases(
     ]
 
 
+def test_cli_split_runner_allows_prefill_only_measurement(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    model_path = tmp_path / "rwkv7-g1d-0.1b-20260129-ctx8192.pth"
+    model_path.write_bytes(b"")
+    output_path = tmp_path / "runner-pd-prefill-only.json"
+    calls: list[Any] = []
+
+    def fake_generate(
+        config,
+        *,
+        prefill_cases,
+        decode_cases,
+        prefill_chunk_tokens,
+        decode_prompt_len,
+        warmup,
+        iters,
+        include_sampling,
+    ):
+        calls.append(
+            (
+                prefill_cases,
+                decode_cases,
+                prefill_chunk_tokens,
+                decode_prompt_len,
+                warmup,
+                iters,
+                include_sampling,
+            )
+        )
+        return {
+            "schema_version": bench.SCHEMA_VERSION,
+            "benchmark": bench.BENCHMARK_NAME,
+            "runner_prefill": {},
+            "runner_decode": {},
+        }
+
+    monkeypatch.setattr(bench, "generate_vllm_runner_pd_measurement", fake_generate)
+
+    rc = bench.main(
+        [
+            "--repo-root",
+            str(repo_root),
+            "--model",
+            str(model_path),
+            "--measure-vllm-runner-pd",
+            "--runner-pd-prefill-cases",
+            "1x1024,32x32",
+            "--runner-pd-decode-cases",
+            "",
+            "--runner-warmup",
+            "5",
+            "--runner-iters",
+            "10",
+            "--measurement-output",
+            str(output_path),
+        ]
+    )
+
+    assert rc == 0
+    assert calls == [
+        (
+            [(1, 1024), (32, 32)],
+            [],
+            1024,
+            1,
+            5,
+            10,
+            False,
+        )
+    ]
+
+
+def test_cli_split_runner_allows_decode_only_measurement(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    model_path = tmp_path / "rwkv7-g1d-0.1b-20260129-ctx8192.pth"
+    model_path.write_bytes(b"")
+    output_path = tmp_path / "runner-pd-decode-only.json"
+    calls: list[Any] = []
+
+    def fake_generate(
+        config,
+        *,
+        prefill_cases,
+        decode_cases,
+        prefill_chunk_tokens,
+        decode_prompt_len,
+        warmup,
+        iters,
+        include_sampling,
+    ):
+        calls.append(
+            (
+                prefill_cases,
+                decode_cases,
+                prefill_chunk_tokens,
+                decode_prompt_len,
+                warmup,
+                iters,
+                include_sampling,
+            )
+        )
+        return {
+            "schema_version": bench.SCHEMA_VERSION,
+            "benchmark": bench.BENCHMARK_NAME,
+            "runner_prefill": {},
+            "runner_decode": {},
+        }
+
+    monkeypatch.setattr(bench, "generate_vllm_runner_pd_measurement", fake_generate)
+
+    rc = bench.main(
+        [
+            "--repo-root",
+            str(repo_root),
+            "--model",
+            str(model_path),
+            "--measure-vllm-runner-pd",
+            "--runner-pd-prefill-cases",
+            "",
+            "--runner-pd-decode-cases",
+            "1024x1",
+            "--runner-prefill-chunk-tokens",
+            "1",
+            "--runner-pd-decode-prompt-len",
+            "1",
+            "--measurement-output",
+            str(output_path),
+        ]
+    )
+
+    assert rc == 0
+    assert calls == [([], [(1024, 1)], 1, 1, 1, 3, False)]
+
+
+def test_cli_split_runner_rejects_empty_prefill_and_decode_cases(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    model_path = tmp_path / "rwkv7-g1d-0.1b-20260129-ctx8192.pth"
+    model_path.write_bytes(b"")
+    output_path = tmp_path / "runner-pd-empty.json"
+
+    with pytest.raises(ValueError, match="at least one prefill or decode"):
+        bench.main(
+            [
+                "--repo-root",
+                str(repo_root),
+                "--model",
+                str(model_path),
+                "--measure-vllm-runner-pd",
+                "--runner-pd-prefill-cases",
+                "",
+                "--runner-pd-decode-cases",
+                "",
+                "--measurement-output",
+                str(output_path),
+            ]
+        )
+
+
 def test_cli_split_runner_single_uses_pd_prefill_chunk_tokens(
     tmp_path: Path,
     monkeypatch,

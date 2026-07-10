@@ -491,14 +491,16 @@ def _parse_albatross_case(case: str) -> tuple[int, int]:
     return _parse_bxt_case(case, "albatross case")
 
 
-def _parse_bxt_cases(cases: str, label: str) -> list[tuple[int, int]]:
+def _parse_bxt_cases(
+    cases: str, label: str, *, allow_empty: bool = False
+) -> list[tuple[int, int]]:
     parsed: list[tuple[int, int]] = []
     for item in cases.split(","):
         item = item.strip()
         if not item:
             continue
         parsed.append(_parse_bxt_case(item, label))
-    if not parsed:
+    if not parsed and not allow_empty:
         raise ValueError(f"{label} must include at least one BxT case")
     return parsed
 
@@ -3173,19 +3175,31 @@ def main(argv: list[str] | None = None) -> int:
         prefill_cases = _parse_bxt_cases(
             args.runner_pd_prefill_cases,
             "runner prefill cases",
+            allow_empty=True,
         )
+        decode_cases = _parse_bxt_cases(
+            args.runner_pd_decode_cases,
+            "runner decode cases",
+            allow_empty=True,
+        )
+        if not prefill_cases and not decode_cases:
+            raise ValueError(
+                "runner prefill/decode measurement must include at least one "
+                "prefill or decode BxT case"
+            )
         pd_prefill_chunk_tokens = (
             args.runner_pd_prefill_chunk_tokens
             if args.runner_pd_prefill_chunk_tokens is not None
-            else max(seq_len for _batch_size, seq_len in prefill_cases)
+            else (
+                max(seq_len for _batch_size, seq_len in prefill_cases)
+                if prefill_cases
+                else args.runner_prefill_chunk_tokens
+            )
         )
         measurement = generate_vllm_runner_pd_measurement(
             config,
             prefill_cases=prefill_cases,
-            decode_cases=_parse_bxt_cases(
-                args.runner_pd_decode_cases,
-                "runner decode cases",
-            ),
+            decode_cases=decode_cases,
             prefill_chunk_tokens=pd_prefill_chunk_tokens,
             decode_prompt_len=args.runner_pd_decode_prompt_len,
             warmup=args.runner_warmup,
