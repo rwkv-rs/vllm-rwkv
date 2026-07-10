@@ -126,6 +126,48 @@ def _new_default_loader_for_weight_tests(
     )
 
 
+def test_rwkv7_slot_mixed_cmix_path_keeps_nofc_or_downgrades_sparse():
+    b1_sparse = rwkv7.PathConfig(1, False, rwkv7.CMIX_B1T1_SPARSE)
+    rows_sparse = rwkv7.PathConfig(2, False, rwkv7.CMIX_ROWS2_SPARSE)
+    b1_nofc = rwkv7.PathConfig(1, False, rwkv7.CMIX_B1T1_NOFC)
+    rows_nofc = rwkv7.PathConfig(8, False, rwkv7.CMIX_ROWS2_NOFC)
+    dense = rwkv7.PathConfig(320, False, rwkv7.CMIX_DENSE)
+
+    assert rwkv7.slot_mixed_cmix_path(b1_sparse).cmix_mode == rwkv7.CMIX_B1T1_NOFC
+    assert rwkv7.slot_mixed_cmix_path(rows_sparse).cmix_mode == rwkv7.CMIX_ROWS2_NOFC
+    assert rwkv7.slot_mixed_cmix_path(b1_nofc) is b1_nofc
+    assert rwkv7.slot_mixed_cmix_path(rows_nofc) is rows_nofc
+    assert rwkv7.slot_mixed_cmix_path(dense) is dense
+
+
+def test_rwkv7_forward_tokens_keeps_slot_selected_cmix_path(monkeypatch):
+    monkeypatch.setattr(rwkv7, "C", 4)
+    seen = []
+
+    def embed(tokens):
+        return torch.zeros((*tokens.shape, 4), dtype=torch.float32)
+
+    def forward_from_x(x, state, path, *, slot_indices=None):
+        seen.append((path.cmix_mode, path.rows, slot_indices.tolist()))
+        return x.squeeze(1)
+
+    model = _new_rwkv7_forward_test_model(
+        embed=embed,
+        forward_from_x=forward_from_x,
+    )
+
+    out = RWKV7ForCausalLM.forward_tokens(
+        model,
+        torch.tensor([7], dtype=torch.long),
+        [torch.empty(0)],
+        slot_indices=torch.tensor([3], dtype=torch.int32),
+    )
+
+    assert out.shape == (1, 4)
+    assert seen == [(rwkv7.select_path(1, 1).cmix_mode, 1, [3])]
+    assert seen[0][0] != rwkv7.CMIX_DENSE
+
+
 def _zero_state_movement_stats(**overrides: int) -> dict[str, int]:
     stats = {
         "resident_to_decode_copies": 0,

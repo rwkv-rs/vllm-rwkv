@@ -119,6 +119,14 @@ def select_path(B: int, T: int) -> PathConfig:
     return PathConfig(rows=rows, use_batched_rkv=use_batched_rkv, cmix_mode=cmix_mode)
 
 
+def slot_mixed_cmix_path(path: PathConfig) -> PathConfig:
+    if path.cmix_mode == CMIX_B1T1_SPARSE:
+        return PathConfig(path.rows, path.use_batched_rkv, CMIX_B1T1_NOFC)
+    if path.cmix_mode == CMIX_ROWS2_SPARSE:
+        return PathConfig(path.rows, path.use_batched_rkv, CMIX_ROWS2_NOFC)
+    return path
+
+
 def use_orig_linear(group: str) -> bool:
     return group in ORIG_LINEAR_GROUPS
 
@@ -989,8 +997,6 @@ class RWKV7ForCausalLM(nn.Module):
                     decode_slot_indices = None
                     decode_position_tensor = None
                 path = select_path(decode_batch_size, 1)
-                if decode_slot_indices is not None:
-                    path = PathConfig(path.rows, path.use_batched_rkv, CMIX_DENSE)
                 forward_kwargs = {}
                 if decode_slot_indices is not None:
                     forward_kwargs["slot_indices"] = decode_slot_indices
@@ -1285,8 +1291,6 @@ class RWKV7ForCausalLM(nn.Module):
             tokens = tokens.unsqueeze(0)
         B, T = tokens.shape
         path = select_path(B, T)
-        if slot_indices is not None:
-            path = PathConfig(path.rows, path.use_batched_rkv, CMIX_DENSE)
         x = self.embed(tokens)
         return self.forward_from_x(x, state, path, slot_indices=slot_indices)
 
@@ -1576,8 +1580,6 @@ class RWKV7ForCausalLM(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         z = self.z
         B, T, _ = x.shape
-        if slot_indices is not None:
-            path = PathConfig(path.rows, path.use_batched_rkv, CMIX_DENSE)
         start_layer = getattr(self, "start_layer", 0)
         end_layer = getattr(self, "end_layer", L)
 
@@ -2432,8 +2434,7 @@ class RWKV7ForCausalLM(nn.Module):
             mixed = ops.cmix_mix_slot(
                 B, T, C, x.contiguous(), shift_state[1], slot_indices, z[p + "x_k"]
             )
-            dense_path = PathConfig(path.rows, path.use_batched_rkv, CMIX_DENSE)
-            return self.cmix_from_mixed(mixed, p, dense_path)
+            return self.cmix_from_mixed(mixed, p, slot_mixed_cmix_path(path))
 
         if path.cmix_mode == CMIX_B1T1_SPARSE:
             return self._tp_all_reduce(
