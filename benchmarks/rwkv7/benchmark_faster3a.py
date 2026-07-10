@@ -2400,6 +2400,7 @@ def generate_vllm_runner_pd_single_measurement(
         )
     else:
         raise ValueError(f"unsupported runner pd phase: {phase}")
+    metrics["state_movement"] = state_movement
     return {
         "schema_version": SCHEMA_VERSION,
         "benchmark": BENCHMARK_NAME,

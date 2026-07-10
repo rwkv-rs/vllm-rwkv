@@ -202,6 +202,14 @@ def _assert_same_storage_view(actual: torch.Tensor, expected: torch.Tensor) -> N
     assert actual.untyped_storage().data_ptr() == expected.untyped_storage().data_ptr()
 
 
+def _assert_no_varlen_prefill_inputs(inputs: dict[str, Any]) -> None:
+    assert "rwkv_prefill_query_start_loc" not in inputs
+    assert "rwkv_prefill_slot_indices" not in inputs
+    assert "rwkv_prefill_token_positions" not in inputs
+    assert "rwkv_prefill_req_id" not in inputs
+    assert "rwkv_prefill_max_t" not in inputs
+
+
 def test_rwkv7_rejects_torch_compile():
     with pytest.raises(ValueError, match="RWKV7 does not support torch.compile"):
         RWKV7ForCausalLM(
@@ -1590,12 +1598,8 @@ def test_rwkv7_model_state_keeps_decode_prefix_when_prefill_reuses_free_row():
     assert inputs["rwkv_decode_token_positions"].tolist() == [0]
     assert inputs["slot_indices"].tolist() == [1]
     assert inputs["rwkv_prefill_rows"] == [prefill_row]
-    assert inputs["rwkv_prefill_groups"] == []
-    assert inputs["rwkv_prefill_query_start_loc"].tolist() == [0, 3]
-    assert inputs["rwkv_prefill_slot_indices"].tolist() == [prefill_row]
-    assert inputs["rwkv_prefill_token_positions"].tolist() == [1, 2, 3]
-    assert inputs["rwkv_prefill_req_id"].tolist() == [0, 0, 0]
-    assert inputs["rwkv_prefill_max_t"] == 3
+    assert inputs["rwkv_prefill_groups"] == [(1, 2, 3, 1, 4, prefill_row)]
+    _assert_no_varlen_prefill_inputs(inputs)
     assert inputs["prefill_idx_mapping"].tolist() == [-1, -1]
     assert inputs["shift_state"].data_ptr() == state.shift_state.data_ptr()
     assert inputs["wkv_state"].data_ptr() == state.wkv_state.data_ptr()
@@ -1688,12 +1692,8 @@ def test_rwkv7_model_state_keeps_decode_and_resident_prefill_slots_separate():
     assert inputs["rwkv_decode_rows"] == [1]
     assert inputs["slot_indices"].tolist() == [1]
     assert inputs["rwkv_prefill_rows"] == [0]
-    assert inputs["rwkv_prefill_groups"] == []
-    assert inputs["rwkv_prefill_query_start_loc"].tolist() == [0, 3]
-    assert inputs["rwkv_prefill_slot_indices"].tolist() == [0]
-    assert inputs["rwkv_prefill_token_positions"].tolist() == [0, 1, 2]
-    assert inputs["rwkv_prefill_req_id"].tolist() == [0, 0, 0]
-    assert inputs["rwkv_prefill_max_t"] == 3
+    assert inputs["rwkv_prefill_groups"] == [(0, 1, 3, 0, 3, 0)]
+    _assert_no_varlen_prefill_inputs(inputs)
     assert torch.all(state.shift_state[:, :, 0] == 10)
     assert torch.all(state.shift_state[:, :, 1] == 20)
     assert torch.all(state.wkv_state[:, 0] == 10)
@@ -1907,12 +1907,8 @@ def test_rwkv7_model_state_keeps_prefill_transition_slots_before_forward():
     assert inputs["idx_mapping"].tolist() == [0, 2, 3]
     assert inputs["slot_indices"].tolist() == [0, 2]
     assert inputs["rwkv_prefill_rows"] == [3]
-    assert inputs["rwkv_prefill_groups"] == []
-    assert inputs["rwkv_prefill_query_start_loc"].tolist() == [0, 3]
-    assert inputs["rwkv_prefill_slot_indices"].tolist() == [3]
-    assert inputs["rwkv_prefill_token_positions"].tolist() == [2, 3, 4]
-    assert inputs["rwkv_prefill_req_id"].tolist() == [0, 0, 0]
-    assert inputs["rwkv_prefill_max_t"] == 3
+    assert inputs["rwkv_prefill_groups"] == [(2, 3, 3, 2, 5, 3)]
+    _assert_no_varlen_prefill_inputs(inputs)
     assert state.req_slot_to_row[:4] == [0, -1, 2, 3]
     assert state.row_to_req_slot[:4] == [0, -1, 2, 3]
     assert torch.all(state.shift_state[:, :, 0] == 10)
@@ -1927,9 +1923,8 @@ def test_rwkv7_model_state_reports_zero_prepare_compaction_after_transition():
     assert state.get_state_movement_stats() == _zero_state_movement_stats(
         prefill_batches=1,
         prefill_ranges=1,
-        prefill_varlen_batches=1,
-        prefill_varlen_tokens=3,
-        prefill_varlen_model_calls=1,
+        prefill_groups=1,
+        prefill_group_model_calls=1,
     )
 
 
@@ -1974,12 +1969,8 @@ def test_rwkv7_model_state_prefill_uses_resident_state():
     assert inputs["wkv_state"].data_ptr() == state.wkv_state.data_ptr()
     assert inputs["elapsed"].data_ptr() == state.elapsed.data_ptr()
     assert inputs["rwkv_prefill_rows"] == [0]
-    assert inputs["rwkv_prefill_groups"] == []
-    assert inputs["rwkv_prefill_query_start_loc"].tolist() == [0, 3]
-    assert inputs["rwkv_prefill_slot_indices"].tolist() == [0]
-    assert inputs["rwkv_prefill_token_positions"].tolist() == [0, 1, 2]
-    assert inputs["rwkv_prefill_req_id"].tolist() == [0, 0, 0]
-    assert inputs["rwkv_prefill_max_t"] == 3
+    assert inputs["rwkv_prefill_groups"] == [(0, 1, 3, 0, 3, 0)]
+    _assert_no_varlen_prefill_inputs(inputs)
     assert torch.all(state.shift_state == 7)
     assert torch.all(state.wkv_state == 8)
     assert torch.all(state.elapsed == 9)
@@ -2424,7 +2415,7 @@ def test_rwkv7_vllm_forward_groups_equal_length_prefill_requests(monkeypatch):
     assert elapsed.tolist() == [1, 1, 2, 2]
 
 
-def test_rwkv7_model_state_reports_equal_length_prefill_varlen_metadata():
+def test_rwkv7_model_state_reports_equal_length_prefill_group():
     state = _new_rwkv7_model_state(max_num_reqs=4)
     for req_slot in range(4):
         state.add_request(req_slot, _new_request(f"req-{req_slot}"))
@@ -2440,12 +2431,8 @@ def test_rwkv7_model_state_reports_equal_length_prefill_varlen_metadata():
 
     inputs = state.prepare_inputs(input_batch, req_states=None)
 
-    assert inputs["rwkv_prefill_groups"] == []
-    assert inputs["rwkv_prefill_query_start_loc"].tolist() == [0, 2, 4]
-    assert inputs["rwkv_prefill_slot_indices"].tolist() == [2, 3]
-    assert inputs["rwkv_prefill_token_positions"].tolist() == [2, 3, 4, 5]
-    assert inputs["rwkv_prefill_req_id"].tolist() == [0, 0, 1, 1]
-    assert inputs["rwkv_prefill_max_t"] == 2
+    assert inputs["rwkv_prefill_groups"] == [(2, 4, 2, 2, 6, 2)]
+    _assert_no_varlen_prefill_inputs(inputs)
 
 
 def test_rwkv7_model_state_rejects_grouped_prefill_fallback_on_fast_path():
@@ -2917,38 +2904,19 @@ def test_rwkv7_vllm_forward_uses_slot_mapped_mixed_decode_state_without_gather(
         assert model_state[2].tolist() == [12, 0, 22, 32]
         return tokens.to(torch.float32).expand(tokens.shape[0], 3)
 
-    def forward_varlen_hidden(
-        tokens,
-        model_state,
-        *,
-        query_start_loc,
-        slot_indices,
-        req_id,
-        max_t,
-    ):
-        calls.append(
-            (
-                "varlen",
-                tokens.tolist(),
-                query_start_loc.tolist(),
-                slot_indices.tolist(),
-                req_id.tolist(),
-                max_t,
-            )
-        )
-        assert tuple(tensor.data_ptr() for tensor in model_state) == (
-            state.shift_state.data_ptr(),
-            state.wkv_state.data_ptr(),
-            state.elapsed.data_ptr(),
-        )
+    def forward_all_hidden(tokens, model_state):
+        calls.append(("all_hidden", tokens.tolist(), [3]))
+        _assert_same_storage_view(model_state[0], state.shift_state[:, :, 3:4, :])
+        _assert_same_storage_view(model_state[1], state.wkv_state[:, 3:4, :, :, :])
+        _assert_same_storage_view(model_state[2], state.elapsed[3:4])
         return tokens.to(torch.float32).unsqueeze(-1).expand(*tokens.shape, 3)
 
     model = _new_rwkv7_forward_test_model(
         forward_tokens=forward_tokens,
-        forward_varlen_hidden=forward_varlen_hidden,
-        forward_all_hidden=lambda *args: pytest.fail(
-            "mixed prefill should use varlen metadata"
+        forward_varlen_hidden=lambda *args, **kwargs: pytest.fail(
+            "equal-length mixed prefill should not use varlen metadata"
         ),
+        forward_all_hidden=forward_all_hidden,
     )
 
     out = RWKV7ForCausalLM.forward(
@@ -2960,7 +2928,7 @@ def test_rwkv7_vllm_forward_uses_slot_mapped_mixed_decode_state_without_gather(
 
     assert calls == [
         ("tokens", [[10], [20]], [0, 2]),
-        ("varlen", [30, 31, 32], [0, 3], [3], [0, 0, 0], 3),
+        ("all_hidden", [[30, 31, 32]], [3]),
     ]
     assert out.tolist() == [
         [10.0, 10.0, 10.0],

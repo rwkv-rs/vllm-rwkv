@@ -733,11 +733,24 @@ class RWKV7ModelState(ModelState):
         ]
         prefill_groups = self._build_prefill_groups(prefill_ranges, prefill_rows)
         prefill_lengths = [end - start for _batch_idx, start, end in prefill_ranges]
-        can_use_varlen_prefill = self.use_slot_mapped_state and all(
-            length > 0 for length in prefill_lengths
+        has_positive_prefill_lengths = all(length > 0 for length in prefill_lengths)
+        grouped_ranges = sum(
+            batch_end - batch_start for batch_start, batch_end, *_ in prefill_groups
+        )
+        can_use_grouped_prefill = (
+            has_positive_prefill_lengths
+            and len(prefill_groups) == 1
+            and grouped_ranges == len(prefill_ranges)
+        )
+        can_use_varlen_prefill = (
+            self.use_slot_mapped_state
+            and not can_use_grouped_prefill
+            and has_positive_prefill_lengths
         )
         prefill_varlen_inputs: dict[str, Any] = {}
-        if can_use_varlen_prefill:
+        if can_use_grouped_prefill:
+            fallback_ranges = 0
+        elif can_use_varlen_prefill:
             query_offsets = [0]
             token_positions: list[int] = []
             req_id: list[int] = []
@@ -771,20 +784,16 @@ class RWKV7ModelState(ModelState):
                 ),
                 "rwkv_prefill_max_t": max(prefill_lengths),
             }
-            grouped_ranges = len(prefill_ranges)
             fallback_ranges = 0
         else:
             if self.use_slot_mapped_state:
                 raise RuntimeError(
-                    "RWKV7 fast prefill requires positive-length varlen "
-                    "metadata. Refusing to use the grouped prefill fallback "
-                    "on the default serving path."
+                    "RWKV7 fast prefill requires one contiguous equal-length "
+                    "group or positive-length varlen metadata. Refusing to use "
+                    "the grouped prefill fallback on the default serving path."
                 )
-            grouped_ranges = sum(
-                batch_end - batch_start
-                for batch_start, batch_end, *_ in prefill_groups
-            )
             fallback_ranges = max(0, len(prefill_ranges) - grouped_ranges)
+        can_use_varlen_prefill = bool(prefill_varlen_inputs)
         self._state_movement_stats["prefill_batches"] += 1
         self._state_movement_stats["prefill_ranges"] += len(prefill_ranges)
         self._state_movement_stats["prefill_groups"] += len(prefill_groups)
