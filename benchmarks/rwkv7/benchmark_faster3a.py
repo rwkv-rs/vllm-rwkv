@@ -82,6 +82,19 @@ PROVENANCE_ENV_VARS = (
     "VLLM_RWKV7_SLOT_MAPPED_STATE",
     "VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP",
 )
+PROVENANCE_ENV_DEFAULTS = {
+    "VLLM_RWKV7_WKV_MODE": "fp16",
+    "VLLM_RWKV7_EMB_DEVICE": "gpu",
+    "VLLM_RWKV7_RKV_MODE": "off",
+    "VLLM_RWKV7_CMIX_SPARSE": "no-fc",
+    "VLLM_RWKV7_LOW_RANK_WEIGHT": "both",
+    "VLLM_RWKV7_ORIG_LINEAR_GROUPS": "att_c2c,ffn_key,head",
+    "VLLM_USE_RAPID_SAMPLER": "1",
+    "VLLM_USE_V2_MODEL_RUNNER": "1",
+    "VLLM_ALLOW_INSECURE_SERIALIZATION": "1",
+    "VLLM_RWKV7_SLOT_MAPPED_STATE": "1",
+    "VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP": "1",
+}
 ACCEPTANCE_THRESHOLDS = {
     "model_only_steady_decode": {
         "min_vllm_to_albatross_ratio": 0.95,
@@ -267,8 +280,16 @@ def _cuda_device_metadata() -> dict[str, Any]:
     }
 
 
-def _rwkv_environment_metadata() -> dict[str, str | None]:
+def _rwkv_environment_raw_metadata() -> dict[str, str | None]:
     return {name: os.environ.get(name) for name in PROVENANCE_ENV_VARS}
+
+
+def _rwkv_environment_metadata() -> dict[str, str | None]:
+    raw = _rwkv_environment_raw_metadata()
+    return {
+        name: raw[name] if raw[name] is not None else PROVENANCE_ENV_DEFAULTS.get(name)
+        for name in PROVENANCE_ENV_VARS
+    }
 
 
 def _benchmark_provenance(config: BenchmarkConfig) -> dict[str, Any]:
@@ -276,6 +297,7 @@ def _benchmark_provenance(config: BenchmarkConfig) -> dict[str, Any]:
         "git_revision": _git_revision(config.repo_root),
         "cuda": _cuda_device_metadata(),
         "env": _rwkv_environment_metadata(),
+        "raw_env": _rwkv_environment_raw_metadata(),
         "workload": {
             "batch_size": config.batch_size,
             "prompt_len": config.prompt_len,

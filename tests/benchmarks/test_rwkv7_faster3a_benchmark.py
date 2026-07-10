@@ -88,11 +88,46 @@ def test_git_revision_reads_remote_source_marker(tmp_path: Path) -> None:
     assert bench._git_revision(tmp_path) == "abc123-dirty"
 
 
+def test_rwkv_environment_metadata_records_resolved_defaults(monkeypatch) -> None:
+    for name in bench.PROVENANCE_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+    env = bench._rwkv_environment_metadata()
+    raw_env = bench._rwkv_environment_raw_metadata()
+
+    assert set(env) == set(bench.PROVENANCE_ENV_VARS)
+    assert set(raw_env) == set(bench.PROVENANCE_ENV_VARS)
+    assert all(value is None for value in raw_env.values())
+    assert env["VLLM_RWKV7_WKV_MODE"] == "fp16"
+    assert env["VLLM_RWKV7_EMB_DEVICE"] == "gpu"
+    assert env["VLLM_RWKV7_ORIG_LINEAR_GROUPS"] == "att_c2c,ffn_key,head"
+    assert env["VLLM_RWKV7_SLOT_MAPPED_STATE"] == "1"
+
+
+def test_rwkv_environment_metadata_preserves_explicit_values(monkeypatch) -> None:
+    for name in bench.PROVENANCE_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("VLLM_RWKV7_WKV_MODE", "fp32io16")
+    monkeypatch.setenv("VLLM_RWKV7_EMB_DEVICE", "cpu")
+
+    env = bench._rwkv_environment_metadata()
+    raw_env = bench._rwkv_environment_raw_metadata()
+
+    assert env["VLLM_RWKV7_WKV_MODE"] == "fp32io16"
+    assert raw_env["VLLM_RWKV7_WKV_MODE"] == "fp32io16"
+    assert env["VLLM_RWKV7_EMB_DEVICE"] == "cpu"
+    assert raw_env["VLLM_RWKV7_EMB_DEVICE"] == "cpu"
+    assert env["VLLM_RWKV7_ORIG_LINEAR_GROUPS"] == "att_c2c,ffn_key,head"
+    assert raw_env["VLLM_RWKV7_ORIG_LINEAR_GROUPS"] is None
+
+
 def test_report_blocks_without_runtime_paths_and_records_provenance(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     repo_root = Path(__file__).resolve().parents[2]
+    for name in bench.PROVENANCE_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(
         bench,
         "_cuda_device_metadata",
@@ -149,6 +184,9 @@ def test_report_blocks_without_runtime_paths_and_records_provenance(
     assert provenance["sampling"] == bench.VLLM_RUNNER_SAMPLING
     assert provenance["cuda"]["available"] is False
     assert set(provenance["env"]) == set(bench.PROVENANCE_ENV_VARS)
+    assert set(provenance["raw_env"]) == set(bench.PROVENANCE_ENV_VARS)
+    assert provenance["env"]["VLLM_RWKV7_WKV_MODE"] == "fp16"
+    assert provenance["raw_env"]["VLLM_RWKV7_WKV_MODE"] is None
 
 
 def test_report_evaluates_passing_measurements() -> None:
