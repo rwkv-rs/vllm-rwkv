@@ -196,18 +196,24 @@ class RepetitionDetectionParams:
             )
         if self.mode not in ("consecutive", "occurrence"):
             raise ValueError(
-                "mode must be either 'consecutive' or 'occurrence', "
-                f"got {self.mode!r}."
+                f"mode must be either 'consecutive' or 'occurrence', got {self.mode!r}."
             )
         if self.occurrence_rules is not None:
             if self.mode != "occurrence":
-                raise ValueError("occurrence_rules can only be used with mode='occurrence'.")
+                raise ValueError(
+                    "occurrence_rules can only be used with mode='occurrence'."
+                )
             normalized_rules = []
             for ngram_size, min_count in self.occurrence_rules:
                 if ngram_size <= 0:
-                    raise ValueError(f"occurrence rule ngram_size must be positive, got {ngram_size}.")
+                    raise ValueError(
+                        "occurrence rule ngram_size must be positive, "
+                        f"got {ngram_size}."
+                    )
                 if min_count < 2:
-                    raise ValueError(f"occurrence rule min_count must be >= 2, got {min_count}.")
+                    raise ValueError(
+                        f"occurrence rule min_count must be >= 2, got {min_count}."
+                    )
                 normalized_rules.append((int(ngram_size), int(min_count)))
             if not normalized_rules:
                 raise ValueError("occurrence_rules must contain at least one rule.")

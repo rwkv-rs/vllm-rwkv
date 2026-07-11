@@ -530,6 +530,7 @@ FAST_RETURNING_CASES = [
 
 RETURNING_CASES = V3A_RETURNING_CASES + FAST_RETURNING_CASES
 
+
 @pytest.fixture(scope="module", autouse=True)
 def rwkv7_ops_registered() -> None:
     _rwkv7_import_or_skip()

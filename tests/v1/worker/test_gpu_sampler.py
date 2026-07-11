@@ -154,10 +154,16 @@ def test_rapid_sampler_recomputes_processed_logits_for_logprobs(monkeypatch):
 
     def fake_apply_sampling_params(*args, **kwargs):
         sampling_param_calls.append(kwargs)
-        return first_processed_logits if len(sampling_param_calls) == 1 else logprob_processed_logits
+        return (
+            first_processed_logits
+            if len(sampling_param_calls) == 1
+            else logprob_processed_logits
+        )
 
     sampler.apply_sampling_params = fake_apply_sampling_params
-    monkeypatch.setattr(sampler_module, "rapid_sample_input_supported", lambda logits: True)
+    monkeypatch.setattr(
+        sampler_module, "rapid_sample_input_supported", lambda logits: True
+    )
     monkeypatch.setattr(
         sampler_module,
         "rapid_sample",
@@ -246,10 +252,16 @@ def test_rapid_sampler_default_recomputes_native_logits_when_input_unsupported(
 
     def fake_apply_sampling_params(*args, **kwargs):
         sampling_param_calls.append(kwargs)
-        return rapid_processed_logits if len(sampling_param_calls) == 1 else native_processed_logits
+        return (
+            rapid_processed_logits
+            if len(sampling_param_calls) == 1
+            else native_processed_logits
+        )
 
     sampler.apply_sampling_params = fake_apply_sampling_params
-    monkeypatch.setattr(sampler_module, "rapid_sample_input_supported", lambda logits: False)
+    monkeypatch.setattr(
+        sampler_module, "rapid_sample_input_supported", lambda logits: False
+    )
     monkeypatch.setattr(
         sampler_module,
         "rapid_sample",

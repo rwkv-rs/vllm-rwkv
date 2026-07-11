@@ -203,9 +203,7 @@ def _render_tool_chat(
                     "name": name,
                     "arguments": _json_value(arguments),
                 }
-                lines.extend(
-                    ["**Tool Call:**", "```json", _json_text(payload), "```"]
-                )
+                lines.extend(["**Tool Call:**", "```json", _json_text(payload), "```"])
         elif role == "tool":
             payload = _json_value(content)
             lines.extend(["### Tool Output", "```json", _json_text(payload), "```"])

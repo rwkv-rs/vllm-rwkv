@@ -729,7 +729,9 @@ def test_rapid_sample_rejects_mixed_penalty_params(
         lambda module, logits: fake_states,
     )
 
-    with pytest.raises(RuntimeError, match="with penalties only supports uniform scalar"):
+    with pytest.raises(
+        RuntimeError, match="with penalties only supports uniform scalar"
+    ):
         topk_topp_sampler.rapid_sample(
             logits,
             None,
@@ -811,9 +813,15 @@ def test_rapid_sample_reference_example_respects_top_p_support():
     top_p = 0.5
 
     samples = topk_topp_sampler.rapid_sample(logits, top_k, top_p)
-    top_k_tensor = torch.full((batch_size,), vocab_size, dtype=torch.int32, device=DEVICE_TYPE)
-    top_p_tensor = torch.full((batch_size,), top_p, dtype=torch.float32, device=DEVICE_TYPE)
-    masked_logits = apply_top_k_top_p_pytorch(logits.clone(), top_k_tensor, top_p_tensor)
+    top_k_tensor = torch.full(
+        (batch_size,), vocab_size, dtype=torch.int32, device=DEVICE_TYPE
+    )
+    top_p_tensor = torch.full(
+        (batch_size,), top_p, dtype=torch.float32, device=DEVICE_TYPE
+    )
+    masked_logits = apply_top_k_top_p_pytorch(
+        logits.clone(), top_k_tensor, top_p_tensor
+    )
     sampled_logits = masked_logits.gather(1, samples.long().unsqueeze(1)).view(-1)
 
     assert torch.isfinite(sampled_logits).all()

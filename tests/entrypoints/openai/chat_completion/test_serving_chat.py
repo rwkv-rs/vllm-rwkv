@@ -40,10 +40,6 @@ from vllm.entrypoints.openai.models.serving import (
     OpenAIServingModels,
 )
 from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
-from vllm.tokenizers.rwkv_defaults import (
-    RWKV_DEFAULT_STOP_TOKEN_IDS,
-    RWKV_DEFAULT_STOPS,
-)
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import TokensPrompt
 from vllm.multimodal.inputs import PlaceholderRange
@@ -55,6 +51,10 @@ from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tokenizers import get_tokenizer
 from vllm.tokenizers.mistral import MistralTokenizer
 from vllm.tokenizers.registry import cached_tokenizer_from_config
+from vllm.tokenizers.rwkv_defaults import (
+    RWKV_DEFAULT_STOP_TOKEN_IDS,
+    RWKV_DEFAULT_STOPS,
+)
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.metrics.stats import RequestStateStats
 

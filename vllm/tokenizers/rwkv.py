@@ -12,11 +12,13 @@ from typing import Any, overload
 from transformers import BatchEncoding
 from transformers.utils import chat_template_utils as hf_chat_utils
 
+from .protocol import TokenizerLike
 from .rwkv_defaults import (
     RWKV_NATIVE_CHAT_TEMPLATE as _RWKV_NATIVE_CHAT_TEMPLATE,
+)
+from .rwkv_defaults import (
     render_rwkv_chat_template,
 )
-from .protocol import TokenizerLike
 
 _VOCAB_FILE = Path(__file__).parent / "assets" / "rwkv_vocab_v20230424.txt"
 _RWKV7_VOCAB_SIZE = 65536

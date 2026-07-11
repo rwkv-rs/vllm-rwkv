@@ -21,11 +21,11 @@ from vllm.entrypoints.chat_utils import (
     validate_chat_template,
 )
 from vllm.entrypoints.openai.models.protocol import LoRAModulePath
-from vllm.tokenizers.rwkv_defaults import resolve_rwkv_tool_parser
 from vllm.entrypoints.serve.utils.constants import (
     H11_MAX_HEADER_COUNT_DEFAULT,
     H11_MAX_INCOMPLETE_EVENT_SIZE_DEFAULT,
 )
+from vllm.tokenizers.rwkv_defaults import resolve_rwkv_tool_parser
 from vllm.tool_parsers import ToolParserManager
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 

@@ -21,7 +21,10 @@ def _occurrence_rules(params: RepetitionDetectionParams) -> list[tuple[int, int]
     if max_pattern_size <= 0 or min_count < 2 or min_pattern_size > max_pattern_size:
         return []
 
-    return [(ngram_size, min_count) for ngram_size in range(min_pattern_size, max_pattern_size + 1)]
+    return [
+        (ngram_size, min_count)
+        for ngram_size in range(min_pattern_size, max_pattern_size + 1)
+    ]
 
 
 def _has_repeating_pattern(

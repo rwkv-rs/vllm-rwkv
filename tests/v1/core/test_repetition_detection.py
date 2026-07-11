@@ -391,7 +391,10 @@ class TestRepetitionDetectionIntegration:
         assert check_stop(request, max_model_len=1024)
         assert request.status == RequestStatus.FINISHED_REPETITION
         assert request.stop_reason == "repetition_detected"
-        assert request.repetition_ngram_next_start[16] == len(request.output_token_ids) - 16 + 1
+        assert (
+            request.repetition_ngram_next_start[16]
+            == len(request.output_token_ids) - 16 + 1
+        )
 
     def test_occurrence_rules_stop_generation_incrementally(self):
         """Occurrence rules share request-local counts across decode steps."""
@@ -418,4 +421,7 @@ class TestRepetitionDetectionIntegration:
         assert check_stop(request, max_model_len=1024)
         assert request.status == RequestStatus.FINISHED_REPETITION
         assert request.stop_reason == "repetition_detected"
-        assert request.repetition_ngram_next_start[8] == len(request.output_token_ids) - 8 + 1
+        assert (
+            request.repetition_ngram_next_start[8]
+            == len(request.output_token_ids) - 8 + 1
+        )

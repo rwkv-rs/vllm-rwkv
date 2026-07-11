@@ -3,8 +3,8 @@ name: Rebase RWKV on upstream vLLM
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 4 * * *"
-      timezone: "America/Chicago"
+    # GitHub Actions cron is UTC: 10:00 is 04:00 CST / 05:00 CDT.
+    - cron: "0 10 * * *"
 
 permissions:
   contents: write

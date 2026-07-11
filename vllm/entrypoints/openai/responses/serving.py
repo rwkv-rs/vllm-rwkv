@@ -89,10 +89,6 @@ from vllm.entrypoints.openai.responses.utils import (
     extract_function_tool_names,
     extract_tool_types,
 )
-from vllm.tokenizers.rwkv_defaults import (
-    apply_rwkv_default_sampling_params,
-    resolve_rwkv_tool_parser,
-)
 from vllm.entrypoints.serve.utils.api_utils import get_max_tokens
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.exceptions import VLLMValidationError
@@ -106,6 +102,10 @@ from vllm.parser import Parser, ParserManager
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
+from vllm.tokenizers.rwkv_defaults import (
+    apply_rwkv_default_sampling_params,
+    resolve_rwkv_tool_parser,
+)
 from vllm.utils import random_uuid
 from vllm.utils.collection_utils import as_list
 

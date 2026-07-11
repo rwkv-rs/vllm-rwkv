@@ -112,12 +112,15 @@ def test_rwkv_chat_template_tokenizes_rendered_prompt():
     assert isinstance(token_ids, list)
     assert token_ids[0] == tokenizer.bos_token_id
     assert tokenizer.decode(token_ids) == rendered
-    assert tokenizer.apply_chat_template(
-        [{"role": "user", "content": "Hi"}],
-        tokenize=True,
-        add_generation_prompt=True,
-        add_special_tokens=False,
-    )[0] != tokenizer.bos_token_id
+    assert (
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": "Hi"}],
+            tokenize=True,
+            add_generation_prompt=True,
+            add_special_tokens=False,
+        )[0]
+        != tokenizer.bos_token_id
+    )
 
 
 def test_rwkv_chat_template_can_render_fake_think_generation_prompt():
@@ -137,7 +140,8 @@ def test_rwkv_chat_template_strips_dapo_math_prompt_wrapper():
     tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
     problem = "已知 x+y=3, 求 x。"
     wrapped_problem = (
-        "Solve the following math problem step by step. The last line of your response should be of the form "
+        "Solve the following math problem step by step. The last line of your "
+        "response should be of the form "
         "Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n"
         f"{problem}\n"
         'Remember to put your answer on its own line after "Answer:".'
