@@ -1787,6 +1787,7 @@ def test_rwkv7_model_state_keeps_slots_after_generic_input_batch_condense():
         vocab_size=128,
         block_sizes=[1],
         kernel_block_sizes=[1],
+        max_num_blocks_per_req=[16],
     )
     for req_slot in range(3):
         req_id = f"req-{req_slot}"

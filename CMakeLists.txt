@@ -419,15 +419,21 @@ if((VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP") AND
     WITH_SOABI)
 endif()
 
-# RWKV7 operators are self-contained and do not use CUTLASS or the generic
+# RWKV7 operators are self-contained and do not use CUTLASS or the full generic
 # stable operator bundle. Keep this target before the full-only FetchContent
-# path so the reduced profile never downloads those sources.
+# path so the reduced profile never downloads those sources. The reduced
+# profile carries the one generic runtime helper required by Model Runner V2.
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   set(RWKV7_CUDA_SRCS
     "csrc/libtorch_stable/rwkv7/rwkv7_fast_ops_fp16.cu"
     "csrc/libtorch_stable/rwkv7/rwkv7_v3a_ops.cu"
     "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp16_v2.cu"
     "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp32_v2.cu")
+
+  if(VLLM_RWKV_ONLY_BUILD)
+    list(APPEND RWKV7_CUDA_SRCS
+      "csrc/libtorch_stable/cuda_view.cu")
+  endif()
 
   set(RWKV7_EXT_SRC
     "csrc/libtorch_stable/rwkv7/rwkv7_fast_ops_fp16.cpp"
@@ -462,6 +468,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     USE_SABI 3
     WITH_SOABI)
   target_compile_definitions(rwkv7_ops PRIVATE USE_CUDA)
+  if(VLLM_RWKV_ONLY_BUILD)
+    target_compile_definitions(rwkv7_ops PRIVATE VLLM_RWKV_RUNTIME_OPS)
+  endif()
 endif()
 
 #

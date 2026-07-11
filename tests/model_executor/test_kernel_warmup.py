@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -45,7 +46,10 @@ def _make_worker(attn_groups):
 
 @pytest.fixture(autouse=True)
 def _disable_unrelated_warmups(monkeypatch):
-    import vllm.model_executor.warmup.minimax_m3_msa_warmup as minimax_warmup
+    minimax_module_name = "vllm.model_executor.warmup.minimax_m3_msa_warmup"
+    minimax_warmup = ModuleType(minimax_module_name)
+    minimax_warmup.minimax_m3_msa_warmup = lambda *_args: None
+    monkeypatch.setitem(sys.modules, minimax_module_name, minimax_warmup)
 
     monkeypatch.setattr(kernel_warmup_module, "qwen_triton_warmup", lambda *args: None)
     monkeypatch.setattr(
@@ -66,7 +70,6 @@ def _disable_unrelated_warmups(monkeypatch):
         "deepseek_v4_sparse_mla_attention_warmup",
         lambda *args, **kwargs: None,
     )
-    monkeypatch.setattr(minimax_warmup, "minimax_m3_msa_warmup", lambda *args: None)
     monkeypatch.setattr(kernel_warmup_module.envs, "VLLM_USE_DEEP_GEMM", False)
     monkeypatch.setattr(kernel_warmup_module, "has_flashinfer", lambda: True)
     monkeypatch.setattr(

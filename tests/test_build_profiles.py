@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from pathlib import Path
 
@@ -71,13 +72,22 @@ def test_cmake_declares_profile_manifest() -> None:
     assert "vllm_build_profile.json" in cmake
     assert "VLLM_EXTENSION_TARGETS" in cmake
     assert "VLLM_EXTERNAL_PROJECTS" in cmake
-    early_return = cmake.index(
-        'if (NOT VLLM_TARGET_DEVICE STREQUAL "cuda" AND'
-    )
-    manifest_index = cmake.index(
-        "vllm_write_build_profile_manifest()", early_return
-    )
+    early_return = cmake.index('if (NOT VLLM_TARGET_DEVICE STREQUAL "cuda" AND')
+    manifest_index = cmake.index("vllm_write_build_profile_manifest()", early_return)
     assert manifest_index < cmake.index("return()", early_return)
+
+
+def test_rwkv_profile_carries_model_runner_uva_helper() -> None:
+    root = Path(__file__).parents[1]
+    cmake = (root / "CMakeLists.txt").read_text()
+    registration = (
+        root / "csrc/libtorch_stable/rwkv7/rwkv7_registration.cpp"
+    ).read_text()
+
+    assert '"csrc/libtorch_stable/cuda_view.cu"' in cmake
+    assert "VLLM_RWKV_RUNTIME_OPS" in cmake
+    assert "#ifdef VLLM_RWKV_RUNTIME_OPS" in registration
+    assert "get_cuda_view_from_cpu_tensor" in registration
 
 
 def test_sdist_declares_profile_inputs() -> None:
