@@ -54,12 +54,6 @@ def _command_options(command: list[str]) -> dict[str, str | bool]:
     return options
 
 
-def _state_movement(**overrides: int) -> dict[str, int]:
-    stats = {name: 0 for name in bench.STATE_MOVEMENT_COUNTERS}
-    stats.update(overrides)
-    return stats
-
-
 def _phase_result(tokens: int = 1024) -> dict[str, Any]:
     return {
         "avg_tokens_per_s": 1.0,
@@ -76,10 +70,6 @@ def _phase_result(tokens: int = 1024) -> dict[str, Any]:
         "unit_p90_ms": 1.0,
         "worker_count": 1,
     }
-
-
-def _empty_state_movement() -> dict[str, int | None]:
-    return {name: None for name in bench.STATE_MOVEMENT_COUNTERS}
 
 
 def _matching_model_only_contracts(
@@ -124,12 +114,7 @@ def _matching_model_only_contracts(
 
 
 def _fp16_runner_provenance() -> dict[str, Any]:
-    return {
-        "env": {
-            "VLLM_RWKV7_WKV_MODE": "fp16",
-            "VLLM_RWKV7_ALLOW_FP16_ACCUMULATION": "1",
-        }
-    }
+    return {"env": {"VLLM_RWKV7_WKV_MODE": "fp16"}}
 
 
 def test_git_revision_reads_remote_source_marker(tmp_path: Path) -> None:
@@ -182,44 +167,18 @@ def test_rwkv_environment_metadata_records_resolved_defaults(monkeypatch) -> Non
     assert set(raw_env) == set(bench.PROVENANCE_ENV_VARS)
     assert all(value is None for value in raw_env.values())
     assert env["VLLM_RWKV7_WKV_MODE"] == "fp16"
-    assert env["VLLM_RWKV7_EMB_DEVICE"] == "gpu"
-    assert env["VLLM_RWKV7_ALLOW_FP16_ACCUMULATION"] == "1"
-    assert env["VLLM_RWKV7_ORIG_LINEAR_GROUPS"] == "none"
-    assert env["VLLM_RWKV7_SLOT_MAPPED_STATE"] == "1"
 
 
 def test_rwkv_environment_metadata_preserves_explicit_values(monkeypatch) -> None:
     for name in bench.PROVENANCE_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("VLLM_RWKV7_WKV_MODE", "fp32io16")
-    monkeypatch.setenv("VLLM_RWKV7_EMB_DEVICE", "cpu")
-    monkeypatch.setenv("VLLM_RWKV7_ALLOW_FP16_ACCUMULATION", "1")
 
     env = bench._rwkv_environment_metadata()
     raw_env = bench._rwkv_environment_raw_metadata()
 
     assert env["VLLM_RWKV7_WKV_MODE"] == "fp32io16"
     assert raw_env["VLLM_RWKV7_WKV_MODE"] == "fp32io16"
-    assert env["VLLM_RWKV7_EMB_DEVICE"] == "cpu"
-    assert raw_env["VLLM_RWKV7_EMB_DEVICE"] == "cpu"
-    assert env["VLLM_RWKV7_ALLOW_FP16_ACCUMULATION"] == "1"
-    assert raw_env["VLLM_RWKV7_ALLOW_FP16_ACCUMULATION"] == "1"
-    assert env["VLLM_RWKV7_ORIG_LINEAR_GROUPS"] == "none"
-    assert raw_env["VLLM_RWKV7_ORIG_LINEAR_GROUPS"] is None
-
-
-def test_rwkv_environment_metadata_derives_accumulation_from_wkv_mode(
-    monkeypatch,
-) -> None:
-    for name in bench.PROVENANCE_ENV_VARS:
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("VLLM_RWKV7_WKV_MODE", "fp32io16")
-
-    env = bench._rwkv_environment_metadata()
-    raw_env = bench._rwkv_environment_raw_metadata()
-
-    assert env["VLLM_RWKV7_ALLOW_FP16_ACCUMULATION"] == "0"
-    assert raw_env["VLLM_RWKV7_ALLOW_FP16_ACCUMULATION"] is None
 
 
 def test_report_blocks_without_runtime_paths_and_records_provenance(
@@ -269,7 +228,6 @@ def test_report_blocks_without_runtime_paths_and_records_provenance(
         "missing_albatross_impl_path",
         "missing_albatross_checkpoint_path",
     }
-    assert report["checks"]["state_movement"]["metrics"] == _empty_state_movement()
     provenance = report["config"]["provenance"]
     assert provenance["git_revision"]
     assert provenance["workload"] == {
@@ -279,7 +237,6 @@ def test_report_blocks_without_runtime_paths_and_records_provenance(
         "decode_tokens": 128,
         "runner_prefill_chunk_tokens": bench.DEFAULT_RUNNER_PREFILL_CHUNK_TOKENS,
         "runner_enforce_eager": False,
-        "runner_disable_rapid_sampler": False,
         "runner_cudagraph_capture_sizes": None,
     }
     assert provenance["sampling"] == bench.VLLM_RUNNER_SAMPLING
@@ -301,7 +258,6 @@ def test_report_evaluates_passing_measurements() -> None:
         "runner_steady_decode": {
             "runner_tokens_per_s": 91.0,
         },
-        "state_movement": _state_movement(),
         "config": {"provenance": _fp16_runner_provenance()},
     }
 
@@ -314,8 +270,6 @@ def test_report_evaluates_passing_measurements() -> None:
     assert report["overall_status"] == "passed"
     assert report["checks"]["model_only_steady_decode"]["status"] == "passed"
     assert report["checks"]["runner_steady_decode"]["status"] == "passed"
-    assert report["checks"]["state_movement"]["status"] == "passed"
-    assert report["checks"]["state_movement"]["metrics"] == _state_movement()
 
 
 def test_report_blocks_model_only_comparison_without_contracts() -> None:
@@ -1050,12 +1004,6 @@ def test_cli_merges_vllm_model_only_measurement_with_albatross_json(
     calls: list[Any] = []
 
     monkeypatch.setenv("VLLM_RWKV7_WKV_MODE", "fp16")
-    monkeypatch.setenv("VLLM_RWKV7_ALLOW_FP16_ACCUMULATION", "1")
-    monkeypatch.setenv("VLLM_RWKV7_EMB_DEVICE", "cpu")
-    monkeypatch.setenv("VLLM_RWKV7_RKV_MODE", "off")
-    monkeypatch.setenv("VLLM_RWKV7_CMIX_SPARSE", "no-fc")
-    monkeypatch.setenv("VLLM_RWKV7_LOW_RANK_WEIGHT", "both")
-    monkeypatch.setenv("VLLM_RWKV7_ORIG_LINEAR_GROUPS", "att_c2c,ffn_key,head")
     monkeypatch.setattr(
         bench,
         "_benchmark_provenance",
@@ -1187,20 +1135,8 @@ def test_cli_writes_vllm_runner_measurement_json(
             "worker_count": 1,
         }
 
-    def fake_state_stats(llm):
-        calls.append(("state", llm))
-        return _state_movement(
-            decode_compactions=1,
-            decode_compaction_rows=2,
-        )
-
     monkeypatch.setattr(bench, "_create_vllm_runner_llm", fake_create)
     monkeypatch.setattr(bench, "_time_vllm_runner_steady_decode", fake_time)
-    monkeypatch.setattr(
-        bench,
-        "_extract_runner_state_movement_stats",
-        fake_state_stats,
-    )
 
     rc = bench.main(
         [
@@ -1252,10 +1188,6 @@ def test_cli_writes_vllm_runner_measurement_json(
     assert runner["runner_postprocess_timing_available"] is False
     assert runner["runner_decode_steps"] == 7
     assert runner["runner_worker_count"] == 1
-    assert measurement["state_movement"] == _state_movement(
-        decode_compactions=1,
-        decode_compaction_rows=2,
-    )
     assert measurement["config"]["provenance"]["workload"] == {
         "batch_size": 3,
         "prompt_len": 5,
@@ -1263,7 +1195,6 @@ def test_cli_writes_vllm_runner_measurement_json(
         "decode_tokens": 7,
         "runner_prefill_chunk_tokens": 2,
         "runner_enforce_eager": False,
-        "runner_disable_rapid_sampler": False,
         "runner_cudagraph_capture_sizes": None,
     }
     assert (
@@ -1273,7 +1204,6 @@ def test_cli_writes_vllm_runner_measurement_json(
     assert calls == [
         ("create", str(model_path), 9),
         ("time", fake_llm, 3, 5, 2, 7, 2, 11),
-        ("state", fake_llm),
     ]
 
 
@@ -1754,11 +1684,6 @@ def test_runner_pd_single_uses_exact_cudagraph_capture_size(
         "_time_vllm_runner_decode_phase",
         lambda llm, **kwargs: _phase_result(tokens=1024),
     )
-    monkeypatch.setattr(
-        bench,
-        "_extract_runner_state_movement_stats",
-        lambda llm: _state_movement(),
-    )
     monkeypatch.setattr(bench, "_shutdown_vllm_runner_llm", lambda llm: None)
 
     measurement = bench.generate_vllm_runner_pd_single_measurement(
@@ -1788,7 +1713,6 @@ def test_runner_pd_aggregate_records_case_provenance(
             "schema_version": bench.SCHEMA_VERSION,
             "benchmark": bench.BENCHMARK_NAME,
             "metrics": _phase_result(tokens=capture_size),
-            "state_movement": _state_movement(),
             "config": {
                 "provenance": {
                     "workload": {
@@ -1860,12 +1784,6 @@ def test_cli_merges_vllm_runner_measurement_with_model_only_json(
             "worker_count": 1,
         },
     )
-    monkeypatch.setattr(
-        bench,
-        "_extract_runner_state_movement_stats",
-        lambda llm: _state_movement(),
-    )
-
     rc = bench.main(
         [
             "--repo-root",
@@ -1897,7 +1815,6 @@ def test_cli_merges_vllm_runner_measurement_with_model_only_json(
     assert measurement["runner_steady_decode"]["runner_tokens_per_s"] == 91.0
     assert measurement["runner_steady_decode"]["runner_batch_size"] == 2
     assert measurement["runner_steady_decode"]["runner_timing_clock"] == "cuda_event"
-    assert measurement["state_movement"]["resident_to_decode_copies"] == 0
     assert (
         measurement["config"]["measurement_source"]
         == "merged_vllm_runner_worker_execute_model"
@@ -1910,7 +1827,6 @@ def test_cli_merges_vllm_runner_measurement_with_model_only_json(
     )
     assert report["checks"]["model_only_steady_decode"]["status"] == "passed"
     assert report["checks"]["runner_steady_decode"]["status"] == "passed"
-    assert report["checks"]["state_movement"]["status"] == "passed"
     runner_metrics = report["checks"]["runner_steady_decode"]["metrics"]
     assert runner_metrics == {
         "runner_tokens_per_s": 91.0,
@@ -1941,7 +1857,6 @@ def test_runner_check_does_not_compare_worker_timing_to_logits_baseline() -> Non
             "runner_measurement_mode": "worker_execute_model",
             "runner_internal_timing_target": "worker.execute_model",
         },
-        "state_movement": _state_movement(),
         "config": {"provenance": _fp16_runner_provenance()},
     }
 
@@ -1999,10 +1914,7 @@ def test_runner_check_blocks_non_fp16_throughput_contract() -> None:
             "runner_steady_decode": {"runner_tokens_per_s": 1.0},
             "config": {
                 "provenance": {
-                    "env": {
-                        "VLLM_RWKV7_WKV_MODE": "fp32io16",
-                        "VLLM_RWKV7_ALLOW_FP16_ACCUMULATION": "0",
-                    }
+                    "env": {"VLLM_RWKV7_WKV_MODE": "fp32io16"}
                 }
             },
         },
@@ -2021,10 +1933,6 @@ def test_runner_check_blocks_non_fp16_throughput_contract() -> None:
                 "VLLM_RWKV7_WKV_MODE": {
                     "required": "fp16",
                     "actual": "fp32io16",
-                },
-                "VLLM_RWKV7_ALLOW_FP16_ACCUMULATION": {
-                    "required": "1",
-                    "actual": "0",
                 },
             },
         }
@@ -2056,12 +1964,6 @@ def test_cli_writes_blocked_vllm_runner_json_without_fake_tokens(
             ],
         },
     )
-    monkeypatch.setattr(
-        bench,
-        "_extract_runner_state_movement_stats",
-        lambda llm: _state_movement(),
-    )
-
     rc = bench.main(
         [
             "--repo-root",
@@ -2135,7 +2037,6 @@ def test_cli_writes_blocked_vllm_runner_json_without_fake_tokens(
             "message": "No internal worker decode timing samples were recorded.",
         }
     ]
-    assert report["checks"]["state_movement"]["status"] == "passed"
 
 
 def test_internal_runner_timing_syncs_once_around_decode_loop(monkeypatch) -> None:
@@ -2451,7 +2352,6 @@ def test_runner_pd_subprocess_skips_generic_warmup_without_slow_path_flags(
                     "schema_version": bench.SCHEMA_VERSION,
                     "benchmark": bench.BENCHMARK_NAME,
                     "metrics": {},
-                    "state_movement": {},
                 }
             ),
             encoding="utf-8",
@@ -2478,65 +2378,10 @@ def test_runner_pd_subprocess_skips_generic_warmup_without_slow_path_flags(
     assert "--runner-enforce-eager" not in options
     assert "--runner-disable-rapid-sampler" not in options
     assert "VLLM_USE_RAPID_SAMPLER" not in env
-    assert env["VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP"] == "1"
+    assert "VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP" not in env
 
 
-def test_runner_pd_subprocess_honors_explicit_slow_path_flags(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    model_path = tmp_path / "rwkv7-g1d-0.1b-20260129-ctx8192.pth"
-    model_path.write_bytes(b"")
-    calls: list[tuple[list[str], dict[str, str]]] = []
-
-    def fake_run(command, *, cwd, env, check):
-        calls.append((command, env))
-        options = _command_options(command)
-        output_value = options["--measurement-output"]
-        assert isinstance(output_value, str)
-        output_path = Path(output_value)
-        output_path.write_text(
-            json.dumps(
-                {
-                    "schema_version": bench.SCHEMA_VERSION,
-                    "benchmark": bench.BENCHMARK_NAME,
-                    "metrics": {},
-                    "state_movement": {},
-                }
-            ),
-            encoding="utf-8",
-        )
-        return subprocess.CompletedProcess(command, 0)
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    config = replace(
-        _config(repo_root, model=str(model_path)),
-        runner_enforce_eager=True,
-        runner_disable_rapid_sampler=True,
-    )
-
-    bench._run_vllm_runner_pd_case_subprocess(
-        config,
-        phase="decode",
-        case=(4, 1),
-        prefill_chunk_tokens=1,
-        decode_prompt_len=1,
-        warmup=0,
-        iters=1,
-        include_sampling=False,
-    )
-
-    command, env = calls[0]
-    options = _command_options(command)
-    assert options["--runner-enforce-eager"] is True
-    assert options["--runner-disable-rapid-sampler"] is True
-    assert env["VLLM_USE_RAPID_SAMPLER"] == "0"
-    assert env["VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP"] == "1"
-
-
-def test_v2_kernel_warmup_skip_only_applies_to_rwkv7(monkeypatch) -> None:
-    import vllm.envs as envs
+def test_v2_kernel_warmup_skip_is_fixed_for_rwkv7() -> None:
     from vllm.v1.worker.gpu.warmup import should_skip_v2_kernel_warmup
 
     class RWKV7ModelState:
@@ -2545,23 +2390,9 @@ def test_v2_kernel_warmup_skip_only_applies_to_rwkv7(monkeypatch) -> None:
     class DefaultModelState:
         pass
 
-    monkeypatch.setitem(
-        envs.environment_variables,
-        "VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP",
-        lambda: True,
-    )
     assert should_skip_v2_kernel_warmup(SimpleNamespace(model_state=RWKV7ModelState()))
     assert not should_skip_v2_kernel_warmup(
         SimpleNamespace(model_state=DefaultModelState())
-    )
-
-    monkeypatch.setitem(
-        envs.environment_variables,
-        "VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP",
-        lambda: False,
-    )
-    assert not should_skip_v2_kernel_warmup(
-        SimpleNamespace(model_state=RWKV7ModelState())
     )
 
 
@@ -2742,7 +2573,6 @@ def test_report_blocks_when_runner_measurement_is_missing() -> None:
             "vllm_tokens_per_s": 96.0,
             **_matching_model_only_contracts(),
         },
-        "state_movement": _state_movement(),
     }
 
     report = bench.build_report(
@@ -2760,34 +2590,6 @@ def test_report_blocks_when_runner_measurement_is_missing() -> None:
             "runner_steady_decode.",
         }
     ]
-    assert report["checks"]["state_movement"]["status"] == "passed"
-
-
-def test_extract_runner_state_movement_stats_uses_collective_rpc() -> None:
-    class FakeLLM:
-        def __init__(self) -> None:
-            self.calls: list[Any] = []
-
-        def collective_rpc(self, method, timeout=None, args=(), kwargs=None):
-            self.calls.append((method, timeout, args, kwargs))
-            return [
-                _state_movement(
-                    resident_to_decode_copies=1,
-                    decode_compactions=2,
-                    decode_compaction_rows=3,
-                )
-            ]
-
-    llm = FakeLLM()
-
-    stats = bench._extract_runner_state_movement_stats(llm)
-
-    assert stats == _state_movement(
-        resident_to_decode_copies=1,
-        decode_compactions=2,
-        decode_compaction_rows=3,
-    )
-    assert callable(llm.calls[0][0])
 
 
 def test_report_blocks_without_measurement_json_when_runtime_paths_exist(
@@ -2816,7 +2618,6 @@ def test_report_blocks_without_measurement_json_when_runtime_paths_exist(
     for check_name in (
         "model_only_steady_decode",
         "runner_steady_decode",
-        "state_movement",
     ):
         assert report["checks"][check_name]["blockers"] == [
             {
@@ -2827,7 +2628,7 @@ def test_report_blocks_without_measurement_json_when_runtime_paths_exist(
         ]
 
 
-def test_report_fails_low_model_only_and_resident_decode_copies() -> None:
+def test_report_fails_low_model_only() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     measurements = {
         "model_only_steady_decode": {
@@ -2838,7 +2639,6 @@ def test_report_fails_low_model_only_and_resident_decode_copies() -> None:
         "runner_steady_decode": {
             "runner_tokens_per_s": 70.0,
         },
-        "state_movement": _state_movement(resident_to_decode_copies=1),
         "config": {"provenance": _fp16_runner_provenance()},
     }
 
@@ -2851,41 +2651,6 @@ def test_report_fails_low_model_only_and_resident_decode_copies() -> None:
     assert report["overall_status"] == "failed"
     assert report["checks"]["model_only_steady_decode"]["status"] == "failed"
     assert report["checks"]["runner_steady_decode"]["status"] == "passed"
-    assert report["checks"]["state_movement"]["status"] == "failed"
-
-
-def test_report_fails_decode_compactions_and_full_row_copies() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    measurements = {
-        "model_only_steady_decode": {
-            "albatross_tokens_per_s": 100.0,
-            "vllm_tokens_per_s": 96.0,
-            **_matching_model_only_contracts(),
-        },
-        "runner_steady_decode": {
-            "runner_tokens_per_s": 70.0,
-        },
-        "state_movement": _state_movement(
-            decode_compactions=1,
-            decode_full_row_copies=2,
-        ),
-        "config": {"provenance": _fp16_runner_provenance()},
-    }
-
-    report = bench.build_report(
-        _config(repo_root),
-        measurements=measurements,
-        cuda_available=True,
-    )
-
-    assert report["checks"]["model_only_steady_decode"]["status"] == "passed"
-    assert report["checks"]["runner_steady_decode"]["status"] == "passed"
-    state_check = report["checks"]["state_movement"]
-    assert state_check["status"] == "failed"
-    assert state_check["errors"] == [
-        "steady decode recurrent-state compactions must remain zero",
-        "steady decode full recurrent-state row copies must remain zero",
-    ]
 
 
 def test_cli_writes_structured_blocked_json(tmp_path: Path) -> None:
@@ -2912,7 +2677,6 @@ def test_cli_writes_structured_blocked_json(tmp_path: Path) -> None:
     assert set(report["checks"]) == {
         "model_only_steady_decode",
         "runner_steady_decode",
-        "state_movement",
     }
 
 

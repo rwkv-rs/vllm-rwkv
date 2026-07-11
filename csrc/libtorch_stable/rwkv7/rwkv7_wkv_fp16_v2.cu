@@ -878,42 +878,6 @@ void wkv_seq_w0_varlen_v2_cuda(int B, int max_t, int C, int H,
                               true, k, v, a, b, y, elapsed_t);
 }
 
-void wkv_one_v2_cuda(int B, int C, int H, at::Tensor state, at::Tensor r,
-                     at::Tensor w, at::Tensor k, at::Tensor v, at::Tensor a,
-                     at::Tensor b, at::Tensor y, at::Tensor elapsed_t) {
-  at::Tensor slot_indices;
-  wkv_one_v2_cuda_impl(B, C, H, state, r, w, nullptr, false, k, v, a, b, y,
-                       elapsed_t, slot_indices);
-}
-
-void wkv_one_slot_v2_cuda(int B, int C, int H, at::Tensor state, at::Tensor r,
-                          at::Tensor w, at::Tensor k, at::Tensor v,
-                          at::Tensor a, at::Tensor b, at::Tensor y,
-                          at::Tensor slot_indices, at::Tensor elapsed_t) {
-  wkv_one_v2_cuda_impl(B, C, H, state, r, w, nullptr, false, k, v, a, b, y,
-                       elapsed_t, slot_indices);
-}
-
-void wkv_one_w0_v2_cuda(int B, int C, int H, at::Tensor state, at::Tensor r,
-                        at::Tensor w, at::Tensor w0, at::Tensor k, at::Tensor v,
-                        at::Tensor a, at::Tensor b, at::Tensor y,
-                        at::Tensor elapsed_t) {
-  at::Tensor slot_indices;
-  wkv_one_v2_cuda_impl(B, C, H, state, r, w,
-                       reinterpret_cast<const half*>(w0.data_ptr()), true, k, v,
-                       a, b, y, elapsed_t, slot_indices);
-}
-
-void wkv_one_w0_slot_v2_cuda(int B, int C, int H, at::Tensor state,
-                             at::Tensor r, at::Tensor w, at::Tensor w0,
-                             at::Tensor k, at::Tensor v, at::Tensor a,
-                             at::Tensor b, at::Tensor y,
-                             at::Tensor slot_indices, at::Tensor elapsed_t) {
-  wkv_one_v2_cuda_impl(B, C, H, state, r, w,
-                       reinterpret_cast<const half*>(w0.data_ptr()), true, k, v,
-                       a, b, y, elapsed_t, slot_indices);
-}
-
 void wkv_one_v2_cuda_impl(int B, int C, int H, at::Tensor state, at::Tensor r,
                           at::Tensor w, const half* w0_ptr, bool add_w0,
                           at::Tensor k, at::Tensor v, at::Tensor a,

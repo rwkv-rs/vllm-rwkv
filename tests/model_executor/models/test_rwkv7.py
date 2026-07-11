@@ -104,8 +104,6 @@ def _new_rwkv7_forward_test_model(**attrs: Any) -> RWKV7ForCausalLM:
 def _new_rwkv7_for_weight_tests() -> RWKV7ForCausalLM:
     model = _new_rwkv7_forward_test_model()
     model.z = {"old": torch.tensor([1])}
-    model.emb_cpu = True
-    model.emb_cache = {(1, 1): (torch.empty(1), torch.empty(1))}
     model._dummy_param = nn.Parameter(torch.empty(0), requires_grad=False)
     return model
 
@@ -126,20 +124,6 @@ def _new_default_loader_for_weight_tests(
             pt_load_map_location="cpu",
         )
     )
-
-
-def test_rwkv7_slot_mixed_cmix_path_keeps_nofc_or_downgrades_sparse():
-    b1_sparse = rwkv7.PathConfig(1, False, rwkv7.CMIX_B1T1_SPARSE)
-    rows_sparse = rwkv7.PathConfig(2, False, rwkv7.CMIX_ROWS2_SPARSE)
-    b1_nofc = rwkv7.PathConfig(1, False, rwkv7.CMIX_B1T1_NOFC)
-    rows_nofc = rwkv7.PathConfig(8, False, rwkv7.CMIX_ROWS2_NOFC)
-    dense = rwkv7.PathConfig(320, False, rwkv7.CMIX_DENSE)
-
-    assert rwkv7.slot_mixed_cmix_path(b1_sparse).cmix_mode == rwkv7.CMIX_B1T1_NOFC
-    assert rwkv7.slot_mixed_cmix_path(rows_sparse).cmix_mode == rwkv7.CMIX_ROWS2_NOFC
-    assert rwkv7.slot_mixed_cmix_path(b1_nofc) is b1_nofc
-    assert rwkv7.slot_mixed_cmix_path(rows_nofc) is rows_nofc
-    assert rwkv7.slot_mixed_cmix_path(dense) is dense
 
 
 def test_rwkv7_forward_tokens_keeps_slot_selected_cmix_path(monkeypatch):
@@ -227,7 +211,7 @@ def test_rwkv7_forward_layer_range_uses_slot_fused_cmix(monkeypatch):
         model,
         torch.zeros((2, 1, 4)),
         state,
-        rwkv7.PathConfig(2, False, rwkv7.CMIX_ROWS2_SPARSE),
+        rwkv7.PathConfig(2, rwkv7.CMIX_ROWS2_NOFC),
         v_first=None,
         final=False,
         all_logits=False,
@@ -351,7 +335,7 @@ def test_rwkv7_forward_layer_range_uses_slot_fused_tmix_for_batched_decode(
         model,
         torch.zeros((2, 1, 4)),
         state,
-        rwkv7.PathConfig(2, False, rwkv7.CMIX_ROWS2_SPARSE),
+        rwkv7.PathConfig(2, rwkv7.CMIX_ROWS2_NOFC),
         v_first=None,
         final=False,
         all_logits=False,
@@ -366,30 +350,6 @@ def test_rwkv7_forward_layer_range_uses_slot_fused_tmix_for_batched_decode(
         ("fused_cmix", [3, 1]),
         ("advance", [3, 1], 1),
     ]
-
-
-def _zero_state_movement_stats(**overrides: int) -> dict[str, int]:
-    stats = {
-        "resident_to_decode_copies": 0,
-        "decode_compactions": 0,
-        "decode_compaction_rows": 0,
-        "decode_compaction_bytes": 0,
-        "decode_compaction_time_ns": 0,
-        "decode_full_row_copies": 0,
-        "decode_full_row_copy_bytes": 0,
-        "decode_hole_fills": 0,
-        "prefill_batches": 0,
-        "prefill_ranges": 0,
-        "prefill_groups": 0,
-        "prefill_group_model_calls": 0,
-        "prefill_varlen_batches": 0,
-        "prefill_varlen_tokens": 0,
-        "prefill_varlen_model_calls": 0,
-        "prefill_fallback_ranges": 0,
-        "prefill_fallback_model_calls": 0,
-    }
-    stats.update(overrides)
-    return stats
 
 
 def _rwkv7_vllm_config(
@@ -697,94 +657,73 @@ def test_rwkv7_config_preserves_disabled_cudagraph():
     assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
 
 
-def test_rwkv7_config_rejects_invalid_albatross_knob(monkeypatch):
-    import vllm.model_executor.models.config as model_config
-
-    monkeypatch.setattr(model_config.envs, "VLLM_RWKV7_RKV_MODE", "bad")
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(enforce_eager=False),
-        compilation_config=CompilationConfig(),
-    )
-
-    with pytest.raises(ValueError, match="VLLM_RWKV7_RKV_MODE"):
-        RWKV7ForCausalLMConfig.verify_and_update_config(vllm_config)
-
-
-@pytest.mark.parametrize("allow_fp16_accumulation", [False, True])
-def test_rwkv7_passes_linear_accumulation_to_custom_ops(
-    monkeypatch, allow_fp16_accumulation
+@pytest.mark.parametrize(
+    ("mode", "state_dtype", "allow_fp16_accumulation", "accumulation_policy"),
+    [
+        ("fp32io16", torch.float32, False, "fp32"),
+        ("fp16", torch.float16, True, "fp16"),
+    ],
+)
+def test_rwkv7_execution_profile_is_coherent(
+    mode,
+    state_dtype,
+    allow_fp16_accumulation,
+    accumulation_policy,
 ):
+    profile = rwkv7.resolve_execution_profile(mode)
+
+    assert profile.wkv_mode == mode
+    assert profile.wkv_state_dtype == state_dtype
+    assert profile.allow_fp16_accumulation is allow_fp16_accumulation
+    assert profile.gemm_accumulation_policy == accumulation_policy
+
+
+def test_rwkv7_execution_profile_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="VLLM_RWKV7_WKV_MODE"):
+        rwkv7.resolve_execution_profile("legacy")
+
+
+@pytest.mark.parametrize("mode", ["fp32io16", "fp16"])
+def test_rwkv7_passes_profile_accumulation_to_custom_op(monkeypatch, mode):
     calls: list[Any] = []
 
     def linear_f16(x, weight, allow):
         calls.append(("linear_f16", allow))
         return torch.empty((x.size(0), weight.size(1)))
 
-    def linear_f16_orig(x, weight, allow):
-        calls.append(("linear_f16_orig", allow))
-        return torch.empty((x.size(0), weight.size(0)))
-
-    def linear_f16_orig_lt_cfg(x, weight, workspace_mb, algo_index, allow):
-        calls.append(("linear_f16_orig_lt_cfg", workspace_mb, algo_index, allow))
-        return torch.empty((x.size(0), weight.size(0)))
-
     monkeypatch.setattr(torch.ops.rwkv7_v3a_ops, "linear_f16", linear_f16)
-    monkeypatch.setattr(torch.ops.rwkv7_v3a_ops, "linear_f16_orig", linear_f16_orig)
-    monkeypatch.setattr(
-        torch.ops.rwkv7_v3a_ops,
-        "linear_f16_orig_lt_cfg",
-        linear_f16_orig_lt_cfg,
-    )
+    profile = rwkv7.resolve_execution_profile(mode)
     model = _new_rwkv7_forward_test_model(
-        allow_fp16_accumulation=allow_fp16_accumulation
+        allow_fp16_accumulation=profile.allow_fp16_accumulation
     )
     x = torch.empty((2, 4))
 
     model.linear(x, torch.empty((4, 3)))
-    model._linear_f16_orig(x, torch.empty((3, 4)))
-    model._linear_f16_orig_lt_cfg(x, torch.empty((3, 4)), 16, 2)
 
-    assert calls == [
-        ("linear_f16", allow_fp16_accumulation),
-        ("linear_f16_orig", allow_fp16_accumulation),
-        ("linear_f16_orig_lt_cfg", 16, 2, allow_fp16_accumulation),
-    ]
+    assert calls == [("linear_f16", profile.allow_fp16_accumulation)]
 
 
-def test_rwkv7_config_rejects_invalid_orig_linear_group(monkeypatch):
-    import vllm.model_executor.models.config as model_config
+def test_rwkv7_model_exposes_no_legacy_execution_paths():
+    for name in (
+        "_get_cpu_embedding_cache",
+        "_copy_cpu_embedding_to_device",
+        "prepare_cudagraph_embedding",
+        "linear_orig_layout",
+        "_linear_f16_orig",
+        "_linear_f16_orig_lt_cfg",
+        "linear_t_orig",
+    ):
+        assert not hasattr(RWKV7ForCausalLM, name)
 
-    monkeypatch.setattr(model_config.envs, "VLLM_RWKV7_ORIG_LINEAR_GROUPS", "none,head")
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(enforce_eager=False),
-        compilation_config=CompilationConfig(),
-    )
-
-    with pytest.raises(ValueError, match="VLLM_RWKV7_ORIG_LINEAR_GROUPS"):
-        RWKV7ForCausalLMConfig.verify_and_update_config(vllm_config)
-
-
-def test_rwkv7_parse_orig_linear_groups():
-    assert rwkv7.parse_orig_linear_groups("none") == set()
-    assert rwkv7.parse_orig_linear_groups("att_c2c, ffn_key head") == {
-        "att_c2c",
-        "ffn_key",
-        "head",
-    }
-    with pytest.raises(ValueError, match="VLLM_RWKV7_ORIG_LINEAR_GROUPS"):
-        rwkv7.parse_orig_linear_groups("bad")
+    for name in (
+        "parse_orig_linear_groups",
+        "use_orig_linear",
+        "is_orig_linear_weight",
+    ):
+        assert not hasattr(rwkv7, name)
 
 
-def test_rwkv7_select_path_treats_batched_rkv_as_enabled(monkeypatch):
-    monkeypatch.setattr(rwkv7, "RKV_MODE", "batched")
-    monkeypatch.setattr(rwkv7, "ORIG_LINEAR_GROUPS", set())
-
-    path = rwkv7.select_path(B=320, T=1)
-
-    assert path.use_batched_rkv
-
-
-def test_rwkv7_dummy_inputs_decode_capture_advertises_compact_rows():
+def test_rwkv7_dummy_inputs_decode_capture_advertises_contiguous_rows():
     state = object.__new__(RWKV7ModelState)
     state.num_layers = 2
     state.max_num_reqs = 4
@@ -836,130 +775,6 @@ def test_rwkv7_dummy_inputs_decode_capture_uses_persistent_state_buffers():
     assert inputs["slot_indices"] is None
 
 
-def test_rwkv7_embed_uses_cached_device_buffer_during_cuda_graph_capture(
-    monkeypatch,
-):
-    model = object.__new__(RWKV7ForCausalLM)
-    model.emb_cpu = True
-    host = torch.empty((2, 4), dtype=torch.float16)
-    dev = torch.empty((2, 1, 4), dtype=torch.float16)
-    model.emb_cache = {(2, 1): (host, dev)}
-    model.z = {"emb.weight": torch.empty((8, 4), dtype=torch.float16)}
-    monkeypatch.setattr(rwkv7, "C", 4)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    monkeypatch.setattr(
-        torch,
-        "index_select",
-        lambda *args, **kwargs: pytest.fail(
-            "CUDA graph capture must not run CPU embedding lookup"
-        ),
-    )
-
-    out = model.embed(torch.tensor([[1], [2]], dtype=torch.long))
-
-    assert out is dev
-
-
-def test_rwkv7_prepare_cudagraph_embedding_updates_cached_device_buffer(
-    monkeypatch,
-):
-    model = object.__new__(RWKV7ForCausalLM)
-    model.emb_cpu = True
-    model.z = {
-        "emb.weight": torch.arange(24, dtype=torch.float16).view(8, 3),
-    }
-    host = torch.empty((2, 3), dtype=torch.float16)
-    dev = torch.empty((2, 1, 3), dtype=torch.float16)
-    model.emb_cache = {(2, 1): (host, dev)}
-    monkeypatch.setattr(rwkv7, "C", 3)
-
-    model.prepare_cudagraph_embedding(torch.tensor([[1], [3]], dtype=torch.long))
-
-    expected = model.z["emb.weight"][torch.tensor([1, 3])].view(2, 1, 3)
-    torch.testing.assert_close(dev, expected)
-
-
-def test_rwkv7_prepare_cudagraph_embedding_treats_flat_tokens_as_decode_batch(
-    monkeypatch,
-):
-    model = object.__new__(RWKV7ForCausalLM)
-    model.emb_cpu = True
-    model.z = {
-        "emb.weight": torch.arange(24, dtype=torch.float16).view(8, 3),
-    }
-    host = torch.empty((2, 3), dtype=torch.float16)
-    decode_dev = torch.empty((2, 1, 3), dtype=torch.float16)
-    wrong_dev = torch.full((1, 2, 3), -1, dtype=torch.float16)
-    model.emb_cache = {
-        (2, 1): (host, decode_dev),
-        (1, 2): (torch.empty((2, 3), dtype=torch.float16), wrong_dev),
-    }
-    monkeypatch.setattr(rwkv7, "C", 3)
-
-    model.prepare_cudagraph_embedding(torch.tensor([1, 3], dtype=torch.long))
-
-    expected = model.z["emb.weight"][torch.tensor([1, 3])].view(2, 1, 3)
-    torch.testing.assert_close(decode_dev, expected)
-    torch.testing.assert_close(wrong_dev, torch.full_like(wrong_dev, -1))
-
-
-def test_rwkv7_prepare_cudagraph_inputs_rejects_non_compact_decode_rows():
-    model = object.__new__(RWKV7ForCausalLM)
-    seen = []
-    model.prepare_cudagraph_embedding = lambda tokens: seen.append(tokens.clone())
-
-    with pytest.raises(RuntimeError, match="compact prefix rows"):
-        model.prepare_cudagraph_inputs(
-            {
-                "input_ids": torch.tensor([10, 20], dtype=torch.int64),
-                "rwkv_decode_batch_size": 2,
-                "rwkv_decode_rows": [1, 0],
-                "rwkv_decode_token_positions": [0, 1],
-            }
-        )
-
-    assert seen == []
-
-
-def test_rwkv7_prepare_cudagraph_inputs_uses_dense_view_for_compact_rows():
-    model = object.__new__(RWKV7ForCausalLM)
-    seen = []
-    input_ids = torch.tensor([10, 20], dtype=torch.int64)
-    model.prepare_cudagraph_embedding = lambda tokens: seen.append(tokens)
-
-    model.prepare_cudagraph_inputs(
-        {
-            "input_ids": input_ids,
-            "rwkv_decode_batch_size": 2,
-            "rwkv_decode_rows": [0, 1],
-            "rwkv_decode_token_positions": [0, 1],
-        }
-    )
-
-    assert len(seen) == 1
-    assert seen[0].shape == (2, 1)
-    assert seen[0].tolist() == [[10], [20]]
-    _assert_same_storage_view(seen[0].view(-1), input_ids[:2])
-
-
-def test_rwkv7_prepare_cudagraph_inputs_rejects_non_dense_decode_positions():
-    model = object.__new__(RWKV7ForCausalLM)
-    seen = []
-    model.prepare_cudagraph_embedding = lambda tokens: seen.append(tokens.clone())
-
-    with pytest.raises(RuntimeError, match="dense contiguous"):
-        model.prepare_cudagraph_inputs(
-            {
-                "input_ids": torch.tensor([10, 20, 30], dtype=torch.int64),
-                "rwkv_decode_batch_size": 2,
-                "rwkv_decode_rows": [0, 1],
-                "rwkv_decode_token_positions": [0, 2],
-            }
-        )
-
-    assert seen == []
-
-
 def test_rwkv7_load_weights_preprocesses_full_raw_weights(monkeypatch):
     model = _new_rwkv7_for_weight_tests()
     raw_weights = {
@@ -972,7 +787,6 @@ def test_rwkv7_load_weights_preprocesses_full_raw_weights(monkeypatch):
         calls.append(set(z))
         z["processed"] = torch.tensor([3.0])
         self.z = z
-        self.emb_cache = {}
 
     monkeypatch.setattr(RWKV7ForCausalLM, "_preprocess_weights", fake_preprocess)
 
@@ -985,7 +799,6 @@ def test_rwkv7_load_weights_preprocesses_full_raw_weights(monkeypatch):
     torch.testing.assert_close(model.z["emb.weight"], raw_weights["emb.weight"])
     torch.testing.assert_close(model.z["head.weight"], raw_weights["head.weight"])
     torch.testing.assert_close(model.z["processed"], torch.tensor([3.0]))
-    assert model.emb_cache == {}
 
 
 def test_rwkv7_default_loader_validation_uses_raw_weight_names():
@@ -1128,7 +941,6 @@ def test_rwkv7_online_weight_update_restores_old_weights_after_partial_preproces
 
     def fail_after_partial_preprocess(self, z):
         self.z = {"partial": torch.tensor([9.0])}
-        self.emb_cache = {}
         raise RuntimeError("post preprocess failure")
 
     monkeypatch.setattr(
@@ -1143,31 +955,6 @@ def test_rwkv7_online_weight_update_restores_old_weights_after_partial_preproces
 
     assert model.z is old_z
     assert not hasattr(model, "_pending_weight_update")
-
-
-def test_rwkv7_online_weight_update_cpu_copies_pending_tensors(monkeypatch):
-    model = _new_rwkv7_for_weight_tests()
-    model.raw_weight_names = {"emb.weight"}
-    source = torch.tensor([1.0])
-    captured = {}
-
-    def fake_preprocess(self, z):
-        captured.update(z)
-        self.z = z
-
-    monkeypatch.setattr(RWKV7ForCausalLM, "_preprocess_weights", fake_preprocess)
-
-    model.start_weight_update()
-    model.load_weights([("emb.weight", source)])
-    pending = model._pending_weight_update["emb.weight"]
-    source.fill_(99.0)
-
-    assert pending.device.type == "cpu"
-    assert pending.data_ptr() != source.data_ptr()
-
-    model.finish_weight_update()
-
-    assert captured["emb.weight"].item() == 1.0
 
 
 def test_rwkv7_online_weight_update_cuda_stages_pending_tensors_on_device(monkeypatch):
@@ -1566,7 +1353,6 @@ def test_rwkv7_tensor_parallel_embedding_masks_remote_tokens(monkeypatch):
     model.tp_size = 2
     model.tp_rank = 0
     model.vocab_size = 5
-    model.emb_cpu = False
     model.z = {
         "emb.weight": torch.tensor(
             [
@@ -1725,6 +1511,17 @@ def test_rwkv7_model_state_uses_contiguous_decode_path_for_prefix_rows():
     assert inputs["slot_indices"] is None
 
 
+def test_rwkv7_model_state_exposes_no_legacy_state_movement_path():
+    for name in (
+        "_state_row_nbytes",
+        "_sync_decode_rows_to_resident_rows",
+        "_fill_decode_row_hole",
+        "_move_decode_row",
+        "_compact_decode_rows_into_free_prefix",
+    ):
+        assert not hasattr(RWKV7ModelState, name)
+
+
 def test_rwkv7_model_state_keeps_steady_decode_slot_after_row_removal():
     state = _new_rwkv7_model_state(max_num_reqs=4)
     state.add_request(0, _new_request("req-0"))
@@ -1748,10 +1545,6 @@ def test_rwkv7_model_state_keeps_steady_decode_slot_after_row_removal():
     assert torch.count_nonzero(state.wkv_state[:, 0]) == 0
     assert torch.all(state.wkv_state[:, 1] == 30)
     assert state.elapsed.tolist()[:2] == [0, 40]
-    stats = state.get_state_movement_stats()
-    assert stats == _zero_state_movement_stats()
-
-    state.reset_state_movement_stats()
     decode_batch = SimpleNamespace(
         idx_mapping_np=np.array([1], dtype=np.int32),
         num_reqs=1,
@@ -1769,7 +1562,6 @@ def test_rwkv7_model_state_keeps_steady_decode_slot_after_row_removal():
     assert inputs["shift_state"].data_ptr() == state.shift_state.data_ptr()
     assert inputs["wkv_state"].data_ptr() == state.wkv_state.data_ptr()
     assert inputs["elapsed"].data_ptr() == state.elapsed.data_ptr()
-    assert state.get_state_movement_stats() == _zero_state_movement_stats()
 
 
 def test_rwkv7_model_state_keeps_slots_after_generic_input_batch_condense():
@@ -1817,8 +1609,6 @@ def test_rwkv7_model_state_keeps_slots_after_generic_input_batch_condense():
     input_batch.query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32)
     input_batch.query_start_loc_np = np.array([0, 1, 2], dtype=np.int32)
     input_batch.is_prefilling_np = np.array([False, False], dtype=np.bool_)
-    state.reset_state_movement_stats()
-
     inputs = state.prepare_inputs(input_batch, req_states=None)
 
     assert state.req_id_to_index == {"req-0": 0, "req-2": 2}
@@ -1830,40 +1620,6 @@ def test_rwkv7_model_state_keeps_slots_after_generic_input_batch_condense():
     assert torch.all(state.shift_state[:, :, 2] == 20)
     assert torch.all(state.wkv_state[:, 2] == 30)
     assert state.elapsed.tolist()[:3] == [0, 0, 40]
-    assert state.get_state_movement_stats() == _zero_state_movement_stats()
-
-
-def test_rwkv7_model_state_compacts_multiple_decode_holes_with_one_plan():
-    state = _new_rwkv7_model_state(max_num_reqs=6)
-    state.use_slot_mapped_state = False
-    for req_slot in range(6):
-        state.add_request(req_slot, _new_request(f"req-{req_slot}"))
-    state.remove_request("req-1")
-    state.remove_request("req-3")
-    state.decode_req_slots = {0, 2, 4, 5}
-    state.num_decode_rows = len(state.decode_req_slots)
-    state.shift_state[:, :, 4].fill_(40)
-    state.shift_state[:, :, 5].fill_(50)
-    state.wkv_state[:, 4].fill_(41)
-    state.wkv_state[:, 5].fill_(51)
-    state.elapsed[4] = 42
-    state.elapsed[5] = 52
-    state.reset_state_movement_stats()
-
-    state._compact_decode_rows_into_free_prefix()
-
-    assert state.req_slot_to_row[:6] == [0, -1, 2, -1, 3, 1]
-    assert state.row_to_req_slot[:6] == [0, 5, 2, 4, -1, -1]
-    assert torch.all(state.shift_state[:, :, 1] == 50)
-    assert torch.all(state.wkv_state[:, 1] == 51)
-    assert torch.all(state.shift_state[:, :, 3] == 40)
-    assert torch.all(state.wkv_state[:, 3] == 41)
-    assert state.elapsed.tolist()[:6] == [0, 52, 0, 42, 0, 0]
-    assert state.get_state_movement_stats() == _zero_state_movement_stats(
-        decode_hole_fills=2,
-        decode_full_row_copies=2,
-        decode_full_row_copy_bytes=2 * state._state_row_nbytes(),
-    )
 
 
 def test_rwkv7_model_state_keeps_decode_prefix_when_prefill_reuses_free_row():
@@ -1908,16 +1664,13 @@ def test_rwkv7_model_state_keeps_decode_prefix_when_prefill_reuses_free_row():
     assert inputs["rwkv_prefill_rows"] == [prefill_row]
     assert inputs["rwkv_prefill_groups"] == [(1, 2, 3, 1, 4, prefill_row)]
     _assert_no_varlen_prefill_inputs(inputs)
-    assert inputs["prefill_idx_mapping"].tolist() == [-1, -1]
     assert inputs["shift_state"].data_ptr() == state.shift_state.data_ptr()
     assert inputs["wkv_state"].data_ptr() == state.wkv_state.data_ptr()
     assert inputs["elapsed"].data_ptr() == state.elapsed.data_ptr()
     assert inputs["prefill_shift_state"].data_ptr() == state.shift_state.data_ptr()
     assert inputs["prefill_wkv_state"].data_ptr() == state.wkv_state.data_ptr()
     assert inputs["prefill_elapsed"].data_ptr() == state.elapsed.data_ptr()
-    assert state.num_decode_rows == 1
     assert state.decode_req_slots == {1}
-    assert state._prefill_decode_rows == [prefill_row]
     assert state.req_slot_to_row[:3] == [-1, decode_row, prefill_row]
     assert state.row_to_req_slot[:3] == [2, 1, -1]
     assert 2 in state.free_rows
@@ -2030,7 +1783,7 @@ def test_rwkv7_model_state_rejects_partial_live_decode_wave():
 
     with pytest.raises(RuntimeError, match="all live decode rows"):
         state.prepare_inputs(input_batch, req_states=None)
-    assert state.num_decode_rows == 2
+    assert len(state.decode_req_slots) == 2
     assert state.req_slot_to_row[:2] == [0, 1]
 
 
@@ -2054,7 +1807,7 @@ def test_rwkv7_model_state_does_not_park_unscheduled_decode_rows():
 
     with pytest.raises(RuntimeError, match="all live decode rows"):
         state.prepare_inputs(input_batch, req_states=None)
-    assert state.num_decode_rows == 2
+    assert len(state.decode_req_slots) == 2
     assert state.req_slot_to_row[:2] == [0, 1]
 
 
@@ -2191,8 +1944,6 @@ def _fragmented_mixed_rwkv7_inputs() -> tuple[RWKV7ModelState, dict[str, Any]]:
     state.wkv_state[:, 2].fill_(21)
     state.wkv_state[:, 3].fill_(31)
     state.elapsed[:4] = torch.tensor([12, 0, 22, 32], dtype=torch.int32)
-    state.reset_state_movement_stats()
-
     mixed_batch = SimpleNamespace(
         idx_mapping_np=np.array([0, 2, 3], dtype=np.int32),
         num_reqs=3,
@@ -2223,35 +1974,6 @@ def test_rwkv7_model_state_keeps_prefill_transition_slots_before_forward():
     assert torch.all(state.shift_state[:, :, 2] == 20)
     assert torch.all(state.shift_state[:, :, 3] == 30)
     assert state.elapsed.tolist()[:4] == [12, 0, 22, 32]
-
-
-def test_rwkv7_model_state_reports_zero_prepare_compaction_after_transition():
-    state, _inputs = _fragmented_mixed_rwkv7_inputs()
-
-    assert state.get_state_movement_stats() == _zero_state_movement_stats(
-        prefill_batches=1,
-        prefill_ranges=1,
-        prefill_groups=1,
-        prefill_group_model_calls=1,
-    )
-
-
-def test_rwkv7_model_state_reports_zero_steady_decode_copies():
-    state = _new_rwkv7_model_state(max_num_reqs=4)
-    state.add_request(0, _new_request("req-0"))
-    state.add_request(1, _new_request("req-1"))
-    decode_batch = SimpleNamespace(
-        idx_mapping_np=np.array([0, 1], dtype=np.int32),
-        num_reqs=2,
-        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
-        is_prefilling_np=np.array([False, False], dtype=np.bool_),
-    )
-
-    state.prepare_inputs(decode_batch, req_states=None)
-    state.reset_state_movement_stats()
-    state.prepare_inputs(decode_batch, req_states=None)
-
-    assert state.get_state_movement_stats() == _zero_state_movement_stats()
 
 
 def test_rwkv7_model_state_prefill_uses_resident_state():
@@ -2352,7 +2074,7 @@ def test_rwkv7_model_state_prefill_becomes_decode_without_resident_copy():
     state.postprocess_state(inputs["idx_mapping"], torch.tensor([1], dtype=torch.int32))
 
     assert 2 in state.decode_req_slots
-    assert state.num_decode_rows == 1
+    assert len(state.decode_req_slots) == 1
     assert state.req_slot_to_row[2] == row
     assert state.row_to_req_slot[row] == 2
     assert torch.all(state.shift_state[:, :, row] == 11)
@@ -2508,7 +2230,7 @@ def test_rwkv7_model_state_remove_decode_row_keeps_other_resident_rows_stable():
 
     state.remove_request("req-0")
 
-    assert state.num_decode_rows == 1
+    assert len(state.decode_req_slots) == 1
     assert state.req_slot_to_row[:4] == [-1, 1, 2, 3]
     assert state.row_to_req_slot[:4] == [-1, 1, 2, 3]
     assert 0 in state.free_rows
@@ -2521,7 +2243,6 @@ def test_rwkv7_model_state_remove_decode_row_keeps_other_resident_rows_stable():
     assert torch.all(state.wkv_state[:, 2] == 30)
     assert torch.all(state.wkv_state[:, 3] == 40)
     assert state.elapsed.tolist()[:4] == [0, 20, 30, 40]
-    assert state.get_state_movement_stats() == _zero_state_movement_stats()
 
 
 def test_rwkv7_model_state_remove_prefill_row_preserves_decode_prefix():
@@ -2547,7 +2268,7 @@ def test_rwkv7_model_state_remove_prefill_row_preserves_decode_prefix():
 
     state.remove_request("req-2")
 
-    assert state.num_decode_rows == 2
+    assert len(state.decode_req_slots) == 2
     assert state.req_slot_to_row[:4] == [0, 1, -1, 3]
     assert state.row_to_req_slot[:4] == [0, 1, -1, 3]
     assert 2 in state.free_rows
@@ -2608,8 +2329,20 @@ def test_rwkv7_model_state_dummy_batch_uses_scratch_state():
     assert torch.all(state.elapsed == 3)
 
 
-def test_rwkv7_uses_default_vllm_sampler():
-    assert RWKV7ModelState.custom_sampler(SimpleNamespace(), SimpleNamespace()) is None
+def test_rwkv7_model_state_requires_rapid_sampler():
+    state = object.__new__(RWKV7ModelState)
+    sampler = SimpleNamespace(use_rapid=True, require_rapid=False)
+
+    assert state.custom_sampler(sampler) == (sampler, None)
+    assert sampler.require_rapid is True
+
+
+def test_rwkv7_model_state_rejects_unavailable_rapid_sampler():
+    state = object.__new__(RWKV7ModelState)
+    sampler = SimpleNamespace(use_rapid=False, require_rapid=False)
+
+    with pytest.raises(RuntimeError, match="requires rapid-sampling"):
+        state.custom_sampler(sampler)
 
 
 def test_rwkv7_dummy_inputs_cover_all_tokens():
@@ -2757,11 +2490,11 @@ def test_rwkv7_model_state_rejects_grouped_prefill_fallback_on_fast_path():
         prefill_len_np=np.array([1], dtype=np.int32),
     )
 
-    with pytest.raises(RuntimeError, match="Refusing to use the grouped prefill"):
+    with pytest.raises(RuntimeError, match="fast prefill requires"):
         state.prepare_inputs(input_batch, req_states=None)
 
 
-def test_rwkv7_vllm_forward_uses_dense_decode_input_view_for_compact_rows(
+def test_rwkv7_vllm_forward_uses_dense_decode_input_view_for_contiguous_rows(
     monkeypatch,
 ):
     monkeypatch.setattr(rwkv7, "C", 3)
@@ -2791,7 +2524,7 @@ def test_rwkv7_vllm_forward_uses_dense_decode_input_view_for_compact_rows(
     model = _new_rwkv7_forward_test_model(
         forward_tokens=forward_tokens,
         forward_all_hidden=lambda *args: pytest.fail(
-            "pure compact decode must not run prefill path"
+            "pure contiguous decode must not run prefill path"
         ),
     )
 
@@ -2837,7 +2570,7 @@ def test_rwkv7_vllm_forward_rejects_permuted_decode_rows(monkeypatch):
     wkv_state = torch.zeros((1, 2, 1, 1, 1), dtype=torch.float32)
     elapsed = torch.zeros((2,), dtype=torch.int32)
 
-    with pytest.raises(RuntimeError, match="compact prefix rows"):
+    with pytest.raises(RuntimeError, match="contiguous prefix rows"):
         RWKV7ForCausalLM.forward(
             model,
             torch.tensor([10, 20], dtype=torch.int64),
@@ -2866,8 +2599,10 @@ def test_rwkv7_vllm_forward_uses_slot_indices_for_permuted_decode_rows(
     monkeypatch.setattr(rwkv7, "first_device", lambda: torch.device("cpu"))
     monkeypatch.setattr(
         RWKV7ForCausalLM,
-        "_compact_decode_token_range",
-        staticmethod(lambda *args: pytest.fail("slot decode must not compact")),
+        "_contiguous_decode_token_range",
+        staticmethod(
+            lambda *args: pytest.fail("slot decode must not require contiguous rows")
+        ),
     )
 
     seen = []
@@ -2942,7 +2677,7 @@ def test_rwkv7_vllm_forward_rejects_non_prefix_decode_rows_before_gather(
         forward_all_hidden=lambda *args: pytest.fail("decode must stay T=1"),
     )
 
-    with pytest.raises(RuntimeError, match="compact prefix rows"):
+    with pytest.raises(RuntimeError, match="contiguous prefix rows"):
         RWKV7ForCausalLM.forward(
             model,
             torch.tensor([10, 20], dtype=torch.int64),
@@ -2958,9 +2693,9 @@ def test_rwkv7_vllm_forward_rejects_non_prefix_decode_rows_before_gather(
         )
 
 
-def test_rwkv7_compact_decode_token_range_rejects_non_prefix_rows():
-    with pytest.raises(RuntimeError, match="compact prefix rows"):
-        RWKV7ForCausalLM._compact_decode_token_range(2, [1, 2], [0, 1])
+def test_rwkv7_contiguous_decode_token_range_rejects_non_prefix_rows():
+    with pytest.raises(RuntimeError, match="contiguous prefix rows"):
+        RWKV7ForCausalLM._contiguous_decode_token_range(2, [1, 2], [0, 1])
 
 
 def test_rwkv7_vllm_forward_resident_row_without_decode_metadata_uses_singleton_prefill(

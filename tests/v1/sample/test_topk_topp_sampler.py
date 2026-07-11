@@ -715,9 +715,47 @@ def test_rapid_sample_passes_indexed_penalties_to_indexed_kernel(
         "indexed_calls": 1,
         "indexed_rows": 2,
         "indexed_vocab_elements": 16,
-        "wrapper_gather_scatter_calls": 0,
-        "wrapper_gather_scatter_elements": 0,
     }
+
+
+def test_rapid_sample_requires_indexed_penalty_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.v1.sample.ops import topk_topp_sampler
+
+    class FakeRapidModule:
+        @staticmethod
+        def batch_sampling_repetition_temperature_topk_topp(*args, **kwargs):
+            pytest.fail("indexed penalties must not use the contiguous kernel")
+
+    logits = torch.randn(2, 8, dtype=torch.float32)
+    penalties = torch.zeros(4, 8, dtype=torch.float32)
+    penalty_indices = torch.tensor([3, 1], dtype=torch.int32)
+
+    monkeypatch.setattr(
+        topk_topp_sampler,
+        "rapid_sample_input_supported",
+        lambda logits: True,
+    )
+    monkeypatch.setattr(
+        topk_topp_sampler,
+        "_load_rapid_sampler_module",
+        lambda: FakeRapidModule(),
+    )
+    monkeypatch.setattr(
+        topk_topp_sampler,
+        "_rapid_states",
+        lambda module, logits: torch.empty(2, dtype=torch.uint8),
+    )
+
+    with pytest.raises(RuntimeError, match="indexed penalty kernel"):
+        topk_topp_sampler.rapid_sample(
+            logits,
+            None,
+            None,
+            penalties=penalties,
+            penalty_indices=penalty_indices,
+        )
 
 
 def test_rapid_sample_rejects_mixed_penalty_params(
@@ -872,8 +910,6 @@ def test_rapid_sample_updates_indexed_penalties():
         "indexed_calls": 2,
         "indexed_rows": 4,
         "indexed_vocab_elements": 32,
-        "wrapper_gather_scatter_calls": 0,
-        "wrapper_gather_scatter_elements": 0,
     }
 
 

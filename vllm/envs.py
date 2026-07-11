@@ -122,14 +122,6 @@ if TYPE_CHECKING:
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_RWKV7_WKV_MODE: str = "fp16"
-    VLLM_RWKV7_EMB_DEVICE: str = "gpu"
-    VLLM_RWKV7_RKV_MODE: str = "off"
-    VLLM_RWKV7_CMIX_SPARSE: str = "no-fc"
-    VLLM_RWKV7_LOW_RANK_WEIGHT: str = "both"
-    VLLM_RWKV7_ORIG_LINEAR_GROUPS: str = "none"
-    VLLM_RWKV7_ALLOW_FP16_ACCUMULATION: bool = True
-    VLLM_RWKV7_SLOT_MAPPED_STATE: bool = True
-    VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP: bool = True
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -328,15 +320,6 @@ def maybe_convert_bool(value: str | None) -> bool | None:
     if value is None:
         return None
     return bool(int(value))
-
-
-def rwkv7_allow_fp16_accumulation() -> bool:
-    name = "VLLM_RWKV7_ALLOW_FP16_ACCUMULATION"
-    default = "1" if os.getenv("VLLM_RWKV7_WKV_MODE", "fp16") == "fp16" else "0"
-    value = os.getenv(name, default)
-    if value not in {"0", "1"}:
-        raise ValueError(f"{name} must be 0 or 1, got {value!r}")
-    return value == "1"
 
 
 def maybe_convert_json_str_or_file(value: str | None) -> dict[str, Any] | None:
@@ -1170,24 +1153,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": lambda: bool(
         int(os.getenv("VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", "1"))
     ),
-    # RWKV7 Albatross/faster3a compatibility knobs.
+    # RWKV7 execution profile: fp16 throughput or fp32io16 high precision.
     "VLLM_RWKV7_WKV_MODE": lambda: os.getenv("VLLM_RWKV7_WKV_MODE", "fp16"),
-    "VLLM_RWKV7_EMB_DEVICE": lambda: os.getenv("VLLM_RWKV7_EMB_DEVICE", "gpu"),
-    "VLLM_RWKV7_RKV_MODE": lambda: os.getenv("VLLM_RWKV7_RKV_MODE", "off"),
-    "VLLM_RWKV7_CMIX_SPARSE": lambda: os.getenv("VLLM_RWKV7_CMIX_SPARSE", "no-fc"),
-    "VLLM_RWKV7_LOW_RANK_WEIGHT": lambda: os.getenv(
-        "VLLM_RWKV7_LOW_RANK_WEIGHT", "both"
-    ),
-    "VLLM_RWKV7_ORIG_LINEAR_GROUPS": lambda: os.getenv(
-        "VLLM_RWKV7_ORIG_LINEAR_GROUPS", "none"
-    ),
-    "VLLM_RWKV7_ALLOW_FP16_ACCUMULATION": rwkv7_allow_fp16_accumulation,
-    "VLLM_RWKV7_SLOT_MAPPED_STATE": lambda: bool(
-        int(os.getenv("VLLM_RWKV7_SLOT_MAPPED_STATE", "1"))
-    ),
-    "VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP": lambda: bool(
-        int(os.getenv("VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP", "1"))
-    ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (
         os.getenv("VLLM_DISABLE_PYNCCL", "False").lower() in ("true", "1")

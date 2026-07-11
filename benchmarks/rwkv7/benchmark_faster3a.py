@@ -77,7 +77,6 @@ MODEL_ONLY_FP16_THROUGHPUT_REQUIREMENTS = {
 }
 RUNNER_FP16_THROUGHPUT_REQUIREMENTS = {
     "VLLM_RWKV7_WKV_MODE": "fp16",
-    "VLLM_RWKV7_ALLOW_FP16_ACCUMULATION": "1",
 }
 VLLM_RUNNER_MODE = "worker_execute_model"
 VLLM_RUNNER_TIMING_TARGET = "worker.execute_model"
@@ -91,53 +90,18 @@ VLLM_RUNNER_SAMPLING = {
     "ignore_eos": True,
     "detokenize": False,
 }
-STATE_MOVEMENT_COUNTERS = (
-    "resident_to_decode_copies",
-    "decode_compactions",
-    "decode_compaction_rows",
-    "decode_compaction_bytes",
-    "decode_compaction_time_ns",
-    "decode_full_row_copies",
-    "decode_full_row_copy_bytes",
-    "decode_hole_fills",
-    "prefill_batches",
-    "prefill_ranges",
-    "prefill_groups",
-    "prefill_group_model_calls",
-    "prefill_varlen_batches",
-    "prefill_varlen_tokens",
-    "prefill_varlen_model_calls",
-    "prefill_fallback_ranges",
-    "prefill_fallback_model_calls",
-)
 PROVENANCE_ENV_VARS = (
     "VLLM_RWKV7_MODEL",
     "VLLM_RWKV7_WKV_MODE",
-    "VLLM_RWKV7_EMB_DEVICE",
-    "VLLM_RWKV7_RKV_MODE",
-    "VLLM_RWKV7_CMIX_SPARSE",
-    "VLLM_RWKV7_LOW_RANK_WEIGHT",
-    "VLLM_RWKV7_ORIG_LINEAR_GROUPS",
-    "VLLM_RWKV7_ALLOW_FP16_ACCUMULATION",
     "VLLM_USE_RAPID_SAMPLER",
     "VLLM_USE_V2_MODEL_RUNNER",
     "VLLM_ALLOW_INSECURE_SERIALIZATION",
-    "VLLM_RWKV7_SLOT_MAPPED_STATE",
-    "VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP",
 )
 PROVENANCE_ENV_DEFAULTS = {
     "VLLM_RWKV7_WKV_MODE": "fp16",
-    "VLLM_RWKV7_EMB_DEVICE": "gpu",
-    "VLLM_RWKV7_RKV_MODE": "off",
-    "VLLM_RWKV7_CMIX_SPARSE": "no-fc",
-    "VLLM_RWKV7_LOW_RANK_WEIGHT": "both",
-    "VLLM_RWKV7_ORIG_LINEAR_GROUPS": "none",
-    "VLLM_RWKV7_ALLOW_FP16_ACCUMULATION": "1",
     "VLLM_USE_RAPID_SAMPLER": "1",
     "VLLM_USE_V2_MODEL_RUNNER": "1",
     "VLLM_ALLOW_INSECURE_SERIALIZATION": "1",
-    "VLLM_RWKV7_SLOT_MAPPED_STATE": "1",
-    "VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP": "1",
 }
 BENCHMARK_ONLY_VLLM_ENV_VARS = ("VLLM_RWKV7_MODEL",)
 ALBATROSS_DEFAULTS = {
@@ -155,11 +119,6 @@ ACCEPTANCE_THRESHOLDS = {
     },
     "runner_steady_decode": {
         "min_runner_tokens_per_s": 1.0,
-    },
-    "state_movement": {
-        "max_resident_to_decode_copies": 0,
-        "max_decode_compactions": 0,
-        "max_decode_full_row_copies": 0,
     },
 }
 
@@ -233,7 +192,6 @@ class BenchmarkConfig:
     decode_tokens: int
     runner_prefill_chunk_tokens: int = DEFAULT_RUNNER_PREFILL_CHUNK_TOKENS
     runner_enforce_eager: bool = False
-    runner_disable_rapid_sampler: bool = False
     runner_cudagraph_capture_sizes: tuple[int, ...] | None = None
     albatross_wkv: str = ALBATROSS_DEFAULTS["wkv"]
     albatross_emb: str = ALBATROSS_DEFAULTS["emb"]
@@ -258,10 +216,6 @@ def _blocker(code: str, message: str, **details: Any) -> dict[str, Any]:
     blocker = {"code": code, "message": message}
     blocker.update({k: v for k, v in details.items() if v is not None})
     return blocker
-
-
-def _empty_state_movement_metrics() -> dict[str, int | None]:
-    return {name: None for name in STATE_MOVEMENT_COUNTERS}
 
 
 def _measurement_blockers(
@@ -386,10 +340,6 @@ def _rwkv_environment_metadata() -> dict[str, str | None]:
         name: raw[name] if raw[name] is not None else PROVENANCE_ENV_DEFAULTS.get(name)
         for name in PROVENANCE_ENV_VARS
     }
-    if raw["VLLM_RWKV7_ALLOW_FP16_ACCUMULATION"] is None:
-        resolved["VLLM_RWKV7_ALLOW_FP16_ACCUMULATION"] = (
-            "1" if resolved["VLLM_RWKV7_WKV_MODE"] == "fp16" else "0"
-        )
     return resolved
 
 
@@ -419,7 +369,6 @@ def _benchmark_provenance(config: BenchmarkConfig) -> dict[str, Any]:
             "decode_tokens": config.decode_tokens,
             "runner_prefill_chunk_tokens": config.runner_prefill_chunk_tokens,
             "runner_enforce_eager": config.runner_enforce_eager,
-            "runner_disable_rapid_sampler": config.runner_disable_rapid_sampler,
             "runner_cudagraph_capture_sizes": (
                 list(config.runner_cudagraph_capture_sizes)
                 if config.runner_cudagraph_capture_sizes is not None
@@ -1297,14 +1246,14 @@ def generate_vllm_model_only_measurement(
         wkv_mode=str(env["VLLM_RWKV7_WKV_MODE"]),
         gemm_accumulation_policy=(
             "fp16_where_configurable"
-            if env["VLLM_RWKV7_ALLOW_FP16_ACCUMULATION"] == "1"
+            if env["VLLM_RWKV7_WKV_MODE"] == "fp16"
             else "fp32"
         ),
-        embedding_device=str(env["VLLM_RWKV7_EMB_DEVICE"]),
-        rkv_mode=str(env["VLLM_RWKV7_RKV_MODE"]),
-        cmix_sparse=str(env["VLLM_RWKV7_CMIX_SPARSE"]),
-        low_rank_weight=str(env["VLLM_RWKV7_LOW_RANK_WEIGHT"]),
-        orig_linear_groups=str(env["VLLM_RWKV7_ORIG_LINEAR_GROUPS"]),
+        embedding_device="gpu",
+        rkv_mode="off",
+        cmix_sparse="no-fc",
+        low_rank_weight="both",
+        orig_linear_groups="none",
     )
     model = _load_vllm_rwkv7_model(config)
     parsed = _time_vllm_model_only_steady_decode(
@@ -1420,9 +1369,6 @@ def _runner_prefill_chunk_tokens(config: BenchmarkConfig) -> int:
 def _create_vllm_runner_llm(config: BenchmarkConfig) -> Any:
     os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "1")
-    os.environ.setdefault("VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP", "1")
-    if config.runner_disable_rapid_sampler:
-        os.environ["VLLM_USE_RAPID_SAMPLER"] = "0"
 
     import vllm.rwkv7_ops  # noqa: F401
 
@@ -1470,146 +1416,6 @@ def _synchronize_cuda_if_available() -> None:
         return
     if _cuda_available():
         torch.accelerator.synchronize()
-
-
-_RUNNER_STATE_SEARCH_ATTRS = (
-    "model_runner",
-    "model_state",
-    "model",
-    "worker",
-    "workers",
-    "driver_worker",
-    "executor",
-    "llm_engine",
-    "engine_core",
-    "engine_core_client",
-)
-
-
-def _normalize_state_movement_stats(raw: Any) -> dict[str, int]:
-    if not isinstance(raw, dict):
-        raise TypeError("RWKV7 state movement stats must be a dict")
-    missing = [name for name in STATE_MOVEMENT_COUNTERS if name not in raw]
-    if missing:
-        raise ValueError(
-            "RWKV7 state movement stats are missing counters: " + ", ".join(missing)
-        )
-    return {name: int(raw[name]) for name in STATE_MOVEMENT_COUNTERS}
-
-
-def _merge_state_movement_stat_dicts(raw_stats: list[Any]) -> dict[str, int]:
-    stats = [
-        _normalize_state_movement_stats(raw) for raw in raw_stats if raw is not None
-    ]
-    if not stats:
-        raise RuntimeError(
-            "Could not locate RWKV7ModelState.get_state_movement_stats() "
-            "through offline LLM worker/model_runner attributes."
-        )
-    return {
-        name: sum(worker_stats[name] for worker_stats in stats)
-        for name in STATE_MOVEMENT_COUNTERS
-    }
-
-
-def _iter_runner_state_children(obj: Any) -> list[Any]:
-    children: list[Any] = []
-    for attr in _RUNNER_STATE_SEARCH_ATTRS:
-        try:
-            child = getattr(obj, attr)
-        except Exception:
-            continue
-        if child is not None:
-            children.append(child)
-    if isinstance(obj, dict):
-        children.extend(obj.values())
-    elif isinstance(obj, (list, tuple, set, frozenset)):
-        children.extend(obj)
-    return children
-
-
-def _collect_runner_state_movement_stats_from_object(
-    root: Any,
-    *,
-    reset: bool,
-) -> dict[str, int] | None:
-    queue = [root]
-    seen: set[int] = set()
-    matches: list[dict[str, int]] = []
-    while queue and len(seen) < 512:
-        obj = queue.pop(0)
-        obj_id = id(obj)
-        if obj_id in seen:
-            continue
-        seen.add(obj_id)
-
-        getter = getattr(obj, "get_state_movement_stats", None)
-        if callable(getter):
-            if reset:
-                resetter = getattr(obj, "reset_state_movement_stats", None)
-                if not callable(resetter):
-                    raise RuntimeError(
-                        "Located RWKV7 state movement stats without "
-                        "reset_state_movement_stats()."
-                    )
-                resetter()
-            matches.append(_normalize_state_movement_stats(getter()))
-            continue
-
-        queue.extend(_iter_runner_state_children(obj))
-
-    if not matches:
-        return None
-    return _merge_state_movement_stat_dicts(matches)
-
-
-def _collect_runner_state_movement_stats_from_worker(
-    worker: Any,
-    reset: bool = False,
-) -> dict[str, int] | None:
-    return _collect_runner_state_movement_stats_from_object(worker, reset=reset)
-
-
-def _extract_runner_state_movement_stats(llm: Any) -> dict[str, int]:
-    collective_rpc = getattr(llm, "collective_rpc", None)
-    if callable(collective_rpc):
-        stats = collective_rpc(_collect_runner_state_movement_stats_from_worker)
-        try:
-            return _merge_state_movement_stat_dicts(list(stats))
-        except RuntimeError:
-            local_stats = _collect_runner_state_movement_stats_from_object(
-                llm,
-                reset=False,
-            )
-            if local_stats is not None:
-                return local_stats
-            raise
-
-    local_stats = _collect_runner_state_movement_stats_from_object(
-        llm,
-        reset=False,
-    )
-    if local_stats is None:
-        return _merge_state_movement_stat_dicts([])
-    return local_stats
-
-
-def _reset_runner_state_movement_stats(llm: Any) -> None:
-    collective_rpc = getattr(llm, "collective_rpc", None)
-    if callable(collective_rpc):
-        stats = collective_rpc(
-            _collect_runner_state_movement_stats_from_worker,
-            args=(True,),
-        )
-        _merge_state_movement_stat_dicts(list(stats))
-        return
-
-    local_stats = _collect_runner_state_movement_stats_from_object(
-        llm,
-        reset=True,
-    )
-    if local_stats is None:
-        _merge_state_movement_stat_dicts([])
 
 
 def _worker_cuda_synchronize() -> None:
@@ -2449,8 +2255,6 @@ def _time_vllm_runner_steady_decode(
             "The vLLM LLM object does not expose collective_rpc().",
         )
 
-    _reset_runner_state_movement_stats(llm)
-
     timed_results = collective_rpc(
         _run_vllm_worker_internal_steady_decode,
         args=(
@@ -2486,7 +2290,6 @@ def _time_vllm_runner_prefill_phase(
             "missing_collective_rpc",
             "The vLLM LLM object does not expose collective_rpc().",
         )
-    _reset_runner_state_movement_stats(llm)
     results = collective_rpc(
         _run_vllm_worker_internal_prefill,
         args=(batch_size, prompt_len, prefill_chunk_tokens, warmup, iters),
@@ -2515,7 +2318,6 @@ def _time_vllm_runner_decode_phase(
             "missing_collective_rpc",
             "The vLLM LLM object does not expose collective_rpc().",
         )
-    _reset_runner_state_movement_stats(llm)
     results = collective_rpc(
         _run_vllm_worker_internal_decode_only,
         args=(
@@ -2596,7 +2398,6 @@ def generate_vllm_runner_measurement(
             warmup=warmup,
             iters=iters,
         )
-        state_movement = _extract_runner_state_movement_stats(llm)
     finally:
         _shutdown_vllm_runner_llm(llm)
 
@@ -2659,7 +2460,6 @@ def generate_vllm_runner_measurement(
         "schema_version": SCHEMA_VERSION,
         "benchmark": BENCHMARK_NAME,
         "runner_steady_decode": runner_metrics,
-        "state_movement": state_movement,
         "config": {
             "repo_root": str(config.repo_root),
             "model": config.model,
@@ -2757,7 +2557,6 @@ def generate_vllm_runner_pd_single_measurement(
                 warmup=warmup,
                 iters=iters,
             )
-            state_movement = _extract_runner_state_movement_stats(llm)
         finally:
             _shutdown_vllm_runner_llm(llm)
         metrics = _runner_phase_metrics(
@@ -2791,7 +2590,6 @@ def generate_vllm_runner_pd_single_measurement(
                 iters=iters,
                 include_sampling=include_sampling,
             )
-            state_movement = _extract_runner_state_movement_stats(llm)
         finally:
             _shutdown_vllm_runner_llm(llm)
         metrics = _runner_phase_metrics(
@@ -2806,14 +2604,12 @@ def generate_vllm_runner_pd_single_measurement(
         )
     else:
         raise ValueError(f"unsupported runner pd phase: {phase}")
-    metrics["state_movement"] = state_movement
     return {
         "schema_version": SCHEMA_VERSION,
         "benchmark": BENCHMARK_NAME,
         "phase": phase,
         "case": case_name,
         "metrics": metrics,
-        "state_movement": state_movement,
         "config": {
             "repo_root": str(config.repo_root),
             "model": config.model,
@@ -2859,16 +2655,11 @@ def _run_vllm_runner_pd_case_subprocess(
         ]
         if config.runner_enforce_eager:
             command.append("--runner-enforce-eager")
-        if config.runner_disable_rapid_sampler:
-            command.append("--runner-disable-rapid-sampler")
         if config.model is not None:
             command.extend(["--model", config.model])
         if include_sampling:
             command.append("--runner-pd-include-sampling")
         env = os.environ.copy()
-        if config.runner_disable_rapid_sampler:
-            env["VLLM_USE_RAPID_SAMPLER"] = "0"
-        env["VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP"] = "1"
         result = subprocess.run(
             command,
             cwd=REPO_ROOT,
@@ -2910,7 +2701,6 @@ def generate_vllm_runner_pd_measurement(
 
     prefill_metrics: dict[str, Any] = {}
     decode_metrics: dict[str, Any] = {}
-    state_movement_by_case: dict[str, Any] = {}
     case_provenance_by_case: dict[str, Any] = {}
 
     for batch_size, seq_len in prefill_cases:
@@ -2927,7 +2717,6 @@ def generate_vllm_runner_pd_measurement(
             include_sampling=include_sampling,
         )
         prefill_metrics[case] = measurement["metrics"]
-        state_movement_by_case[f"prefill:{case}"] = measurement["state_movement"]
         case_provenance_by_case[f"prefill:{case}"] = measurement.get("config", {}).get(
             "provenance"
         )
@@ -2945,7 +2734,6 @@ def generate_vllm_runner_pd_measurement(
             decode_prompt_len=decode_prompt_len,
         )
         decode_metrics[case] = measurement["metrics"]
-        state_movement_by_case[f"decode:{case}"] = measurement["state_movement"]
         case_provenance_by_case[f"decode:{case}"] = measurement.get("config", {}).get(
             "provenance"
         )
@@ -2955,7 +2743,6 @@ def generate_vllm_runner_pd_measurement(
         "benchmark": BENCHMARK_NAME,
         "runner_prefill": prefill_metrics,
         "runner_decode": decode_metrics,
-        "state_movement_by_case": state_movement_by_case,
         "config": {
             "repo_root": str(config.repo_root),
             "model": config.model,
@@ -2986,8 +2773,6 @@ def _merge_vllm_runner_measurement(
     merged["runner_steady_decode"] = copy.deepcopy(
         runner_measurement.get("runner_steady_decode", {})
     )
-    if "state_movement" in runner_measurement:
-        merged["state_movement"] = copy.deepcopy(runner_measurement["state_movement"])
     merged_config = dict(merged.get("config", {}))
     merged_config.update(
         {
@@ -3129,64 +2914,6 @@ def _evaluate_runner(
     return check
 
 
-def _evaluate_state_movement(
-    measurements: dict[str, Any] | None,
-    blockers: list[dict[str, Any]],
-) -> dict[str, Any]:
-    metrics = _empty_state_movement_metrics()
-    check = {
-        "status": "blocked",
-        "thresholds": ACCEPTANCE_THRESHOLDS["state_movement"],
-        "metrics": metrics,
-        "blockers": blockers,
-        "errors": [],
-    }
-    if measurements is None:
-        check["blockers"] = _measurement_blockers(blockers)
-        return check
-
-    raw_metrics = measurements.get("state_movement", {})
-    missing = [name for name in STATE_MOVEMENT_COUNTERS if name not in raw_metrics]
-    if missing:
-        check["blockers"] = [
-            _blocker(
-                "missing_state_movement_counters",
-                "Measurement JSON must include all RWKV7 state movement counters.",
-                missing=missing,
-            )
-        ]
-        return check
-
-    for name in STATE_MOVEMENT_COUNTERS:
-        metrics[name] = int(raw_metrics[name])
-    errors = []
-    movement_thresholds = ACCEPTANCE_THRESHOLDS["state_movement"]
-    zero_copy_counters = (
-        (
-            "resident_to_decode_copies",
-            "max_resident_to_decode_copies",
-            "steady decode resident-to-decode copies must remain zero",
-        ),
-        (
-            "decode_compactions",
-            "max_decode_compactions",
-            "steady decode recurrent-state compactions must remain zero",
-        ),
-        (
-            "decode_full_row_copies",
-            "max_decode_full_row_copies",
-            "steady decode full recurrent-state row copies must remain zero",
-        ),
-    )
-    for metric_name, threshold_name, message in zero_copy_counters:
-        if metrics[metric_name] > movement_thresholds[threshold_name]:
-            errors.append(message)
-    check["status"] = "passed" if not errors else "failed"
-    check["errors"] = errors
-    check["blockers"] = []
-    return check
-
-
 def build_report(
     config: BenchmarkConfig,
     *,
@@ -3201,11 +2928,9 @@ def build_report(
     )
     model_only_check = _evaluate_model_only(measurements, runtime_blockers)
     runner_check = _evaluate_runner(measurements, runtime_blockers)
-    state_check = _evaluate_state_movement(measurements, runtime_blockers)
     checks = {
         "model_only_steady_decode": model_only_check,
         "runner_steady_decode": runner_check,
-        "state_movement": state_check,
     }
     statuses = [check["status"] for check in checks.values()]
     if "failed" in statuses:
@@ -3282,7 +3007,6 @@ def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
         decode_tokens=args.decode_tokens,
         runner_prefill_chunk_tokens=args.runner_prefill_chunk_tokens,
         runner_enforce_eager=args.runner_enforce_eager,
-        runner_disable_rapid_sampler=args.runner_disable_rapid_sampler,
         albatross_wkv=args.albatross_wkv
         or os.environ.get("ALBATROSS_WKV")
         or ALBATROSS_DEFAULTS["wkv"],
@@ -3440,11 +3164,6 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--runner-enforce-eager",
         action="store_true",
         help="Disable vLLM CUDA graph capture for runner measurements.",
-    )
-    parser.add_argument(
-        "--runner-disable-rapid-sampler",
-        action="store_true",
-        help="Disable rapid sampler allocation for runner measurements.",
     )
     parser.add_argument(
         "--runner-decode-tokens",

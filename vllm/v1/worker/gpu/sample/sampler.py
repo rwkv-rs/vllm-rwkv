@@ -56,6 +56,7 @@ class Sampler:
         self.num_speculative_tokens = num_speculative_tokens
         self.use_rapid = rapid_sampler_supported()
         self.use_flashinfer = not self.use_rapid and flashinfer_sampler_supported()
+        self.require_rapid = False
         self.rapid_penalties: torch.Tensor | None = None
 
     def add_request(
@@ -71,7 +72,13 @@ class Sampler:
         if (
             self.use_rapid
             and sampling_params.frequency_penalty != 0.0
-            and envs.is_set("VLLM_USE_RAPID_SAMPLER")
+            and (
+                self.require_rapid
+                or (
+                    envs.is_set("VLLM_USE_RAPID_SAMPLER")
+                    and envs.VLLM_USE_RAPID_SAMPLER
+                )
+            )
         ):
             raise RuntimeError(
                 "rapid-sampling does not support frequency_penalty. "
@@ -286,7 +293,12 @@ class Sampler:
         return_logprobs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         use_rapid = self.use_rapid
-        rapid_sampler_forced = envs.is_set("VLLM_USE_RAPID_SAMPLER")
+        rapid_sampler_forced = self.require_rapid or (
+            envs.is_set("VLLM_USE_RAPID_SAMPLER")
+            and envs.VLLM_USE_RAPID_SAMPLER
+        )
+        if self.require_rapid and not use_rapid:
+            raise RuntimeError("RWKV7 requires rapid-sampling on CUDA.")
         needs_processed_logprobs = (
             return_logprobs and self.logprobs_mode == "processed_logprobs"
         )
@@ -338,6 +350,11 @@ class Sampler:
                 for value in (temperatures, top_k, top_p)
                 if value is not None
             ):
+                if rapid_sampler_forced:
+                    raise RuntimeError(
+                        "rapid-sampling requires uniform temperature, top_k, "
+                        "and top_p within each batch."
+                    )
                 use_rapid = False
                 processed_logits, top_k, top_p = use_native_sampling_params()
         use_flashinfer = self.use_flashinfer and not (

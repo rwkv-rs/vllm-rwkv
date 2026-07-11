@@ -27,8 +27,6 @@ _RAPID_PENALTY_INDEX_STATS = {
     "indexed_calls": 0,
     "indexed_rows": 0,
     "indexed_vocab_elements": 0,
-    "wrapper_gather_scatter_calls": 0,
-    "wrapper_gather_scatter_elements": 0,
 }
 
 
@@ -45,15 +43,11 @@ def _record_rapid_penalty_index_stats(
     *,
     rows: int,
     vocab_size: int,
-    wrapper_gather_scatter: bool,
 ) -> None:
     elements = rows * vocab_size
     _RAPID_PENALTY_INDEX_STATS["indexed_calls"] += 1
     _RAPID_PENALTY_INDEX_STATS["indexed_rows"] += rows
     _RAPID_PENALTY_INDEX_STATS["indexed_vocab_elements"] += elements
-    if wrapper_gather_scatter:
-        _RAPID_PENALTY_INDEX_STATS["wrapper_gather_scatter_calls"] += 1
-        _RAPID_PENALTY_INDEX_STATS["wrapper_gather_scatter_elements"] += 2 * elements
 
 
 def flashinfer_sampler_supported() -> bool:
@@ -729,34 +723,33 @@ def rapid_sample(
                 "batch_sampling_repetition_temperature_topk_topp_indexed",
                 None,
             )
+            if indexed_sampler is None:
+                raise RuntimeError(
+                    "rapid-sampling indexed penalty kernel is unavailable; "
+                    "refusing the legacy gather/scatter path."
+                )
             _record_rapid_penalty_index_stats(
                 rows=batch_size,
                 vocab_size=vocab_size,
-                wrapper_gather_scatter=indexed_sampler is None,
             )
-            if indexed_sampler is not None:
-                return indexed_sampler(
-                    logits,
-                    penalties,
-                    penalty_indices,
-                    states,
-                    float(scalar_presence_penalty),
-                    float(scalar_repetition_penalty),
-                    float(scalar_penalty_decay),
-                    float(scalar_temperature),
-                    int(scalar_top_k),
-                    float(scalar_top_p),
-                ).view(-1)
-            penalty_rows = penalty_indices.to(dtype=torch.long)
-            penalties_for_batch = penalties.index_select(0, penalty_rows).contiguous()
-        else:
-            assert penalties.shape[0] == batch_size
-            penalty_rows = None
-            penalties_for_batch = penalties
+            return indexed_sampler(
+                logits,
+                penalties,
+                penalty_indices,
+                states,
+                float(scalar_presence_penalty),
+                float(scalar_repetition_penalty),
+                float(scalar_penalty_decay),
+                float(scalar_temperature),
+                int(scalar_top_k),
+                float(scalar_top_p),
+            ).view(-1)
 
-        out = module.batch_sampling_repetition_temperature_topk_topp(
+        assert penalties.shape[0] == batch_size
+
+        return module.batch_sampling_repetition_temperature_topk_topp(
             logits,
-            penalties_for_batch,
+            penalties,
             states,
             float(scalar_presence_penalty),
             float(scalar_repetition_penalty),
@@ -765,9 +758,6 @@ def rapid_sample(
             int(scalar_top_k),
             float(scalar_top_p),
         ).view(-1)
-        if penalty_rows is not None:
-            penalties.index_copy_(0, penalty_rows, penalties_for_batch)
-        return out
 
     raise RuntimeError(
         "rapid-sampling without penalties only supports uniform scalar "

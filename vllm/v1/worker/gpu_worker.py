@@ -855,11 +855,7 @@ class Worker(WorkerBase):
         if self.use_v2_model_runner:
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
             if should_skip_v2_kernel_warmup(self.model_runner):
-                logger.info(
-                    "Skipping V2 kernel warmup for RWKV7. Set "
-                    "VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP=0 to force the generic "
-                    "vLLM warmup path."
-                )
+                logger.info("Skipping the incompatible V2 kernel warmup for RWKV7.")
             else:
                 warmup_kernels(
                     self.model_runner, self.execute_model, self.sample_tokens

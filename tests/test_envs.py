@@ -36,23 +36,15 @@ def test_nixl_side_channel_host_is_not_compile_factor(
     assert "VLLM_NIXL_SIDE_CHANNEL_HOST" not in envs.compile_factors()
 
 
-def test_rwkv7_runtime_environment_variables_are_registered() -> None:
-    rwkv7_env = {
-        "VLLM_RWKV7_WKV_MODE": "fp32io16",
-        "VLLM_RWKV7_EMB_DEVICE": "cuda",
-        "VLLM_RWKV7_ALLOW_FP16_ACCUMULATION": "1",
-        "VLLM_RWKV7_SLOT_MAPPED_STATE": "0",
-        "VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP": "0",
-    }
-
-    with patch.dict(os.environ, rwkv7_env, clear=True):
+def test_rwkv7_runtime_profile_is_registered() -> None:
+    with patch.dict(
+        os.environ,
+        {"VLLM_RWKV7_WKV_MODE": "fp32io16"},
+        clear=True,
+    ):
         envs.validate_environ(hard_fail=True)
 
         assert envs.VLLM_RWKV7_WKV_MODE == "fp32io16"
-        assert envs.VLLM_RWKV7_EMB_DEVICE == "cuda"
-        assert envs.VLLM_RWKV7_ALLOW_FP16_ACCUMULATION is True
-        assert envs.VLLM_RWKV7_SLOT_MAPPED_STATE is False
-        assert envs.VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP is False
 
 
 def test_rwkv7_wkv_mode_defaults_to_fp16() -> None:
@@ -60,44 +52,28 @@ def test_rwkv7_wkv_mode_defaults_to_fp16() -> None:
         assert envs.environment_variables["VLLM_RWKV7_WKV_MODE"]() == "fp16"
 
 
-def test_rwkv7_emb_device_defaults_to_gpu() -> None:
-    with patch.dict(os.environ, {}, clear=True):
-        assert envs.environment_variables["VLLM_RWKV7_EMB_DEVICE"]() == "gpu"
+@pytest.mark.parametrize(
+    "name",
+    [
+        "VLLM_RWKV7_EMB_DEVICE",
+        "VLLM_RWKV7_RKV_MODE",
+        "VLLM_RWKV7_CMIX_SPARSE",
+        "VLLM_RWKV7_LOW_RANK_WEIGHT",
+        "VLLM_RWKV7_ORIG_LINEAR_GROUPS",
+        "VLLM_RWKV7_ALLOW_FP16_ACCUMULATION",
+        "VLLM_RWKV7_SLOT_MAPPED_STATE",
+        "VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP",
+    ],
+)
+def test_rwkv7_legacy_path_environment_variables_are_rejected(name: str) -> None:
+    assert name not in environment_variables
+    assert not hasattr(envs, name)
 
-
-def test_rwkv7_fp16_accumulation_defaults_to_match_wkv_mode() -> None:
-    with patch.dict(os.environ, {}, clear=True):
-        assert (
-            envs.environment_variables["VLLM_RWKV7_ALLOW_FP16_ACCUMULATION"]() is True
-        )
-    with patch.dict(
-        os.environ,
-        {"VLLM_RWKV7_WKV_MODE": "fp32io16"},
-        clear=True,
-    ):
-        assert (
-            envs.environment_variables["VLLM_RWKV7_ALLOW_FP16_ACCUMULATION"]() is False
-        )
-
-
-@pytest.mark.parametrize("value", ["true", "2", "-1"])
-def test_rwkv7_fp16_accumulation_rejects_value_outside_binary_domain(
-    value: str,
-) -> None:
     with (
-        patch.dict(
-            os.environ,
-            {"VLLM_RWKV7_ALLOW_FP16_ACCUMULATION": value},
-            clear=True,
-        ),
-        pytest.raises(ValueError, match="must be 0 or 1"),
+        patch.dict(os.environ, {name: "1"}, clear=True),
+        pytest.raises(ValueError, match=name),
     ):
-        envs.environment_variables["VLLM_RWKV7_ALLOW_FP16_ACCUMULATION"]()
-
-
-def test_rwkv7_skips_v2_kernel_warmup_by_default() -> None:
-    with patch.dict(os.environ, {}, clear=True):
-        assert envs.environment_variables["VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP"]() is True
+        envs.validate_environ(hard_fail=True)
 
 
 def test_rwkv7_model_is_not_a_registered_runtime_environment_variable() -> None:

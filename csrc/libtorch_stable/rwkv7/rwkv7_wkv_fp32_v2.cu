@@ -16,7 +16,6 @@ namespace {
 
 constexpr int N = 64;
 constexpr int WARP_THREADS = 32;
-constexpr int BLOCK_THREADS = 32;
 constexpr float W_SCALE_LOG2_E = -0.8750387749145276f;
 constexpr float NLOG2_E = -1.4426950408889634f;
 
@@ -50,26 +49,6 @@ __device__ __forceinline__ float warp_sum(float x) {
 
 __device__ __forceinline__ float warp_sum_broadcast(float x) {
   return __shfl_sync(0xffffffffu, warp_sum(x), 0);
-}
-
-__device__ __forceinline__ float block_sum_broadcast(float x) {
-  __shared__ float partial[BLOCK_THREADS / WARP_THREADS];
-  const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
-  x = warp_sum(x);
-  if (lane == 0) {
-    partial[warp] = x;
-  }
-  __syncthreads();
-  x = (threadIdx.x < (BLOCK_THREADS / WARP_THREADS)) ? partial[lane] : 0.0f;
-  if (warp == 0) {
-    x = warp_sum(x);
-  }
-  if (threadIdx.x == 0) {
-    partial[0] = x;
-  }
-  __syncthreads();
-  return partial[0];
 }
 
 template <int HeadSize>
@@ -172,46 +151,6 @@ __launch_bounds__(WARP_THREADS, 4) void wkv_fp32_v2_small_warp_kernel(
     if (lane == 0) {
       y_ptr[token + row] = float_to_io(yy);
     }
-  }
-}
-
-__global__
-__launch_bounds__(BLOCK_THREADS, 4) void wkv_fp32_v2_short_block_kernel(
-    int T, int C, int H, float* __restrict__ state_ptr,
-    const io_t* __restrict__ r_ptr, const io_t* __restrict__ w_ptr,
-    const io_t* __restrict__ k_ptr, const io_t* __restrict__ v_ptr,
-    const io_t* __restrict__ a_ptr, const io_t* __restrict__ b_ptr,
-    io_t* __restrict__ y_ptr, const int* __restrict__ slot_indices) {
-  const int row = blockIdx.x;
-  const int h = blockIdx.y;
-  const int b_id = blockIdx.z;
-  const int tid = threadIdx.x;
-  const int state_b = slot_indices == nullptr ? b_id : slot_indices[b_id];
-  const int c_base = h * N;
-  const int state_base = ((state_b * H + h) * N + row) * N;
-
-  for (int t = 0; t < T; ++t) {
-    const int token = (b_id * T + t) * C + c_base;
-    float sa = 0.0f;
-    for (int j = tid; j < N; j += BLOCK_THREADS) {
-      sa += state_ptr[state_base + j] * load_io(a_ptr, token + j);
-    }
-    sa = block_sum_broadcast(sa);
-
-    float yy = 0.0f;
-    const float vv = load_io(v_ptr, token + row);
-    for (int j = tid; j < N; j += BLOCK_THREADS) {
-      const int idx = token + j;
-      const float s = state_ptr[state_base + j] * w_eff(load_io(w_ptr, idx)) +
-                      vv * load_io(k_ptr, idx) + sa * load_io(b_ptr, idx);
-      state_ptr[state_base + j] = s;
-      yy += s * load_io(r_ptr, idx);
-    }
-    yy = block_sum_broadcast(yy);
-    if (tid == 0) {
-      y_ptr[token + row] = float_to_io(yy);
-    }
-    __syncthreads();
   }
 }
 
@@ -323,49 +262,6 @@ __launch_bounds__(WARP_THREADS, 4) void wkv_fp32_v2_small_warp_varlen_kernel(
   }
 }
 
-__global__
-__launch_bounds__(BLOCK_THREADS, 4) void wkv_fp32_v2_short_block_varlen_kernel(
-    int C, int H, const int* __restrict__ query_start_loc,
-    const int* __restrict__ slot_indices, float* __restrict__ state_ptr,
-    const io_t* __restrict__ r_ptr, const io_t* __restrict__ w_ptr,
-    const io_t* __restrict__ k_ptr, const io_t* __restrict__ v_ptr,
-    const io_t* __restrict__ a_ptr, const io_t* __restrict__ b_ptr,
-    io_t* __restrict__ y_ptr) {
-  const int row = blockIdx.x;
-  const int h = blockIdx.y;
-  const int b_id = blockIdx.z;
-  const int tid = threadIdx.x;
-  const int state_b = slot_indices[b_id];
-  const int c_base = h * N;
-  const int state_base = ((state_b * H + h) * N + row) * N;
-  const int token_base = query_start_loc[b_id];
-  const int my_t = query_start_loc[b_id + 1] - token_base;
-
-  for (int t = 0; t < my_t; ++t) {
-    const int token = (token_base + t) * C + c_base;
-    float sa = 0.0f;
-    for (int j = tid; j < N; j += BLOCK_THREADS) {
-      sa += state_ptr[state_base + j] * load_io(a_ptr, token + j);
-    }
-    sa = block_sum_broadcast(sa);
-
-    float yy = 0.0f;
-    const float vv = load_io(v_ptr, token + row);
-    for (int j = tid; j < N; j += BLOCK_THREADS) {
-      const int idx = token + j;
-      const float s = state_ptr[state_base + j] * w_eff(load_io(w_ptr, idx)) +
-                      vv * load_io(k_ptr, idx) + sa * load_io(b_ptr, idx);
-      state_ptr[state_base + j] = s;
-      yy += s * load_io(r_ptr, idx);
-    }
-    yy = block_sum_broadcast(yy);
-    if (tid == 0) {
-      y_ptr[token + row] = float_to_io(yy);
-    }
-    __syncthreads();
-  }
-}
-
 bool use_small_auto(int B, int T) {
 #ifdef _IO_FP16_
   return (T == 1 && B <= 96) || (T == 2 && B <= 21) || (T == 3 && B <= 3) ||
@@ -378,7 +274,7 @@ bool use_small_auto(int B, int T) {
 
 }  // namespace
 
-void wkv_fp32_v2_cuda(int B, int T, int C, int H, int mode, at::Tensor state,
+void wkv_fp32_v2_cuda(int B, int T, int C, int H, at::Tensor state,
                       at::Tensor r, at::Tensor w, at::Tensor k, at::Tensor v,
                       at::Tensor a, at::Tensor b, at::Tensor y,
                       at::Tensor slot_indices) {
@@ -387,18 +283,7 @@ void wkv_fp32_v2_cuda(int B, int T, int C, int H, int mode, at::Tensor state,
   const int* slot_ptr = slot_indices.defined() && slot_indices.numel() > 0
                             ? slot_indices.data_ptr<int>()
                             : nullptr;
-  const bool use_small = (mode == 2) || (mode == 0 && use_small_auto(B, T));
-  if (mode == 3) {
-    wkv_fp32_v2_short_block_kernel<<<dim3(N, H, B), dim3(BLOCK_THREADS), 0,
-                                     stream>>>(
-        T, C, H, state.data_ptr<float>(), reinterpret_cast<io_t*>(r.data_ptr()),
-        reinterpret_cast<io_t*>(w.data_ptr()),
-        reinterpret_cast<io_t*>(k.data_ptr()),
-        reinterpret_cast<io_t*>(v.data_ptr()),
-        reinterpret_cast<io_t*>(a.data_ptr()),
-        reinterpret_cast<io_t*>(b.data_ptr()),
-        reinterpret_cast<io_t*>(y.data_ptr()), slot_ptr);
-  } else if (use_small) {
+  if (use_small_auto(B, T)) {
     wkv_fp32_v2_small_warp_kernel<<<dim3(N, H, B), dim3(WARP_THREADS), 0,
                                     stream>>>(
         T, C, H, state.data_ptr<float>(), reinterpret_cast<io_t*>(r.data_ptr()),
@@ -421,7 +306,7 @@ void wkv_fp32_v2_cuda(int B, int T, int C, int H, int mode, at::Tensor state,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void wkv_fp32_v2_cuda_varlen(int B, int max_t, int C, int H, int mode,
+void wkv_fp32_v2_cuda_varlen(int B, int max_t, int C, int H,
                              at::Tensor query_start_loc,
                              at::Tensor slot_indices, at::Tensor state,
                              at::Tensor r, at::Tensor w, at::Tensor k,
@@ -431,19 +316,7 @@ void wkv_fp32_v2_cuda_varlen(int B, int max_t, int C, int H, int mode,
   auto stream = at::cuda::getCurrentCUDAStream();
   const int* query_start_loc_ptr = query_start_loc.data_ptr<int>();
   const int* slot_ptr = slot_indices.data_ptr<int>();
-  const bool use_small = (mode == 2) || (mode == 0 && use_small_auto(B, max_t));
-  if (mode == 3) {
-    wkv_fp32_v2_short_block_varlen_kernel<<<dim3(N, H, B), dim3(BLOCK_THREADS),
-                                            0, stream>>>(
-        C, H, query_start_loc_ptr, slot_ptr, state.data_ptr<float>(),
-        reinterpret_cast<io_t*>(r.data_ptr()),
-        reinterpret_cast<io_t*>(w.data_ptr()),
-        reinterpret_cast<io_t*>(k.data_ptr()),
-        reinterpret_cast<io_t*>(v.data_ptr()),
-        reinterpret_cast<io_t*>(a.data_ptr()),
-        reinterpret_cast<io_t*>(b.data_ptr()),
-        reinterpret_cast<io_t*>(y.data_ptr()));
-  } else if (use_small) {
+  if (use_small_auto(B, max_t)) {
     wkv_fp32_v2_small_warp_varlen_kernel<<<dim3(N, H, B), dim3(WARP_THREADS), 0,
                                            stream>>>(
         C, H, query_start_loc_ptr, slot_ptr, state.data_ptr<float>(),

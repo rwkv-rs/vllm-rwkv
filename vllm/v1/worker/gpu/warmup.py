@@ -8,7 +8,6 @@ from typing import Any
 import numpy as np
 import torch
 
-import vllm.envs as envs
 from vllm import PoolingParams, SamplingParams
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
@@ -27,8 +26,6 @@ logger = init_logger(__name__)
 
 
 def should_skip_v2_kernel_warmup(model_runner: object) -> bool:
-    if not envs.VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP:
-        return False
     model_state = getattr(model_runner, "model_state", None)
     return model_state.__class__.__name__ == "RWKV7ModelState"
 

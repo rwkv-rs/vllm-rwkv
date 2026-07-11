@@ -122,76 +122,10 @@ V3A_RETURNING_CASES = [
         lambda d: (_bf(d, (11, 8)), _bf(d, (8,)), _bf(d, (8,))),
         _emb_expected,
     ),
-    OpCase(
-        "rwkv7_v3a_ops::layer_norm_f16_small",
-        lambda d: _ln_args(d, 4096),
-        _same(0),
-    ),
-    OpCase(
-        "rwkv7_v3a_ops::layer_norm_f16_small512",
-        lambda d: _ln_args(d, 4096),
-        _same(0),
-    ),
     OpCase("rwkv7_v3a_ops::linear_f16", _linear_args, _last_dim(0, 5)),
-    OpCase(
-        "rwkv7_v3a_ops::linear_f16_orig",
-        _linear_orig_args,
-        _last_dim_from_weight(0, 1, 0),
-    ),
-    OpCase(
-        "rwkv7_v3a_ops::linear_orig_rows_f16",
-        lambda d: (*_linear_orig_args(d), 2, 2),
-        _last_dim_from_weight(0, 1, 0),
-    ),
-    OpCase(
-        "rwkv7_v3a_ops::linear_orig_rows_cfg_f16",
-        lambda d: (*_linear_orig_args(d), 64, 2, 2),
-        _last_dim_from_weight(0, 1, 0),
-    ),
-    OpCase(
-        "rwkv7_v3a_ops::linear_orig_rows_exact_f16",
-        lambda d: (*_linear_orig_args(d), 64, 2, True),
-        _last_dim_from_weight(0, 1, 0),
-    ),
-    OpCase(
-        "rwkv7_v3a_ops::linear_orig_wmma16_f16",
-        _linear_orig_args,
-        _last_dim_from_weight(0, 1, 0),
-    ),
-    OpCase(
-        "rwkv7_v3a_ops::linear_f16_orig_lt",
-        _linear_orig_args,
-        _last_dim_from_weight(0, 1, 0),
-    ),
-    OpCase(
-        "rwkv7_v3a_ops::linear_f16_orig_lt_cfg",
-        lambda d: (*_linear_orig_args(d), 0, 0),
-        _last_dim_from_weight(0, 1, 0),
-    ),
-    OpCase("rwkv7_v3a_ops::linear_f16_lt", _linear_args, _last_dim(0, 5)),
     OpCase(
         "rwkv7_v3a_ops::linear_f16_m1_splitk",
         lambda d: (_h(d, (1, 8)), _h(d, (8, 5))),
-        _last_dim(0, 5),
-    ),
-    OpCase(
-        "rwkv7_v3a_ops::linear_f16_m1_splitk_cfg",
-        lambda d: (_h(d, (1, 8)), _h(d, (8, 5)), 64),
-        _last_dim(0, 5),
-    ),
-    OpCase(
-        "rwkv7_v3a_ops::linear_f16_m1_splitk_tile",
-        lambda d: (_h(d, (1, 8)), _h(d, (8, 5)), 64, 2),
-        _last_dim(0, 5),
-    ),
-    OpCase(
-        "rwkv7_v3a_ops::linear_f16_m1_splitk_warpred_tile",
-        lambda d: (_h(d, (1, 8)), _h(d, (8, 5)), 64, 2),
-        _last_dim(0, 5),
-    ),
-    OpCase(
-        "rwkv7_v3a_ops::linear_f16_rows_splitk",
-        lambda d: (*_linear_args(d), 64),
         _last_dim(0, 5),
     ),
     OpCase(
@@ -326,58 +260,6 @@ V3A_RETURNING_CASES = [
         ),
         _same(0, 7),
     ),
-    OpCase(
-        "rwkv7_v3a_ops::add_layer_norm_tmix_mix6_f16_cfg",
-        lambda d: (
-            _h(d, (2, 1, 4096)),
-            _h(d, (2, 1, 4096)),
-            _h(d, (2, 4096)),
-            _h(d, (4096,)),
-            _h(d, (4096,)),
-            *[_h(d, (4096,)) for _ in range(6)],
-            1e-5,
-            256,
-        ),
-        _same(0, 7),
-    ),
-    OpCase(
-        "rwkv7_v3a_ops::add_layer_norm_tmix_mix6_f16_scalar_stats",
-        lambda d: (
-            _h(d, (2, 1, 4096)),
-            _h(d, (2, 1, 4096)),
-            _h(d, (2, 4096)),
-            _h(d, (4096,)),
-            _h(d, (4096,)),
-            *[_h(d, (4096,)) for _ in range(6)],
-        ),
-        _same(0, 7),
-    ),
-    OpCase(
-        "rwkv7_v3a_ops::add_layer_norm_cmix_mix_f16_cfg",
-        lambda d: (
-            _h(d, (2, 1, 4096)),
-            _h(d, (2, 1, 4096)),
-            _h(d, (2, 4096)),
-            _h(d, (4096,)),
-            _h(d, (4096,)),
-            _h(d, (4096,)),
-            1e-5,
-            256,
-        ),
-        _same(0, 2),
-    ),
-    OpCase(
-        "rwkv7_v3a_ops::add_layer_norm_cmix_mix_f16_scalar_stats",
-        lambda d: (
-            _h(d, (2, 1, 4096)),
-            _h(d, (2, 1, 4096)),
-            _h(d, (2, 4096)),
-            _h(d, (4096,)),
-            _h(d, (4096,)),
-            _h(d, (4096,)),
-        ),
-        _same(0, 2),
-    ),
 ]
 
 
@@ -408,33 +290,6 @@ FAST_RETURNING_CASES = [
         _same(3, 6),
     ),
     OpCase(
-        "rwkv7_fast_ops_fp16::tmix_mix6_cfg",
-        lambda d: (
-            2,
-            3,
-            8,
-            _h(d, (2, 3, 8)),
-            _h(d, (2, 8)),
-            *[_h(d, (8,)) for _ in range(6)],
-            256,
-        ),
-        _same(3, 6),
-    ),
-    OpCase(
-        "rwkv7_fast_ops_fp16::tmix_mix6_cfg_slot",
-        lambda d: (
-            2,
-            3,
-            8,
-            _h(d, (2, 3, 8)),
-            _h(d, (5, 8)),
-            _i32(d, (2,)),
-            *[_h(d, (8,)) for _ in range(6)],
-            256,
-        ),
-        _same(3, 6),
-    ),
-    OpCase(
         "rwkv7_fast_ops_fp16::tmix_mix6_varlen",
         lambda d: (
             2,
@@ -450,19 +305,6 @@ FAST_RETURNING_CASES = [
         _same(3, 6),
     ),
     OpCase(
-        "rwkv7_fast_ops_fp16::tmix_mix6_t1_c4096",
-        lambda d: (
-            2,
-            _h(d, (2, 1, 4096)),
-            _h(d, (2, 4096)),
-            *[_h(d, (4096,)) for _ in range(6)],
-            256,
-            1,
-            False,
-        ),
-        _same(1, 6),
-    ),
-    OpCase(
         "rwkv7_fast_ops_fp16::tmix_kk_a_gate",
         lambda d: (
             2,
@@ -474,23 +316,6 @@ FAST_RETURNING_CASES = [
             _h(d, (128,)),
             _h(d, (2, 3, 128)),
             _h(d, (128,)),
-        ),
-        _same(4, 3),
-    ),
-    OpCase(
-        "rwkv7_fast_ops_fp16::tmix_kk_a_gate_update_shift",
-        lambda d: (
-            2,
-            1,
-            128,
-            2,
-            _h(d, (2, 1, 128)),
-            _h(d, (128,)),
-            _h(d, (128,)),
-            _h(d, (2, 1, 128)),
-            _h(d, (128,)),
-            _h(d, (2, 1, 128)),
-            _h(d, (2, 128)),
         ),
         _same(4, 3),
     ),
@@ -523,44 +348,6 @@ FAST_RETURNING_CASES = [
         _same(3),
     ),
     OpCase(
-        "rwkv7_fast_ops_fp16::cmix_sparse_one",
-        lambda d: (
-            128,
-            128,
-            _h(d, (1, 1, 128)),
-            _h(d, (1, 128)),
-            _h(d, (128,)),
-            _h(d, (128, 128)),
-            _h(d, (128, 128)),
-        ),
-        _shape_expected((1, 1, 128), 2),
-    ),
-    OpCase(
-        "rwkv7_fast_ops_fp16::cmix_sparse_rows",
-        lambda d: (
-            2,
-            3,
-            128,
-            128,
-            _h(d, (2, 3, 128)),
-            _h(d, (2, 128)),
-            _h(d, (128,)),
-            _h(d, (128, 128)),
-            _h(d, (128, 128)),
-        ),
-        _shape_expected((2, 3, 128), 4),
-    ),
-    OpCase(
-        "rwkv7_fast_ops_fp16::cmix_sparse_down_one",
-        lambda d: (128, 128, _h(d, (128,)), _h(d, (128, 128))),
-        _shape_expected((128,), 2),
-    ),
-    OpCase(
-        "rwkv7_fast_ops_fp16::cmix_sparse_down_rows",
-        lambda d: (2, 3, 128, 128, _h(d, (2, 3, 128)), _h(d, (128, 128))),
-        _shape_expected((2, 3, 128), 4),
-    ),
-    OpCase(
         "rwkv7_fast_ops_fp16::cmix_sparse_down_relu_one",
         lambda d: (128, 128, _h(d, (128,)), _h(d, (128, 128))),
         _shape_expected((128,), 2),
@@ -590,25 +377,6 @@ FAST_RETURNING_CASES = [
             _h(d, (5, 8)),
             _i32(d, (2,)),
             _h(d, (8,)),
-        ),
-        _same(3),
-    ),
-    OpCase(
-        "rwkv7_fast_ops_fp16::cmix_mix_cfg",
-        lambda d: (2, 3, 8, _h(d, (2, 3, 8)), _h(d, (2, 8)), _h(d, (8,)), 256),
-        _same(3),
-    ),
-    OpCase(
-        "rwkv7_fast_ops_fp16::cmix_mix_cfg_slot",
-        lambda d: (
-            2,
-            3,
-            8,
-            _h(d, (2, 3, 8)),
-            _h(d, (5, 8)),
-            _i32(d, (2,)),
-            _h(d, (8,)),
-            256,
         ),
         _same(3),
     ),
@@ -646,30 +414,17 @@ def rwkv7_ops_registered() -> None:
     _rwkv7_import_or_skip()
 
 
-@pytest.mark.parametrize(
-    ("op_name", "uses_original_layout", "extra_args"),
-    [
-        ("linear_f16", False, ()),
-        ("linear_f16_orig", True, ()),
-        ("linear_f16_lt", False, ()),
-        ("linear_f16_orig_lt_cfg", True, (0, 0)),
-    ],
-)
-def test_rwkv7_linear_ops_honor_fp16_accumulation(
-    op_name: str,
-    uses_original_layout: bool,
-    extra_args: tuple,
-) -> None:
+def test_rwkv7_linear_op_honors_fp16_accumulation() -> None:
     torch.manual_seed(20260710)
     x = torch.randn((64, 1024), device="cuda", dtype=torch.float16)
     weight_orig = torch.randn((256, 1024), device="cuda", dtype=torch.float16)
-    weight = weight_orig if uses_original_layout else weight_orig.t().contiguous()
-    op = getattr(torch.ops.rwkv7_v3a_ops, op_name)
+    weight = weight_orig.t().contiguous()
+    op = torch.ops.rwkv7_v3a_ops.linear_f16
     reference = torch.nn.functional.linear(x.float(), weight_orig.float()).half()
 
-    default_accumulation = op(x, weight, *extra_args)
-    fp32_accumulation = op(x, weight, *extra_args, False)
-    fp16_accumulation = op(x, weight, *extra_args, True)
+    default_accumulation = op(x, weight)
+    fp32_accumulation = op(x, weight, False)
+    fp16_accumulation = op(x, weight, True)
     torch.accelerator.synchronize()
 
     assert fp16_accumulation.shape == reference.shape
@@ -867,51 +622,6 @@ def test_rwkv7_advance_i32_varlen_updates_only_mapped_slots() -> None:
                 _h("cuda", (5, 64)),
             ),
         ),
-        (
-            "rwkv7_wkv_fp32_v2::forward_seq_varlen",
-            lambda: (
-                2,
-                5,
-                3,
-                64,
-                1,
-                torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32),
-                torch.tensor([3, 0], device="cuda", dtype=torch.int32),
-                torch.empty((5, 1, 64, 64), device="cuda", dtype=torch.float32),
-                *[_h("cuda", (5, 64)) for _ in range(6)],
-                _h("cuda", (5, 64)),
-            ),
-        ),
-        (
-            "rwkv7_wkv_fp32_v2::forward_small_varlen",
-            lambda: (
-                2,
-                5,
-                3,
-                64,
-                1,
-                torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32),
-                torch.tensor([3, 0], device="cuda", dtype=torch.int32),
-                torch.empty((5, 1, 64, 64), device="cuda", dtype=torch.float32),
-                *[_h("cuda", (5, 64)) for _ in range(6)],
-                _h("cuda", (5, 64)),
-            ),
-        ),
-        (
-            "rwkv7_wkv_fp32_v2::forward_block_varlen",
-            lambda: (
-                2,
-                5,
-                3,
-                64,
-                1,
-                torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32),
-                torch.tensor([3, 0], device="cuda", dtype=torch.int32),
-                torch.empty((5, 1, 64, 64), device="cuda", dtype=torch.float32),
-                *[_h("cuda", (5, 64)) for _ in range(6)],
-                _h("cuda", (5, 64)),
-            ),
-        ),
     ],
 )
 def test_rwkv7_wkv_slot_schema_opcheck(op_name, args) -> None:
@@ -988,10 +698,7 @@ def test_rwkv7_add_layer_norm_tmix_mix6_slot_matches_scattered_reference(
     torch.testing.assert_close(shift_state, expected_shift_state, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("use_cfg", [False, True])
-def test_rwkv7_tmix_mix6_batched_shift_state_matches_reference(
-    use_cfg: bool,
-) -> None:
+def test_rwkv7_tmix_mix6_batched_shift_state_matches_reference() -> None:
     torch.manual_seed(0)
     device = "cuda"
     batch, seq_len, hidden = 4, 5, 64
@@ -1002,13 +709,9 @@ def test_rwkv7_tmix_mix6_batched_shift_state_matches_reference(
     )
     initial_shift_state = shift_state.clone()
 
-    op = (
-        torch.ops.rwkv7_fast_ops_fp16.tmix_mix6_cfg
-        if use_cfg
-        else torch.ops.rwkv7_fast_ops_fp16.tmix_mix6
-    )
+    op = torch.ops.rwkv7_fast_ops_fp16.tmix_mix6
     args = (batch, seq_len, hidden, x, shift_state, x_r, x_w, x_k, x_v, x_a, x_g)
-    outputs = op(*args, 128) if use_cfg else op(*args)
+    outputs = op(*args)
 
     prev = torch.cat((initial_shift_state[:, None, :], x[:, :-1, :]), dim=1)
     delta = prev.float() - x.float()
@@ -1022,8 +725,7 @@ def test_rwkv7_tmix_mix6_batched_shift_state_matches_reference(
     torch.testing.assert_close(shift_state, x[:, -1, :], atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("use_cfg", [False, True])
-def test_rwkv7_tmix_mix6_slot_matches_scattered_reference(use_cfg: bool) -> None:
+def test_rwkv7_tmix_mix6_slot_matches_scattered_reference() -> None:
     torch.manual_seed(2)
     device = "cuda"
     batch, seq_len, hidden, slots = 3, 4, 64, 6
@@ -1035,11 +737,7 @@ def test_rwkv7_tmix_mix6_slot_matches_scattered_reference(use_cfg: bool) -> None
     )
     initial_shift_state = shift_state.clone()
 
-    op = (
-        torch.ops.rwkv7_fast_ops_fp16.tmix_mix6_cfg_slot
-        if use_cfg
-        else torch.ops.rwkv7_fast_ops_fp16.tmix_mix6_slot
-    )
+    op = torch.ops.rwkv7_fast_ops_fp16.tmix_mix6_slot
     args = (
         batch,
         seq_len,
@@ -1054,7 +752,7 @@ def test_rwkv7_tmix_mix6_slot_matches_scattered_reference(use_cfg: bool) -> None
         x_a,
         x_g,
     )
-    outputs = op(*args, 128) if use_cfg else op(*args)
+    outputs = op(*args)
 
     prev = torch.cat(
         (initial_shift_state[slot_indices.long(), None, :], x[:, :-1, :]), dim=1
@@ -1129,10 +827,7 @@ def test_rwkv7_tmix_mix6_varlen_matches_scattered_reference() -> None:
     torch.testing.assert_close(shift_state, expected_state, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("use_cfg", [False, True])
-def test_rwkv7_cmix_mix_batched_shift_state_matches_reference(
-    use_cfg: bool,
-) -> None:
+def test_rwkv7_cmix_mix_batched_shift_state_matches_reference() -> None:
     torch.manual_seed(1)
     device = "cuda"
     batch, seq_len, hidden = 4, 5, 64
@@ -1141,13 +836,9 @@ def test_rwkv7_cmix_mix_batched_shift_state_matches_reference(
     x_k = torch.randn((hidden,), device=device, dtype=torch.float16)
     initial_shift_state = shift_state.clone()
 
-    op = (
-        torch.ops.rwkv7_fast_ops_fp16.cmix_mix_cfg
-        if use_cfg
-        else torch.ops.rwkv7_fast_ops_fp16.cmix_mix
-    )
+    op = torch.ops.rwkv7_fast_ops_fp16.cmix_mix
     args = (batch, seq_len, hidden, x, shift_state, x_k)
-    output = op(*args, 128) if use_cfg else op(*args)
+    output = op(*args)
 
     prev = torch.cat((initial_shift_state[:, None, :], x[:, :-1, :]), dim=1)
     expected = (x.float() + (prev.float() - x.float()) * x_k.float()).to(torch.float16)
@@ -1155,8 +846,7 @@ def test_rwkv7_cmix_mix_batched_shift_state_matches_reference(
     torch.testing.assert_close(shift_state, x[:, -1, :], atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("use_cfg", [False, True])
-def test_rwkv7_cmix_mix_slot_matches_scattered_reference(use_cfg: bool) -> None:
+def test_rwkv7_cmix_mix_slot_matches_scattered_reference() -> None:
     torch.manual_seed(3)
     device = "cuda"
     batch, seq_len, hidden, slots = 3, 4, 64, 6
@@ -1166,13 +856,9 @@ def test_rwkv7_cmix_mix_slot_matches_scattered_reference(use_cfg: bool) -> None:
     x_k = torch.randn((hidden,), device=device, dtype=torch.float16)
     initial_shift_state = shift_state.clone()
 
-    op = (
-        torch.ops.rwkv7_fast_ops_fp16.cmix_mix_cfg_slot
-        if use_cfg
-        else torch.ops.rwkv7_fast_ops_fp16.cmix_mix_slot
-    )
+    op = torch.ops.rwkv7_fast_ops_fp16.cmix_mix_slot
     args = (batch, seq_len, hidden, x, shift_state, slot_indices, x_k)
-    output = op(*args, 128) if use_cfg else op(*args)
+    output = op(*args)
 
     prev = torch.cat(
         (initial_shift_state[slot_indices.long(), None, :], x[:, :-1, :]), dim=1

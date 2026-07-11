@@ -28,13 +28,16 @@ if str(REPO_ROOT) not in sys.path:
 from vllm.platforms import current_platform  # noqa: E402
 from vllm.utils.argparse_utils import FlexibleArgumentParser  # noqa: E402
 from vllm.v1.sample.ops.topk_topp_sampler import (
-    _record_rapid_penalty_index_stats,
     flashinfer_sample,
     get_rapid_penalty_index_stats,
     rapid_sample,
     rapid_sample_input_supported,
     reset_rapid_penalty_index_stats,
 )  # noqa: E402
+
+SUPPORTED_PROVIDERS = frozenset(
+    {"rapid", "flashinfer", "rapid_penalty", "rapid_penalty_indexed"}
+)
 
 
 @dataclass(frozen=True)
@@ -137,6 +140,9 @@ def run_config(
     warmup_iters: int,
     benchmark_iters: int,
 ) -> dict:
+    unsupported = sorted(set(providers) - SUPPORTED_PROVIDERS)
+    if unsupported:
+        raise ValueError(f"Unsupported provider(s): {', '.join(unsupported)}")
     logits = create_logits(config, seed=2026 + config.logit_type)
     if not rapid_sample_input_supported(logits):
         raise ValueError(
@@ -209,54 +215,6 @@ def run_config(
         )
         result["rapid_penalty_index_stats"] = get_rapid_penalty_index_stats()
 
-    if "rapid_penalty_indexed_legacy" in providers:
-        rapid_top_k, rapid_top_p = make_rapid_args(config)
-        penalty_indices, penalty_rows, penalty_index_pattern = (
-            make_non_contiguous_penalty_indices(config)
-        )
-        penalties = torch.zeros(
-            (penalty_rows, config.vocab_size),
-            dtype=torch.float32,
-            device="cuda",
-        )
-        presence_penalties = 0.1
-        repetition_penalties = 0.1
-        penalty_decays = 0.996
-        result.setdefault("rapid_penalty_index_pattern", penalty_index_pattern)
-        result.setdefault("rapid_penalty_index_rows", penalty_rows)
-        result.setdefault(
-            "rapid_penalty_index_first_values",
-            penalty_indices[: min(16, config.batch_size)].cpu().tolist(),
-        )
-        reset_rapid_penalty_index_stats()
-
-        def legacy_wrapper_sample() -> torch.Tensor:
-            _record_rapid_penalty_index_stats(
-                rows=config.batch_size,
-                vocab_size=config.vocab_size,
-                wrapper_gather_scatter=True,
-            )
-            penalty_rows = penalty_indices.to(dtype=torch.long)
-            penalties_for_batch = penalties.index_select(0, penalty_rows).contiguous()
-            out = rapid_sample(
-                logits,
-                rapid_top_k,
-                rapid_top_p,
-                penalties=penalties_for_batch,
-                presence_penalties=presence_penalties,
-                repetition_penalties=repetition_penalties,
-                penalty_decays=penalty_decays,
-            )
-            penalties.index_copy_(0, penalty_rows, penalties_for_batch)
-            return out
-
-        result["rapid_penalty_indexed_legacy_ms"] = benchmark_cuda_call(
-            legacy_wrapper_sample,
-            warmup_iters,
-            benchmark_iters,
-        )
-        result["rapid_penalty_indexed_legacy_stats"] = get_rapid_penalty_index_stats()
-
     if "flashinfer" in providers:
         flashinfer_top_k, flashinfer_top_p = make_flashinfer_args(config)
         if flashinfer_top_k is None and flashinfer_top_p is None:
@@ -317,7 +275,6 @@ def print_result(result: dict) -> None:
         "rapid_ms",
         "rapid_penalty_ms",
         "rapid_penalty_indexed_ms",
-        "rapid_penalty_indexed_legacy_ms",
         "flashinfer_ms",
     ):
         if key in result:
@@ -343,13 +300,7 @@ def parse_args():
     parser.add_argument(
         "--providers",
         nargs="+",
-        choices=[
-            "rapid",
-            "flashinfer",
-            "rapid_penalty",
-            "rapid_penalty_indexed",
-            "rapid_penalty_indexed_legacy",
-        ],
+        choices=sorted(SUPPORTED_PROVIDERS),
         default=["rapid", "flashinfer"],
     )
     parser.add_argument("--warmup-iters", type=int, default=5)

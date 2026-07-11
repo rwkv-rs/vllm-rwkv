@@ -260,8 +260,10 @@ def test_rapid_sampler_recomputes_processed_logits_for_logprobs(monkeypatch):
     assert sampling_param_calls[1].get("skip_temperature", False) is False
 
 
-def test_rapid_sampler_default_recomputes_native_logits_when_input_unsupported(
+@pytest.mark.parametrize("require_rapid", [False, True])
+def test_rapid_sampler_native_fallback_is_forbidden_when_required(
     monkeypatch,
+    require_rapid,
 ):
     monkeypatch.delenv("VLLM_USE_RAPID_SAMPLER", raising=False)
 
@@ -271,6 +273,7 @@ def test_rapid_sampler_default_recomputes_native_logits_when_input_unsupported(
     sampler.logprobs_mode = "raw_logprobs"
     sampler.rapid_penalties = None
     sampler.use_fp64_gumbel = False
+    sampler.require_rapid = require_rapid
 
     top_k_calls = []
 
@@ -344,7 +347,7 @@ def test_rapid_sampler_default_recomputes_native_logits_when_input_unsupported(
         lambda *args, **kwargs: torch.tensor([2]),
     )
 
-    sampled, processed_logits = sampler.sample(
+    sample = lambda: sampler.sample(
         logits=torch.zeros((1, 4)),
         expanded_idx_mapping=torch.tensor([0]),
         idx_mapping_np=np.array([0]),
@@ -352,6 +355,13 @@ def test_rapid_sampler_default_recomputes_native_logits_when_input_unsupported(
         input_ids=torch.tensor([0]),
         expanded_local_pos=torch.tensor([0]),
     )
+
+    if require_rapid:
+        with pytest.raises(RuntimeError, match="rapid-sampling requires"):
+            sample()
+        return
+
+    sampled, processed_logits = sample()
 
     assert sampled.tolist() == [2]
     assert processed_logits is native_processed_logits
