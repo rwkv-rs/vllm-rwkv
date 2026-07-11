@@ -21,8 +21,10 @@ torch::Tensor layer_norm_f16_small_cuda(torch::Tensor x, torch::Tensor weight,
 torch::Tensor layer_norm_f16_small512_cuda(torch::Tensor x,
                                            torch::Tensor weight,
                                            torch::Tensor bias, double eps);
-torch::Tensor linear_f16_cuda(torch::Tensor x, torch::Tensor weight);
-torch::Tensor linear_f16_orig_cuda(torch::Tensor x, torch::Tensor weight_orig);
+torch::Tensor linear_f16_cuda(torch::Tensor x, torch::Tensor weight,
+                              bool allow_fp16_accumulation);
+torch::Tensor linear_f16_orig_cuda(torch::Tensor x, torch::Tensor weight_orig,
+                                   bool allow_fp16_accumulation);
 torch::Tensor linear_orig_rows_f16_cuda(torch::Tensor x,
                                         torch::Tensor weight_orig,
                                         int64_t row_tile, int64_t out_tile);
@@ -37,12 +39,15 @@ torch::Tensor linear_orig_rows_exact_f16_cuda(torch::Tensor x,
 torch::Tensor linear_orig_wmma16_f16_cuda(torch::Tensor x,
                                           torch::Tensor weight_orig);
 torch::Tensor linear_f16_orig_lt_cuda(torch::Tensor x,
-                                      torch::Tensor weight_orig);
+                                      torch::Tensor weight_orig,
+                                      bool allow_fp16_accumulation);
 torch::Tensor linear_f16_orig_lt_cfg_cuda(torch::Tensor x,
                                           torch::Tensor weight_orig,
                                           int64_t workspace_mb,
-                                          int64_t algo_index);
-torch::Tensor linear_f16_lt_cuda(torch::Tensor x, torch::Tensor weight);
+                                          int64_t algo_index,
+                                          bool allow_fp16_accumulation);
+torch::Tensor linear_f16_lt_cuda(torch::Tensor x, torch::Tensor weight,
+                                 bool allow_fp16_accumulation);
 torch::Tensor linear_f16_m1_splitk_cuda(torch::Tensor x, torch::Tensor weight);
 torch::Tensor linear_f16_m1_splitk_cfg_cuda(torch::Tensor x,
                                             torch::Tensor weight,
@@ -203,23 +208,25 @@ torch::Tensor layer_norm_f16_small512(torch::Tensor x, torch::Tensor weight,
   return layer_norm_f16_small512_cuda(x, weight, bias, eps);
 }
 
-torch::Tensor linear_f16(torch::Tensor x, torch::Tensor weight) {
+torch::Tensor linear_f16(torch::Tensor x, torch::Tensor weight,
+                         bool allow_fp16_accumulation) {
   check_half_cuda_contig(x, "x");
   check_half_cuda_contig(weight, "weight");
   TORCH_CHECK(x.dim() >= 2, "x must have at least 2 dims");
   TORCH_CHECK(weight.dim() == 2, "weight must have shape [K, N]");
   TORCH_CHECK(x.size(-1) == weight.size(0), "linear_f16 shape mismatch");
-  return linear_f16_cuda(x, weight);
+  return linear_f16_cuda(x, weight, allow_fp16_accumulation);
 }
 
-torch::Tensor linear_f16_orig(torch::Tensor x, torch::Tensor weight_orig) {
+torch::Tensor linear_f16_orig(torch::Tensor x, torch::Tensor weight_orig,
+                              bool allow_fp16_accumulation) {
   check_half_cuda_contig(x, "x");
   check_half_cuda_contig(weight_orig, "weight_orig");
   TORCH_CHECK(x.dim() >= 2, "x must have at least 2 dims");
   TORCH_CHECK(weight_orig.dim() == 2, "weight_orig must have shape [N, K]");
   TORCH_CHECK(x.size(-1) == weight_orig.size(1),
               "linear_f16_orig shape mismatch");
-  return linear_f16_orig_cuda(x, weight_orig);
+  return linear_f16_orig_cuda(x, weight_orig, allow_fp16_accumulation);
 }
 
 torch::Tensor linear_orig_rows_f16(torch::Tensor x, torch::Tensor weight_orig,
@@ -272,18 +279,20 @@ torch::Tensor linear_orig_wmma16_f16(torch::Tensor x,
   return linear_orig_wmma16_f16_cuda(x, weight_orig);
 }
 
-torch::Tensor linear_f16_orig_lt(torch::Tensor x, torch::Tensor weight_orig) {
+torch::Tensor linear_f16_orig_lt(torch::Tensor x, torch::Tensor weight_orig,
+                                 bool allow_fp16_accumulation) {
   check_half_cuda_contig(x, "x");
   check_half_cuda_contig(weight_orig, "weight_orig");
   TORCH_CHECK(x.dim() >= 2, "x must have at least 2 dims");
   TORCH_CHECK(weight_orig.dim() == 2, "weight_orig must have shape [N, K]");
   TORCH_CHECK(x.size(-1) == weight_orig.size(1),
               "linear_f16_orig_lt shape mismatch");
-  return linear_f16_orig_lt_cuda(x, weight_orig);
+  return linear_f16_orig_lt_cuda(x, weight_orig, allow_fp16_accumulation);
 }
 
 torch::Tensor linear_f16_orig_lt_cfg(torch::Tensor x, torch::Tensor weight_orig,
-                                     int64_t workspace_mb, int64_t algo_index) {
+                                     int64_t workspace_mb, int64_t algo_index,
+                                     bool allow_fp16_accumulation) {
   check_half_cuda_contig(x, "x");
   check_half_cuda_contig(weight_orig, "weight_orig");
   TORCH_CHECK(x.dim() >= 2, "x must have at least 2 dims");
@@ -293,16 +302,18 @@ torch::Tensor linear_f16_orig_lt_cfg(torch::Tensor x, torch::Tensor weight_orig,
   TORCH_CHECK(workspace_mb >= 0 && workspace_mb <= 1024,
               "workspace_mb out of range");
   TORCH_CHECK(algo_index >= 0 && algo_index < 64, "algo_index out of range");
-  return linear_f16_orig_lt_cfg_cuda(x, weight_orig, workspace_mb, algo_index);
+  return linear_f16_orig_lt_cfg_cuda(x, weight_orig, workspace_mb, algo_index,
+                                     allow_fp16_accumulation);
 }
 
-torch::Tensor linear_f16_lt(torch::Tensor x, torch::Tensor weight) {
+torch::Tensor linear_f16_lt(torch::Tensor x, torch::Tensor weight,
+                            bool allow_fp16_accumulation) {
   check_half_cuda_contig(x, "x");
   check_half_cuda_contig(weight, "weight");
   TORCH_CHECK(x.dim() >= 2, "x must have at least 2 dims");
   TORCH_CHECK(weight.dim() == 2, "weight must have shape [K, N]");
   TORCH_CHECK(x.size(-1) == weight.size(0), "linear_f16_lt shape mismatch");
-  return linear_f16_lt_cuda(x, weight);
+  return linear_f16_lt_cuda(x, weight, allow_fp16_accumulation);
 }
 
 torch::Tensor linear_f16_m1_splitk(torch::Tensor x, torch::Tensor weight) {
@@ -859,8 +870,12 @@ TORCH_LIBRARY(rwkv7_v3a_ops, m) {
   m.def(
       "layer_norm_f16_small512(Tensor x, Tensor weight, Tensor bias, float "
       "eps=" RWKV7_LAYER_NORM_EPS_SCHEMA ") -> Tensor");
-  m.def("linear_f16(Tensor x, Tensor weight) -> Tensor");
-  m.def("linear_f16_orig(Tensor x, Tensor weight_orig) -> Tensor");
+  m.def(
+      "linear_f16(Tensor x, Tensor weight, bool allow_fp16_accumulation=False) "
+      "-> Tensor");
+  m.def(
+      "linear_f16_orig(Tensor x, Tensor weight_orig, bool "
+      "allow_fp16_accumulation=False) -> Tensor");
   m.def(
       "linear_orig_rows_f16(Tensor x, Tensor weight_orig, int row_tile, int "
       "out_tile) -> Tensor");
@@ -871,11 +886,15 @@ TORCH_LIBRARY(rwkv7_v3a_ops, m) {
       "linear_orig_rows_exact_f16(Tensor x, Tensor weight_orig, int threads, "
       "int out_tile, bool use4) -> Tensor");
   m.def("linear_orig_wmma16_f16(Tensor x, Tensor weight_orig) -> Tensor");
-  m.def("linear_f16_orig_lt(Tensor x, Tensor weight_orig) -> Tensor");
+  m.def(
+      "linear_f16_orig_lt(Tensor x, Tensor weight_orig, bool "
+      "allow_fp16_accumulation=False) -> Tensor");
   m.def(
       "linear_f16_orig_lt_cfg(Tensor x, Tensor weight_orig, int workspace_mb, "
-      "int algo_index) -> Tensor");
-  m.def("linear_f16_lt(Tensor x, Tensor weight) -> Tensor");
+      "int algo_index, bool allow_fp16_accumulation=False) -> Tensor");
+  m.def(
+      "linear_f16_lt(Tensor x, Tensor weight, bool "
+      "allow_fp16_accumulation=False) -> Tensor");
   m.def("linear_f16_m1_splitk(Tensor x, Tensor weight) -> Tensor");
   m.def(
       "linear_f16_m1_splitk_cfg(Tensor x, Tensor weight, int chunk_k) -> "
@@ -950,7 +969,8 @@ TORCH_LIBRARY(rwkv7_v3a_ops, m) {
       "Tensor(a!) shift_state, Tensor weight, Tensor bias, Tensor x_k, float "
       "eps=" RWKV7_LAYER_NORM_EPS_SCHEMA ") -> Tensor[]");
   m.def("advance_i32(Tensor(a!) x, int amount) -> ()");
-  m.def("advance_i32_slots(Tensor(a!) x, Tensor slot_indices, int amount) -> ()");
+  m.def(
+      "advance_i32_slots(Tensor(a!) x, Tensor slot_indices, int amount) -> ()");
   m.def(
       "advance_i32_varlen(Tensor(a!) x, Tensor query_start_loc, Tensor "
       "slot_indices) -> ()");

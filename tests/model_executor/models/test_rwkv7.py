@@ -19,11 +19,13 @@ from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.engine.core import _supports_no_kv_cache_chunked_prefill
+from vllm.v1.worker.gpu.model_states.rwkv import RWKV7ModelState
 from vllm.v1.worker.gpu_input_batch import (
     CachedRequestState,
+)
+from vllm.v1.worker.gpu_input_batch import (
     InputBatch as LegacyInputBatch,
 )
-from vllm.v1.worker.gpu.model_states.rwkv import RWKV7ModelState
 
 
 def test_rwkv7_cuda_ops_match_torch_reference():
@@ -708,12 +710,51 @@ def test_rwkv7_config_rejects_invalid_albatross_knob(monkeypatch):
         RWKV7ForCausalLMConfig.verify_and_update_config(vllm_config)
 
 
+@pytest.mark.parametrize("allow_fp16_accumulation", [False, True])
+def test_rwkv7_passes_linear_accumulation_to_custom_ops(
+    monkeypatch, allow_fp16_accumulation
+):
+    calls: list[Any] = []
+
+    def linear_f16(x, weight, allow):
+        calls.append(("linear_f16", allow))
+        return torch.empty((x.size(0), weight.size(1)))
+
+    def linear_f16_orig(x, weight, allow):
+        calls.append(("linear_f16_orig", allow))
+        return torch.empty((x.size(0), weight.size(0)))
+
+    def linear_f16_orig_lt_cfg(x, weight, workspace_mb, algo_index, allow):
+        calls.append(("linear_f16_orig_lt_cfg", workspace_mb, algo_index, allow))
+        return torch.empty((x.size(0), weight.size(0)))
+
+    monkeypatch.setattr(torch.ops.rwkv7_v3a_ops, "linear_f16", linear_f16)
+    monkeypatch.setattr(torch.ops.rwkv7_v3a_ops, "linear_f16_orig", linear_f16_orig)
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "linear_f16_orig_lt_cfg",
+        linear_f16_orig_lt_cfg,
+    )
+    model = _new_rwkv7_forward_test_model(
+        allow_fp16_accumulation=allow_fp16_accumulation
+    )
+    x = torch.empty((2, 4))
+
+    model.linear(x, torch.empty((4, 3)))
+    model._linear_f16_orig(x, torch.empty((3, 4)))
+    model._linear_f16_orig_lt_cfg(x, torch.empty((3, 4)), 16, 2)
+
+    assert calls == [
+        ("linear_f16", allow_fp16_accumulation),
+        ("linear_f16_orig", allow_fp16_accumulation),
+        ("linear_f16_orig_lt_cfg", 16, 2, allow_fp16_accumulation),
+    ]
+
+
 def test_rwkv7_config_rejects_invalid_orig_linear_group(monkeypatch):
     import vllm.model_executor.models.config as model_config
 
-    monkeypatch.setattr(
-        model_config.envs, "VLLM_RWKV7_ORIG_LINEAR_GROUPS", "none,head"
-    )
+    monkeypatch.setattr(model_config.envs, "VLLM_RWKV7_ORIG_LINEAR_GROUPS", "none,head")
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=False),
         compilation_config=CompilationConfig(),
@@ -3115,9 +3156,7 @@ def test_rwkv7_vllm_forward_uses_varlen_prefill_metadata(monkeypatch):
         rwkv_prefill_groups=[(99, 100, 1, 99, 100, 0)],
         rwkv_prefill_query_start_loc=torch.tensor([0, 2, 5], dtype=torch.int32),
         rwkv_prefill_slot_indices=torch.tensor([2, 0], dtype=torch.int32),
-        rwkv_prefill_token_positions=torch.tensor(
-            [1, 2, 3, 4, 5], dtype=torch.long
-        ),
+        rwkv_prefill_token_positions=torch.tensor([1, 2, 3, 4, 5], dtype=torch.long),
         rwkv_prefill_req_id=torch.tensor([0, 0, 1, 1, 1], dtype=torch.int32),
         rwkv_prefill_max_t=3,
         slot_indices=torch.tensor([1], dtype=torch.int32),

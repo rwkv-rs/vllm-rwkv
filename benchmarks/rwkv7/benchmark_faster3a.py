@@ -13,6 +13,7 @@ import argparse
 import copy
 import csv
 import gc
+import hashlib
 import json
 import os
 import socket
@@ -20,7 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,6 +39,46 @@ ALBATROSS_REPO = "https://github.com/BlinkDL/Albatross"
 ALBATROSS_COMMIT = "5e941fb1eeb7f735a562fb5bbb30fad19adc825b"
 ALBATROSS_IMPL = "faster3a_2605"
 VLLM_MODEL_ONLY_LABEL = "RWKV7ForCausalLM.forward_logits"
+MODEL_ONLY_OUTPUT_BOUNDARY = "last_token_logits"
+ALBATROSS_GEMM_ACCUMULATION_POLICY = "fp32"
+MODEL_ONLY_CONTRACT_FIELDS = (
+    "checkpoint",
+    "checkpoint_sha256",
+    "implementation_revision",
+    "device",
+    "batch_size",
+    "seq_len",
+    "output_boundary",
+    "wkv_mode",
+    "gemm_accumulation_policy",
+    "embedding_device",
+    "rkv_mode",
+    "cmix_sparse",
+    "low_rank_weight",
+    "orig_linear_groups",
+)
+MODEL_ONLY_COMPARISON_FIELDS = (
+    "checkpoint_sha256",
+    "device",
+    "batch_size",
+    "seq_len",
+    "output_boundary",
+    "wkv_mode",
+    "gemm_accumulation_policy",
+    "embedding_device",
+    "rkv_mode",
+    "cmix_sparse",
+    "low_rank_weight",
+    "orig_linear_groups",
+)
+MODEL_ONLY_FP16_THROUGHPUT_REQUIREMENTS = {
+    "wkv_mode": "fp16",
+    "gemm_accumulation_policy": "fp16_where_configurable",
+}
+RUNNER_FP16_THROUGHPUT_REQUIREMENTS = {
+    "VLLM_RWKV7_WKV_MODE": "fp16",
+    "VLLM_RWKV7_ALLOW_FP16_ACCUMULATION": "1",
+}
 VLLM_RUNNER_MODE = "worker_execute_model"
 VLLM_RUNNER_TIMING_TARGET = "worker.execute_model"
 VLLM_RUNNER_TIMING_CLOCK = "cuda_event"
@@ -77,6 +118,7 @@ PROVENANCE_ENV_VARS = (
     "VLLM_RWKV7_CMIX_SPARSE",
     "VLLM_RWKV7_LOW_RANK_WEIGHT",
     "VLLM_RWKV7_ORIG_LINEAR_GROUPS",
+    "VLLM_RWKV7_ALLOW_FP16_ACCUMULATION",
     "VLLM_USE_RAPID_SAMPLER",
     "VLLM_USE_V2_MODEL_RUNNER",
     "VLLM_ALLOW_INSECURE_SERIALIZATION",
@@ -90,6 +132,7 @@ PROVENANCE_ENV_DEFAULTS = {
     "VLLM_RWKV7_CMIX_SPARSE": "no-fc",
     "VLLM_RWKV7_LOW_RANK_WEIGHT": "both",
     "VLLM_RWKV7_ORIG_LINEAR_GROUPS": "none",
+    "VLLM_RWKV7_ALLOW_FP16_ACCUMULATION": "1",
     "VLLM_USE_RAPID_SAMPLER": "1",
     "VLLM_USE_V2_MODEL_RUNNER": "1",
     "VLLM_ALLOW_INSECURE_SERIALIZATION": "1",
@@ -282,7 +325,25 @@ def _git_revision(repo_root: Path) -> str | None:
         revision = marker.read_text(encoding="utf-8").strip()
         return revision or None
     revision = result.stdout.strip()
-    return revision or None
+    if not revision:
+        return None
+    try:
+        status = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "status",
+                "--porcelain",
+                "--untracked-files=normal",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return None
+    return f"{revision}-dirty" if status.stdout.strip() else revision
 
 
 def _cuda_device_metadata() -> dict[str, Any]:
@@ -291,12 +352,27 @@ def _cuda_device_metadata() -> dict[str, Any]:
     cuda = _cuda_module()
     device_index = cuda.current_device()
     props = cuda.get_device_properties(device_index)
+    device_uuid = getattr(props, "uuid", None)
     return {
         "available": True,
         "device_index": int(device_index),
+        "device_uuid": str(device_uuid) if device_uuid is not None else None,
         "device_name": cuda.get_device_name(device_index),
         "capability": list(cuda.get_device_capability(device_index)),
         "total_memory": int(props.total_memory),
+    }
+
+
+def _model_only_device_identity() -> dict[str, Any]:
+    metadata = _cuda_device_metadata()
+    if not metadata["available"]:
+        return {"available": False}
+    return {
+        "available": True,
+        "device_uuid": metadata["device_uuid"],
+        "device_name": metadata["device_name"],
+        "capability": metadata["capability"],
+        "total_memory": metadata["total_memory"],
     }
 
 
@@ -306,10 +382,15 @@ def _rwkv_environment_raw_metadata() -> dict[str, str | None]:
 
 def _rwkv_environment_metadata() -> dict[str, str | None]:
     raw = _rwkv_environment_raw_metadata()
-    return {
+    resolved = {
         name: raw[name] if raw[name] is not None else PROVENANCE_ENV_DEFAULTS.get(name)
         for name in PROVENANCE_ENV_VARS
     }
+    if raw["VLLM_RWKV7_ALLOW_FP16_ACCUMULATION"] is None:
+        resolved["VLLM_RWKV7_ALLOW_FP16_ACCUMULATION"] = (
+            "1" if resolved["VLLM_RWKV7_WKV_MODE"] == "fp16" else "0"
+        )
+    return resolved
 
 
 @contextmanager
@@ -441,6 +522,188 @@ def _get_number(metrics: dict[str, Any], name: str) -> float | None:
     return float(value)
 
 
+def _canonical_orig_linear_groups(value: str) -> list[str]:
+    return sorted(
+        {
+            group
+            for item in value.replace(",", " ").split()
+            if (group := item.strip()) and group != "none"
+        }
+    )
+
+
+def _checkpoint_sha256(checkpoint: Path) -> str:
+    digest = hashlib.sha256()
+    with checkpoint.expanduser().open("rb") as file:
+        for chunk in iter(lambda: file.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _model_only_comparison_contract(
+    *,
+    checkpoint: Path,
+    checkpoint_sha256: str,
+    implementation_revision: str | None,
+    device: dict[str, Any],
+    batch_size: int,
+    seq_len: int,
+    wkv_mode: str,
+    gemm_accumulation_policy: str,
+    embedding_device: str,
+    rkv_mode: str,
+    cmix_sparse: str,
+    low_rank_weight: str,
+    orig_linear_groups: str,
+) -> dict[str, Any]:
+    return {
+        "checkpoint": str(checkpoint.expanduser().resolve()),
+        "checkpoint_sha256": checkpoint_sha256,
+        "implementation_revision": implementation_revision,
+        "device": device,
+        "batch_size": batch_size,
+        "seq_len": seq_len,
+        "output_boundary": MODEL_ONLY_OUTPUT_BOUNDARY,
+        "wkv_mode": wkv_mode,
+        "gemm_accumulation_policy": gemm_accumulation_policy,
+        "embedding_device": embedding_device,
+        "rkv_mode": rkv_mode,
+        "cmix_sparse": cmix_sparse,
+        "low_rank_weight": low_rank_weight,
+        "orig_linear_groups": _canonical_orig_linear_groups(orig_linear_groups),
+    }
+
+
+def _model_only_contract_blocker(
+    raw_metrics: dict[str, Any],
+) -> dict[str, Any] | None:
+    contract_names = ("albatross_contract", "vllm_contract")
+    missing = [
+        name for name in contract_names if not isinstance(raw_metrics.get(name), dict)
+    ]
+    if missing:
+        return _blocker(
+            "missing_model_only_comparison_contract",
+            "Model-only comparison requires retained Albatross and vLLM "
+            "measurement contracts.",
+            missing=missing,
+        )
+
+    missing_fields = {
+        name: [
+            field
+            for field in MODEL_ONLY_CONTRACT_FIELDS
+            if field not in raw_metrics[name]
+        ]
+        for name in contract_names
+    }
+    missing_fields = {name: fields for name, fields in missing_fields.items() if fields}
+    if missing_fields:
+        return _blocker(
+            "missing_model_only_comparison_contract",
+            "Model-only comparison contracts are incomplete.",
+            missing_fields=missing_fields,
+        )
+
+    albatross = raw_metrics["albatross_contract"]
+    vllm = raw_metrics["vllm_contract"]
+    mismatches = {
+        field: {
+            "albatross": albatross[field],
+            "vllm": vllm[field],
+        }
+        for field in MODEL_ONLY_COMPARISON_FIELDS
+        if albatross[field] != vllm[field]
+    }
+    if mismatches:
+        return _blocker(
+            "non_like_for_like_model_only_comparison",
+            "Albatross and vLLM model-only measurements use different "
+            "comparison contracts.",
+            mismatches=mismatches,
+        )
+
+    provenance_violations: dict[str, Any] = {}
+    for name, contract in (("albatross_contract", albatross), ("vllm_contract", vllm)):
+        checkpoint_digest = contract["checkpoint_sha256"]
+        try:
+            valid_checkpoint_digest = (
+                isinstance(checkpoint_digest, str)
+                and len(checkpoint_digest) == 64
+                and int(checkpoint_digest, 16) >= 0
+            )
+        except ValueError:
+            valid_checkpoint_digest = False
+        if not valid_checkpoint_digest:
+            provenance_violations.setdefault(name, {})["checkpoint_sha256"] = {
+                "required": "64-character SHA-256",
+                "actual": checkpoint_digest,
+            }
+
+        device = contract["device"]
+        required_device_fields = {
+            "available",
+            "device_uuid",
+            "device_name",
+            "capability",
+            "total_memory",
+        }
+        if (
+            not isinstance(device, dict)
+            or device.get("available") is not True
+            or not required_device_fields.issubset(device)
+            or not isinstance(device.get("device_uuid"), str)
+            or not device["device_uuid"]
+        ):
+            provenance_violations.setdefault(name, {})["device"] = {
+                "required": "identified CUDA device",
+                "actual": device,
+            }
+
+    if albatross["implementation_revision"] != ALBATROSS_COMMIT:
+        provenance_violations["albatross_contract"] = {
+            "implementation_revision": {
+                "required": ALBATROSS_COMMIT,
+                "actual": albatross["implementation_revision"],
+            }
+        }
+    vllm_revision = vllm["implementation_revision"]
+    if not isinstance(vllm_revision, str) or vllm_revision.endswith("-dirty"):
+        provenance_violations["vllm_contract"] = {
+            "implementation_revision": {
+                "required": "clean git revision",
+                "actual": vllm_revision,
+            }
+        }
+    if provenance_violations:
+        return _blocker(
+            "invalid_model_only_measurement_provenance",
+            "Model-only performance acceptance requires identified artifacts, "
+            "devices, and clean implementations.",
+            violations=provenance_violations,
+        )
+
+    violations = {
+        name: {
+            field: {
+                "required": required,
+                "actual": raw_metrics[name][field],
+            }
+            for field, required in MODEL_ONLY_FP16_THROUGHPUT_REQUIREMENTS.items()
+            if raw_metrics[name][field] != required
+        }
+        for name in contract_names
+    }
+    violations = {name: fields for name, fields in violations.items() if fields}
+    if violations:
+        return _blocker(
+            "invalid_model_only_throughput_contract",
+            "Model-only performance acceptance requires the FP16 throughput contract.",
+            violations=violations,
+        )
+    return None
+
+
 def _evaluate_model_only(
     measurements: dict[str, Any] | None,
     blockers: list[dict[str, Any]],
@@ -501,6 +764,11 @@ def _evaluate_model_only(
         check["errors"] = [
             "model_only_steady_decode token throughput values must be positive"
         ]
+        return check
+
+    contract_blocker = _model_only_contract_blocker(raw_metrics)
+    if contract_blocker is not None:
+        check["blockers"] = [contract_blocker]
         return check
 
     ratio = vllm_tps / albatross_tps
@@ -650,6 +918,21 @@ def generate_albatross_model_only_measurement(
 
     script = _required_albatross_script(config)
     checkpoint = _required_albatross_checkpoint(config)
+    albatross_contract = _model_only_comparison_contract(
+        checkpoint=checkpoint,
+        checkpoint_sha256=_checkpoint_sha256(checkpoint),
+        implementation_revision=_git_revision(script.parent),
+        device=_model_only_device_identity(),
+        batch_size=batch_size,
+        seq_len=seq_len,
+        wkv_mode=config.albatross_wkv,
+        gemm_accumulation_policy=ALBATROSS_GEMM_ACCUMULATION_POLICY,
+        embedding_device=config.albatross_emb,
+        rkv_mode=config.albatross_batched_rkv,
+        cmix_sparse=config.albatross_cmix_sparse,
+        low_rank_weight=config.albatross_lowrank_weight,
+        orig_linear_groups=config.albatross_orig_linear_groups,
+    )
     command = [
         sys.executable,
         str(script),
@@ -709,6 +992,7 @@ def generate_albatross_model_only_measurement(
             "albatross_p10_ms": parsed["p10_ms"],
             "albatross_p50_ms": parsed["p50_ms"],
             "albatross_p90_ms": parsed["p90_ms"],
+            "albatross_contract": albatross_contract,
         },
         "config": {
             "repo_root": str(config.repo_root),
@@ -907,6 +1191,7 @@ def _time_vllm_model_only_steady_decode(
     seq_len: int,
     warmup: int,
     iters: int,
+    capture_cuda_profiler: bool = False,
 ) -> dict[str, Any]:
     import torch
 
@@ -958,12 +1243,18 @@ def _time_vllm_model_only_steady_decode(
         torch.accelerator.synchronize()
         start_event = cuda.Event(enable_timing=True)
         end_event = cuda.Event(enable_timing=True)
-        for _ in range(iters):
-            start_event.record()
-            graph.replay()
-            end_event.record()
-            end_event.synchronize()
-            durations_ms.append(start_event.elapsed_time(end_event))
+        if capture_cuda_profiler:
+            cuda.cudart().cudaProfilerStart()
+        try:
+            for _ in range(iters):
+                start_event.record()
+                graph.replay()
+                end_event.record()
+                end_event.synchronize()
+                durations_ms.append(start_event.elapsed_time(end_event))
+        finally:
+            if capture_cuda_profiler:
+                cuda.cudart().cudaProfilerStop()
 
     p50_ms = _percentile(durations_ms, 0.5)
     return {
@@ -975,6 +1266,7 @@ def _time_vllm_model_only_steady_decode(
         "measurement_mode": "cuda_graph_replay",
         "output": "logits",
         "logits_included": True,
+        "cuda_profiler_capture": capture_cuda_profiler,
         "distributed_backend": getattr(model, "_benchmark_distributed_backend", None),
     }
 
@@ -985,6 +1277,7 @@ def generate_vllm_model_only_measurement(
     case: str,
     warmup: int,
     iters: int,
+    capture_cuda_profiler: bool = False,
 ) -> dict[str, Any]:
     batch_size, seq_len = _parse_bxt_case(case, "vLLM case")
     if warmup < 0:
@@ -992,6 +1285,27 @@ def generate_vllm_model_only_measurement(
     if iters <= 0:
         raise ValueError("vLLM iters must be positive")
 
+    model_path = _required_vllm_model_path(config)
+    env = _rwkv_environment_metadata()
+    vllm_contract = _model_only_comparison_contract(
+        checkpoint=model_path,
+        checkpoint_sha256=_checkpoint_sha256(model_path),
+        implementation_revision=_git_revision(config.repo_root),
+        device=_model_only_device_identity(),
+        batch_size=batch_size,
+        seq_len=seq_len,
+        wkv_mode=str(env["VLLM_RWKV7_WKV_MODE"]),
+        gemm_accumulation_policy=(
+            "fp16_where_configurable"
+            if env["VLLM_RWKV7_ALLOW_FP16_ACCUMULATION"] == "1"
+            else "fp32"
+        ),
+        embedding_device=str(env["VLLM_RWKV7_EMB_DEVICE"]),
+        rkv_mode=str(env["VLLM_RWKV7_RKV_MODE"]),
+        cmix_sparse=str(env["VLLM_RWKV7_CMIX_SPARSE"]),
+        low_rank_weight=str(env["VLLM_RWKV7_LOW_RANK_WEIGHT"]),
+        orig_linear_groups=str(env["VLLM_RWKV7_ORIG_LINEAR_GROUPS"]),
+    )
     model = _load_vllm_rwkv7_model(config)
     parsed = _time_vllm_model_only_steady_decode(
         model,
@@ -999,6 +1313,7 @@ def generate_vllm_model_only_measurement(
         seq_len=seq_len,
         warmup=warmup,
         iters=iters,
+        capture_cuda_profiler=capture_cuda_profiler,
     )
     return {
         "schema_version": SCHEMA_VERSION,
@@ -1017,12 +1332,15 @@ def generate_vllm_model_only_measurement(
             "vllm_measurement_mode": parsed["measurement_mode"],
             "vllm_output": "logits",
             "vllm_logits_included": True,
+            "vllm_cuda_profiler_capture": parsed["cuda_profiler_capture"],
             "vllm_distributed_backend": parsed["distributed_backend"],
+            "vllm_contract": vllm_contract,
         },
         "config": {
             "repo_root": str(config.repo_root),
             "model": config.model,
             "vllm_distributed_backend": parsed["distributed_backend"],
+            "vllm_provenance": _benchmark_provenance(config),
             "measurement_source": "vllm_model_direct",
         },
     }
@@ -1072,9 +1390,12 @@ def _merge_vllm_model_only_measurement(
     merged["schema_version"] = merged.get("schema_version", SCHEMA_VERSION)
     merged["benchmark"] = merged.get("benchmark", BENCHMARK_NAME)
     merged_config = dict(merged.get("config", {}))
+    vllm_config = vllm_measurement.get("config", {})
     merged_config.update(
         {
-            "model": vllm_measurement.get("config", {}).get("model"),
+            "model": vllm_config.get("model"),
+            "vllm_distributed_backend": vllm_config.get("vllm_distributed_backend"),
+            "vllm_provenance": vllm_config.get("vllm_provenance"),
             "measurement_source": "merged_vllm_model_direct",
         }
     )
@@ -1616,8 +1937,7 @@ def _run_vllm_worker_internal_prefill(
 
     for warmup_iteration in range(warmup):
         req_ids = [
-            f"{prefix}-warmup-{warmup_iteration}-{idx}"
-            for idx in range(batch_size)
+            f"{prefix}-warmup-{warmup_iteration}-{idx}" for idx in range(batch_size)
         ]
         _worker_execute_prefill_chunks(
             worker,
@@ -1635,10 +1955,7 @@ def _run_vllm_worker_internal_prefill(
         _worker_cuda_synchronize()
 
     for iteration in range(iters):
-        req_ids = [
-            f"{prefix}-measure-{iteration}-{idx}"
-            for idx in range(batch_size)
-        ]
+        req_ids = [f"{prefix}-measure-{iteration}-{idx}" for idx in range(batch_size)]
         chunk_durations_s, chunk_token_counts = _worker_execute_prefill_chunks(
             worker,
             req_ids=req_ids,
@@ -2229,10 +2546,8 @@ def _shutdown_vllm_runner_llm(llm: Any) -> None:
             shutdown(timeout=30)
         except TypeError:
             shutdown()
-    try:
+    with suppress(Exception):
         llm.llm_engine = None
-    except Exception:
-        pass
     gc.collect()
     if _cuda_available():
         cuda = _cuda_module()
@@ -2318,15 +2633,11 @@ def generate_vllm_runner_measurement(
                 "runner_p10_ms": parsed["p10_ms"],
                 "runner_p50_ms": parsed["p50_ms"],
                 "runner_p90_ms": parsed["p90_ms"],
-                "runner_execute_model_p50_ms": parsed.get(
-                    "execute_model_p50_ms"
-                ),
+                "runner_execute_model_p50_ms": parsed.get("execute_model_p50_ms"),
                 "runner_execute_model_p50_tokens_per_s": parsed.get(
                     "execute_model_p50_tokens_per_s"
                 ),
-                "runner_sample_tokens_p50_ms": parsed.get(
-                    "sample_tokens_p50_ms"
-                ),
+                "runner_sample_tokens_p50_ms": parsed.get("sample_tokens_p50_ms"),
                 "runner_sample_tokens_p50_tokens_per_s": parsed.get(
                     "sample_tokens_p50_tokens_per_s"
                 ),
@@ -2395,9 +2706,7 @@ def _runner_phase_metrics(
         {
             "avg_tokens_per_s": parsed["avg_tokens_per_s"],
             "peak_tokens_per_s": parsed["peak_tokens_per_s"],
-            "peak_iteration_tokens_per_s": parsed.get(
-                "peak_iteration_tokens_per_s"
-            ),
+            "peak_iteration_tokens_per_s": parsed.get("peak_iteration_tokens_per_s"),
             "peak_unit_tokens_per_s": parsed.get("peak_unit_tokens_per_s"),
             "total_tokens": parsed["total_tokens"],
             "total_duration_ms": parsed["total_duration_ms"],
@@ -2619,9 +2928,9 @@ def generate_vllm_runner_pd_measurement(
         )
         prefill_metrics[case] = measurement["metrics"]
         state_movement_by_case[f"prefill:{case}"] = measurement["state_movement"]
-        case_provenance_by_case[f"prefill:{case}"] = measurement.get(
-            "config", {}
-        ).get("provenance")
+        case_provenance_by_case[f"prefill:{case}"] = measurement.get("config", {}).get(
+            "provenance"
+        )
 
     for batch_size, decode_tokens in decode_cases:
         case = _format_bxt_case(batch_size, decode_tokens)
@@ -2637,9 +2946,9 @@ def generate_vllm_runner_pd_measurement(
         )
         decode_metrics[case] = measurement["metrics"]
         state_movement_by_case[f"decode:{case}"] = measurement["state_movement"]
-        case_provenance_by_case[f"decode:{case}"] = measurement.get(
-            "config", {}
-        ).get("provenance")
+        case_provenance_by_case[f"decode:{case}"] = measurement.get("config", {}).get(
+            "provenance"
+        )
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -2691,6 +3000,37 @@ def _merge_vllm_runner_measurement(
     return merged
 
 
+def _runner_throughput_contract_blocker(
+    measurements: dict[str, Any],
+) -> dict[str, Any] | None:
+    config = measurements.get("config")
+    provenance = config.get("provenance") if isinstance(config, dict) else None
+    env = provenance.get("env") if isinstance(provenance, dict) else None
+    if not isinstance(env, dict) or any(
+        name not in env for name in RUNNER_FP16_THROUGHPUT_REQUIREMENTS
+    ):
+        return _blocker(
+            "missing_runner_throughput_provenance",
+            "Runner performance acceptance requires retained precision provenance.",
+        )
+
+    violations = {
+        name: {
+            "required": required,
+            "actual": env[name],
+        }
+        for name, required in RUNNER_FP16_THROUGHPUT_REQUIREMENTS.items()
+        if env[name] != required
+    }
+    if violations:
+        return _blocker(
+            "invalid_runner_throughput_contract",
+            "Runner performance acceptance requires the FP16 throughput contract.",
+            violations=violations,
+        )
+    return None
+
+
 def _evaluate_runner(
     measurements: dict[str, Any] | None,
     blockers: list[dict[str, Any]],
@@ -2740,6 +3080,12 @@ def _evaluate_runner(
         check["errors"] = ["runner_steady_decode token throughput must be positive"]
         return check
 
+    metrics["runner_tokens_per_s"] = runner_tps
+    contract_blocker = _runner_throughput_contract_blocker(measurements)
+    if contract_blocker is not None:
+        check["blockers"] = [contract_blocker]
+        return check
+
     metrics.update(
         {
             "runner_tokens_per_s": runner_tps,
@@ -2760,15 +3106,11 @@ def _evaluate_runner(
             "runner_sample_tokens_p50_tokens_per_s": raw_metrics.get(
                 "runner_sample_tokens_p50_tokens_per_s"
             ),
-            "runner_decode_step_p50_ms": raw_metrics.get(
-                "runner_decode_step_p50_ms"
-            ),
+            "runner_decode_step_p50_ms": raw_metrics.get("runner_decode_step_p50_ms"),
             "runner_decode_step_p50_tokens_per_s": raw_metrics.get(
                 "runner_decode_step_p50_tokens_per_s"
             ),
-            "runner_postprocess_p50_ms": raw_metrics.get(
-                "runner_postprocess_p50_ms"
-            ),
+            "runner_postprocess_p50_ms": raw_metrics.get("runner_postprocess_p50_ms"),
             "runner_postprocess_timing_available": raw_metrics.get(
                 "runner_postprocess_timing_available"
             ),
@@ -2980,7 +3322,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--albatross-emb", choices=("gpu", "cpu"))
     parser.add_argument("--albatross-batched-rkv", choices=("auto", "on", "off"))
     parser.add_argument("--albatross-cmix-sparse", choices=("auto", "no-fc", "off"))
-    parser.add_argument("--albatross-lowrank-weight", choices=("orig", "transpose", "both"))
+    parser.add_argument(
+        "--albatross-lowrank-weight", choices=("orig", "transpose", "both")
+    )
     parser.add_argument("--albatross-orig-linear-groups")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--prompt-len", type=int, default=128)
@@ -3010,8 +3354,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--measure-vllm-runner-pd",
         action="store_true",
         help=(
-            "Run split vLLM runner prefill/decode execute_model throughput "
-            "benchmarks."
+            "Run split vLLM runner prefill/decode execute_model throughput benchmarks."
         ),
     )
     parser.add_argument(
@@ -3063,6 +3406,14 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=3,
         help="Timed iterations for vLLM model-only steady decode.",
+    )
+    parser.add_argument(
+        "--cuda-profiler-capture",
+        action="store_true",
+        help=(
+            "Bracket vLLM model-only timed graph replays with "
+            "cudaProfilerStart/Stop for Nsight Systems capture-range profiling."
+        ),
     )
     parser.add_argument(
         "--runner-batch-size",
@@ -3119,9 +3470,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--runner-pd-prefill-cases",
         default=DEFAULT_RUNNER_PD_PREFILL_CASES,
-        help=(
-            "Comma-separated BxT prefill cases for --measure-vllm-runner-pd."
-        ),
+        help=("Comma-separated BxT prefill cases for --measure-vllm-runner-pd."),
     )
     parser.add_argument(
         "--runner-pd-prefill-chunk-tokens",
@@ -3212,6 +3561,7 @@ def main(argv: list[str] | None = None) -> int:
             or f"{config.batch_size}x{config.prompt_len}",
             warmup=args.vllm_warmup,
             iters=args.vllm_iters,
+            capture_cuda_profiler=args.cuda_profiler_capture,
         )
         if existing_measurements is not None:
             measurement = _merge_vllm_model_only_measurement(

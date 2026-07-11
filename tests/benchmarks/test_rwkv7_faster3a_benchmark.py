@@ -82,11 +82,93 @@ def _empty_state_movement() -> dict[str, int | None]:
     return {name: None for name in bench.STATE_MOVEMENT_COUNTERS}
 
 
+def _matching_model_only_contracts(
+    *,
+    checkpoint: str = "/tmp/model.pth",
+    checkpoint_sha256: str = "a" * 64,
+    gemm_accumulation_policy: str = "fp16_where_configurable",
+) -> dict[str, dict[str, Any]]:
+    common = {
+        "checkpoint": checkpoint,
+        "checkpoint_sha256": checkpoint_sha256,
+        "batch_size": 2,
+        "seq_len": 4,
+        "output_boundary": bench.MODEL_ONLY_OUTPUT_BOUNDARY,
+        "wkv_mode": "fp16",
+        "gemm_accumulation_policy": gemm_accumulation_policy,
+        "embedding_device": "cpu",
+        "rkv_mode": "off",
+        "cmix_sparse": "no-fc",
+        "low_rank_weight": "both",
+        "orig_linear_groups": ["att_c2c", "ffn_key", "head"],
+    }
+    device = {
+        "available": True,
+        "device_uuid": "GPU-test-uuid",
+        "device_name": "test-gpu",
+        "capability": [9, 0],
+        "total_memory": 24 * 1024**3,
+    }
+    return {
+        "albatross_contract": {
+            **common,
+            "implementation_revision": bench.ALBATROSS_COMMIT,
+            "device": dict(device),
+        },
+        "vllm_contract": {
+            **common,
+            "implementation_revision": "vllm-test-revision",
+            "device": dict(device),
+        },
+    }
+
+
+def _fp16_runner_provenance() -> dict[str, Any]:
+    return {
+        "env": {
+            "VLLM_RWKV7_WKV_MODE": "fp16",
+            "VLLM_RWKV7_ALLOW_FP16_ACCUMULATION": "1",
+        }
+    }
+
+
 def test_git_revision_reads_remote_source_marker(tmp_path: Path) -> None:
     marker = tmp_path / ".helicopter-source-revision"
     marker.write_text("abc123-dirty\n", encoding="utf-8")
 
     assert bench._git_revision(tmp_path) == "abc123-dirty"
+
+
+def test_git_revision_marks_untracked_files_dirty(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test User"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("tracked\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "add", tracked.name],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-m", "test fixture"],
+        check=True,
+        capture_output=True,
+    )
+    revision = subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (tmp_path / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+
+    assert bench._git_revision(tmp_path) == f"{revision}-dirty"
 
 
 def test_rwkv_environment_metadata_records_resolved_defaults(monkeypatch) -> None:
@@ -101,6 +183,7 @@ def test_rwkv_environment_metadata_records_resolved_defaults(monkeypatch) -> Non
     assert all(value is None for value in raw_env.values())
     assert env["VLLM_RWKV7_WKV_MODE"] == "fp16"
     assert env["VLLM_RWKV7_EMB_DEVICE"] == "gpu"
+    assert env["VLLM_RWKV7_ALLOW_FP16_ACCUMULATION"] == "1"
     assert env["VLLM_RWKV7_ORIG_LINEAR_GROUPS"] == "none"
     assert env["VLLM_RWKV7_SLOT_MAPPED_STATE"] == "1"
 
@@ -110,6 +193,7 @@ def test_rwkv_environment_metadata_preserves_explicit_values(monkeypatch) -> Non
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("VLLM_RWKV7_WKV_MODE", "fp32io16")
     monkeypatch.setenv("VLLM_RWKV7_EMB_DEVICE", "cpu")
+    monkeypatch.setenv("VLLM_RWKV7_ALLOW_FP16_ACCUMULATION", "1")
 
     env = bench._rwkv_environment_metadata()
     raw_env = bench._rwkv_environment_raw_metadata()
@@ -118,8 +202,24 @@ def test_rwkv_environment_metadata_preserves_explicit_values(monkeypatch) -> Non
     assert raw_env["VLLM_RWKV7_WKV_MODE"] == "fp32io16"
     assert env["VLLM_RWKV7_EMB_DEVICE"] == "cpu"
     assert raw_env["VLLM_RWKV7_EMB_DEVICE"] == "cpu"
+    assert env["VLLM_RWKV7_ALLOW_FP16_ACCUMULATION"] == "1"
+    assert raw_env["VLLM_RWKV7_ALLOW_FP16_ACCUMULATION"] == "1"
     assert env["VLLM_RWKV7_ORIG_LINEAR_GROUPS"] == "none"
     assert raw_env["VLLM_RWKV7_ORIG_LINEAR_GROUPS"] is None
+
+
+def test_rwkv_environment_metadata_derives_accumulation_from_wkv_mode(
+    monkeypatch,
+) -> None:
+    for name in bench.PROVENANCE_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("VLLM_RWKV7_WKV_MODE", "fp32io16")
+
+    env = bench._rwkv_environment_metadata()
+    raw_env = bench._rwkv_environment_raw_metadata()
+
+    assert env["VLLM_RWKV7_ALLOW_FP16_ACCUMULATION"] == "0"
+    assert raw_env["VLLM_RWKV7_ALLOW_FP16_ACCUMULATION"] is None
 
 
 def test_report_blocks_without_runtime_paths_and_records_provenance(
@@ -196,11 +296,13 @@ def test_report_evaluates_passing_measurements() -> None:
         "model_only_steady_decode": {
             "albatross_tokens_per_s": 100.0,
             "vllm_tokens_per_s": 96.0,
+            **_matching_model_only_contracts(),
         },
         "runner_steady_decode": {
             "runner_tokens_per_s": 91.0,
         },
         "state_movement": _state_movement(),
+        "config": {"provenance": _fp16_runner_provenance()},
     }
 
     report = bench.build_report(
@@ -214,6 +316,233 @@ def test_report_evaluates_passing_measurements() -> None:
     assert report["checks"]["runner_steady_decode"]["status"] == "passed"
     assert report["checks"]["state_movement"]["status"] == "passed"
     assert report["checks"]["state_movement"]["metrics"] == _state_movement()
+
+
+def test_report_blocks_model_only_comparison_without_contracts() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    measurements = {
+        "model_only_steady_decode": {
+            "albatross_tokens_per_s": 100.0,
+            "vllm_tokens_per_s": 96.0,
+        }
+    }
+
+    report = bench.build_report(
+        _config(repo_root),
+        measurements=measurements,
+        cuda_available=True,
+    )
+
+    check = report["checks"]["model_only_steady_decode"]
+    assert check["status"] == "blocked"
+    assert check["blockers"] == [
+        {
+            "code": "missing_model_only_comparison_contract",
+            "message": "Model-only comparison requires retained Albatross and "
+            "vLLM measurement contracts.",
+            "missing": ["albatross_contract", "vllm_contract"],
+        }
+    ]
+
+
+def test_report_blocks_non_like_for_like_model_only_precision() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    contracts = _matching_model_only_contracts()
+    contracts["albatross_contract"]["gemm_accumulation_policy"] = "fp32"
+    measurements = {
+        "model_only_steady_decode": {
+            "albatross_tokens_per_s": 100.0,
+            "vllm_tokens_per_s": 96.0,
+            **contracts,
+        }
+    }
+
+    report = bench.build_report(
+        _config(repo_root),
+        measurements=measurements,
+        cuda_available=True,
+    )
+
+    check = report["checks"]["model_only_steady_decode"]
+    assert check["status"] == "blocked"
+    assert check["metrics"]["vllm_to_albatross_ratio"] is None
+    assert check["blockers"] == [
+        {
+            "code": "non_like_for_like_model_only_comparison",
+            "message": "Albatross and vLLM model-only measurements use "
+            "different comparison contracts.",
+            "mismatches": {
+                "gemm_accumulation_policy": {
+                    "albatross": "fp32",
+                    "vllm": "fp16_where_configurable",
+                }
+            },
+        }
+    ]
+
+
+def test_report_blocks_matching_non_fp16_throughput_contracts() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    measurements = {
+        "model_only_steady_decode": {
+            "albatross_tokens_per_s": 100.0,
+            "vllm_tokens_per_s": 96.0,
+            **_matching_model_only_contracts(gemm_accumulation_policy="fp32"),
+        }
+    }
+
+    report = bench.build_report(
+        _config(repo_root),
+        measurements=measurements,
+        cuda_available=True,
+    )
+
+    check = report["checks"]["model_only_steady_decode"]
+    assert check["status"] == "blocked"
+    assert check["metrics"]["vllm_to_albatross_ratio"] is None
+    assert check["blockers"] == [
+        {
+            "code": "invalid_model_only_throughput_contract",
+            "message": "Model-only performance acceptance requires the FP16 "
+            "throughput contract.",
+            "violations": {
+                "albatross_contract": {
+                    "gemm_accumulation_policy": {
+                        "required": "fp16_where_configurable",
+                        "actual": "fp32",
+                    }
+                },
+                "vllm_contract": {
+                    "gemm_accumulation_policy": {
+                        "required": "fp16_where_configurable",
+                        "actual": "fp32",
+                    }
+                },
+            },
+        }
+    ]
+
+
+def test_report_blocks_model_only_checkpoint_digest_mismatch() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    contracts = _matching_model_only_contracts()
+    contracts["vllm_contract"]["checkpoint_sha256"] = "b" * 64
+    report = bench.build_report(
+        _config(repo_root),
+        measurements={
+            "model_only_steady_decode": {
+                "albatross_tokens_per_s": 100.0,
+                "vllm_tokens_per_s": 96.0,
+                **contracts,
+            }
+        },
+        cuda_available=True,
+    )
+
+    check = report["checks"]["model_only_steady_decode"]
+    assert check["status"] == "blocked"
+    assert check["blockers"][0]["code"] == ("non_like_for_like_model_only_comparison")
+    assert check["blockers"][0]["mismatches"] == {
+        "checkpoint_sha256": {
+            "albatross": "a" * 64,
+            "vllm": "b" * 64,
+        }
+    }
+
+
+def test_report_blocks_model_only_device_mismatch() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    contracts = _matching_model_only_contracts()
+    contracts["vllm_contract"]["device"]["device_uuid"] = "GPU-different-uuid"
+    report = bench.build_report(
+        _config(repo_root),
+        measurements={
+            "model_only_steady_decode": {
+                "albatross_tokens_per_s": 100.0,
+                "vllm_tokens_per_s": 96.0,
+                **contracts,
+            }
+        },
+        cuda_available=True,
+    )
+
+    check = report["checks"]["model_only_steady_decode"]
+    assert check["status"] == "blocked"
+    assert check["blockers"][0]["code"] == ("non_like_for_like_model_only_comparison")
+    assert (
+        check["blockers"][0]["mismatches"]["device"]["vllm"]["device_uuid"]
+        == "GPU-different-uuid"
+    )
+
+
+def test_report_blocks_wrong_albatross_implementation_revision() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    contracts = _matching_model_only_contracts()
+    contracts["albatross_contract"]["implementation_revision"] = "wrong-revision"
+    report = bench.build_report(
+        _config(repo_root),
+        measurements={
+            "model_only_steady_decode": {
+                "albatross_tokens_per_s": 100.0,
+                "vllm_tokens_per_s": 96.0,
+                **contracts,
+            }
+        },
+        cuda_available=True,
+    )
+
+    check = report["checks"]["model_only_steady_decode"]
+    assert check["status"] == "blocked"
+    assert check["blockers"] == [
+        {
+            "code": "invalid_model_only_measurement_provenance",
+            "message": "Model-only performance acceptance requires identified "
+            "artifacts, devices, and clean implementations.",
+            "violations": {
+                "albatross_contract": {
+                    "implementation_revision": {
+                        "required": bench.ALBATROSS_COMMIT,
+                        "actual": "wrong-revision",
+                    }
+                }
+            },
+        }
+    ]
+
+
+def test_report_blocks_dirty_model_only_implementation_revision() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    contracts = _matching_model_only_contracts()
+    contracts["vllm_contract"]["implementation_revision"] = "abc123-dirty"
+    report = bench.build_report(
+        _config(repo_root),
+        measurements={
+            "model_only_steady_decode": {
+                "albatross_tokens_per_s": 100.0,
+                "vllm_tokens_per_s": 96.0,
+                **contracts,
+            }
+        },
+        cuda_available=True,
+    )
+
+    check = report["checks"]["model_only_steady_decode"]
+    assert check["status"] == "blocked"
+    assert check["blockers"] == [
+        {
+            "code": "invalid_model_only_measurement_provenance",
+            "message": "Model-only performance acceptance requires identified "
+            "artifacts, devices, and clean implementations.",
+            "violations": {
+                "vllm_contract": {
+                    "implementation_revision": {
+                        "required": "clean git revision",
+                        "actual": "abc123-dirty",
+                    }
+                }
+            },
+        }
+    ]
 
 
 def test_report_blocks_only_missing_vllm_when_albatross_measurement_exists() -> None:
@@ -260,6 +589,10 @@ def test_cli_writes_albatross_model_only_measurement_json(
     checkpoint_path.write_bytes(b"")
     output_path = tmp_path / "measurement.json"
     calls: list[Any] = []
+    device = _matching_model_only_contracts()["albatross_contract"]["device"]
+
+    monkeypatch.setattr(bench, "_model_only_device_identity", lambda: dict(device))
+    monkeypatch.setattr(bench, "_git_revision", lambda path: bench.ALBATROSS_COMMIT)
 
     def fake_run(*args, **kwargs):
         calls.append((args, kwargs))
@@ -321,6 +654,22 @@ def test_cli_writes_albatross_model_only_measurement_json(
     assert model_only["albatross_iters"] == 7
     assert model_only["albatross_p50_ms"] == 2.5
     assert model_only["albatross_label"] == "rwkv7_fast_v3a"
+    assert model_only["albatross_contract"] == {
+        "checkpoint": str(checkpoint_path.resolve()),
+        "checkpoint_sha256": bench._checkpoint_sha256(checkpoint_path),
+        "implementation_revision": bench.ALBATROSS_COMMIT,
+        "device": device,
+        "batch_size": 2,
+        "seq_len": 4,
+        "output_boundary": bench.MODEL_ONLY_OUTPUT_BOUNDARY,
+        "wkv_mode": "fp16",
+        "gemm_accumulation_policy": "fp32",
+        "embedding_device": "cpu",
+        "rkv_mode": "off",
+        "cmix_sparse": "no-fc",
+        "low_rank_weight": "both",
+        "orig_linear_groups": ["att_c2c", "head"],
+    }
     assert measurement["config"]["measurement_source"] == "albatross_subprocess"
     assert measurement["config"]["albatross_wkv"] == "fp16"
     assert measurement["config"]["albatross_emb"] == "cpu"
@@ -357,13 +706,34 @@ def test_cli_writes_vllm_model_only_measurement_json(
     output_path = tmp_path / "measurement.json"
     calls: list[Any] = []
     fake_model = object()
+    device = _matching_model_only_contracts()["vllm_contract"]["device"]
+
+    for name in bench.PROVENANCE_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        bench,
+        "_benchmark_provenance",
+        lambda config: {"source": "test"},
+    )
+    monkeypatch.setattr(bench, "_model_only_device_identity", lambda: dict(device))
+    monkeypatch.setattr(bench, "_git_revision", lambda path: "vllm-test-revision")
 
     def fake_load(config):
         calls.append(("load", config.model))
         return fake_model
 
-    def fake_time(model, *, batch_size, seq_len, warmup, iters):
-        calls.append(("time", model, batch_size, seq_len, warmup, iters))
+    def fake_time(model, *, batch_size, seq_len, warmup, iters, capture_cuda_profiler):
+        calls.append(
+            (
+                "time",
+                model,
+                batch_size,
+                seq_len,
+                warmup,
+                iters,
+                capture_cuda_profiler,
+            )
+        )
         return {
             "tokens_per_s": 3040.0,
             "p10_ms": 1.75,
@@ -371,6 +741,7 @@ def test_cli_writes_vllm_model_only_measurement_json(
             "p90_ms": 2.5,
             "graph": True,
             "measurement_mode": "cuda_graph_replay",
+            "cuda_profiler_capture": capture_cuda_profiler,
             "distributed_backend": "nccl",
         }
 
@@ -394,6 +765,7 @@ def test_cli_writes_vllm_model_only_measurement_json(
             "3",
             "--vllm-iters",
             "7",
+            "--cuda-profiler-capture",
             "--measurement-output",
             str(output_path),
         ]
@@ -414,10 +786,27 @@ def test_cli_writes_vllm_model_only_measurement_json(
     assert model_only["vllm_graph"] is True
     assert model_only["vllm_measurement_mode"] == "cuda_graph_replay"
     assert model_only["vllm_distributed_backend"] == "nccl"
+    assert model_only["vllm_contract"] == {
+        "checkpoint": str(model_path.resolve()),
+        "checkpoint_sha256": bench._checkpoint_sha256(model_path),
+        "implementation_revision": "vllm-test-revision",
+        "device": device,
+        "batch_size": 2,
+        "seq_len": 4,
+        "output_boundary": bench.MODEL_ONLY_OUTPUT_BOUNDARY,
+        "wkv_mode": "fp16",
+        "gemm_accumulation_policy": "fp16_where_configurable",
+        "embedding_device": "gpu",
+        "rkv_mode": "off",
+        "cmix_sparse": "no-fc",
+        "low_rank_weight": "both",
+        "orig_linear_groups": [],
+    }
     assert measurement["config"]["measurement_source"] == "vllm_model_direct"
+    assert measurement["config"]["vllm_provenance"] == {"source": "test"}
     assert calls == [
         ("load", str(model_path)),
-        ("time", fake_model, 2, 4, 3, 7),
+        ("time", fake_model, 2, 4, 3, 7, True),
     ]
 
 
@@ -446,6 +835,15 @@ def test_vllm_model_only_timer_includes_logits_for_albatross_parity(
 
         def elapsed_time(self, other) -> float:
             return 1.0
+
+    profiler_calls = []
+
+    class FakeCudart:
+        def cudaProfilerStart(self) -> None:
+            profiler_calls.append("start")
+
+        def cudaProfilerStop(self) -> None:
+            profiler_calls.append("stop")
 
     class FakeModel:
         vocab_size = 16
@@ -481,6 +879,7 @@ def test_vllm_model_only_timer_includes_logits_for_albatross_parity(
     monkeypatch.setattr(torch.cuda, "graph", lambda graph: nullcontext())
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
     monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: FakeCudart())
     monkeypatch.setattr(torch, "arange", fake_arange)
     monkeypatch.setattr(rwkv7, "select_path", lambda batch, seq: "fake-path")
 
@@ -491,6 +890,7 @@ def test_vllm_model_only_timer_includes_logits_for_albatross_parity(
         seq_len=1,
         warmup=0,
         iters=1,
+        capture_cuda_profiler=True,
     )
 
     assert model.calls == [
@@ -502,6 +902,7 @@ def test_vllm_model_only_timer_includes_logits_for_albatross_parity(
     assert parsed["output"] == "logits"
     assert parsed["logits_included"] is True
     assert parsed["tokens_per_s"] == 2000.0
+    assert profiler_calls == ["start", "stop"]
 
 
 def test_vllm_model_loader_initializes_distributed_before_model_construction(
@@ -622,6 +1023,13 @@ def test_cli_merges_vllm_model_only_measurement_with_albatross_json(
     model_path.write_bytes(b"")
     input_path = tmp_path / "albatross.json"
     output_path = tmp_path / "combined.json"
+    contracts = _matching_model_only_contracts(
+        checkpoint=str(model_path.resolve()),
+        checkpoint_sha256=bench._checkpoint_sha256(model_path),
+    )
+    albatross_contract = contracts["albatross_contract"]
+    device = contracts["vllm_contract"]["device"]
+    albatross_contract["gemm_accumulation_policy"] = "fp32"
     input_path.write_text(
         json.dumps(
             {
@@ -632,6 +1040,7 @@ def test_cli_merges_vllm_model_only_measurement_with_albatross_json(
                     "albatross_batch_size": 2,
                     "albatross_seq_len": 4,
                     "albatross_p50_ms": 2.5,
+                    "albatross_contract": albatross_contract,
                 },
                 "config": {"measurement_source": "albatross_subprocess"},
             }
@@ -640,10 +1049,25 @@ def test_cli_merges_vllm_model_only_measurement_with_albatross_json(
     )
     calls: list[Any] = []
 
+    monkeypatch.setenv("VLLM_RWKV7_WKV_MODE", "fp16")
+    monkeypatch.setenv("VLLM_RWKV7_ALLOW_FP16_ACCUMULATION", "1")
+    monkeypatch.setenv("VLLM_RWKV7_EMB_DEVICE", "cpu")
+    monkeypatch.setenv("VLLM_RWKV7_RKV_MODE", "off")
+    monkeypatch.setenv("VLLM_RWKV7_CMIX_SPARSE", "no-fc")
+    monkeypatch.setenv("VLLM_RWKV7_LOW_RANK_WEIGHT", "both")
+    monkeypatch.setenv("VLLM_RWKV7_ORIG_LINEAR_GROUPS", "att_c2c,ffn_key,head")
+    monkeypatch.setattr(
+        bench,
+        "_benchmark_provenance",
+        lambda config: {"source": "test"},
+    )
+    monkeypatch.setattr(bench, "_model_only_device_identity", lambda: dict(device))
+    monkeypatch.setattr(bench, "_git_revision", lambda path: "vllm-test-revision")
+
     monkeypatch.setattr(bench, "_load_vllm_rwkv7_model", lambda config: object())
 
-    def fake_time(model, *, batch_size, seq_len, warmup, iters):
-        calls.append((batch_size, seq_len, warmup, iters))
+    def fake_time(model, *, batch_size, seq_len, warmup, iters, capture_cuda_profiler):
+        calls.append((batch_size, seq_len, warmup, iters, capture_cuda_profiler))
         return {
             "tokens_per_s": 3040.0,
             "p10_ms": 1.75,
@@ -651,6 +1075,7 @@ def test_cli_merges_vllm_model_only_measurement_with_albatross_json(
             "p90_ms": 2.5,
             "graph": True,
             "measurement_mode": "cuda_graph_replay",
+            "cuda_profiler_capture": capture_cuda_profiler,
             "distributed_backend": "gloo",
         }
 
@@ -689,8 +1114,11 @@ def test_cli_merges_vllm_model_only_measurement_with_albatross_json(
     assert model_only["vllm_graph"] is True
     assert model_only["vllm_measurement_mode"] == "cuda_graph_replay"
     assert model_only["vllm_distributed_backend"] == "gloo"
+    assert model_only["albatross_contract"] != model_only["vllm_contract"]
     assert measurement["config"]["measurement_source"] == "merged_vllm_model_direct"
-    assert calls == [(2, 4, 3, 7)]
+    assert measurement["config"]["vllm_distributed_backend"] == "gloo"
+    assert measurement["config"]["vllm_provenance"] == {"source": "test"}
+    assert calls == [(2, 4, 3, 7, False)]
 
     report = bench.build_report(
         _config(repo_root),
@@ -698,8 +1126,9 @@ def test_cli_merges_vllm_model_only_measurement_with_albatross_json(
         cuda_available=True,
     )
     check = report["checks"]["model_only_steady_decode"]
-    assert check["status"] == "passed"
-    assert check["metrics"]["vllm_to_albatross_ratio"] == 0.95
+    assert check["status"] == "blocked"
+    assert check["metrics"]["vllm_to_albatross_ratio"] is None
+    assert check["blockers"][0]["code"] == ("non_like_for_like_model_only_comparison")
 
 
 def test_cli_writes_vllm_runner_measurement_json(
@@ -1383,12 +1812,10 @@ def test_runner_pd_aggregate_records_case_provenance(
     )
 
     provenance = measurement["config"]["case_provenance_by_case"]
-    assert provenance["prefill:1x8"]["workload"][
-        "runner_cudagraph_capture_sizes"
-    ] == [8]
-    assert provenance["decode:4x1"]["workload"][
-        "runner_cudagraph_capture_sizes"
-    ] == [4]
+    assert provenance["prefill:1x8"]["workload"]["runner_cudagraph_capture_sizes"] == [
+        8
+    ]
+    assert provenance["decode:4x1"]["workload"]["runner_cudagraph_capture_sizes"] == [4]
 
 
 def test_cli_merges_vllm_runner_measurement_with_model_only_json(
@@ -1410,6 +1837,7 @@ def test_cli_merges_vllm_runner_measurement_with_model_only_json(
                     "vllm_tokens_per_s": 96.0,
                     "albatross_batch_size": 2,
                     "albatross_seq_len": 4,
+                    **_matching_model_only_contracts(),
                 },
                 "config": {"measurement_source": "merged_vllm_model_direct"},
             }
@@ -1506,6 +1934,7 @@ def test_runner_check_does_not_compare_worker_timing_to_logits_baseline() -> Non
         "model_only_steady_decode": {
             "albatross_tokens_per_s": 1000.0,
             "vllm_tokens_per_s": 950.0,
+            **_matching_model_only_contracts(),
         },
         "runner_steady_decode": {
             "runner_tokens_per_s": 1.0,
@@ -1513,6 +1942,7 @@ def test_runner_check_does_not_compare_worker_timing_to_logits_baseline() -> Non
             "runner_internal_timing_target": "worker.execute_model",
         },
         "state_movement": _state_movement(),
+        "config": {"provenance": _fp16_runner_provenance()},
     }
 
     report = bench.build_report(
@@ -1538,6 +1968,67 @@ def test_runner_check_does_not_compare_worker_timing_to_logits_baseline() -> Non
         "runner_postprocess_p50_ms": None,
         "runner_postprocess_timing_available": None,
     }
+
+
+def test_runner_check_blocks_without_precision_provenance() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    report = bench.build_report(
+        _config(repo_root),
+        measurements={
+            "runner_steady_decode": {"runner_tokens_per_s": 1.0},
+        },
+        cuda_available=True,
+    )
+
+    check = report["checks"]["runner_steady_decode"]
+    assert check["status"] == "blocked"
+    assert check["blockers"] == [
+        {
+            "code": "missing_runner_throughput_provenance",
+            "message": "Runner performance acceptance requires retained "
+            "precision provenance.",
+        }
+    ]
+
+
+def test_runner_check_blocks_non_fp16_throughput_contract() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    report = bench.build_report(
+        _config(repo_root),
+        measurements={
+            "runner_steady_decode": {"runner_tokens_per_s": 1.0},
+            "config": {
+                "provenance": {
+                    "env": {
+                        "VLLM_RWKV7_WKV_MODE": "fp32io16",
+                        "VLLM_RWKV7_ALLOW_FP16_ACCUMULATION": "0",
+                    }
+                }
+            },
+        },
+        cuda_available=True,
+    )
+
+    check = report["checks"]["runner_steady_decode"]
+    assert check["status"] == "blocked"
+    assert check["metrics"]["runner_tokens_per_s"] == 1.0
+    assert check["blockers"] == [
+        {
+            "code": "invalid_runner_throughput_contract",
+            "message": "Runner performance acceptance requires the FP16 "
+            "throughput contract.",
+            "violations": {
+                "VLLM_RWKV7_WKV_MODE": {
+                    "required": "fp16",
+                    "actual": "fp32io16",
+                },
+                "VLLM_RWKV7_ALLOW_FP16_ACCUMULATION": {
+                    "required": "1",
+                    "actual": "0",
+                },
+            },
+        }
+    ]
 
 
 def test_cli_writes_blocked_vllm_runner_json_without_fake_tokens(
@@ -1632,6 +2123,7 @@ def test_cli_writes_blocked_vllm_runner_json_without_fake_tokens(
             "model_only_steady_decode": {
                 "albatross_tokens_per_s": 100.0,
                 "vllm_tokens_per_s": 96.0,
+                **_matching_model_only_contracts(),
             },
         },
         cuda_available=True,
@@ -2054,9 +2546,7 @@ def test_v2_kernel_warmup_skip_only_applies_to_rwkv7(monkeypatch) -> None:
         "VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP",
         lambda: True,
     )
-    assert should_skip_v2_kernel_warmup(
-        SimpleNamespace(model_state=RWKV7ModelState())
-    )
+    assert should_skip_v2_kernel_warmup(SimpleNamespace(model_state=RWKV7ModelState()))
     assert not should_skip_v2_kernel_warmup(
         SimpleNamespace(model_state=DefaultModelState())
     )
@@ -2231,9 +2721,7 @@ def test_internal_runner_merge_reports_component_timings() -> None:
 
     assert result["tokens_per_s"] == pytest.approx(333.3333333333333)
     assert result["execute_model_p50_ms"] == pytest.approx(3.0)
-    assert result["execute_model_p50_tokens_per_s"] == pytest.approx(
-        666.6666666666666
-    )
+    assert result["execute_model_p50_tokens_per_s"] == pytest.approx(666.6666666666666)
     assert result["sample_tokens_p50_ms"] == pytest.approx(1.0)
     assert result["sample_tokens_p50_tokens_per_s"] == pytest.approx(2000.0)
     assert result["decode_step_p50_ms"] == pytest.approx(4.0)
@@ -2248,6 +2736,7 @@ def test_report_blocks_when_runner_measurement_is_missing() -> None:
         "model_only_steady_decode": {
             "albatross_tokens_per_s": 100.0,
             "vllm_tokens_per_s": 96.0,
+            **_matching_model_only_contracts(),
         },
         "state_movement": _state_movement(),
     }
@@ -2340,11 +2829,13 @@ def test_report_fails_low_model_only_and_resident_decode_copies() -> None:
         "model_only_steady_decode": {
             "albatross_tokens_per_s": 100.0,
             "vllm_tokens_per_s": 80.0,
+            **_matching_model_only_contracts(),
         },
         "runner_steady_decode": {
             "runner_tokens_per_s": 70.0,
         },
         "state_movement": _state_movement(resident_to_decode_copies=1),
+        "config": {"provenance": _fp16_runner_provenance()},
     }
 
     report = bench.build_report(
@@ -2365,6 +2856,7 @@ def test_report_fails_decode_compactions_and_full_row_copies() -> None:
         "model_only_steady_decode": {
             "albatross_tokens_per_s": 100.0,
             "vllm_tokens_per_s": 96.0,
+            **_matching_model_only_contracts(),
         },
         "runner_steady_decode": {
             "runner_tokens_per_s": 70.0,
@@ -2373,6 +2865,7 @@ def test_report_fails_decode_compactions_and_full_row_copies() -> None:
             decode_compactions=1,
             decode_full_row_copies=2,
         ),
+        "config": {"provenance": _fp16_runner_provenance()},
     }
 
     report = bench.build_report(

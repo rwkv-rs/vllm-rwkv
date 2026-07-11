@@ -77,6 +77,7 @@ def _rwkv7_emb_ln0_bf16_to_f16_fake(
 def _rwkv7_linear_f16_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
+    allow_fp16_accumulation: bool = False,
 ) -> torch.Tensor:
     return _rwkv7_linear_out(x, weight.shape[1])
 
@@ -88,6 +89,7 @@ def _rwkv7_linear_f16_fake(
 def _rwkv7_linear_orig_f16_fake(
     x: torch.Tensor,
     weight_orig: torch.Tensor,
+    allow_fp16_accumulation: bool = False,
 ) -> torch.Tensor:
     return _rwkv7_linear_out(x, weight_orig.shape[0])
 
@@ -130,6 +132,7 @@ def _rwkv7_linear_f16_orig_lt_cfg_fake(
     weight_orig: torch.Tensor,
     workspace_mb: int,
     algo_index: int,
+    allow_fp16_accumulation: bool = False,
 ) -> torch.Tensor:
     return _rwkv7_linear_out(x, weight_orig.shape[0])
 

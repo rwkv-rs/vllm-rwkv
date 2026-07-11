@@ -646,6 +646,60 @@ def rwkv7_ops_registered() -> None:
     _rwkv7_import_or_skip()
 
 
+@pytest.mark.parametrize(
+    ("op_name", "uses_original_layout", "extra_args"),
+    [
+        ("linear_f16", False, ()),
+        ("linear_f16_orig", True, ()),
+        ("linear_f16_lt", False, ()),
+        ("linear_f16_orig_lt_cfg", True, (0, 0)),
+    ],
+)
+def test_rwkv7_linear_ops_honor_fp16_accumulation(
+    op_name: str,
+    uses_original_layout: bool,
+    extra_args: tuple,
+) -> None:
+    torch.manual_seed(20260710)
+    x = torch.randn((64, 1024), device="cuda", dtype=torch.float16)
+    weight_orig = torch.randn((256, 1024), device="cuda", dtype=torch.float16)
+    weight = weight_orig if uses_original_layout else weight_orig.t().contiguous()
+    op = getattr(torch.ops.rwkv7_v3a_ops, op_name)
+    reference = torch.nn.functional.linear(x.float(), weight_orig.float()).half()
+
+    default_accumulation = op(x, weight, *extra_args)
+    fp32_accumulation = op(x, weight, *extra_args, False)
+    fp16_accumulation = op(x, weight, *extra_args, True)
+    torch.accelerator.synchronize()
+
+    assert fp16_accumulation.shape == reference.shape
+    assert fp16_accumulation.dtype == reference.dtype
+    assert fp16_accumulation.device == reference.device
+    assert torch.isfinite(fp16_accumulation).all()
+    assert torch.equal(default_accumulation, fp32_accumulation)
+    fp32_relative_l2 = (
+        fp32_accumulation.float() - reference.float()
+    ).norm() / reference.float().norm()
+    fp16_relative_l2 = (
+        fp16_accumulation.float() - reference.float()
+    ).norm() / reference.float().norm()
+    fp32_cosine = torch.nn.functional.cosine_similarity(
+        fp32_accumulation.float().flatten(),
+        reference.float().flatten(),
+        dim=0,
+    )
+    fp16_cosine = torch.nn.functional.cosine_similarity(
+        fp16_accumulation.float().flatten(),
+        reference.float().flatten(),
+        dim=0,
+    )
+    assert fp32_relative_l2 < 1e-3
+    assert fp32_cosine > 0.999999
+    assert fp16_relative_l2 < 5e-3
+    assert fp16_cosine > 0.99999
+    assert torch.count_nonzero(fp16_accumulation != fp32_accumulation) > 0
+
+
 @pytest.mark.parametrize("case", RETURNING_CASES, ids=lambda c: c.name)
 def test_rwkv7_returning_ops_schema_matches_meta_contract(case: OpCase) -> None:
     torch.library.opcheck(
@@ -711,9 +765,7 @@ def test_rwkv7_advance_i32_varlen_updates_only_mapped_slots() -> None:
     query_start_loc = torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32)
     slot_indices = torch.tensor([3, 0], device="cuda", dtype=torch.int32)
 
-    torch.ops.rwkv7_v3a_ops.advance_i32_varlen(
-        elapsed, query_start_loc, slot_indices
-    )
+    torch.ops.rwkv7_v3a_ops.advance_i32_varlen(elapsed, query_start_loc, slot_indices)
 
     assert elapsed.cpu().tolist() == [13, 20, 30, 42]
 
@@ -1004,7 +1056,9 @@ def test_rwkv7_tmix_mix6_slot_matches_scattered_reference(use_cfg: bool) -> None
     )
     outputs = op(*args, 128) if use_cfg else op(*args)
 
-    prev = torch.cat((initial_shift_state[slot_indices.long(), None, :], x[:, :-1, :]), dim=1)
+    prev = torch.cat(
+        (initial_shift_state[slot_indices.long(), None, :], x[:, :-1, :]), dim=1
+    )
     delta = prev.float() - x.float()
     for output, mix_weight in zip(
         outputs,
@@ -1120,7 +1174,9 @@ def test_rwkv7_cmix_mix_slot_matches_scattered_reference(use_cfg: bool) -> None:
     args = (batch, seq_len, hidden, x, shift_state, slot_indices, x_k)
     output = op(*args, 128) if use_cfg else op(*args)
 
-    prev = torch.cat((initial_shift_state[slot_indices.long(), None, :], x[:, :-1, :]), dim=1)
+    prev = torch.cat(
+        (initial_shift_state[slot_indices.long(), None, :], x[:, :-1, :]), dim=1
+    )
     expected = (x.float() + (prev.float() - x.float()) * x_k.float()).to(torch.float16)
     torch.testing.assert_close(output, expected, atol=1e-3, rtol=1e-3)
     expected_state = initial_shift_state.clone()
@@ -1163,9 +1219,7 @@ def test_rwkv7_cmix_mix_varlen_matches_scattered_reference() -> None:
         )
         assert end - start == length
     prev = torch.cat(prev_parts, dim=0)
-    expected = (x.float() + (prev.float() - x.float()) * x_k.float()).to(
-        torch.float16
-    )
+    expected = (x.float() + (prev.float() - x.float()) * x_k.float()).to(torch.float16)
     torch.testing.assert_close(output, expected, atol=1e-3, rtol=1e-3)
     expected_state = initial_shift_state.clone()
     for local_req, slot in enumerate(slot_indices.long().tolist()):

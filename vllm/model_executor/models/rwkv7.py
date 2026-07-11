@@ -204,6 +204,7 @@ class RWKV7ForCausalLM(nn.Module):
         self.vocab_size_padded = self._get_padded_vocab_size(V)
         self.wkv_mode = WKV_MODE
         self.emb_cpu = EMB_DEVICE == "cpu"
+        self.allow_fp16_accumulation = envs.VLLM_RWKV7_ALLOW_FP16_ACCUMULATION
         self.emb_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
         self.logits_processor = LogitsProcessor(V, logits_as_input=True)
         self.register_buffer("_dummy_param", torch.empty(0), persistent=False)
@@ -714,9 +715,9 @@ class RWKV7ForCausalLM(nn.Module):
                     hidden_position_tensor = decode_position_tensor.to(
                         device=hidden_states.device
                     )
-                    tokens = input_ids.index_select(
-                        0, decode_position_tensor
-                    ).view(decode_batch_size, 1)
+                    tokens = input_ids.index_select(0, decode_position_tensor).view(
+                        decode_batch_size, 1
+                    )
                     state = [shift_state, wkv_state, elapsed]
                     out = self.forward_tokens(
                         tokens,
@@ -946,9 +947,9 @@ class RWKV7ForCausalLM(nn.Module):
                         input_position_tensor = decode_position_tensor.to(
                             device=input_ids.device
                         )
-                        tokens = input_ids.index_select(
-                            0, input_position_tensor
-                        ).view(decode_batch_size, 1)
+                        tokens = input_ids.index_select(0, input_position_tensor).view(
+                            decode_batch_size, 1
+                        )
                         x = self.embed(tokens)
                         group_v_first = None
                     else:
@@ -2130,9 +2131,9 @@ class RWKV7ForCausalLM(nn.Module):
             req_id,
         )
         dense_path = PathConfig(path.rows, path.use_batched_rkv, CMIX_DENSE)
-        return self.cmix_from_mixed(
-            mixed.view(total_tokens, 1, C), p, dense_path
-        ).view(total_tokens, C)
+        return self.cmix_from_mixed(mixed.view(total_tokens, 1, C), p, dense_path).view(
+            total_tokens, C
+        )
 
     def tmix(
         self,
@@ -2533,7 +2534,29 @@ class RWKV7ForCausalLM(nn.Module):
     def linear(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         if x.numel() == x.size(-1) and weight.size(1) % 64 == 0:
             return torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(x.contiguous(), weight)
-        return torch.ops.rwkv7_v3a_ops.linear_f16(x.contiguous(), weight)
+        return torch.ops.rwkv7_v3a_ops.linear_f16(
+            x.contiguous(), weight, self.allow_fp16_accumulation
+        )
+
+    def _linear_f16_orig(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return torch.ops.rwkv7_v3a_ops.linear_f16_orig(
+            x.contiguous(), weight, self.allow_fp16_accumulation
+        )
+
+    def _linear_f16_orig_lt_cfg(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        workspace_mb: int,
+        algo_index: int,
+    ) -> torch.Tensor:
+        return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
+            x.contiguous(),
+            weight,
+            workspace_mb,
+            algo_index,
+            self.allow_fp16_accumulation,
+        )
 
     def linear_head(self, x: torch.Tensor) -> torch.Tensor:
         z = self.z
@@ -2588,13 +2611,9 @@ class RWKV7ForCausalLM(nn.Module):
         if path.rows == 3:
             if group == "head":
                 if C <= 2048:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(
-                        x.contiguous(), weight
-                    )
+                    return self._linear_f16_orig(x.contiguous(), weight)
                 if C == 2560:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(
-                        x.contiguous(), weight
-                    )
+                    return self._linear_f16_orig(x.contiguous(), weight)
                 return torch.ops.rwkv7_v3a_ops.linear_orig_rows_f16(
                     x.contiguous(), weight, 3, 2
                 )
@@ -2604,16 +2623,10 @@ class RWKV7ForCausalLM(nn.Module):
                         x.contiguous(), weight, 64, 3, 4
                     )
                 if C == 2048:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(
-                        x.contiguous(), weight
-                    )
+                    return self._linear_f16_orig(x.contiguous(), weight)
                 if C == 2560:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(
-                        x.contiguous(), weight
-                    )
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 0, 0
-                )
+                    return self._linear_f16_orig(x.contiguous(), weight)
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 0)
             if group == "att_c2c":
                 if C == 768:
                     return torch.ops.rwkv7_v3a_ops.linear_orig_rows_f16(
@@ -2631,9 +2644,7 @@ class RWKV7ForCausalLM(nn.Module):
                     return torch.ops.rwkv7_v3a_ops.linear_orig_rows_f16(
                         x.contiguous(), weight, 3, 2
                     )
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 0, 2
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 2)
             return torch.ops.rwkv7_v3a_ops.linear_orig_rows_cfg_f16(
                 x.contiguous(), weight, 64, 3, 4
             )
@@ -2644,16 +2655,10 @@ class RWKV7ForCausalLM(nn.Module):
                         x.contiguous(), weight, 64, 2, 4
                     )
                 if C == 2048:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(
-                        x.contiguous(), weight
-                    )
+                    return self._linear_f16_orig(x.contiguous(), weight)
                 if C == 2560:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(
-                        x.contiguous(), weight
-                    )
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 0, 0
-                )
+                    return self._linear_f16_orig(x.contiguous(), weight)
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 0)
             if group == "att_c2c":
                 if C <= 1024:
                     return torch.ops.rwkv7_v3a_ops.linear_orig_rows_f16(
@@ -2667,366 +2672,194 @@ class RWKV7ForCausalLM(nn.Module):
                     return torch.ops.rwkv7_v3a_ops.linear_orig_rows_f16(
                         x.contiguous(), weight, 4, 2
                     )
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 0, 2
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 2)
         if group == "head":
             if C == 768:
                 if 192 <= path.rows < 256:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 128, 3
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 3)
                 if 96 <= path.rows < 160:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 0, 1
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 1)
             if C == 1024:
                 if 256 <= path.rows < 384:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(
-                        x.contiguous(), weight
-                    )
+                    return self._linear_f16_orig(x.contiguous(), weight)
                 if 192 <= path.rows < 256:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 0, 2
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 2)
                 if 96 <= path.rows < 160:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 32, 1
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 1)
             if C == 2048:
                 if 256 <= path.rows < 384:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 32, 0
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 0)
                 if 192 <= path.rows < 256:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 32, 6
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 6)
                 if 128 <= path.rows < 160:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 0, 1
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 1)
                 if 96 <= path.rows < 112:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 0, 0
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 0)
             if C == 2560:
                 if path.rows >= 256:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 32, 0
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 0)
                 if path.rows >= 192:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 0, 5
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 5)
                 if path.rows >= 160:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 32, 5
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 5)
                 if path.rows >= 128:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 0, 1
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 1)
                 if path.rows >= 96:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 32, 0
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 0)
                 if path.rows >= 80:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 0, 0
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 0)
                 if path.rows >= 72:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 32, 1
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 1)
             if path.rows >= 1024:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 128, 0
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 0)
             if path.rows >= 512:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 0, 2
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 2)
             if path.rows >= 384:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 128, 2
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 2)
             if path.rows >= 256:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 0, 1
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 1)
             if path.rows >= 192:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 128, 0
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 0)
             if path.rows >= 160:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 32, 0
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 0)
             if path.rows >= 128:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 128, 0
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 0)
             if path.rows >= 112:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 32, 0
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 0)
             if path.rows >= 96:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 32, 1
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 1)
             if path.rows >= 80:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 32, 2
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 2)
             if path.rows >= 72:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 128, 2
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 2)
         if group == "att_c2c":
             if C == 2560 and 17 <= path.rows <= 20:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 0, 0
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 0)
             if C == 768:
                 if 256 <= path.rows < 384:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 128, 1
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 1)
                 if 96 <= path.rows < 112:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 32, 3
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 3)
             if C == 1024:
                 if 256 <= path.rows < 384:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 128, 0
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 0)
                 if 96 <= path.rows < 112:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 32, 6
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 6)
             if C == 2048:
                 if 256 <= path.rows < 384:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 32, 3
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 3)
                 if 192 <= path.rows < 256:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 128, 0
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 0)
                 if 96 <= path.rows < 112:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 32, 4
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 4)
             if C == 2560:
                 if path.rows >= 256:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 0, 1
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 1)
                 if path.rows >= 160:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 0, 2
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 2)
                 if path.rows >= 128:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 128, 2
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 2)
                 if path.rows >= 112:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 128, 3
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 3)
                 if path.rows >= 96:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 32, 2
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 2)
                 if path.rows >= 72:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 128, 2
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 2)
                 if path.rows >= 5:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(
-                        x.contiguous(), weight
-                    )
+                    return self._linear_f16_orig(x.contiguous(), weight)
             if path.rows >= 1024:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 32, 4
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 4)
             if path.rows >= 768:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 32, 0
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 0)
             if path.rows >= 512:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 32, 1
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 1)
             if path.rows >= 384:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 128, 2
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 2)
             if path.rows >= 256:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 32, 4
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 4)
             if path.rows >= 192:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 0, 0
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 0)
             if path.rows >= 160:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 128, 1
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 1)
             if path.rows >= 112:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig(x.contiguous(), weight)
+                return self._linear_f16_orig(x.contiguous(), weight)
             if path.rows >= 96:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 0, 5
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 5)
             if path.rows >= 72:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 32, 0
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 0)
             if path.rows >= 48:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 32, 6
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 6)
             if path.rows >= 32:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 0, 0
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 0)
             if path.rows >= 24:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 0, 6
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 6)
             if path.rows >= 12:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 0, 0
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 0)
             if path.rows >= 5:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 0, 2
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 2)
         if group == "ffn_key":
             if C == 2560 and 17 <= path.rows <= 20:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 0, 0
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 0)
             if C == 768:
                 if 256 <= path.rows < 384:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(
-                        x.contiguous(), weight
-                    )
+                    return self._linear_f16_orig(x.contiguous(), weight)
                 if 96 <= path.rows < 112:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(
-                        x.contiguous(), weight
-                    )
+                    return self._linear_f16_orig(x.contiguous(), weight)
             if C == 1024:
                 if 256 <= path.rows < 384:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 32, 2
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 2)
                 if 192 <= path.rows < 256:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 0, 0
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 0)
                 if 96 <= path.rows < 160:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 32, 2
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 2)
             if C == 2048 and 128 <= path.rows < 160:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 0, 3
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 3)
             if C == 2560:
                 if path.rows >= 192:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 32, 5
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 5)
                 if path.rows >= 160:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 0, 4
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 4)
                 if path.rows >= 128:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 32, 5
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 5)
                 if path.rows >= 112:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 128, 4
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 4)
                 if path.rows >= 96:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 128, 4
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 4)
                 if path.rows >= 80:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 0, 3
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 3)
                 if path.rows >= 72:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                        x.contiguous(), weight, 32, 4
-                    )
+                    return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 4)
                 if path.rows >= 3:
-                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(
-                        x.contiguous(), weight
-                    )
+                    return self._linear_f16_orig(x.contiguous(), weight)
             if path.rows >= 1024:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 0, 0
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 0)
             if path.rows >= 768:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 32, 1
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 1)
             if path.rows >= 512:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 128, 3
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 3)
             if path.rows >= 384:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 32, 0
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 0)
             if path.rows >= 256:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 128, 4
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 4)
             if path.rows >= 192:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 0, 1
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 1)
             if path.rows >= 160:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 0, 2
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 2)
             if path.rows >= 128:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 32, 0
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 0)
             if path.rows >= 112:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 32, 3
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 3)
             if path.rows >= 96:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 32, 1
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 1)
             if path.rows >= 72:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 128, 1
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 1)
             if path.rows >= 48:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 0, 1
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 1)
             if path.rows >= 12:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 0, 0
-                )
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 0)
             if path.rows in (5, 6):
-                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(
-                    x.contiguous(), weight, 0, 1
-                )
-        return torch.ops.rwkv7_v3a_ops.linear_f16_orig(x.contiguous(), weight)
+                return self._linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 1)
+        return self._linear_f16_orig(x.contiguous(), weight)
 
     def linear_rank_in(
         self, x: torch.Tensor, weight: torch.Tensor, weight_t: torch.Tensor, rows: int
@@ -3085,10 +2918,12 @@ class RWKV7ForCausalLM(nn.Module):
     def linear_lowrank_orig(
         self, x: torch.Tensor, weight: torch.Tensor
     ) -> torch.Tensor:
-        return torch.ops.rwkv7_v3a_ops.linear_f16(x.contiguous(), weight)
+        return torch.ops.rwkv7_v3a_ops.linear_f16(
+            x.contiguous(), weight, self.allow_fp16_accumulation
+        )
 
     def linear_t_orig(self, x: torch.Tensor, weight_t: torch.Tensor) -> torch.Tensor:
-        return torch.ops.rwkv7_v3a_ops.linear_f16_orig(x.contiguous(), weight_t)
+        return self._linear_f16_orig(x, weight_t)
 
     def add(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         return torch.ops.rwkv7_v3a_ops.add_f16(x.contiguous(), y.contiguous())
