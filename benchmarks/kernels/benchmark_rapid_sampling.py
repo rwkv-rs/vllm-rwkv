@@ -11,7 +11,9 @@ created outside the timing loop.
 """
 
 import json
+import os
 import statistics
+import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -23,12 +25,19 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from vllm.platforms import current_platform  # noqa: E402
 from vllm.utils.argparse_utils import FlexibleArgumentParser  # noqa: E402
 from vllm.v1.sample.ops.topk_topp_sampler import (
     flashinfer_sample,
+    get_rapid_penalty_index_stats,
     rapid_sample,
     rapid_sample_input_supported,
+    reset_rapid_penalty_index_stats,
 )  # noqa: E402
+
+SUPPORTED_PROVIDERS = frozenset(
+    {"rapid", "flashinfer", "rapid_penalty", "rapid_penalty_indexed"}
+)
 
 
 @dataclass(frozen=True)
@@ -70,14 +79,8 @@ def create_logits(config: BenchmarkConfig, seed: int) -> torch.Tensor:
 
 def make_rapid_args(
     config: BenchmarkConfig,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    top_k = torch.full(
-        (config.batch_size,), config.top_k, dtype=torch.int32, device="cuda"
-    )
-    top_p = torch.full(
-        (config.batch_size,), config.top_p, dtype=torch.float32, device="cuda"
-    )
-    return top_k, top_p
+) -> tuple[int, float]:
+    return config.top_k, config.top_p
 
 
 def make_flashinfer_args(
@@ -95,6 +98,15 @@ def make_flashinfer_args(
             (config.batch_size,), config.top_p, dtype=torch.float32, device="cuda"
         )
     return top_k, top_p
+
+
+def make_non_contiguous_penalty_indices(
+    config: BenchmarkConfig,
+) -> tuple[torch.Tensor, int, str]:
+    rows = max(1, config.batch_size)
+    penalty_rows = rows * 2
+    indices = torch.arange(penalty_rows, dtype=torch.int32, device="cuda")[::2]
+    return indices, penalty_rows, "stride2-view"
 
 
 def benchmark_cuda_call(fn, warmup_iters: int, benchmark_iters: int) -> float:
@@ -128,6 +140,9 @@ def run_config(
     warmup_iters: int,
     benchmark_iters: int,
 ) -> dict:
+    unsupported = sorted(set(providers) - SUPPORTED_PROVIDERS)
+    if unsupported:
+        raise ValueError(f"Unsupported provider(s): {', '.join(unsupported)}")
     logits = create_logits(config, seed=2026 + config.logit_type)
     if not rapid_sample_input_supported(logits):
         raise ValueError(
@@ -148,15 +163,9 @@ def run_config(
     if "rapid_penalty" in providers:
         rapid_top_k, rapid_top_p = make_rapid_args(config)
         penalties = torch.zeros_like(logits)
-        presence_penalties = torch.full(
-            (config.batch_size,), 0.1, dtype=torch.float32, device="cuda"
-        )
-        repetition_penalties = torch.full(
-            (config.batch_size,), 0.1, dtype=torch.float32, device="cuda"
-        )
-        penalty_decays = torch.full(
-            (config.batch_size,), 0.996, dtype=torch.float32, device="cuda"
-        )
+        presence_penalties = 0.1
+        repetition_penalties = 0.1
+        penalty_decays = 0.996
         result["rapid_penalty_ms"] = benchmark_cuda_call(
             lambda: rapid_sample(
                 logits,
@@ -170,6 +179,41 @@ def run_config(
             warmup_iters,
             benchmark_iters,
         )
+
+    if "rapid_penalty_indexed" in providers:
+        rapid_top_k, rapid_top_p = make_rapid_args(config)
+        penalty_indices, penalty_rows, penalty_index_pattern = (
+            make_non_contiguous_penalty_indices(config)
+        )
+        penalties = torch.zeros(
+            (penalty_rows, config.vocab_size),
+            dtype=torch.float32,
+            device="cuda",
+        )
+        presence_penalties = 0.1
+        repetition_penalties = 0.1
+        penalty_decays = 0.996
+        reset_rapid_penalty_index_stats()
+        result["rapid_penalty_index_pattern"] = penalty_index_pattern
+        result["rapid_penalty_index_rows"] = penalty_rows
+        result["rapid_penalty_index_first_values"] = (
+            penalty_indices[: min(16, config.batch_size)].cpu().tolist()
+        )
+        result["rapid_penalty_indexed_ms"] = benchmark_cuda_call(
+            lambda: rapid_sample(
+                logits,
+                rapid_top_k,
+                rapid_top_p,
+                penalties=penalties,
+                presence_penalties=presence_penalties,
+                repetition_penalties=repetition_penalties,
+                penalty_decays=penalty_decays,
+                penalty_indices=penalty_indices,
+            ),
+            warmup_iters,
+            benchmark_iters,
+        )
+        result["rapid_penalty_index_stats"] = get_rapid_penalty_index_stats()
 
     if "flashinfer" in providers:
         flashinfer_top_k, flashinfer_top_p = make_flashinfer_args(config)
@@ -227,7 +271,12 @@ def print_result(result: dict) -> None:
         f"top_k={result['top_k']}",
         f"logit_type={result['logit_type']}",
     ]
-    for key in ("rapid_ms", "rapid_penalty_ms", "flashinfer_ms"):
+    for key in (
+        "rapid_ms",
+        "rapid_penalty_ms",
+        "rapid_penalty_indexed_ms",
+        "flashinfer_ms",
+    ):
         if key in result:
             value = result[key]
             if isinstance(value, float):
@@ -251,7 +300,7 @@ def parse_args():
     parser.add_argument(
         "--providers",
         nargs="+",
-        choices=["rapid", "flashinfer", "rapid_penalty"],
+        choices=sorted(SUPPORTED_PROVIDERS),
         default=["rapid", "flashinfer"],
     )
     parser.add_argument("--warmup-iters", type=int, default=5)
@@ -264,6 +313,44 @@ def parse_args():
     parser.add_argument("--save-json", type=Path, default=None)
     parser.add_argument("--quiet", action="store_true")
     return parser.parse_args()
+
+
+def git_revision() -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return None
+    revision = result.stdout.strip()
+    return revision or None
+
+
+def provenance() -> dict[str, object]:
+    device = torch.accelerator.current_device_index()
+    capability = current_platform.get_device_capability(device)
+    env_names = (
+        "VLLM_USE_RAPID_SAMPLER",
+        "CUDA_VISIBLE_DEVICES",
+        "VLLM_RWKV7_MODEL",
+    )
+    return {
+        "git_revision": git_revision(),
+        "cuda": {
+            "device_index": int(device),
+            "device_name": current_platform.get_device_name(device),
+            "capability": list(capability) if capability is not None else None,
+            "total_memory": current_platform.get_device_total_memory(device),
+        },
+        "env": {
+            name: value
+            for name in env_names
+            if (value := os.environ.get(name)) is not None
+        },
+    }
 
 
 def main() -> None:
@@ -316,6 +403,7 @@ def main() -> None:
             "providers": providers,
             "warmup_iters": args.warmup_iters,
             "benchmark_iters": args.benchmark_iters,
+            "provenance": provenance(),
             "results": results,
         }
         args.save_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")

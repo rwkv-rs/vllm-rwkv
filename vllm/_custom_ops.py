@@ -50,8 +50,6 @@ def _rwkv7_linear_out(x: torch.Tensor, out_features: int) -> torch.Tensor:
 
 
 @_register_fake_if_exists("rwkv7_v3a_ops::layer_norm_f16")
-@_register_fake_if_exists("rwkv7_v3a_ops::layer_norm_f16_small")
-@_register_fake_if_exists("rwkv7_v3a_ops::layer_norm_f16_small512")
 def _rwkv7_layer_norm_f16_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -72,95 +70,21 @@ def _rwkv7_emb_ln0_bf16_to_f16_fake(
 
 
 @_register_fake_if_exists("rwkv7_v3a_ops::linear_f16")
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_lt")
 @_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_m1_splitk")
 def _rwkv7_linear_f16_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
+    allow_fp16_accumulation: bool = False,
 ) -> torch.Tensor:
     return _rwkv7_linear_out(x, weight.shape[1])
 
 
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_orig")
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_orig_wmma16_f16")
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_orig_lt")
 @_register_fake_if_exists("rwkv7_v3a_ops::linear_t_f16")
-def _rwkv7_linear_orig_f16_fake(
+def _rwkv7_linear_t_f16_fake(
     x: torch.Tensor,
-    weight_orig: torch.Tensor,
+    weight_t: torch.Tensor,
 ) -> torch.Tensor:
-    return _rwkv7_linear_out(x, weight_orig.shape[0])
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_orig_rows_f16")
-def _rwkv7_linear_orig_rows_f16_fake(
-    x: torch.Tensor,
-    weight_orig: torch.Tensor,
-    row_tile: int,
-    out_tile: int,
-) -> torch.Tensor:
-    return _rwkv7_linear_out(x, weight_orig.shape[0])
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_orig_rows_cfg_f16")
-def _rwkv7_linear_orig_rows_cfg_f16_fake(
-    x: torch.Tensor,
-    weight_orig: torch.Tensor,
-    threads: int,
-    row_tile: int,
-    out_tile: int,
-) -> torch.Tensor:
-    return _rwkv7_linear_out(x, weight_orig.shape[0])
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_orig_rows_exact_f16")
-def _rwkv7_linear_orig_rows_exact_f16_fake(
-    x: torch.Tensor,
-    weight_orig: torch.Tensor,
-    threads: int,
-    out_tile: int,
-    use4: bool,
-) -> torch.Tensor:
-    return _rwkv7_linear_out(x, weight_orig.shape[0])
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_orig_lt_cfg")
-def _rwkv7_linear_f16_orig_lt_cfg_fake(
-    x: torch.Tensor,
-    weight_orig: torch.Tensor,
-    workspace_mb: int,
-    algo_index: int,
-) -> torch.Tensor:
-    return _rwkv7_linear_out(x, weight_orig.shape[0])
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_m1_splitk_cfg")
-def _rwkv7_linear_f16_m1_splitk_cfg_fake(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    chunk_k: int,
-) -> torch.Tensor:
-    return _rwkv7_linear_out(x, weight.shape[1])
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_m1_splitk_tile")
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_m1_splitk_warpred_tile")
-def _rwkv7_linear_f16_m1_splitk_tile_fake(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    chunk_k: int,
-    tile_cols: int,
-) -> torch.Tensor:
-    return _rwkv7_linear_out(x, weight.shape[1])
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_rows_splitk")
-def _rwkv7_linear_f16_rows_splitk_fake(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    chunk_k: int,
-) -> torch.Tensor:
-    return _rwkv7_linear_out(x, weight.shape[1])
+    return _rwkv7_linear_out(x, weight_t.shape[0])
 
 
 @_register_fake_if_exists("rwkv7_v3a_ops::linear_t_act_f16")
@@ -284,7 +208,6 @@ def _rwkv7_add_last_layer_norm_f16_fake(
 
 
 @_register_fake_if_exists("rwkv7_v3a_ops::add_layer_norm_cmix_mix_f16")
-@_register_fake_if_exists("rwkv7_v3a_ops::add_layer_norm_cmix_mix_f16_scalar_stats")
 def _rwkv7_add_layer_norm_cmix_mix_f16_fake(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -297,22 +220,21 @@ def _rwkv7_add_layer_norm_cmix_mix_f16_fake(
     return [_rwkv7_empty_like(x), _rwkv7_empty_like(x)]
 
 
-@_register_fake_if_exists("rwkv7_v3a_ops::add_layer_norm_cmix_mix_f16_cfg")
-def _rwkv7_add_layer_norm_cmix_mix_f16_cfg_fake(
+@_register_fake_if_exists("rwkv7_v3a_ops::add_layer_norm_cmix_mix_f16_slots")
+def _rwkv7_add_layer_norm_cmix_mix_f16_slots_fake(
     x: torch.Tensor,
     residual: torch.Tensor,
     shift_state: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
     x_k: torch.Tensor,
-    eps: float,
-    threads: int,
+    slot_indices: torch.Tensor,
+    eps: float = 1e-5,
 ) -> list[torch.Tensor]:
     return [_rwkv7_empty_like(x), _rwkv7_empty_like(x)]
 
 
 @_register_fake_if_exists("rwkv7_v3a_ops::add_layer_norm_tmix_mix6_f16")
-@_register_fake_if_exists("rwkv7_v3a_ops::add_layer_norm_tmix_mix6_f16_scalar_stats")
 def _rwkv7_add_layer_norm_tmix_mix6_f16_fake(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -330,8 +252,8 @@ def _rwkv7_add_layer_norm_tmix_mix6_f16_fake(
     return [_rwkv7_empty_like(x) for _ in range(7)]
 
 
-@_register_fake_if_exists("rwkv7_v3a_ops::add_layer_norm_tmix_mix6_f16_cfg")
-def _rwkv7_add_layer_norm_tmix_mix6_f16_cfg_fake(
+@_register_fake_if_exists("rwkv7_v3a_ops::add_layer_norm_tmix_mix6_f16_slots")
+def _rwkv7_add_layer_norm_tmix_mix6_f16_slots_fake(
     x: torch.Tensor,
     residual: torch.Tensor,
     shift_state: torch.Tensor,
@@ -343,8 +265,8 @@ def _rwkv7_add_layer_norm_tmix_mix6_f16_cfg_fake(
     x_v: torch.Tensor,
     x_a: torch.Tensor,
     x_g: torch.Tensor,
-    eps: float,
-    threads: int,
+    slot_indices: torch.Tensor,
+    eps: float = 1e-5,
 ) -> list[torch.Tensor]:
     return [_rwkv7_empty_like(x) for _ in range(7)]
 
@@ -366,38 +288,40 @@ def _rwkv7_tmix_mix6_fake(
     return [_rwkv7_empty_like(x) for _ in range(6)]
 
 
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_mix6_cfg")
-def _rwkv7_tmix_mix6_cfg_fake(
+@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_mix6_slot")
+def _rwkv7_tmix_mix6_slot_fake(
     B: int,
     T: int,
     C: int,
     x: torch.Tensor,
     shift_state: torch.Tensor,
+    slot_indices: torch.Tensor,
     x_r: torch.Tensor,
     x_w: torch.Tensor,
     x_k: torch.Tensor,
     x_v: torch.Tensor,
     x_a: torch.Tensor,
     x_g: torch.Tensor,
-    threads: int,
 ) -> list[torch.Tensor]:
     return [_rwkv7_empty_like(x) for _ in range(6)]
 
 
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_mix6_t1_c4096")
-def _rwkv7_tmix_mix6_t1_c4096_fake(
+@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_mix6_varlen")
+def _rwkv7_tmix_mix6_varlen_fake(
     B: int,
+    total_tokens: int,
+    C: int,
     x: torch.Tensor,
     shift_state: torch.Tensor,
+    slot_indices: torch.Tensor,
     x_r: torch.Tensor,
     x_w: torch.Tensor,
     x_k: torch.Tensor,
     x_v: torch.Tensor,
     x_a: torch.Tensor,
     x_g: torch.Tensor,
-    threads: int,
-    vec: int,
-    half_math: bool = False,
+    query_start_loc: torch.Tensor,
+    req_id: torch.Tensor,
 ) -> list[torch.Tensor]:
     return [_rwkv7_empty_like(x) for _ in range(6)]
 
@@ -413,23 +337,6 @@ def _rwkv7_tmix_kk_a_gate_fake(
     a0: torch.Tensor,
     a12: torch.Tensor,
     k_a: torch.Tensor,
-) -> list[torch.Tensor]:
-    return [_rwkv7_empty_like(k) for _ in range(3)]
-
-
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_kk_a_gate_update_shift")
-def _rwkv7_tmix_kk_a_gate_update_shift_fake(
-    B: int,
-    T: int,
-    C: int,
-    H: int,
-    k: torch.Tensor,
-    k_k: torch.Tensor,
-    a0: torch.Tensor,
-    a12: torch.Tensor,
-    k_a: torch.Tensor,
-    x: torch.Tensor,
-    shift_state: torch.Tensor,
 ) -> list[torch.Tensor]:
     return [_rwkv7_empty_like(k) for _ in range(3)]
 
@@ -465,57 +372,27 @@ def _rwkv7_tmix_vres_gate_fake(
     return _rwkv7_empty_like(v)
 
 
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_sparse_one")
-def _rwkv7_cmix_sparse_one_fake(
-    C: int,
-    F: int,
-    x: torch.Tensor,
-    shift_state: torch.Tensor,
-    x_k: torch.Tensor,
-    key_fc: torch.Tensor,
-    value_fc: torch.Tensor,
-) -> torch.Tensor:
-    return torch.empty((1, 1, C), device=x.device, dtype=x.dtype)
-
-
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_sparse_rows")
-def _rwkv7_cmix_sparse_rows_fake(
-    B: int,
-    T: int,
-    C: int,
-    F: int,
-    x: torch.Tensor,
-    shift_state: torch.Tensor,
-    x_k: torch.Tensor,
-    key_fc: torch.Tensor,
-    value_fc: torch.Tensor,
-) -> torch.Tensor:
-    return torch.empty((B, T, C), device=x.device, dtype=x.dtype)
-
-
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_sparse_down_one")
 @_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_sparse_down_relu_one")
-def _rwkv7_cmix_sparse_down_one_fake(
+def _rwkv7_cmix_sparse_down_relu_one_fake(
     C: int,
     F: int,
-    act: torch.Tensor,
+    preact: torch.Tensor,
     value_fc: torch.Tensor,
 ) -> torch.Tensor:
-    return torch.empty((C,), device=act.device, dtype=act.dtype)
+    return torch.empty((C,), device=preact.device, dtype=preact.dtype)
 
 
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_sparse_down_rows")
 @_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_sparse_down_relu_rows")
 @_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_sparse_down_relu_rows_t512")
-def _rwkv7_cmix_sparse_down_rows_fake(
+def _rwkv7_cmix_sparse_down_relu_rows_fake(
     B: int,
     T: int,
     C: int,
     F: int,
-    act: torch.Tensor,
+    preact: torch.Tensor,
     value_fc: torch.Tensor,
 ) -> torch.Tensor:
-    return torch.empty((B, T, C), device=act.device, dtype=act.dtype)
+    return torch.empty((B, T, C), device=preact.device, dtype=preact.dtype)
 
 
 @_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_mix")
@@ -530,15 +407,30 @@ def _rwkv7_cmix_mix_fake(
     return _rwkv7_empty_like(x)
 
 
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_mix_cfg")
-def _rwkv7_cmix_mix_cfg_fake(
+@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_mix_slot")
+def _rwkv7_cmix_mix_slot_fake(
     B: int,
     T: int,
     C: int,
     x: torch.Tensor,
     shift_state: torch.Tensor,
+    slot_indices: torch.Tensor,
     x_k: torch.Tensor,
-    threads: int,
+) -> torch.Tensor:
+    return _rwkv7_empty_like(x)
+
+
+@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_mix_varlen")
+def _rwkv7_cmix_mix_varlen_fake(
+    B: int,
+    total_tokens: int,
+    C: int,
+    x: torch.Tensor,
+    shift_state: torch.Tensor,
+    slot_indices: torch.Tensor,
+    x_k: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    req_id: torch.Tensor,
 ) -> torch.Tensor:
     return _rwkv7_empty_like(x)
 
@@ -553,6 +445,30 @@ def _rwkv7_unary_fake(x: torch.Tensor) -> torch.Tensor:
 @_register_fake_if_exists("rwkv7_fast_ops_fp16::add_vec")
 def _rwkv7_add_vec_fake(C: int, x: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
     return _rwkv7_empty_like(x)
+
+
+@_register_fake_if_exists("rwkv7_v3a_ops::advance_i32")
+@_register_fake_if_exists("rwkv7_v3a_ops::advance_i32_slots")
+@_register_fake_if_exists("rwkv7_v3a_ops::advance_i32_varlen")
+def _rwkv7_advance_i32_fake(*args) -> None:
+    return None
+
+
+@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq")
+@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_slot")
+@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_w0")
+@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_w0_slot")
+@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_varlen")
+@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_w0_varlen")
+def _rwkv7_wkv_fp16_fake(*args) -> None:
+    return None
+
+
+@_register_fake_if_exists("rwkv7_wkv_fp32_v2::forward")
+@_register_fake_if_exists("rwkv7_wkv_fp32_v2::forward_slot")
+@_register_fake_if_exists("rwkv7_wkv_fp32_v2::forward_varlen")
+def _rwkv7_wkv_fp32_fake(*args) -> None:
+    return None
 
 
 # scaled_fp4_quant functional + out variant for torch.compile buffer management

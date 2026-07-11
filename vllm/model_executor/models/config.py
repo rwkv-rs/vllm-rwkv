@@ -607,35 +607,12 @@ class MambaModelConfig(VerifyAndUpdateConfig):
 class RWKV7ForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
-        rwkv_knobs = {
-            "VLLM_RWKV7_WKV_MODE": (
-                envs.VLLM_RWKV7_WKV_MODE,
-                {"fp16", "fp32io16"},
-            ),
-            "VLLM_RWKV7_EMB_DEVICE": (
-                envs.VLLM_RWKV7_EMB_DEVICE,
-                {"cpu", "gpu"},
-            ),
-            "VLLM_RWKV7_RKV_MODE": (
-                envs.VLLM_RWKV7_RKV_MODE,
-                {"auto", "on", "off", "batched"},
-            ),
-            "VLLM_RWKV7_CMIX_SPARSE": (
-                envs.VLLM_RWKV7_CMIX_SPARSE,
-                {"auto", "no-fc", "off"},
-            ),
-            "VLLM_RWKV7_LOW_RANK_WEIGHT": (
-                envs.VLLM_RWKV7_LOW_RANK_WEIGHT,
-                {"orig", "transpose", "both"},
-            ),
-        }
-        for name, (value, allowed) in rwkv_knobs.items():
-            if value not in allowed:
-                allowed_values = ", ".join(sorted(allowed))
-                raise ValueError(
-                    f"{name}={value!r} is invalid for RWKV7. "
-                    f"Expected one of: {allowed_values}."
-                )
+        wkv_mode = envs.VLLM_RWKV7_WKV_MODE
+        if wkv_mode not in {"fp16", "fp32io16"}:
+            raise ValueError(
+                f"VLLM_RWKV7_WKV_MODE={wkv_mode!r} is invalid for RWKV7. "
+                "Expected one of: fp16, fp32io16."
+            )
 
         cache_config = getattr(vllm_config, "cache_config", None)
         if cache_config is not None:

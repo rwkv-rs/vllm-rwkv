@@ -3,7 +3,7 @@
 """
 Start an RWKV7 OpenAI-compatible server with tool calls enabled:
 
-VLLM_RWKV7_WKV_MODE=fp16 VLLM_RWKV7_EMB_DEVICE=gpu \
+VLLM_RWKV7_WKV_MODE=fp16 \
 vllm serve /path/to/rwkv7-g1g-7.2b-20260523-ctx8192.pth \
     --enable-auto-tool-choice
 """
