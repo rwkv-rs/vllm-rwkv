@@ -25,11 +25,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from vllm.platforms import current_platform  # noqa: E402
 from vllm.utils.argparse_utils import FlexibleArgumentParser  # noqa: E402
 from vllm.v1.sample.ops.topk_topp_sampler import (
-    get_rapid_penalty_index_stats,
     _record_rapid_penalty_index_stats,
     flashinfer_sample,
+    get_rapid_penalty_index_stats,
     rapid_sample,
     rapid_sample_input_supported,
     reset_rapid_penalty_index_stats,
@@ -189,9 +190,9 @@ def run_config(
         reset_rapid_penalty_index_stats()
         result["rapid_penalty_index_pattern"] = penalty_index_pattern
         result["rapid_penalty_index_rows"] = penalty_rows
-        result["rapid_penalty_index_first_values"] = penalty_indices[
-            : min(16, config.batch_size)
-        ].cpu().tolist()
+        result["rapid_penalty_index_first_values"] = (
+            penalty_indices[: min(16, config.batch_size)].cpu().tolist()
+        )
         result["rapid_penalty_indexed_ms"] = benchmark_cuda_call(
             lambda: rapid_sample(
                 logits,
@@ -236,9 +237,7 @@ def run_config(
                 wrapper_gather_scatter=True,
             )
             penalty_rows = penalty_indices.to(dtype=torch.long)
-            penalties_for_batch = penalties.index_select(
-                0, penalty_rows
-            ).contiguous()
+            penalties_for_batch = penalties.index_select(0, penalty_rows).contiguous()
             out = rapid_sample(
                 logits,
                 rapid_top_k,
@@ -256,9 +255,7 @@ def run_config(
             warmup_iters,
             benchmark_iters,
         )
-        result["rapid_penalty_indexed_legacy_stats"] = (
-            get_rapid_penalty_index_stats()
-        )
+        result["rapid_penalty_indexed_legacy_stats"] = get_rapid_penalty_index_stats()
 
     if "flashinfer" in providers:
         flashinfer_top_k, flashinfer_top_p = make_flashinfer_args(config)
@@ -382,8 +379,8 @@ def git_revision() -> str | None:
 
 
 def provenance() -> dict[str, object]:
-    device = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(device)
+    device = torch.accelerator.current_device_index()
+    capability = current_platform.get_device_capability(device)
     env_names = (
         "VLLM_USE_RAPID_SAMPLER",
         "CUDA_VISIBLE_DEVICES",
@@ -393,9 +390,9 @@ def provenance() -> dict[str, object]:
         "git_revision": git_revision(),
         "cuda": {
             "device_index": int(device),
-            "device_name": torch.cuda.get_device_name(device),
-            "capability": list(torch.cuda.get_device_capability(device)),
-            "total_memory": int(props.total_memory),
+            "device_name": current_platform.get_device_name(device),
+            "capability": list(capability) if capability is not None else None,
+            "total_memory": current_platform.get_device_total_memory(device),
         },
         "env": {
             name: value

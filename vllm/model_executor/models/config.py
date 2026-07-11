@@ -614,13 +614,9 @@ class RWKV7ForCausalLMConfig(VerifyAndUpdateConfig):
         orig_linear_groups.discard("")
         valid_orig_linear_groups = {"att_c2c", "ffn_key", "head"}
         if orig_linear_groups != {"none"}:
-            invalid_orig_linear_groups = (
-                orig_linear_groups - valid_orig_linear_groups
-            )
+            invalid_orig_linear_groups = orig_linear_groups - valid_orig_linear_groups
             if invalid_orig_linear_groups or "none" in orig_linear_groups:
-                allowed_values = ", ".join(
-                    ("none", *sorted(valid_orig_linear_groups))
-                )
+                allowed_values = ", ".join(("none", *sorted(valid_orig_linear_groups)))
                 invalid_values = ", ".join(
                     sorted(invalid_orig_linear_groups or {"none"})
                 )

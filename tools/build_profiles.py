@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Build-profile selection shared by setup and its focused tests."""
 
 from __future__ import annotations

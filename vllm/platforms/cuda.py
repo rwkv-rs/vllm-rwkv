@@ -25,9 +25,7 @@ from vllm.build_profile import get_build_profile_metadata
 # original mandatory import; a reduced artifact declares exactly which native
 # targets exist in its immutable manifest.
 _build_profile = get_build_profile_metadata()
-if _build_profile.profile == "full" or _build_profile.has_target(
-    "_C_stable_libtorch"
-):
+if _build_profile.profile == "full" or _build_profile.has_target("_C_stable_libtorch"):
     import vllm._C_stable_libtorch  # noqa
 
 with contextlib.suppress(ImportError):

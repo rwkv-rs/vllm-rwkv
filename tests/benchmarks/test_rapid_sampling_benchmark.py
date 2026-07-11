@@ -18,9 +18,7 @@ def test_run_config_records_indexed_penalty_diagnostics(monkeypatch) -> None:
     real_full = torch.full
     real_zeros = torch.zeros
     logits = real_zeros((config.batch_size, config.vocab_size), dtype=torch.float32)
-    penalty_indices = torch.arange(
-        config.batch_size * 2, dtype=torch.int32
-    )[::2]
+    penalty_indices = torch.arange(config.batch_size * 2, dtype=torch.int32)[::2]
     assert not penalty_indices.is_contiguous()
 
     monkeypatch.setattr(rapid_bench, "create_logits", lambda _config, seed: logits)
@@ -110,9 +108,7 @@ def test_run_config_records_legacy_wrapper_penalty_diagnostics(monkeypatch) -> N
     real_full = torch.full
     real_zeros = torch.zeros
     logits = real_zeros((config.batch_size, config.vocab_size), dtype=torch.float32)
-    penalty_indices = torch.arange(
-        config.batch_size * 2, dtype=torch.int32
-    )[::2]
+    penalty_indices = torch.arange(config.batch_size * 2, dtype=torch.int32)[::2]
     assert not penalty_indices.is_contiguous()
 
     monkeypatch.setattr(rapid_bench, "create_logits", lambda _config, seed: logits)

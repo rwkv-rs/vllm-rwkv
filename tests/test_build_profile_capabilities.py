@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -160,7 +162,7 @@ def test_rwkv_profile_accepts_declared_configuration() -> None:
     ],
 )
 def test_rwkv_profile_rejects_unsupported_configuration(
-    overrides: dict[str, object], reason: str
+    overrides: dict[str, Any], reason: str
 ) -> None:
     with pytest.raises(ValueError, match=rf"RWKV build profile.*{reason}.*full build"):
         validate_build_profile_capabilities(make_config(**overrides), rwkv_metadata())

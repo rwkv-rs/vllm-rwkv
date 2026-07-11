@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import sys
 from types import ModuleType, SimpleNamespace
@@ -76,7 +77,7 @@ def test_rwkv_profile_exposes_only_promised_generation_routes() -> None:
 async def test_rwkv_profile_rejects_mcp_before_importing_optional_modules(
     monkeypatch,
 ) -> None:
-    common_modules = {
+    common_modules: dict[str, dict[str, object]] = {
         "vllm.entrypoints.chat_utils": {"load_chat_template": lambda value: value},
         "vllm.entrypoints.openai.chat_completion.batch_serving": {
             "OpenAIServingChatBatch": object

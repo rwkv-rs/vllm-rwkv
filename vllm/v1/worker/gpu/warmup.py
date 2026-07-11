@@ -26,7 +26,7 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 logger = init_logger(__name__)
 
 
-def should_skip_v2_kernel_warmup(model_runner: GPUModelRunner) -> bool:
+def should_skip_v2_kernel_warmup(model_runner: object) -> bool:
     if not envs.VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP:
         return False
     model_state = getattr(model_runner, "model_state", None)

@@ -3,6 +3,7 @@
 
 import secrets
 from pathlib import Path
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -52,9 +53,7 @@ def _record_rapid_penalty_index_stats(
     _RAPID_PENALTY_INDEX_STATS["indexed_vocab_elements"] += elements
     if wrapper_gather_scatter:
         _RAPID_PENALTY_INDEX_STATS["wrapper_gather_scatter_calls"] += 1
-        _RAPID_PENALTY_INDEX_STATS["wrapper_gather_scatter_elements"] += (
-            2 * elements
-        )
+        _RAPID_PENALTY_INDEX_STATS["wrapper_gather_scatter_elements"] += 2 * elements
 
 
 def flashinfer_sampler_supported() -> bool:
@@ -613,13 +612,14 @@ def _rapid_vector(
         return torch.full((batch_size,), default, dtype=dtype, device=device)
     if isinstance(value, (int, float)):
         return torch.full((batch_size,), value, dtype=dtype, device=device)
-    if value.numel() == 1 and batch_size != 1:
-        value = value.expand(batch_size)
-    assert value.shape == (batch_size,), (
+    tensor = cast(torch.Tensor, value)
+    if tensor.numel() == 1 and batch_size != 1:
+        tensor = tensor.expand(batch_size)
+    assert tensor.shape == (batch_size,), (
         f"rapid sampler parameter must have shape ({batch_size},), "
-        f"got {tuple(value.shape)}"
+        f"got {tuple(tensor.shape)}"
     )
-    return value.to(device=device, dtype=dtype).contiguous()
+    return tensor.to(device=device, dtype=dtype).contiguous()
 
 
 def _rapid_scalar(value: torch.Tensor | int | float | None, default):

@@ -17,9 +17,8 @@ void wkv_fp32_v2_cuda(int B, int T, int C, int H, int mode, torch::Tensor state,
 void wkv_fp32_v2_cuda_varlen(int B, int max_t, int C, int H, int mode,
                              torch::Tensor query_start_loc,
                              torch::Tensor slot_indices, torch::Tensor state,
-                             torch::Tensor r, torch::Tensor w,
-                             torch::Tensor k, torch::Tensor v,
-                             torch::Tensor a, torch::Tensor b,
+                             torch::Tensor r, torch::Tensor w, torch::Tensor k,
+                             torch::Tensor v, torch::Tensor a, torch::Tensor b,
                              torch::Tensor y);
 
 namespace {
@@ -158,10 +157,10 @@ void forward_mode(int64_t B, int64_t T, int64_t C, int64_t H, int64_t mode,
                    slot_indices);
 }
 
-void forward_mode_slot(int64_t B, int64_t T, int64_t C, int64_t H,
-                       int64_t mode, torch::Tensor state, torch::Tensor r,
-                       torch::Tensor w, torch::Tensor k, torch::Tensor v,
-                       torch::Tensor a, torch::Tensor b, torch::Tensor y,
+void forward_mode_slot(int64_t B, int64_t T, int64_t C, int64_t H, int64_t mode,
+                       torch::Tensor state, torch::Tensor r, torch::Tensor w,
+                       torch::Tensor k, torch::Tensor v, torch::Tensor a,
+                       torch::Tensor b, torch::Tensor y,
                        torch::Tensor slot_indices) {
   check_slot_inputs(B, T, C, H, state, r, w, k, v, a, b, y, slot_indices);
   wkv_fp32_v2_cuda(static_cast<int>(B), static_cast<int>(T),
@@ -179,10 +178,10 @@ void forward_mode_varlen(int64_t B, int64_t total_tokens, int64_t max_t,
                          torch::Tensor y) {
   check_varlen_inputs(B, total_tokens, max_t, C, H, query_start_loc,
                       slot_indices, state, r, w, k, v, a, b, y);
-  wkv_fp32_v2_cuda_varlen(
-      static_cast<int>(B), static_cast<int>(max_t), static_cast<int>(C),
-      static_cast<int>(H), static_cast<int>(mode), query_start_loc,
-      slot_indices, state, r, w, k, v, a, b, y);
+  wkv_fp32_v2_cuda_varlen(static_cast<int>(B), static_cast<int>(max_t),
+                          static_cast<int>(C), static_cast<int>(H),
+                          static_cast<int>(mode), query_start_loc, slot_indices,
+                          state, r, w, k, v, a, b, y);
 }
 
 void forward(int64_t B, int64_t T, int64_t C, int64_t H, torch::Tensor state,
@@ -255,8 +254,7 @@ void forward_varlen(int64_t B, int64_t total_tokens, int64_t max_t, int64_t C,
 }
 
 void forward_seq_varlen(int64_t B, int64_t total_tokens, int64_t max_t,
-                        int64_t C, int64_t H,
-                        torch::Tensor query_start_loc,
+                        int64_t C, int64_t H, torch::Tensor query_start_loc,
                         torch::Tensor slot_indices, torch::Tensor state,
                         torch::Tensor r, torch::Tensor w, torch::Tensor k,
                         torch::Tensor v, torch::Tensor a, torch::Tensor b,
@@ -266,8 +264,7 @@ void forward_seq_varlen(int64_t B, int64_t total_tokens, int64_t max_t,
 }
 
 void forward_small_varlen(int64_t B, int64_t total_tokens, int64_t max_t,
-                          int64_t C, int64_t H,
-                          torch::Tensor query_start_loc,
+                          int64_t C, int64_t H, torch::Tensor query_start_loc,
                           torch::Tensor slot_indices, torch::Tensor state,
                           torch::Tensor r, torch::Tensor w, torch::Tensor k,
                           torch::Tensor v, torch::Tensor a, torch::Tensor b,
@@ -277,8 +274,7 @@ void forward_small_varlen(int64_t B, int64_t total_tokens, int64_t max_t,
 }
 
 void forward_block_varlen(int64_t B, int64_t total_tokens, int64_t max_t,
-                          int64_t C, int64_t H,
-                          torch::Tensor query_start_loc,
+                          int64_t C, int64_t H, torch::Tensor query_start_loc,
                           torch::Tensor slot_indices, torch::Tensor state,
                           torch::Tensor r, torch::Tensor w, torch::Tensor k,
                           torch::Tensor v, torch::Tensor a, torch::Tensor b,
@@ -299,7 +295,8 @@ TORCH_LIBRARY(rwkv7_wkv_fp32_v2, m) {
       "forward_seq(int B, int T, int C, int H, Tensor(a!) state, Tensor r, "
       "Tensor w, Tensor k, Tensor v, Tensor a, Tensor b, Tensor(a!) y) -> ()");
   m.def(
-      "forward_seq_slot(int B, int T, int C, int H, Tensor(a!) state, Tensor r, "
+      "forward_seq_slot(int B, int T, int C, int H, Tensor(a!) state, Tensor "
+      "r, "
       "Tensor w, Tensor k, Tensor v, Tensor a, Tensor b, Tensor(a!) y, "
       "Tensor slot_indices) -> ()");
   m.def(

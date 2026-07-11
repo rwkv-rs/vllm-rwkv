@@ -73,16 +73,12 @@ __device__ __forceinline__ float block_sum_broadcast(float x) {
 }
 
 template <int HeadSize>
-__launch_bounds__(HeadSize, 2) __global__
-    void wkv_fp32_v2_kernel(int T, int C, int H, float* __restrict__ state_ptr,
-                            const io_t* __restrict__ r_ptr,
-                            const io_t* __restrict__ w_ptr,
-                            const io_t* __restrict__ k_ptr,
-                            const io_t* __restrict__ v_ptr,
-                            const io_t* __restrict__ a_ptr,
-                            const io_t* __restrict__ b_ptr,
-                            io_t* __restrict__ y_ptr,
-                            const int* __restrict__ slot_indices) {
+__launch_bounds__(HeadSize, 2) __global__ void wkv_fp32_v2_kernel(
+    int T, int C, int H, float* __restrict__ state_ptr,
+    const io_t* __restrict__ r_ptr, const io_t* __restrict__ w_ptr,
+    const io_t* __restrict__ k_ptr, const io_t* __restrict__ v_ptr,
+    const io_t* __restrict__ a_ptr, const io_t* __restrict__ b_ptr,
+    io_t* __restrict__ y_ptr, const int* __restrict__ slot_indices) {
   const int bh = blockIdx.x;
   const int b_id = bh / H;
   const int h = bh - b_id * H;
@@ -140,18 +136,13 @@ __launch_bounds__(HeadSize, 2) __global__
   }
 }
 
-__global__ __launch_bounds__(
-    WARP_THREADS,
-    4) void wkv_fp32_v2_small_warp_kernel(int T, int C, int H,
-                                          float* __restrict__ state_ptr,
-                                          const io_t* __restrict__ r_ptr,
-                                          const io_t* __restrict__ w_ptr,
-                                          const io_t* __restrict__ k_ptr,
-                                          const io_t* __restrict__ v_ptr,
-                                          const io_t* __restrict__ a_ptr,
-                                          const io_t* __restrict__ b_ptr,
-                                          io_t* __restrict__ y_ptr,
-                                          const int* __restrict__ slot_indices) {
+__global__
+__launch_bounds__(WARP_THREADS, 4) void wkv_fp32_v2_small_warp_kernel(
+    int T, int C, int H, float* __restrict__ state_ptr,
+    const io_t* __restrict__ r_ptr, const io_t* __restrict__ w_ptr,
+    const io_t* __restrict__ k_ptr, const io_t* __restrict__ v_ptr,
+    const io_t* __restrict__ a_ptr, const io_t* __restrict__ b_ptr,
+    io_t* __restrict__ y_ptr, const int* __restrict__ slot_indices) {
   const int row = blockIdx.x;
   const int h = blockIdx.y;
   const int b_id = blockIdx.z;
@@ -184,18 +175,13 @@ __global__ __launch_bounds__(
   }
 }
 
-__global__ __launch_bounds__(
-    BLOCK_THREADS,
-    4) void wkv_fp32_v2_short_block_kernel(int T, int C, int H,
-                                           float* __restrict__ state_ptr,
-                                           const io_t* __restrict__ r_ptr,
-                                           const io_t* __restrict__ w_ptr,
-                                           const io_t* __restrict__ k_ptr,
-                                           const io_t* __restrict__ v_ptr,
-                                           const io_t* __restrict__ a_ptr,
-                                           const io_t* __restrict__ b_ptr,
-                                           io_t* __restrict__ y_ptr,
-                                           const int* __restrict__ slot_indices) {
+__global__
+__launch_bounds__(BLOCK_THREADS, 4) void wkv_fp32_v2_short_block_kernel(
+    int T, int C, int H, float* __restrict__ state_ptr,
+    const io_t* __restrict__ r_ptr, const io_t* __restrict__ w_ptr,
+    const io_t* __restrict__ k_ptr, const io_t* __restrict__ v_ptr,
+    const io_t* __restrict__ a_ptr, const io_t* __restrict__ b_ptr,
+    io_t* __restrict__ y_ptr, const int* __restrict__ slot_indices) {
   const int row = blockIdx.x;
   const int h = blockIdx.y;
   const int b_id = blockIdx.z;
@@ -230,14 +216,13 @@ __global__ __launch_bounds__(
 }
 
 template <int HeadSize>
-__launch_bounds__(HeadSize, 2) __global__
-    void wkv_fp32_v2_varlen_kernel(
-        int C, int H, const int* __restrict__ query_start_loc,
-        const int* __restrict__ slot_indices, float* __restrict__ state_ptr,
-        const io_t* __restrict__ r_ptr, const io_t* __restrict__ w_ptr,
-        const io_t* __restrict__ k_ptr, const io_t* __restrict__ v_ptr,
-        const io_t* __restrict__ a_ptr, const io_t* __restrict__ b_ptr,
-        io_t* __restrict__ y_ptr) {
+__launch_bounds__(HeadSize, 2) __global__ void wkv_fp32_v2_varlen_kernel(
+    int C, int H, const int* __restrict__ query_start_loc,
+    const int* __restrict__ slot_indices, float* __restrict__ state_ptr,
+    const io_t* __restrict__ r_ptr, const io_t* __restrict__ w_ptr,
+    const io_t* __restrict__ k_ptr, const io_t* __restrict__ v_ptr,
+    const io_t* __restrict__ a_ptr, const io_t* __restrict__ b_ptr,
+    io_t* __restrict__ y_ptr) {
   const int bh = blockIdx.x;
   const int b_id = bh / H;
   const int h = bh - b_id * H;
@@ -296,9 +281,8 @@ __launch_bounds__(HeadSize, 2) __global__
   }
 }
 
-__global__ __launch_bounds__(
-    WARP_THREADS,
-    4) void wkv_fp32_v2_small_warp_varlen_kernel(
+__global__
+__launch_bounds__(WARP_THREADS, 4) void wkv_fp32_v2_small_warp_varlen_kernel(
     int C, int H, const int* __restrict__ query_start_loc,
     const int* __restrict__ slot_indices, float* __restrict__ state_ptr,
     const io_t* __restrict__ r_ptr, const io_t* __restrict__ w_ptr,
@@ -339,9 +323,8 @@ __global__ __launch_bounds__(
   }
 }
 
-__global__ __launch_bounds__(
-    BLOCK_THREADS,
-    4) void wkv_fp32_v2_short_block_varlen_kernel(
+__global__
+__launch_bounds__(BLOCK_THREADS, 4) void wkv_fp32_v2_short_block_varlen_kernel(
     int C, int H, const int* __restrict__ query_start_loc,
     const int* __restrict__ slot_indices, float* __restrict__ state_ptr,
     const io_t* __restrict__ r_ptr, const io_t* __restrict__ w_ptr,
@@ -448,11 +431,10 @@ void wkv_fp32_v2_cuda_varlen(int B, int max_t, int C, int H, int mode,
   auto stream = at::cuda::getCurrentCUDAStream();
   const int* query_start_loc_ptr = query_start_loc.data_ptr<int>();
   const int* slot_ptr = slot_indices.data_ptr<int>();
-  const bool use_small =
-      (mode == 2) || (mode == 0 && use_small_auto(B, max_t));
+  const bool use_small = (mode == 2) || (mode == 0 && use_small_auto(B, max_t));
   if (mode == 3) {
-    wkv_fp32_v2_short_block_varlen_kernel<<<dim3(N, H, B),
-                                             dim3(BLOCK_THREADS), 0, stream>>>(
+    wkv_fp32_v2_short_block_varlen_kernel<<<dim3(N, H, B), dim3(BLOCK_THREADS),
+                                            0, stream>>>(
         C, H, query_start_loc_ptr, slot_ptr, state.data_ptr<float>(),
         reinterpret_cast<io_t*>(r.data_ptr()),
         reinterpret_cast<io_t*>(w.data_ptr()),
@@ -462,8 +444,8 @@ void wkv_fp32_v2_cuda_varlen(int B, int max_t, int C, int H, int mode,
         reinterpret_cast<io_t*>(b.data_ptr()),
         reinterpret_cast<io_t*>(y.data_ptr()));
   } else if (use_small) {
-    wkv_fp32_v2_small_warp_varlen_kernel<<<dim3(N, H, B),
-                                            dim3(WARP_THREADS), 0, stream>>>(
+    wkv_fp32_v2_small_warp_varlen_kernel<<<dim3(N, H, B), dim3(WARP_THREADS), 0,
+                                           stream>>>(
         C, H, query_start_loc_ptr, slot_ptr, state.data_ptr<float>(),
         reinterpret_cast<io_t*>(r.data_ptr()),
         reinterpret_cast<io_t*>(w.data_ptr()),

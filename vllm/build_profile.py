@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Immutable native build capabilities for reduced vLLM artifacts."""
 
 from __future__ import annotations
@@ -195,9 +196,7 @@ def validate_build_profile_capabilities(
         )
     if pcp != 1:
         reasons.append("requires prefill context parallel size 1")
-    executor_backend = getattr(
-        parallel_config, "distributed_executor_backend", None
-    )
+    executor_backend = getattr(parallel_config, "distributed_executor_backend", None)
     if executor_backend not in (None, "uni"):
         reasons.append("requires the single-process executor")
 

@@ -48,7 +48,9 @@ def _make_worker(attn_groups):
 def _disable_unrelated_warmups(monkeypatch):
     minimax_module_name = "vllm.model_executor.warmup.minimax_m3_msa_warmup"
     minimax_warmup = ModuleType(minimax_module_name)
-    minimax_warmup.minimax_m3_msa_warmup = lambda *_args: None
+    minimax_warmup.minimax_m3_msa_warmup = (  # type: ignore[attr-defined]
+        lambda *_args: None
+    )
     monkeypatch.setitem(sys.modules, minimax_module_name, minimax_warmup)
 
     monkeypatch.setattr(kernel_warmup_module, "qwen_triton_warmup", lambda *args: None)

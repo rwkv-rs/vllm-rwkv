@@ -102,9 +102,9 @@ class RWKV7ModelState(ModelState):
         self._prefill_decode_rows: list[int] = []
         self._prefill_req_slots: list[int] = []
         self._prefill_becomes_decode: list[bool] = []
-        self.use_slot_mapped_state = os.environ.get(
-            "VLLM_RWKV7_SLOT_MAPPED_STATE", "1"
-        ) != "0"
+        self.use_slot_mapped_state = (
+            os.environ.get("VLLM_RWKV7_SLOT_MAPPED_STATE", "1") != "0"
+        )
         if not self.use_slot_mapped_state:
             logger.warning_once(
                 "VLLM_RWKV7_SLOT_MAPPED_STATE=0 enables the legacy RWKV7 "
@@ -219,7 +219,9 @@ class RWKV7ModelState(ModelState):
         enabled: bool,
     ) -> None:
         try:
-            setattr(input_batch, "rwkv_sampling_logits_contiguous", enabled)
+            input_batch.rwkv_sampling_logits_contiguous = (  # type: ignore[attr-defined]
+                enabled
+            )
         except Exception:
             return
 
@@ -289,9 +291,7 @@ class RWKV7ModelState(ModelState):
             self._state_movement_stats["decode_compaction_bytes"] += (
                 len(resident_rows) * self._state_row_nbytes()
             )
-            self._state_movement_stats["decode_full_row_copies"] += len(
-                resident_rows
-            )
+            self._state_movement_stats["decode_full_row_copies"] += len(resident_rows)
             self._state_movement_stats["decode_full_row_copy_bytes"] += (
                 len(resident_rows) * self._state_row_nbytes()
             )
@@ -483,9 +483,7 @@ class RWKV7ModelState(ModelState):
         target_width = len(self.decode_req_slots)
         if target_width <= 0:
             return
-        holes = [
-            row for row in range(target_width) if self.row_to_req_slot[row] == -1
-        ]
+        holes = [row for row in range(target_width) if self.row_to_req_slot[row] == -1]
         if not holes:
             return
         movable = [
@@ -626,9 +624,7 @@ class RWKV7ModelState(ModelState):
         if decode_entries:
             self._validate_decode_membership()
             if not self.use_slot_mapped_state:
-                decode_entries = self._sync_decode_rows_to_resident_rows(
-                    decode_entries
-                )
+                decode_entries = self._sync_decode_rows_to_resident_rows(decode_entries)
         scheduled_rows = [
             self.req_slot_to_row[req_slot]
             for _batch_idx, req_slot, _is_prefill, _start, _end in batch_entries
@@ -797,19 +793,13 @@ class RWKV7ModelState(ModelState):
         self._state_movement_stats["prefill_batches"] += 1
         self._state_movement_stats["prefill_ranges"] += len(prefill_ranges)
         self._state_movement_stats["prefill_groups"] += len(prefill_groups)
-        self._state_movement_stats["prefill_group_model_calls"] += len(
-            prefill_groups
-        )
+        self._state_movement_stats["prefill_group_model_calls"] += len(prefill_groups)
         if can_use_varlen_prefill:
             self._state_movement_stats["prefill_varlen_batches"] += 1
-            self._state_movement_stats["prefill_varlen_tokens"] += sum(
-                prefill_lengths
-            )
+            self._state_movement_stats["prefill_varlen_tokens"] += sum(prefill_lengths)
             self._state_movement_stats["prefill_varlen_model_calls"] += 1
         self._state_movement_stats["prefill_fallback_ranges"] += fallback_ranges
-        self._state_movement_stats["prefill_fallback_model_calls"] += (
-            fallback_ranges
-        )
+        self._state_movement_stats["prefill_fallback_model_calls"] += fallback_ranges
 
         if len(prefill_entries) == input_batch.num_reqs:
             return {

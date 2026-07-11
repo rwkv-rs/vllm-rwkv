@@ -11,7 +11,7 @@ import socket
 import tempfile
 import warnings
 from argparse import Namespace
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any, cast
 
@@ -70,7 +70,7 @@ from vllm.utils.system_utils import decorate_logs, set_ulimit
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.version import __version__ as VLLM_VERSION
 
-sagemaker_standards_bootstrap = None
+sagemaker_standards_bootstrap: Callable[[FastAPI], FastAPI] | None = None
 if get_build_profile_metadata().profile == "full":
     from vllm.entrypoints.serve.sagemaker.api_router import (
         sagemaker_standards_bootstrap,

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Clean-environment smoke checks for an installed RWKV-only artifact."""
 
 from __future__ import annotations

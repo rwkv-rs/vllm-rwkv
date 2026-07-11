@@ -20,8 +20,7 @@ std::vector<torch::Tensor> tmix_mix6_cuda(int B, int T, int C, torch::Tensor x,
 std::vector<torch::Tensor> tmix_mix6_slot_cuda(
     int B, int T, int C, torch::Tensor x, torch::Tensor shift_state,
     torch::Tensor slot_indices, torch::Tensor x_r, torch::Tensor x_w,
-    torch::Tensor x_k, torch::Tensor x_v, torch::Tensor x_a,
-    torch::Tensor x_g);
+    torch::Tensor x_k, torch::Tensor x_v, torch::Tensor x_a, torch::Tensor x_g);
 std::vector<torch::Tensor> tmix_mix6_cfg_cuda(
     int B, int T, int C, torch::Tensor x, torch::Tensor shift_state,
     torch::Tensor x_r, torch::Tensor x_w, torch::Tensor x_k, torch::Tensor x_v,
@@ -29,13 +28,13 @@ std::vector<torch::Tensor> tmix_mix6_cfg_cuda(
 std::vector<torch::Tensor> tmix_mix6_cfg_slot_cuda(
     int B, int T, int C, torch::Tensor x, torch::Tensor shift_state,
     torch::Tensor slot_indices, torch::Tensor x_r, torch::Tensor x_w,
-    torch::Tensor x_k, torch::Tensor x_v, torch::Tensor x_a,
-    torch::Tensor x_g, int threads);
+    torch::Tensor x_k, torch::Tensor x_v, torch::Tensor x_a, torch::Tensor x_g,
+    int threads);
 std::vector<torch::Tensor> tmix_mix6_varlen_cuda(
-    int B, int total_tokens, int C, torch::Tensor x,
-    torch::Tensor shift_state, torch::Tensor slot_indices, torch::Tensor x_r,
-    torch::Tensor x_w, torch::Tensor x_k, torch::Tensor x_v, torch::Tensor x_a,
-    torch::Tensor x_g, torch::Tensor query_start_loc, torch::Tensor req_id);
+    int B, int total_tokens, int C, torch::Tensor x, torch::Tensor shift_state,
+    torch::Tensor slot_indices, torch::Tensor x_r, torch::Tensor x_w,
+    torch::Tensor x_k, torch::Tensor x_v, torch::Tensor x_a, torch::Tensor x_g,
+    torch::Tensor query_start_loc, torch::Tensor req_id);
 std::vector<torch::Tensor> tmix_mix6_t1_c4096_cuda(
     int B, torch::Tensor x, torch::Tensor shift_state, torch::Tensor x_r,
     torch::Tensor x_w, torch::Tensor x_k, torch::Tensor x_v, torch::Tensor x_a,
@@ -88,8 +87,7 @@ torch::Tensor cmix_mix_cuda(int B, int T, int C, torch::Tensor x,
                             torch::Tensor shift_state, torch::Tensor x_k);
 torch::Tensor cmix_mix_slot_cuda(int B, int T, int C, torch::Tensor x,
                                  torch::Tensor shift_state,
-                                 torch::Tensor slot_indices,
-                                 torch::Tensor x_k);
+                                 torch::Tensor slot_indices, torch::Tensor x_k);
 torch::Tensor cmix_mix_cfg_cuda(int B, int T, int C, torch::Tensor x,
                                 torch::Tensor shift_state, torch::Tensor x_k,
                                 int threads);
@@ -98,8 +96,7 @@ torch::Tensor cmix_mix_cfg_slot_cuda(int B, int T, int C, torch::Tensor x,
                                      torch::Tensor slot_indices,
                                      torch::Tensor x_k, int threads);
 torch::Tensor cmix_mix_varlen_cuda(int B, int total_tokens, int C,
-                                   torch::Tensor x,
-                                   torch::Tensor shift_state,
+                                   torch::Tensor x, torch::Tensor shift_state,
                                    torch::Tensor slot_indices,
                                    torch::Tensor x_k,
                                    torch::Tensor query_start_loc,
@@ -139,8 +136,7 @@ void check_2d(const torch::Tensor& x, int64_t rows, int64_t C,
               const char* name) {
   check_half_cuda_contig(x, name);
   TORCH_CHECK(x.dim() == 2, name, " must have shape [rows,C]");
-  TORCH_CHECK(x.size(0) == rows && x.size(1) == C, name,
-              " shape mismatch");
+  TORCH_CHECK(x.size(0) == rows && x.size(1) == C, name, " shape mismatch");
 }
 
 void check_vec(const torch::Tensor& x, int64_t C, const char* name) {
@@ -216,10 +212,9 @@ std::vector<torch::Tensor> tmix_mix6_slot(
   check_vec(x_v, C, "x_v");
   check_vec(x_a, C, "x_a");
   check_vec(x_g, C, "x_g");
-  return tmix_mix6_slot_cuda(
-      checked_int_arg(B, "B"), checked_int_arg(T, "T"),
-      checked_int_arg(C, "C"), x, shift_state, slot_indices, x_r, x_w, x_k,
-      x_v, x_a, x_g);
+  return tmix_mix6_slot_cuda(checked_int_arg(B, "B"), checked_int_arg(T, "T"),
+                             checked_int_arg(C, "C"), x, shift_state,
+                             slot_indices, x_r, x_w, x_k, x_v, x_a, x_g);
 }
 
 std::vector<torch::Tensor> tmix_mix6_cfg(
@@ -250,8 +245,8 @@ std::vector<torch::Tensor> tmix_mix6_cfg(
 std::vector<torch::Tensor> tmix_mix6_cfg_slot(
     int64_t B, int64_t T, int64_t C, torch::Tensor x, torch::Tensor shift_state,
     torch::Tensor slot_indices, torch::Tensor x_r, torch::Tensor x_w,
-    torch::Tensor x_k, torch::Tensor x_v, torch::Tensor x_a,
-    torch::Tensor x_g, int64_t threads) {
+    torch::Tensor x_k, torch::Tensor x_v, torch::Tensor x_a, torch::Tensor x_g,
+    int64_t threads) {
   TORCH_CHECK((C % 2) == 0, "C must be even");
   TORCH_CHECK(
       threads == 128 || threads == 256 || threads == 512 || threads == 1024,
@@ -266,9 +261,9 @@ std::vector<torch::Tensor> tmix_mix6_cfg_slot(
   check_vec(x_a, C, "x_a");
   check_vec(x_g, C, "x_g");
   return tmix_mix6_cfg_slot_cuda(
-      checked_int_arg(B, "B"), checked_int_arg(T, "T"),
-      checked_int_arg(C, "C"), x, shift_state, slot_indices, x_r, x_w, x_k,
-      x_v, x_a, x_g, checked_int_arg(threads, "threads"));
+      checked_int_arg(B, "B"), checked_int_arg(T, "T"), checked_int_arg(C, "C"),
+      x, shift_state, slot_indices, x_r, x_w, x_k, x_v, x_a, x_g,
+      checked_int_arg(threads, "threads"));
 }
 
 std::vector<torch::Tensor> tmix_mix6_varlen(
@@ -289,8 +284,8 @@ std::vector<torch::Tensor> tmix_mix6_varlen(
   check_varlen_metadata(query_start_loc, req_id, B, total_tokens);
   return tmix_mix6_varlen_cuda(
       checked_int_arg(B, "B"), checked_int_arg(total_tokens, "total_tokens"),
-      checked_int_arg(C, "C"), x, shift_state, slot_indices, x_r, x_w, x_k,
-      x_v, x_a, x_g, query_start_loc, req_id);
+      checked_int_arg(C, "C"), x, shift_state, slot_indices, x_r, x_w, x_k, x_v,
+      x_a, x_g, query_start_loc, req_id);
 }
 
 std::vector<torch::Tensor> tmix_mix6_t1_c4096(
@@ -526,9 +521,9 @@ torch::Tensor cmix_mix_slot(int64_t B, int64_t T, int64_t C, torch::Tensor x,
   check_slot_shift_state(shift_state, C);
   check_slot_indices(slot_indices, B);
   check_vec(x_k, C, "x_k");
-  return cmix_mix_slot_cuda(
-      checked_int_arg(B, "B"), checked_int_arg(T, "T"),
-      checked_int_arg(C, "C"), x, shift_state, slot_indices, x_k);
+  return cmix_mix_slot_cuda(checked_int_arg(B, "B"), checked_int_arg(T, "T"),
+                            checked_int_arg(C, "C"), x, shift_state,
+                            slot_indices, x_k);
 }
 
 torch::Tensor cmix_mix_cfg(int64_t B, int64_t T, int64_t C, torch::Tensor x,
@@ -551,8 +546,8 @@ torch::Tensor cmix_mix_cfg(int64_t B, int64_t T, int64_t C, torch::Tensor x,
 
 torch::Tensor cmix_mix_cfg_slot(int64_t B, int64_t T, int64_t C,
                                 torch::Tensor x, torch::Tensor shift_state,
-                                torch::Tensor slot_indices,
-                                torch::Tensor x_k, int64_t threads) {
+                                torch::Tensor slot_indices, torch::Tensor x_k,
+                                int64_t threads) {
   TORCH_CHECK((C % 2) == 0, "C must be even");
   TORCH_CHECK(
       threads == 128 || threads == 256 || threads == 512 || threads == 1024,
@@ -562,9 +557,8 @@ torch::Tensor cmix_mix_cfg_slot(int64_t B, int64_t T, int64_t C,
   check_slot_indices(slot_indices, B);
   check_vec(x_k, C, "x_k");
   return cmix_mix_cfg_slot_cuda(
-      checked_int_arg(B, "B"), checked_int_arg(T, "T"),
-      checked_int_arg(C, "C"), x, shift_state, slot_indices, x_k,
-      checked_int_arg(threads, "threads"));
+      checked_int_arg(B, "B"), checked_int_arg(T, "T"), checked_int_arg(C, "C"),
+      x, shift_state, slot_indices, x_k, checked_int_arg(threads, "threads"));
 }
 
 torch::Tensor cmix_mix_varlen(int64_t B, int64_t total_tokens, int64_t C,
@@ -578,10 +572,10 @@ torch::Tensor cmix_mix_varlen(int64_t B, int64_t total_tokens, int64_t C,
   check_slot_indices(slot_indices, B);
   check_vec(x_k, C, "x_k");
   check_varlen_metadata(query_start_loc, req_id, B, total_tokens);
-  return cmix_mix_varlen_cuda(
-      checked_int_arg(B, "B"), checked_int_arg(total_tokens, "total_tokens"),
-      checked_int_arg(C, "C"), x, shift_state, slot_indices, x_k,
-      query_start_loc, req_id);
+  return cmix_mix_varlen_cuda(checked_int_arg(B, "B"),
+                              checked_int_arg(total_tokens, "total_tokens"),
+                              checked_int_arg(C, "C"), x, shift_state,
+                              slot_indices, x_k, query_start_loc, req_id);
 }
 
 torch::Tensor relu_square(torch::Tensor x) {

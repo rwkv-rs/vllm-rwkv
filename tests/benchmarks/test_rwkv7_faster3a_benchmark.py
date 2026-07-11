@@ -1684,7 +1684,7 @@ def test_create_vllm_runner_llm_passes_configured_cudagraph_sizes(
 
     fake_vllm = ModuleType("vllm")
     fake_vllm.__path__ = []
-    fake_vllm.LLM = FakeLLM
+    fake_vllm.LLM = FakeLLM  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
     monkeypatch.setitem(sys.modules, "vllm.rwkv7_ops", ModuleType("vllm.rwkv7_ops"))
     monkeypatch.setenv("VLLM_RWKV7_MODEL", str(model_path))
@@ -1723,7 +1723,7 @@ def test_create_vllm_runner_llm_does_not_graph_capture_eager_path(
 
     fake_vllm = ModuleType("vllm")
     fake_vllm.__path__ = []
-    fake_vllm.LLM = FakeLLM
+    fake_vllm.LLM = FakeLLM  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
     monkeypatch.setitem(sys.modules, "vllm.rwkv7_ops", ModuleType("vllm.rwkv7_ops"))
 
@@ -1744,11 +1744,11 @@ def test_runner_pd_single_uses_exact_cudagraph_capture_size(
 ) -> None:
     created_configs: list[bench.BenchmarkConfig] = []
 
-    monkeypatch.setattr(
-        bench,
-        "_create_vllm_runner_llm",
-        lambda config: created_configs.append(config) or object(),
-    )
+    def create_llm(config: bench.BenchmarkConfig) -> object:
+        created_configs.append(config)
+        return object()
+
+    monkeypatch.setattr(bench, "_create_vllm_runner_llm", create_llm)
     monkeypatch.setattr(
         bench,
         "_time_vllm_runner_decode_phase",
@@ -2442,7 +2442,9 @@ def test_runner_pd_subprocess_skips_generic_warmup_without_slow_path_flags(
     def fake_run(command, *, cwd, env, check):
         calls.append((command, env))
         options = _command_options(command)
-        output_path = Path(options["--measurement-output"])
+        output_value = options["--measurement-output"]
+        assert isinstance(output_value, str)
+        output_path = Path(output_value)
         output_path.write_text(
             json.dumps(
                 {
@@ -2491,7 +2493,9 @@ def test_runner_pd_subprocess_honors_explicit_slow_path_flags(
     def fake_run(command, *, cwd, env, check):
         calls.append((command, env))
         options = _command_options(command)
-        output_path = Path(options["--measurement-output"])
+        output_value = options["--measurement-output"]
+        assert isinstance(output_value, str)
+        output_path = Path(output_value)
         output_path.write_text(
             json.dumps(
                 {

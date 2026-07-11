@@ -29,9 +29,8 @@ void wkv_seq_w0_v2_cuda(int B, int T, int C, int H, torch::Tensor state,
                         torch::Tensor elapsed_t);
 
 void wkv_seq_w0_slot_v2_cuda(int B, int T, int C, int H, torch::Tensor state,
-                             torch::Tensor r, torch::Tensor w,
-                             torch::Tensor w0, torch::Tensor k,
-                             torch::Tensor v, torch::Tensor a,
+                             torch::Tensor r, torch::Tensor w, torch::Tensor w0,
+                             torch::Tensor k, torch::Tensor v, torch::Tensor a,
                              torch::Tensor b, torch::Tensor y,
                              torch::Tensor slot_indices,
                              torch::Tensor elapsed_t);
@@ -43,14 +42,11 @@ void wkv_seq_varlen_v2_cuda(int B, int max_t, int C, int H,
                             torch::Tensor v, torch::Tensor a, torch::Tensor b,
                             torch::Tensor y, torch::Tensor elapsed_t);
 
-void wkv_seq_w0_varlen_v2_cuda(int B, int max_t, int C, int H,
-                               torch::Tensor query_start_loc,
-                               torch::Tensor slot_indices, torch::Tensor state,
-                               torch::Tensor r, torch::Tensor w,
-                               torch::Tensor w0, torch::Tensor k,
-                               torch::Tensor v, torch::Tensor a,
-                               torch::Tensor b, torch::Tensor y,
-                               torch::Tensor elapsed_t);
+void wkv_seq_w0_varlen_v2_cuda(
+    int B, int max_t, int C, int H, torch::Tensor query_start_loc,
+    torch::Tensor slot_indices, torch::Tensor state, torch::Tensor r,
+    torch::Tensor w, torch::Tensor w0, torch::Tensor k, torch::Tensor v,
+    torch::Tensor a, torch::Tensor b, torch::Tensor y, torch::Tensor elapsed_t);
 
 void wkv_one_v2_cuda(int B, int C, int H, torch::Tensor state, torch::Tensor r,
                      torch::Tensor w, torch::Tensor k, torch::Tensor v,
@@ -70,9 +66,8 @@ void wkv_one_w0_v2_cuda(int B, int C, int H, torch::Tensor state,
                         torch::Tensor elapsed_t);
 
 void wkv_one_w0_slot_v2_cuda(int B, int C, int H, torch::Tensor state,
-                             torch::Tensor r, torch::Tensor w,
-                             torch::Tensor w0, torch::Tensor k,
-                             torch::Tensor v, torch::Tensor a,
+                             torch::Tensor r, torch::Tensor w, torch::Tensor w0,
+                             torch::Tensor k, torch::Tensor v, torch::Tensor a,
                              torch::Tensor b, torch::Tensor y,
                              torch::Tensor slot_indices,
                              torch::Tensor elapsed_t);
@@ -126,8 +121,7 @@ void check_query_start_loc(const torch::Tensor& x, int64_t B) {
 }
 
 void check_slot_common_inputs(int64_t B, int64_t C, int64_t H,
-                              torch::Tensor state,
-                              torch::Tensor slot_indices,
+                              torch::Tensor state, torch::Tensor slot_indices,
                               torch::Tensor elapsed_t) {
   check_positive_int_arg(B, "B");
   check_positive_int_arg(C, "C");
@@ -210,10 +204,9 @@ void check_seq_varlen_inputs(int64_t B, int64_t total_tokens, int64_t max_t,
                              int64_t C, int64_t H,
                              torch::Tensor query_start_loc,
                              torch::Tensor slot_indices, torch::Tensor state,
-                             torch::Tensor r, torch::Tensor w,
-                             torch::Tensor k, torch::Tensor v, torch::Tensor a,
-                             torch::Tensor b, torch::Tensor y,
-                             torch::Tensor elapsed_t) {
+                             torch::Tensor r, torch::Tensor w, torch::Tensor k,
+                             torch::Tensor v, torch::Tensor a, torch::Tensor b,
+                             torch::Tensor y, torch::Tensor elapsed_t) {
   check_positive_int_arg(max_t, "max_t");
   check_positive_int_arg(total_tokens, "total_tokens");
   check_slot_common_inputs(B, C, H, state, slot_indices, elapsed_t);
@@ -241,11 +234,10 @@ void check_one_inputs(int64_t B, int64_t C, int64_t H, torch::Tensor state,
               "r must have shape [B,C]");
 }
 
-void check_one_slot_inputs(int64_t B, int64_t C, int64_t H,
-                           torch::Tensor state, torch::Tensor r,
-                           torch::Tensor w, torch::Tensor k, torch::Tensor v,
-                           torch::Tensor a, torch::Tensor b, torch::Tensor y,
-                           torch::Tensor slot_indices,
+void check_one_slot_inputs(int64_t B, int64_t C, int64_t H, torch::Tensor state,
+                           torch::Tensor r, torch::Tensor w, torch::Tensor k,
+                           torch::Tensor v, torch::Tensor a, torch::Tensor b,
+                           torch::Tensor y, torch::Tensor slot_indices,
                            torch::Tensor elapsed_t) {
   check_slot_common_inputs(B, C, H, state, slot_indices, elapsed_t);
   check_half_cuda_contig(r, "r");
@@ -277,8 +269,8 @@ void wkv_seq(int64_t B, int64_t T, int64_t C, int64_t H, torch::Tensor state,
 void wkv_seq_slot(int64_t B, int64_t T, int64_t C, int64_t H,
                   torch::Tensor state, torch::Tensor r, torch::Tensor w,
                   torch::Tensor k, torch::Tensor v, torch::Tensor a,
-                  torch::Tensor b, torch::Tensor y,
-                  torch::Tensor slot_indices, torch::Tensor elapsed_t) {
+                  torch::Tensor b, torch::Tensor y, torch::Tensor slot_indices,
+                  torch::Tensor elapsed_t) {
   check_seq_slot_inputs(B, T, C, H, state, r, w, k, v, a, b, y, slot_indices,
                         elapsed_t);
   wkv_seq_slot_v2_cuda(static_cast<int>(B), static_cast<int>(T),
@@ -306,8 +298,8 @@ void wkv_seq_w0_slot(int64_t B, int64_t T, int64_t C, int64_t H,
                         elapsed_t);
   check_w0(w0, C);
   wkv_seq_w0_slot_v2_cuda(static_cast<int>(B), static_cast<int>(T),
-                          static_cast<int>(C), static_cast<int>(H), state, r,
-                          w, w0, k, v, a, b, y, slot_indices, elapsed_t);
+                          static_cast<int>(C), static_cast<int>(H), state, r, w,
+                          w0, k, v, a, b, y, slot_indices, elapsed_t);
 }
 
 void wkv_seq_varlen(int64_t B, int64_t total_tokens, int64_t max_t, int64_t C,
@@ -317,12 +309,11 @@ void wkv_seq_varlen(int64_t B, int64_t total_tokens, int64_t max_t, int64_t C,
                     torch::Tensor v, torch::Tensor a, torch::Tensor b,
                     torch::Tensor y, torch::Tensor elapsed_t) {
   check_seq_varlen_inputs(B, total_tokens, max_t, C, H, query_start_loc,
-                          slot_indices, state, r, w, k, v, a, b, y,
-                          elapsed_t);
+                          slot_indices, state, r, w, k, v, a, b, y, elapsed_t);
   wkv_seq_varlen_v2_cuda(static_cast<int>(B), static_cast<int>(max_t),
                          static_cast<int>(C), static_cast<int>(H),
-                         query_start_loc, slot_indices, state, r, w, k, v, a,
-                         b, y, elapsed_t);
+                         query_start_loc, slot_indices, state, r, w, k, v, a, b,
+                         y, elapsed_t);
 }
 
 void wkv_seq_w0_varlen(int64_t B, int64_t total_tokens, int64_t max_t,
@@ -333,13 +324,12 @@ void wkv_seq_w0_varlen(int64_t B, int64_t total_tokens, int64_t max_t,
                        torch::Tensor b, torch::Tensor y,
                        torch::Tensor elapsed_t) {
   check_seq_varlen_inputs(B, total_tokens, max_t, C, H, query_start_loc,
-                          slot_indices, state, r, w, k, v, a, b, y,
-                          elapsed_t);
+                          slot_indices, state, r, w, k, v, a, b, y, elapsed_t);
   check_w0(w0, C);
-  wkv_seq_w0_varlen_v2_cuda(
-      static_cast<int>(B), static_cast<int>(max_t), static_cast<int>(C),
-      static_cast<int>(H), query_start_loc, slot_indices, state, r, w, w0, k, v,
-      a, b, y, elapsed_t);
+  wkv_seq_w0_varlen_v2_cuda(static_cast<int>(B), static_cast<int>(max_t),
+                            static_cast<int>(C), static_cast<int>(H),
+                            query_start_loc, slot_indices, state, r, w, w0, k,
+                            v, a, b, y, elapsed_t);
 }
 
 void wkv_one(int64_t B, int64_t C, int64_t H, torch::Tensor state,

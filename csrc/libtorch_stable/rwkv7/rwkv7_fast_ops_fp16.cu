@@ -59,13 +59,13 @@ __device__ inline float sigmoid_fast(float x) {
 template <bool UpdateShift>
 __global__ void tmix_mix6_kernel(
     int T, int C, const dtype* __restrict__ x, dtype* __restrict__ shift_state,
-    const int* __restrict__ slot_indices,
-    const dtype* __restrict__ x_r, const dtype* __restrict__ x_w,
-    const dtype* __restrict__ x_k, const dtype* __restrict__ x_v,
-    const dtype* __restrict__ x_a, const dtype* __restrict__ x_g,
-    dtype* __restrict__ out_r, dtype* __restrict__ out_w,
-    dtype* __restrict__ out_k, dtype* __restrict__ out_v,
-    dtype* __restrict__ out_a, dtype* __restrict__ out_g, int64_t total_pairs) {
+    const int* __restrict__ slot_indices, const dtype* __restrict__ x_r,
+    const dtype* __restrict__ x_w, const dtype* __restrict__ x_k,
+    const dtype* __restrict__ x_v, const dtype* __restrict__ x_a,
+    const dtype* __restrict__ x_g, dtype* __restrict__ out_r,
+    dtype* __restrict__ out_w, dtype* __restrict__ out_k,
+    dtype* __restrict__ out_v, dtype* __restrict__ out_a,
+    dtype* __restrict__ out_g, int64_t total_pairs) {
   const int64_t pair_idx =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (pair_idx >= total_pairs) {
@@ -109,17 +109,15 @@ __global__ void tmix_mix6_kernel(
 
   if constexpr (UpdateShift) {
     if (t == T - 1) {
-      *reinterpret_cast<__half2*>(
-          shift_state + static_cast<int64_t>(state_b) * C + c) = cur2;
+      *reinterpret_cast<__half2*>(shift_state +
+                                  static_cast<int64_t>(state_b) * C + c) = cur2;
     }
   }
 }
 
-__global__ void update_shift_state_last_kernel(int T, int C,
-                                               const dtype* __restrict__ x,
-                                               dtype* __restrict__ shift_state,
-                                               const int* __restrict__ slot_indices,
-                                               int64_t total_pairs) {
+__global__ void update_shift_state_last_kernel(
+    int T, int C, const dtype* __restrict__ x, dtype* __restrict__ shift_state,
+    const int* __restrict__ slot_indices, int64_t total_pairs) {
   const int64_t pair_idx =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (pair_idx >= total_pairs) {
@@ -132,21 +130,20 @@ __global__ void update_shift_state_last_kernel(int T, int C,
                 << 1;
   const int state_b = slot_indices == nullptr ? b : slot_indices[b];
   const int64_t src_idx = (static_cast<int64_t>(b) * T + (T - 1)) * C + c;
-  *reinterpret_cast<__half2*>(
-      shift_state + static_cast<int64_t>(state_b) * C + c) = load_h2(x + src_idx);
+  *reinterpret_cast<__half2*>(shift_state + static_cast<int64_t>(state_b) * C +
+                              c) = load_h2(x + src_idx);
 }
 
 __global__ void tmix_mix6_varlen_kernel(
     int C, const dtype* __restrict__ x, dtype* __restrict__ shift_state,
-    const int* __restrict__ slot_indices,
-    const dtype* __restrict__ x_r, const dtype* __restrict__ x_w,
-    const dtype* __restrict__ x_k, const dtype* __restrict__ x_v,
-    const dtype* __restrict__ x_a, const dtype* __restrict__ x_g,
-    dtype* __restrict__ out_r, dtype* __restrict__ out_w,
-    dtype* __restrict__ out_k, dtype* __restrict__ out_v,
-    dtype* __restrict__ out_a, dtype* __restrict__ out_g,
-    const int* __restrict__ query_start_loc, const int* __restrict__ req_id,
-    int64_t total_pairs) {
+    const int* __restrict__ slot_indices, const dtype* __restrict__ x_r,
+    const dtype* __restrict__ x_w, const dtype* __restrict__ x_k,
+    const dtype* __restrict__ x_v, const dtype* __restrict__ x_a,
+    const dtype* __restrict__ x_g, dtype* __restrict__ out_r,
+    dtype* __restrict__ out_w, dtype* __restrict__ out_k,
+    dtype* __restrict__ out_v, dtype* __restrict__ out_a,
+    dtype* __restrict__ out_g, const int* __restrict__ query_start_loc,
+    const int* __restrict__ req_id, int64_t total_pairs) {
   const int64_t pair_idx =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (pair_idx >= total_pairs) {
@@ -206,8 +203,8 @@ __global__ void update_shift_state_varlen_kernel(
                 << 1;
   const int last_token = query_start_loc[b + 1] - 1;
   const int state_b = slot_indices[b];
-  *reinterpret_cast<__half2*>(
-      shift_state + static_cast<int64_t>(state_b) * C + c) =
+  *reinterpret_cast<__half2*>(shift_state + static_cast<int64_t>(state_b) * C +
+                              c) =
       load_h2(x + static_cast<int64_t>(last_token) * C + c);
 }
 
@@ -550,20 +547,17 @@ __global__ void cmix_mix_kernel(int T, int C, const dtype* __restrict__ x,
 
   if constexpr (UpdateShift) {
     if (t == T - 1) {
-      *reinterpret_cast<__half2*>(
-          shift_state + static_cast<int64_t>(state_b) * C + c) = cur2;
+      *reinterpret_cast<__half2*>(shift_state +
+                                  static_cast<int64_t>(state_b) * C + c) = cur2;
     }
   }
 }
 
-__global__ void cmix_mix_varlen_kernel(int C, const dtype* __restrict__ x,
-                                       dtype* __restrict__ shift_state,
-                                       const int* __restrict__ slot_indices,
-                                       const dtype* __restrict__ x_k,
-                                       dtype* __restrict__ out,
-                                       const int* __restrict__ query_start_loc,
-                                       const int* __restrict__ req_id,
-                                       int64_t total_pairs) {
+__global__ void cmix_mix_varlen_kernel(
+    int C, const dtype* __restrict__ x, dtype* __restrict__ shift_state,
+    const int* __restrict__ slot_indices, const dtype* __restrict__ x_k,
+    dtype* __restrict__ out, const int* __restrict__ query_start_loc,
+    const int* __restrict__ req_id, int64_t total_pairs) {
   const int64_t pair_idx =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (pair_idx >= total_pairs) {
@@ -998,10 +992,12 @@ __launch_bounds__(256, 2) void cmix_sparse_spmv_relu_rows_t512_kernel(
 
 }  // namespace
 
-std::vector<at::Tensor> tmix_mix6_slot_cuda(
-    int B, int T, int C, at::Tensor x, at::Tensor shift_state,
-    at::Tensor slot_indices, at::Tensor x_r, at::Tensor x_w, at::Tensor x_k,
-    at::Tensor x_v, at::Tensor x_a, at::Tensor x_g);
+std::vector<at::Tensor> tmix_mix6_slot_cuda(int B, int T, int C, at::Tensor x,
+                                            at::Tensor shift_state,
+                                            at::Tensor slot_indices,
+                                            at::Tensor x_r, at::Tensor x_w,
+                                            at::Tensor x_k, at::Tensor x_v,
+                                            at::Tensor x_a, at::Tensor x_g);
 
 std::vector<at::Tensor> tmix_mix6_cfg_slot_cuda(
     int B, int T, int C, at::Tensor x, at::Tensor shift_state,
@@ -1011,12 +1007,12 @@ std::vector<at::Tensor> tmix_mix6_cfg_slot_cuda(
 std::vector<at::Tensor> tmix_mix6_varlen_cuda(
     int B, int total_tokens, int C, at::Tensor x, at::Tensor shift_state,
     at::Tensor slot_indices, at::Tensor x_r, at::Tensor x_w, at::Tensor x_k,
-    at::Tensor x_v, at::Tensor x_a, at::Tensor x_g,
-    at::Tensor query_start_loc, at::Tensor req_id);
+    at::Tensor x_v, at::Tensor x_a, at::Tensor x_g, at::Tensor query_start_loc,
+    at::Tensor req_id);
 
 at::Tensor cmix_mix_slot_cuda(int B, int T, int C, at::Tensor x,
-                              at::Tensor shift_state,
-                              at::Tensor slot_indices, at::Tensor x_k);
+                              at::Tensor shift_state, at::Tensor slot_indices,
+                              at::Tensor x_k);
 
 at::Tensor cmix_mix_cfg_slot_cuda(int B, int T, int C, at::Tensor x,
                                   at::Tensor shift_state,
@@ -1024,9 +1020,9 @@ at::Tensor cmix_mix_cfg_slot_cuda(int B, int T, int C, at::Tensor x,
                                   int threads);
 
 at::Tensor cmix_mix_varlen_cuda(int B, int total_tokens, int C, at::Tensor x,
-                                at::Tensor shift_state,
-                                at::Tensor slot_indices, at::Tensor x_k,
-                                at::Tensor query_start_loc, at::Tensor req_id);
+                                at::Tensor shift_state, at::Tensor slot_indices,
+                                at::Tensor x_k, at::Tensor query_start_loc,
+                                at::Tensor req_id);
 
 std::vector<at::Tensor> tmix_mix6_cuda(int B, int T, int C, at::Tensor x,
                                        at::Tensor shift_state, at::Tensor x_r,
@@ -1038,10 +1034,12 @@ std::vector<at::Tensor> tmix_mix6_cuda(int B, int T, int C, at::Tensor x,
                              x_k, x_v, x_a, x_g);
 }
 
-std::vector<at::Tensor> tmix_mix6_slot_cuda(
-    int B, int T, int C, at::Tensor x, at::Tensor shift_state,
-    at::Tensor slot_indices, at::Tensor x_r, at::Tensor x_w, at::Tensor x_k,
-    at::Tensor x_v, at::Tensor x_a, at::Tensor x_g) {
+std::vector<at::Tensor> tmix_mix6_slot_cuda(int B, int T, int C, at::Tensor x,
+                                            at::Tensor shift_state,
+                                            at::Tensor slot_indices,
+                                            at::Tensor x_r, at::Tensor x_w,
+                                            at::Tensor x_k, at::Tensor x_v,
+                                            at::Tensor x_a, at::Tensor x_g) {
   auto out_r = at::empty_like(x);
   auto out_w = at::empty_like(x);
   auto out_k = at::empty_like(x);
@@ -1139,8 +1137,8 @@ std::vector<at::Tensor> tmix_mix6_cfg_slot_cuda(
 std::vector<at::Tensor> tmix_mix6_varlen_cuda(
     int B, int total_tokens, int C, at::Tensor x, at::Tensor shift_state,
     at::Tensor slot_indices, at::Tensor x_r, at::Tensor x_w, at::Tensor x_k,
-    at::Tensor x_v, at::Tensor x_a, at::Tensor x_g,
-    at::Tensor query_start_loc, at::Tensor req_id) {
+    at::Tensor x_v, at::Tensor x_a, at::Tensor x_g, at::Tensor query_start_loc,
+    at::Tensor req_id) {
   auto out_r = at::empty_like(x);
   auto out_w = at::empty_like(x);
   auto out_k = at::empty_like(x);
@@ -1150,15 +1148,15 @@ std::vector<at::Tensor> tmix_mix6_varlen_cuda(
   constexpr int threads = 256;
   const int64_t total_pairs = static_cast<int64_t>(total_tokens) * (C / 2);
   auto stream = at::cuda::getCurrentCUDAStream();
-  tmix_mix6_varlen_kernel<<<
-      static_cast<int>(ceil_div(total_pairs, threads)), threads, 0, stream>>>(
+  tmix_mix6_varlen_kernel<<<static_cast<int>(ceil_div(total_pairs, threads)),
+                            threads, 0, stream>>>(
       C, x.data_ptr<dtype>(), shift_state.data_ptr<dtype>(),
-      slot_indices.data_ptr<int>(), x_r.data_ptr<dtype>(), x_w.data_ptr<dtype>(),
-      x_k.data_ptr<dtype>(), x_v.data_ptr<dtype>(), x_a.data_ptr<dtype>(),
-      x_g.data_ptr<dtype>(), out_r.data_ptr<dtype>(), out_w.data_ptr<dtype>(),
-      out_k.data_ptr<dtype>(), out_v.data_ptr<dtype>(), out_a.data_ptr<dtype>(),
-      out_g.data_ptr<dtype>(), query_start_loc.data_ptr<int>(),
-      req_id.data_ptr<int>(), total_pairs);
+      slot_indices.data_ptr<int>(), x_r.data_ptr<dtype>(),
+      x_w.data_ptr<dtype>(), x_k.data_ptr<dtype>(), x_v.data_ptr<dtype>(),
+      x_a.data_ptr<dtype>(), x_g.data_ptr<dtype>(), out_r.data_ptr<dtype>(),
+      out_w.data_ptr<dtype>(), out_k.data_ptr<dtype>(), out_v.data_ptr<dtype>(),
+      out_a.data_ptr<dtype>(), out_g.data_ptr<dtype>(),
+      query_start_loc.data_ptr<int>(), req_id.data_ptr<int>(), total_pairs);
   const int64_t state_pairs = static_cast<int64_t>(B) * (C / 2);
   update_shift_state_varlen_kernel<<<
       static_cast<int>(ceil_div(state_pairs, threads)), threads, 0, stream>>>(
@@ -1427,8 +1425,8 @@ at::Tensor cmix_mix_cuda(int B, int T, int C, at::Tensor x,
 }
 
 at::Tensor cmix_mix_slot_cuda(int B, int T, int C, at::Tensor x,
-                              at::Tensor shift_state,
-                              at::Tensor slot_indices, at::Tensor x_k) {
+                              at::Tensor shift_state, at::Tensor slot_indices,
+                              at::Tensor x_k) {
   auto out = at::empty_like(x);
   constexpr int threads = 256;
   const int64_t total_pairs = static_cast<int64_t>(B) * T * (C / 2);
@@ -1437,17 +1435,15 @@ at::Tensor cmix_mix_slot_cuda(int B, int T, int C, at::Tensor x,
                             ? slot_indices.data_ptr<int>()
                             : nullptr;
   if (T == 1) {
-    cmix_mix_kernel<true>
-        <<<static_cast<int>(ceil_div(total_pairs, threads)), threads, 0,
-           stream>>>(T, C, x.data_ptr<dtype>(), shift_state.data_ptr<dtype>(),
-                     slot_ptr, x_k.data_ptr<dtype>(), out.data_ptr<dtype>(),
-                     total_pairs);
+    cmix_mix_kernel<true><<<static_cast<int>(ceil_div(total_pairs, threads)),
+                            threads, 0, stream>>>(
+        T, C, x.data_ptr<dtype>(), shift_state.data_ptr<dtype>(), slot_ptr,
+        x_k.data_ptr<dtype>(), out.data_ptr<dtype>(), total_pairs);
   } else {
-    cmix_mix_kernel<false>
-        <<<static_cast<int>(ceil_div(total_pairs, threads)), threads, 0,
-           stream>>>(T, C, x.data_ptr<dtype>(), shift_state.data_ptr<dtype>(),
-                     slot_ptr, x_k.data_ptr<dtype>(), out.data_ptr<dtype>(),
-                     total_pairs);
+    cmix_mix_kernel<false><<<static_cast<int>(ceil_div(total_pairs, threads)),
+                             threads, 0, stream>>>(
+        T, C, x.data_ptr<dtype>(), shift_state.data_ptr<dtype>(), slot_ptr,
+        x_k.data_ptr<dtype>(), out.data_ptr<dtype>(), total_pairs);
     const int64_t state_pairs = static_cast<int64_t>(B) * (C / 2);
     update_shift_state_last_kernel<<<
         static_cast<int>(ceil_div(state_pairs, threads)), threads, 0, stream>>>(
@@ -1459,19 +1455,19 @@ at::Tensor cmix_mix_slot_cuda(int B, int T, int C, at::Tensor x,
 }
 
 at::Tensor cmix_mix_varlen_cuda(int B, int total_tokens, int C, at::Tensor x,
-                                at::Tensor shift_state,
-                                at::Tensor slot_indices, at::Tensor x_k,
-                                at::Tensor query_start_loc,
+                                at::Tensor shift_state, at::Tensor slot_indices,
+                                at::Tensor x_k, at::Tensor query_start_loc,
                                 at::Tensor req_id) {
   auto out = at::empty_like(x);
   constexpr int threads = 256;
   const int64_t total_pairs = static_cast<int64_t>(total_tokens) * (C / 2);
   auto stream = at::cuda::getCurrentCUDAStream();
-  cmix_mix_varlen_kernel<<<
-      static_cast<int>(ceil_div(total_pairs, threads)), threads, 0, stream>>>(
+  cmix_mix_varlen_kernel<<<static_cast<int>(ceil_div(total_pairs, threads)),
+                           threads, 0, stream>>>(
       C, x.data_ptr<dtype>(), shift_state.data_ptr<dtype>(),
-      slot_indices.data_ptr<int>(), x_k.data_ptr<dtype>(), out.data_ptr<dtype>(),
-      query_start_loc.data_ptr<int>(), req_id.data_ptr<int>(), total_pairs);
+      slot_indices.data_ptr<int>(), x_k.data_ptr<dtype>(),
+      out.data_ptr<dtype>(), query_start_loc.data_ptr<int>(),
+      req_id.data_ptr<int>(), total_pairs);
   const int64_t state_pairs = static_cast<int64_t>(B) * (C / 2);
   update_shift_state_varlen_kernel<<<
       static_cast<int>(ceil_div(state_pairs, threads)), threads, 0, stream>>>(
@@ -1501,17 +1497,15 @@ at::Tensor cmix_mix_cfg_slot_cuda(int B, int T, int C, at::Tensor x,
                             ? slot_indices.data_ptr<int>()
                             : nullptr;
   if (T == 1) {
-    cmix_mix_kernel<true>
-        <<<static_cast<int>(ceil_div(total_pairs, threads)), threads, 0,
-           stream>>>(T, C, x.data_ptr<dtype>(), shift_state.data_ptr<dtype>(),
-                     slot_ptr, x_k.data_ptr<dtype>(), out.data_ptr<dtype>(),
-                     total_pairs);
+    cmix_mix_kernel<true><<<static_cast<int>(ceil_div(total_pairs, threads)),
+                            threads, 0, stream>>>(
+        T, C, x.data_ptr<dtype>(), shift_state.data_ptr<dtype>(), slot_ptr,
+        x_k.data_ptr<dtype>(), out.data_ptr<dtype>(), total_pairs);
   } else {
-    cmix_mix_kernel<false>
-        <<<static_cast<int>(ceil_div(total_pairs, threads)), threads, 0,
-           stream>>>(T, C, x.data_ptr<dtype>(), shift_state.data_ptr<dtype>(),
-                     slot_ptr, x_k.data_ptr<dtype>(), out.data_ptr<dtype>(),
-                     total_pairs);
+    cmix_mix_kernel<false><<<static_cast<int>(ceil_div(total_pairs, threads)),
+                             threads, 0, stream>>>(
+        T, C, x.data_ptr<dtype>(), shift_state.data_ptr<dtype>(), slot_ptr,
+        x_k.data_ptr<dtype>(), out.data_ptr<dtype>(), total_pairs);
     const int64_t state_pairs = static_cast<int64_t>(B) * (C / 2);
     update_shift_state_last_kernel<<<
         static_cast<int>(ceil_div(state_pairs, threads)), threads, 0, stream>>>(

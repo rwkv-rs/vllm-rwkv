@@ -698,7 +698,9 @@ def test_rapid_sample_passes_indexed_penalties_to_indexed_kernel(
     assert torch.equal(out, torch.tensor([4, 5], dtype=torch.int32))
     assert captured["penalties"].shape == (4, 8)
     assert captured["penalty_indices"].is_contiguous()
-    assert torch.equal(captured["penalty_indices"], torch.tensor([3, 1], dtype=torch.int32))
+    assert torch.equal(
+        captured["penalty_indices"], torch.tensor([3, 1], dtype=torch.int32)
+    )
     assert torch.equal(captured["penalties_before"], torch.zeros(4, 8))
     assert penalties[3, 4] == 9.0
     assert penalties[1, 5] == 10.0

@@ -2651,7 +2651,7 @@ def test_rwkv7_vllm_forward_groups_equal_length_prefill_requests(monkeypatch):
     monkeypatch.setattr(rwkv7, "DTYPE", torch.float32)
     monkeypatch.setattr(rwkv7, "first_device", lambda: torch.device("cpu"))
 
-    calls = []
+    calls: list[tuple[Any, ...]] = []
     decode_state_ptrs = []
 
     def forward_tokens(tokens, state):
@@ -3091,7 +3091,7 @@ def test_rwkv7_vllm_forward_uses_varlen_prefill_metadata(monkeypatch):
     monkeypatch.setattr(rwkv7, "DTYPE", torch.float32)
     monkeypatch.setattr(rwkv7, "first_device", lambda: torch.device("cpu"))
 
-    calls = []
+    calls: list[tuple[Any, ...]] = []
     shift_state = torch.zeros((1, 2, 4, 3), dtype=torch.float32)
     wkv_state = torch.zeros((1, 4, 1, 1, 1), dtype=torch.float32)
     elapsed = torch.zeros((4,), dtype=torch.int32)
