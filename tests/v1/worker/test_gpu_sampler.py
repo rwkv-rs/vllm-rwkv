@@ -175,6 +175,7 @@ def test_penalties_state_keeps_mixed_rapid_params_as_vectors():
 def test_rapid_sampler_recomputes_processed_logits_for_logprobs(monkeypatch):
     sampler = object.__new__(Sampler)
     sampler.use_rapid = True
+    sampler.require_rapid = False
     sampler.use_flashinfer = False
     sampler.logprobs_mode = "processed_logprobs"
     sampler.rapid_penalties = None

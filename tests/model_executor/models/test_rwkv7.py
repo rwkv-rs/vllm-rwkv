@@ -397,6 +397,30 @@ def _new_rwkv7_model_state(
     )
 
 
+def _rwkv7_input_batch(
+    state: RWKV7ModelState,
+    *,
+    idx_mapping_np: np.ndarray,
+    query_start_loc: torch.Tensor,
+    is_prefilling_np: np.ndarray,
+    **kwargs: Any,
+) -> SimpleNamespace:
+    req_id_by_slot = {
+        req_slot: req_id for req_id, req_slot in state.req_id_to_index.items()
+    }
+    req_slots = np.asarray(idx_mapping_np, dtype=np.int32)
+    query_start_loc = query_start_loc.to(dtype=torch.int32, device="cpu")
+    return SimpleNamespace(
+        req_ids=[req_id_by_slot[int(req_slot)] for req_slot in req_slots],
+        idx_mapping_np=req_slots,
+        num_reqs=len(req_slots),
+        query_start_loc=query_start_loc,
+        query_start_loc_np=query_start_loc.numpy().copy(),
+        is_prefilling_np=np.asarray(is_prefilling_np, dtype=np.bool_),
+        **kwargs,
+    )
+
+
 def _assert_same_storage_view(actual: torch.Tensor, expected: torch.Tensor) -> None:
     assert actual.shape == expected.shape
     assert actual.stride() == expected.stride()
@@ -1410,9 +1434,9 @@ def test_rwkv7_model_state_allows_permuted_decode_schedule_with_slots():
     state = _new_rwkv7_model_state(max_num_reqs=4)
     state.add_request(0, _new_request("req-0"))
     state.add_request(1, _new_request("req-1"))
-    decode_batch = SimpleNamespace(
+    decode_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([0, 1], dtype=np.int32),
-        num_reqs=2,
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
@@ -1423,9 +1447,9 @@ def test_rwkv7_model_state_allows_permuted_decode_schedule_with_slots():
     state.wkv_state[:, 1].fill_(20)
     state.elapsed[:2] = torch.tensor([10, 20], dtype=torch.int32)
 
-    input_batch = SimpleNamespace(
+    input_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([1, 0], dtype=np.int32),
-        num_reqs=2,
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
@@ -1449,9 +1473,9 @@ def test_rwkv7_model_state_sorts_decode_wave_by_resident_row():
     for req_slot in range(4):
         state.add_request(req_slot, _new_request(f"req-{req_slot}"))
 
-    decode_batch = SimpleNamespace(
+    decode_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([0, 1, 2, 3], dtype=np.int32),
-        num_reqs=4,
         query_start_loc=torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32),
         is_prefilling_np=np.array([False, False, False, False], dtype=np.bool_),
     )
@@ -1496,9 +1520,9 @@ def test_rwkv7_model_state_uses_contiguous_decode_path_for_prefix_rows():
     state = _new_rwkv7_model_state(max_num_reqs=4)
     state.add_request(0, _new_request("req-0"))
     state.add_request(1, _new_request("req-1"))
-    input_batch = SimpleNamespace(
+    input_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([0, 1], dtype=np.int32),
-        num_reqs=2,
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
@@ -1526,9 +1550,9 @@ def test_rwkv7_model_state_keeps_steady_decode_slot_after_row_removal():
     state = _new_rwkv7_model_state(max_num_reqs=4)
     state.add_request(0, _new_request("req-0"))
     state.add_request(1, _new_request("req-1"))
-    decode_batch = SimpleNamespace(
+    decode_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([0, 1], dtype=np.int32),
-        num_reqs=2,
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
@@ -1545,9 +1569,9 @@ def test_rwkv7_model_state_keeps_steady_decode_slot_after_row_removal():
     assert torch.count_nonzero(state.wkv_state[:, 0]) == 0
     assert torch.all(state.wkv_state[:, 1] == 30)
     assert state.elapsed.tolist()[:2] == [0, 40]
-    decode_batch = SimpleNamespace(
+    decode_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([1], dtype=np.int32),
-        num_reqs=1,
         query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         is_prefilling_np=np.array([False], dtype=np.bool_),
     )
@@ -1626,9 +1650,9 @@ def test_rwkv7_model_state_keeps_decode_prefix_when_prefill_reuses_free_row():
     state = _new_rwkv7_model_state(max_num_reqs=4)
     state.add_request(0, _new_request("decode-low"))
     state.add_request(1, _new_request("decode-high"))
-    decode_batch = SimpleNamespace(
+    decode_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([0, 1], dtype=np.int32),
-        num_reqs=2,
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
@@ -1644,9 +1668,9 @@ def test_rwkv7_model_state_keeps_decode_prefix_when_prefill_reuses_free_row():
     assert decode_row == 1
     assert prefill_row == 0
 
-    mixed_batch = SimpleNamespace(
+    mixed_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([1, 2], dtype=np.int32),
-        num_reqs=2,
         query_start_loc=torch.tensor([0, 1, 4], dtype=torch.int32),
         is_prefilling_np=np.array([False, True], dtype=np.bool_),
         num_scheduled_tokens=np.array([1, 3], dtype=np.int32),
@@ -1697,16 +1721,16 @@ def test_rwkv7_prepare_permuted_decode_returns_slot_indices_before_forward():
     state.wkv_state[:, 0].fill_(30)
     state.wkv_state[:, 1].fill_(40)
     state.elapsed[:2] = torch.tensor([50, 60], dtype=torch.int32)
-    decode_batch = SimpleNamespace(
+    decode_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([0, 1], dtype=np.int32),
-        num_reqs=2,
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
     state.prepare_inputs(decode_batch, req_states=None)
-    input_batch = SimpleNamespace(
+    input_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([1, 0], dtype=np.int32),
-        num_reqs=2,
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
@@ -1734,9 +1758,9 @@ def test_rwkv7_model_state_keeps_decode_and_resident_prefill_slots_separate():
     state.wkv_state[:, 0].fill_(10)
     state.wkv_state[:, 1].fill_(20)
     state.elapsed[:2] = torch.tensor([10, 20], dtype=torch.int32)
-    input_batch = SimpleNamespace(
+    input_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([0, 1], dtype=np.int32),
-        num_reqs=2,
         query_start_loc=torch.tensor([0, 3, 4], dtype=torch.int32),
         is_prefilling_np=np.array([True, False], dtype=np.bool_),
         num_scheduled_tokens=np.array([3, 1], dtype=np.int32),
@@ -1766,17 +1790,17 @@ def test_rwkv7_model_state_rejects_partial_live_decode_wave():
     state = _new_rwkv7_model_state(max_num_reqs=4)
     state.add_request(0, _new_request("req-0"))
     state.add_request(1, _new_request("req-1"))
-    decode_batch = SimpleNamespace(
+    decode_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([0, 1], dtype=np.int32),
-        num_reqs=2,
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
     state.prepare_inputs(decode_batch, req_states=None)
 
-    input_batch = SimpleNamespace(
+    input_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([0], dtype=np.int32),
-        num_reqs=1,
         query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         is_prefilling_np=np.array([False], dtype=np.bool_),
     )
@@ -1791,16 +1815,16 @@ def test_rwkv7_model_state_does_not_park_unscheduled_decode_rows():
     state = _new_rwkv7_model_state(max_num_reqs=4)
     state.add_request(0, _new_request("req-0"))
     state.add_request(1, _new_request("req-1"))
-    decode_batch = SimpleNamespace(
+    decode_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([0, 1], dtype=np.int32),
-        num_reqs=2,
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
     state.prepare_inputs(decode_batch, req_states=None)
-    input_batch = SimpleNamespace(
+    input_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([1], dtype=np.int32),
-        num_reqs=1,
         query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         is_prefilling_np=np.array([False], dtype=np.bool_),
     )
@@ -1816,9 +1840,9 @@ def test_rwkv7_model_state_allows_permuted_decode_with_resident_prefill():
     state.add_request(0, _new_request("req-0"))
     state.add_request(1, _new_request("req-1"))
     state.add_request(2, _new_request("req-2"))
-    decode_batch = SimpleNamespace(
+    decode_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([0, 1], dtype=np.int32),
-        num_reqs=2,
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
@@ -1830,9 +1854,9 @@ def test_rwkv7_model_state_allows_permuted_decode_with_resident_prefill():
     state.wkv_state[:, 1].fill_(20)
     state.wkv_state[:, 2].fill_(30)
     state.elapsed[:3] = torch.tensor([10, 20, 30], dtype=torch.int32)
-    input_batch = SimpleNamespace(
+    input_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([1, 0, 2], dtype=np.int32),
-        num_reqs=3,
         query_start_loc=torch.tensor([0, 1, 2, 5], dtype=torch.int32),
         is_prefilling_np=np.array([False, False, True], dtype=np.bool_),
         num_scheduled_tokens=np.array([1, 1, 3], dtype=np.int32),
@@ -1864,9 +1888,9 @@ def test_rwkv7_model_state_keeps_prefill_to_decode_slot_stable():
     state.remove_request("req-1")
     assert state.req_slot_to_row[:3] == [0, -1, 2]
 
-    decode_batch = SimpleNamespace(
+    decode_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([0], dtype=np.int32),
-        num_reqs=1,
         query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         is_prefilling_np=np.array([False], dtype=np.bool_),
     )
@@ -1875,9 +1899,9 @@ def test_rwkv7_model_state_keeps_prefill_to_decode_slot_stable():
     state.wkv_state[:, 2].fill_(21)
     state.elapsed[2] = 22
 
-    prefill_to_decode_batch = SimpleNamespace(
+    prefill_to_decode_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([2], dtype=np.int32),
-        num_reqs=1,
         query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
         is_prefilling_np=np.array([True], dtype=np.bool_),
         num_scheduled_tokens=np.array([2], dtype=np.int32),
@@ -1911,17 +1935,17 @@ def _fragmented_mixed_rwkv7_inputs() -> tuple[RWKV7ModelState, dict[str, Any]]:
         state.add_request(req_slot, _new_request(f"req-{req_slot}"))
     state.remove_request("req-1")
 
-    decode_batch = SimpleNamespace(
+    decode_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([0], dtype=np.int32),
-        num_reqs=1,
         query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         is_prefilling_np=np.array([False], dtype=np.bool_),
     )
     state.prepare_inputs(decode_batch, req_states=None)
 
-    prefill_to_decode_batch = SimpleNamespace(
+    prefill_to_decode_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([2], dtype=np.int32),
-        num_reqs=1,
         query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
         is_prefilling_np=np.array([True], dtype=np.bool_),
         num_scheduled_tokens=np.array([2], dtype=np.int32),
@@ -1944,9 +1968,9 @@ def _fragmented_mixed_rwkv7_inputs() -> tuple[RWKV7ModelState, dict[str, Any]]:
     state.wkv_state[:, 2].fill_(21)
     state.wkv_state[:, 3].fill_(31)
     state.elapsed[:4] = torch.tensor([12, 0, 22, 32], dtype=torch.int32)
-    mixed_batch = SimpleNamespace(
+    mixed_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([0, 2, 3], dtype=np.int32),
-        num_reqs=3,
         query_start_loc=torch.tensor([0, 1, 2, 5], dtype=torch.int32),
         is_prefilling_np=np.array([False, False, True], dtype=np.bool_),
         num_scheduled_tokens=np.array([1, 1, 3], dtype=np.int32),
@@ -1982,9 +2006,9 @@ def test_rwkv7_model_state_prefill_uses_resident_state():
     state.shift_state.fill_(7)
     state.wkv_state.fill_(8)
     state.elapsed.fill_(9)
-    input_batch = SimpleNamespace(
+    input_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([2], dtype=np.int32),
-        num_reqs=1,
         query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
         is_prefilling_np=np.array([True], dtype=np.bool_),
         num_scheduled_tokens=np.array([3], dtype=np.int32),
@@ -2018,9 +2042,9 @@ def test_rwkv7_model_state_keeps_resident_prefill_row_when_decode_row_starts():
     state.wkv_state[:, 0].fill_(7)
     state.wkv_state[:, 1].fill_(9)
     state.elapsed[:2] = torch.tensor([11, 13], dtype=torch.int32)
-    input_batch = SimpleNamespace(
+    input_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([2], dtype=np.int32),
-        num_reqs=1,
         query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
         is_prefilling_np=np.array([True], dtype=np.bool_),
         num_scheduled_tokens=np.array([3], dtype=np.int32),
@@ -2056,9 +2080,9 @@ def test_rwkv7_model_state_prefill_becomes_decode_without_resident_copy():
     state.add_request(1, _new_request("req-1"))
     state.add_request(2, _new_request("req-2"))
     row = state.req_slot_to_row[2]
-    input_batch = SimpleNamespace(
+    input_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([2], dtype=np.int32),
-        num_reqs=1,
         query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
         is_prefilling_np=np.array([True], dtype=np.bool_),
         num_scheduled_tokens=np.array([3], dtype=np.int32),
@@ -2086,9 +2110,9 @@ def test_rwkv7_model_state_prefill_becomes_decode_without_resident_copy():
 def test_rwkv7_model_state_reports_pending_prefill_state_postprocess():
     state = _new_rwkv7_model_state(max_num_reqs=4)
     state.add_request(0, _new_request("req-0"))
-    input_batch = SimpleNamespace(
+    input_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([0], dtype=np.int32),
-        num_reqs=1,
         query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
         is_prefilling_np=np.array([True], dtype=np.bool_),
         num_scheduled_tokens=np.array([3], dtype=np.int32),
@@ -2211,9 +2235,9 @@ def test_rwkv7_model_state_remove_decode_row_keeps_other_resident_rows_stable():
     state = _new_rwkv7_model_state(max_num_reqs=5)
     for req_slot in range(4):
         state.add_request(req_slot, _new_request(f"req-{req_slot}"))
-    input_batch = SimpleNamespace(
+    input_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([0, 1], dtype=np.int32),
-        num_reqs=2,
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
@@ -2249,9 +2273,9 @@ def test_rwkv7_model_state_remove_prefill_row_preserves_decode_prefix():
     state = _new_rwkv7_model_state(max_num_reqs=5)
     for req_slot in range(4):
         state.add_request(req_slot, _new_request(f"req-{req_slot}"))
-    input_batch = SimpleNamespace(
+    input_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([0, 1], dtype=np.int32),
-        num_reqs=2,
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
@@ -2460,9 +2484,9 @@ def test_rwkv7_model_state_reports_equal_length_prefill_group():
     state = _new_rwkv7_model_state(max_num_reqs=4)
     for req_slot in range(4):
         state.add_request(req_slot, _new_request(f"req-{req_slot}"))
-    input_batch = SimpleNamespace(
+    input_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([0, 1, 2, 3], dtype=np.int32),
-        num_reqs=4,
         query_start_loc=torch.tensor([0, 1, 2, 4, 6], dtype=torch.int32),
         is_prefilling_np=np.array([False, False, True, True], dtype=np.bool_),
         num_scheduled_tokens=np.array([1, 1, 2, 2], dtype=np.int32),
@@ -2479,11 +2503,10 @@ def test_rwkv7_model_state_reports_equal_length_prefill_group():
 def test_rwkv7_model_state_rejects_grouped_prefill_fallback_on_fast_path():
     state = _new_rwkv7_model_state(max_num_reqs=2)
     state.add_request(0, _new_request("req-0"))
-    input_batch = SimpleNamespace(
+    input_batch = _rwkv7_input_batch(
+        state,
         idx_mapping_np=np.array([0], dtype=np.int32),
-        num_reqs=1,
         query_start_loc=torch.tensor([0, 0], dtype=torch.int32),
-        query_start_loc_np=np.array([0, 0], dtype=np.int32),
         is_prefilling_np=np.array([True], dtype=np.bool_),
         num_scheduled_tokens=np.array([0], dtype=np.int32),
         num_computed_prefill_tokens_np=np.array([0], dtype=np.int32),
@@ -2698,7 +2721,7 @@ def test_rwkv7_contiguous_decode_token_range_rejects_non_prefix_rows():
         RWKV7ForCausalLM._contiguous_decode_token_range(2, [1, 2], [0, 1])
 
 
-def test_rwkv7_vllm_forward_resident_row_without_decode_metadata_uses_singleton_prefill(
+def test_rwkv7_vllm_forward_uses_grouped_singleton_prefill(
     monkeypatch,
 ):
     monkeypatch.setattr(rwkv7, "C", 3)
@@ -2736,6 +2759,9 @@ def test_rwkv7_vllm_forward_resident_row_without_decode_metadata_uses_singleton_
         shift_state=shift_state,
         wkv_state=wkv_state,
         elapsed=elapsed,
+        rwkv_prefill_token_ranges=[(0, 0, 1)],
+        rwkv_prefill_rows=[1],
+        rwkv_prefill_groups=[(0, 1, 1, 0, 1, 1)],
     )
 
     assert seen == [([[20]], shift_state[:, :, 1:2, :].storage_offset())]
@@ -2801,6 +2827,7 @@ def test_rwkv7_vllm_forward_passes_resident_state_to_single_prefill(monkeypatch)
         rwkv_decode_token_positions=[0, 1],
         rwkv_prefill_token_ranges=[(2, 2, 5)],
         rwkv_prefill_rows=[2],
+        rwkv_prefill_groups=[(2, 3, 3, 2, 5, 2)],
     )
 
     assert calls == [
@@ -3076,6 +3103,7 @@ def test_rwkv7_vllm_pp_non_last_stage_returns_v_first(monkeypatch):
         rwkv_decode_token_positions=[0, 1],
         rwkv_prefill_token_ranges=[(2, 2, 4)],
         rwkv_prefill_rows=[2],
+        rwkv_prefill_groups=[(2, 3, 2, 2, 4, 2)],
     )
 
     assert isinstance(out, IntermediateTensors)
@@ -3136,6 +3164,9 @@ def test_rwkv7_vllm_pp_non_last_stage_all_gathers_tp_v_first(monkeypatch):
         shift_state=torch.zeros((1, 2, 1, 4), dtype=torch.float32),
         wkv_state=torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32),
         elapsed=torch.zeros((1,), dtype=torch.int32),
+        rwkv_decode_batch_size=1,
+        rwkv_decode_rows=[0],
+        rwkv_decode_token_positions=[0],
     )
 
     assert isinstance(out, IntermediateTensors)
@@ -3218,6 +3249,7 @@ def test_rwkv7_vllm_pp_last_stage_uses_intermediate_tensors(monkeypatch):
         rwkv_decode_token_positions=[0, 1],
         rwkv_prefill_token_ranges=[(2, 2, 4)],
         rwkv_prefill_rows=[2],
+        rwkv_prefill_groups=[(2, 3, 2, 2, 4, 2)],
     )
 
     assert isinstance(out, torch.Tensor)
@@ -3274,6 +3306,9 @@ def test_rwkv7_vllm_pp_last_stage_slices_full_tp_v_first(monkeypatch):
         shift_state=torch.zeros((1, 2, 1, 4), dtype=torch.float32),
         wkv_state=torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32),
         elapsed=torch.zeros((1,), dtype=torch.int32),
+        rwkv_decode_batch_size=1,
+        rwkv_decode_rows=[0],
+        rwkv_decode_token_positions=[0],
     )
 
     assert isinstance(out, torch.Tensor)
