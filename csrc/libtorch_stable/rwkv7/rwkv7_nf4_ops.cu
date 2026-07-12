@@ -265,7 +265,7 @@ __global__ __launch_bounds__(32, 1) void linear_nvfp4_rkv_orig_row1_blk16_f16_ke
       const __half2 wv3 = byte_lut[packed.x >> 24];
       const __half2 wv4 = byte_lut[packed.y & 0xFF];
       const __half2 wv5 = byte_lut[(packed.y >> 8) & 0xFF];
-      const __half2 wv6 = byte_lut[packed.y >> 16];
+      const __half2 wv6 = byte_lut[(packed.y >> 16) & 0xFF];
       const __half2 wv7 = byte_lut[packed.y >> 24];
       __half2 acc_h = __hfma2(wv0, xv0, __float2half2_rn(0.0f));
       acc_h = __hfma2(wv1, xv1, acc_h);
@@ -633,6 +633,13 @@ __global__ __launch_bounds__(32, 1) void linear_nvfp4_orig_row1_blk16_f16_kernel
     }
   }
 }
+
+// ═══════════════════════════════════════════════════════════════
+// M=2 GEMV: x[2,K] — 2 rows batched, same weight
+// ═══════════════════════════════════════════════════════════════
+template <int OutTile>
+__global__ __launch_bounds__(32, 1) void linear_nvfp4_orig_row2_blk16_f16_kernel(
+    int K,
     int N,
     const dtype* __restrict__ x,
     const uint8_t* __restrict__ w_nf4,

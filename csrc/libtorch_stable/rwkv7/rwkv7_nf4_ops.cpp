@@ -167,6 +167,7 @@ torch::Tensor cmix_sparse_down_relu_rows_t512_nf4(
 
 TORCH_LIBRARY(rwkv7_nf4_ops, m) {
   m.def("linear_nf4_orig_rows_exact_f16(Tensor x, Tensor w_nf4, Tensor b_scale, float t_scale, int threads, int out_tile, bool use4) -> Tensor");
+  m.def("linear_nvfp4_rkv_orig_row1_blk16_f16(Tensor x_r, Tensor x_k, Tensor x_v, Tensor w_r, Tensor w_k, Tensor w_v, Tensor bs_r, Tensor bs_k, Tensor bs_v, float ts_r, float ts_k, float ts_v, int out_tile) -> Tensor[]");
   m.def("linear_nvfp4_orig_row1_blk16_f16(Tensor x, Tensor w_nf4, Tensor b_scale, float t_scale, int out_tile) -> Tensor");
   m.def("linear_nvfp4_orig_row2_blk16_f16(Tensor x, Tensor w_nf4, Tensor b_scale, float t_scale, int out_tile) -> Tensor");
   m.def("linear_nf4_orig_rows_f16(Tensor x, Tensor w_nf4, Tensor b_scale, float t_scale, int row_tile, int out_tile) -> Tensor");
@@ -178,12 +179,18 @@ TORCH_LIBRARY(rwkv7_nf4_ops, m) {
 
 TORCH_LIBRARY_IMPL(rwkv7_nf4_ops, CUDA, m) {
   m.impl("linear_nf4_orig_rows_exact_f16", &linear_nf4_orig_rows_exact_f16);
-    m.impl("linear_nvfp4_rkv_orig_row1_blk16_f16", &linear_nvfp4_rkv_orig_row1_blk16_f16);
-m.impl("linear_nvfp4_orig_row1_blk16_f16", &linear_nvfp4_orig_row1_blk16_f16);
+  m.impl("linear_nvfp4_rkv_orig_row1_blk16_f16", &linear_nvfp4_rkv_orig_row1_blk16_f16);
+  m.impl("linear_nvfp4_orig_row1_blk16_f16", &linear_nvfp4_orig_row1_blk16_f16);
   m.impl("linear_nvfp4_orig_row2_blk16_f16", &linear_nvfp4_orig_row2_blk16_f16);
   m.impl("linear_nf4_orig_rows_f16", &linear_nf4_orig_rows_f16);
   m.impl("dequant_nf4_to_f16", &dequant_nf4_to_f16);
   m.impl("cmix_sparse_down_relu_one_nf4", &cmix_sparse_down_relu_one_nf4);
   m.impl("cmix_sparse_down_relu_rows_nf4", &cmix_sparse_down_relu_rows_nf4);
   m.impl("cmix_sparse_down_relu_rows_t512_nf4", &cmix_sparse_down_relu_rows_t512_nf4);
+}
+
+// Standalone module init (for testing without vllm build system)
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    // The TORCH_LIBRARY registration above handles op registration.
+    // This empty PYBIND11_MODULE just makes it a loadable Python extension.
 }
