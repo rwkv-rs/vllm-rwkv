@@ -501,7 +501,7 @@ class LlamaBidirectionalConfig(VerifyAndUpdateConfig):
             "last": "LAST",
         }
 
-        pooling_type = pooling_type_map.get(hf_config.pooling, None)
+        pooling_type = pooling_type_map.get(hf_config.pooling)
         if pooling_type is None:
             raise ValueError(f"pool_type {hf_config.pooling!r} not supported")
 
@@ -607,35 +607,12 @@ class MambaModelConfig(VerifyAndUpdateConfig):
 class RWKV7ForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
-        rwkv_knobs = {
-            "VLLM_RWKV7_WKV_MODE": (
-                envs.VLLM_RWKV7_WKV_MODE,
-                {"fp16", "fp32io16"},
-            ),
-            "VLLM_RWKV7_EMB_DEVICE": (
-                envs.VLLM_RWKV7_EMB_DEVICE,
-                {"cpu", "gpu"},
-            ),
-            "VLLM_RWKV7_RKV_MODE": (
-                envs.VLLM_RWKV7_RKV_MODE,
-                {"auto", "on", "off", "batched"},
-            ),
-            "VLLM_RWKV7_CMIX_SPARSE": (
-                envs.VLLM_RWKV7_CMIX_SPARSE,
-                {"auto", "no-fc", "off"},
-            ),
-            "VLLM_RWKV7_LOW_RANK_WEIGHT": (
-                envs.VLLM_RWKV7_LOW_RANK_WEIGHT,
-                {"orig", "transpose", "both"},
-            ),
-        }
-        for name, (value, allowed) in rwkv_knobs.items():
-            if value not in allowed:
-                allowed_values = ", ".join(sorted(allowed))
-                raise ValueError(
-                    f"{name}={value!r} is invalid for RWKV7. "
-                    f"Expected one of: {allowed_values}."
-                )
+        wkv_mode = envs.VLLM_RWKV7_WKV_MODE
+        if wkv_mode not in {"fp16", "fp32io16"}:
+            raise ValueError(
+                f"VLLM_RWKV7_WKV_MODE={wkv_mode!r} is invalid for RWKV7. "
+                "Expected one of: fp16, fp32io16."
+            )
 
         cache_config = getattr(vllm_config, "cache_config", None)
         if cache_config is not None:
@@ -885,6 +862,23 @@ class VoyageQwen3BidirectionalEmbedModelConfig(VerifyAndUpdateConfig):
         model_config.hf_config.embedding_size = model_config.hf_config.num_labels
 
 
+class LongcatFlashNgramForCausalLMConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        # LongCat-Flash-Lite's zero-expert MoE trips a data-dependent assert
+        # under torch.compile, and its n-gram inputs_embeds are only wired for
+        # FULL cudagraph capture (PIECEWISE prefill drops them). Default to
+        # no-compile + FULL cudagraph (prefill runs eager) unless the user
+        # configured compilation explicitly.
+        from vllm.config.compilation import CompilationMode, CUDAGraphMode
+
+        compilation_config = vllm_config.compilation_config
+        if compilation_config.mode is None:
+            compilation_config.mode = CompilationMode.NONE
+        if compilation_config.cudagraph_mode is None:
+            compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+
+
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "ColBERTJinaRobertaModel": JinaRobertaModelConfig,
     "ColQwen3_5": ColQwen3_5Config,
@@ -898,6 +892,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Gemma4ForConditionalGeneration": Gemma4Config,
     "Gemma4UnifiedForConditionalGeneration": Gemma4Config,
     "GptOssForCausalLM": GptOssForCausalLMConfig,
+    "LongcatFlashNgramForCausalLM": LongcatFlashNgramForCausalLMConfig,
     "GteModel": SnowflakeGteNewModelConfig,
     "GteNewForSequenceClassification": GteNewModelConfig,
     "GteNewModel": GteNewModelConfig,

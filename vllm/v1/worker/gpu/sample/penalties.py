@@ -96,8 +96,29 @@ class PenaltiesState:
         )
 
     def rapid_penalty_params(
-        self, expanded_idx_mapping: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self,
+        expanded_idx_mapping: torch.Tensor,
+        idx_mapping_np: np.ndarray | None = None,
+        *,
+        scalar_if_uniform: bool = False,
+    ) -> tuple[torch.Tensor | float, torch.Tensor | float, torch.Tensor | float]:
+        if scalar_if_uniform:
+            if idx_mapping_np is None:
+                raise ValueError("idx_mapping_np is required for scalar_if_uniform")
+            presence_values = self.presence_penalty.np[idx_mapping_np]
+            repetition_values = self.repetition_penalty.np[idx_mapping_np]
+            decay_values = self.penalty_decay.np[idx_mapping_np]
+            if (
+                presence_values.size > 0
+                and np.all(presence_values == presence_values[0])
+                and np.all(repetition_values == repetition_values[0])
+                and np.all(decay_values == decay_values[0])
+            ):
+                return (
+                    float(presence_values[0]),
+                    float(repetition_values[0]),
+                    float(decay_values[0]),
+                )
         return (
             self.presence_penalty.gpu[expanded_idx_mapping],
             self.repetition_penalty.gpu[expanded_idx_mapping],

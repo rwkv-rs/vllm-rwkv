@@ -43,6 +43,29 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _attention_backend_name(backend: object) -> str | None:
+    get_name = getattr(backend, "get_name", None)
+    if get_name is None:
+        return None
+    try:
+        return get_name()
+    except NotImplementedError:
+        return None
+
+
+def _has_flashinfer_attention_backend(runner: "GPUModelRunner") -> bool:
+    for groups in getattr(runner, "attn_groups", []) or ():
+        for group in groups:
+            name = _attention_backend_name(getattr(group, "backend", None))
+            if name is not None and name.startswith("FLASHINFER"):
+                return True
+    return False
+
+
+def _is_flashinfer_backend(backend: object) -> bool:
+    return _attention_backend_name(backend) == "FLASHINFER"
+
+
 def kernel_warmup(worker: "Worker"):
     from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
         minimax_m3_msa_warmup,
@@ -91,18 +114,17 @@ def kernel_warmup(worker: "Worker"):
     # FlashInfer autotune for Hopper (SM 9.0) and Blackwell (SM 10.0) GPUs
     if enable_flashinfer_autotune is False:
         logger.info("Skipping FlashInfer autotune because it is disabled.")
+    elif not _has_flashinfer_attention_backend(worker.model_runner):
+        logger.info(
+            "Skipping FlashInfer autotune because the model has no FlashInfer "
+            "attention backend."
+        )
     elif has_flashinfer() and current_platform.has_device_capability(90):
         flashinfer_autotune(worker.model_runner)
 
     # FlashInfer attention warmup
     # Only warmup if the model has FlashInfer attention groups
     # and is not a pooling model
-    def _is_flashinfer_backend(backend):
-        try:
-            return backend.get_name() == "FLASHINFER"
-        except NotImplementedError:
-            return False
-
     if (
         not worker.model_runner.is_pooling_model
         and worker.model_runner.attn_groups
@@ -130,6 +152,25 @@ def kernel_warmup(worker: "Worker"):
         cutedsl_warmup()
 
 
+def _flashinfer_autotune_skip_ops(runner: "GPUModelRunner") -> set[str] | None:
+    if envs.VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS is not None:
+        return set(envs.VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS) or None
+
+    from vllm.model_executor.kernels.linear import (
+        FlashInferCuteDslNvFp4LinearKernel,
+    )
+
+    for module in runner.get_model().modules():
+        for holder_name in ("quant_method", "scheme"):
+            kernel = getattr(getattr(module, holder_name, None), "kernel", None)
+            # CuTe-DSL mm_fp4 tuning JIT-compiles every tactic and its
+            # fallback is already the heuristic; all mm_fp4 backends share
+            # the "fp4_gemm" op name, so skip only when cute-dsl is selected.
+            if isinstance(kernel, FlashInferCuteDslNvFp4LinearKernel):
+                return {"fp4_gemm"}
+    return None
+
+
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     """
     Autotune FlashInfer operations.
@@ -146,21 +187,23 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     import vllm.utils.flashinfer as fi_utils
     from vllm.distributed.parallel_state import get_world_group
 
+    autotune_kwargs: dict = {}
+    skip_ops = _flashinfer_autotune_skip_ops(runner)
+    if skip_ops:
+        logger.info(
+            "Skipping FlashInfer autotuning for ops %s",
+            sorted(skip_ops),
+        )
+        autotune_kwargs["skip_ops"] = skip_ops
+
     use_persistent_cache = True
 
-    deepep_a2a_backends = {
-        "deepep_high_throughput",
-        "deepep_low_latency",
-        "deepep_v2",
-    }
-    if runner.vllm_config.parallel_config.all2all_backend in deepep_a2a_backends:
-        # DeepEP dispatch/combine can timeout when only rank 0
-        # performs autotune and falls behind other ranks.
-        # Thus we skip persistent cache in this case.
+    # When distributed, tune on every rank so the collectives stay synchronized.
+    if get_world_group().world_size > 1:
         use_persistent_cache = False
 
     if not use_persistent_cache:
-        with torch.inference_mode(), fi_utils.autotune():
+        with torch.inference_mode(), fi_utils.autotune(**autotune_kwargs):
             runner._dummy_run(
                 num_tokens=runner.scheduler_config.max_num_batched_tokens,
                 skip_eplb=True,
@@ -188,7 +231,9 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
 
     with torch.inference_mode():
         if is_leader:
-            with fi_utils.autotune(tune_mode=True, cache=str(cache_path)):
+            with fi_utils.autotune(
+                tune_mode=True, cache=str(cache_path), **autotune_kwargs
+            ):
                 runner._dummy_run(**dummy_run_kwargs)
         else:
             runner._dummy_run(**dummy_run_kwargs)

@@ -15,9 +15,23 @@ from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.models.config import RWKV7ForCausalLMConfig
 from vllm.model_executor.models.interfaces import supports_pp
 from vllm.model_executor.models.rwkv7 import RWKV7ForCausalLM
+<<<<<<< HEAD
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.worker.gpu.model_states.rwkv import RWKV7ModelState
+=======
+from vllm.sampling_params import SamplingParams
+from vllm.sequence import IntermediateTensors
+from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.engine.core import _supports_no_kv_cache_chunked_prefill
+from vllm.v1.worker.gpu.model_states.rwkv import RWKV7ModelState
+from vllm.v1.worker.gpu_input_batch import (
+    CachedRequestState,
+)
+from vllm.v1.worker.gpu_input_batch import (
+    InputBatch as LegacyInputBatch,
+)
+>>>>>>> origin/rwkv
 
 
 def test_rwkv7_cuda_ops_match_torch_reference():
@@ -70,6 +84,22 @@ def _new_request(req_id: str) -> NewRequestData:
     )
 
 
+<<<<<<< HEAD
+=======
+def _new_cached_request_state(req_id: str) -> CachedRequestState:
+    return CachedRequestState(
+        req_id=req_id,
+        prompt_token_ids=[1, 2, 3],
+        mm_features=[],
+        sampling_params=SamplingParams(max_tokens=8),
+        generator=None,
+        block_ids=([],),
+        num_computed_tokens=0,
+        output_token_ids=[],
+    )
+
+
+>>>>>>> origin/rwkv
 def _new_rwkv7_forward_test_model(**attrs: Any) -> RWKV7ForCausalLM:
     model = object.__new__(RWKV7ForCausalLM)
     nn.Module.__init__(model)
@@ -83,8 +113,11 @@ def _new_rwkv7_forward_test_model(**attrs: Any) -> RWKV7ForCausalLM:
 def _new_rwkv7_for_weight_tests() -> RWKV7ForCausalLM:
     model = _new_rwkv7_forward_test_model()
     model.z = {"old": torch.tensor([1])}
+<<<<<<< HEAD
     model.emb_cpu = True
     model.emb_cache = {(1, 1): (torch.empty(1), torch.empty(1))}
+=======
+>>>>>>> origin/rwkv
     model._dummy_param = nn.Parameter(torch.empty(0), requires_grad=False)
     return model
 
@@ -107,6 +140,235 @@ def _new_default_loader_for_weight_tests(
     )
 
 
+<<<<<<< HEAD
+=======
+def test_rwkv7_forward_tokens_keeps_slot_selected_cmix_path(monkeypatch):
+    monkeypatch.setattr(rwkv7, "C", 4)
+    seen = []
+
+    def embed(tokens):
+        return torch.zeros((*tokens.shape, 4), dtype=torch.float32)
+
+    def forward_from_x(x, state, path, *, slot_indices=None):
+        seen.append((path.cmix_mode, path.rows, slot_indices.tolist()))
+        return x.squeeze(1)
+
+    model = _new_rwkv7_forward_test_model(
+        embed=embed,
+        forward_from_x=forward_from_x,
+    )
+
+    out = RWKV7ForCausalLM.forward_tokens(
+        model,
+        torch.tensor([7], dtype=torch.long),
+        [torch.empty(0)],
+        slot_indices=torch.tensor([3], dtype=torch.int32),
+    )
+
+    assert out.shape == (1, 4)
+    assert seen == [(rwkv7.select_path(1, 1).cmix_mode, 1, [3])]
+    assert seen[0][0] != rwkv7.CMIX_DENSE
+
+
+def test_rwkv7_forward_layer_range_uses_slot_fused_cmix(monkeypatch):
+    monkeypatch.setattr(rwkv7, "C", 4)
+    calls: list[Any] = []
+
+    def fused_cmix(x, residual, shift_state, weight, bias, x_k, slot_indices):
+        calls.append(("fused_cmix", shift_state.shape, slot_indices.tolist()))
+        return x + residual, torch.ones_like(x)
+
+    def advance_slots(elapsed, slot_indices, amount):
+        calls.append(("advance", slot_indices.tolist(), amount))
+
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "add_layer_norm_cmix_mix_f16_slots",
+        fused_cmix,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "advance_i32_slots",
+        advance_slots,
+        raising=False,
+    )
+
+    model = _new_rwkv7_forward_test_model()
+    model.start_layer = 0
+    model.end_layer = 1
+    model.z = {
+        "blocks.0.ln1.weight": torch.empty(4),
+        "blocks.0.ln1.bias": torch.empty(4),
+        "blocks.0.ln2.weight": torch.empty(4),
+        "blocks.0.ln2.bias": torch.empty(4),
+        "blocks.0.ffn.x_k": torch.empty(4),
+    }
+    model.ln = lambda x, weight, bias: x
+    model.add = lambda x, y: x + y
+
+    def tmix(layer, x, shift_state, wkv_state, elapsed_t, v_first, *args, **kwargs):
+        return x, v_first
+
+    def cmix_from_mixed(mixed, p, path):
+        calls.append(("cmix_path", path.cmix_mode))
+        return mixed
+
+    model.tmix = tmix
+    model.cmix_from_mixed = cmix_from_mixed
+    slot_indices = torch.tensor([3, 1], dtype=torch.int32)
+    state = [
+        torch.zeros((1, 2, 6, 4)),
+        torch.empty((1,)),
+        torch.zeros((6,), dtype=torch.int32),
+    ]
+
+    RWKV7ForCausalLM.forward_layer_range(
+        model,
+        torch.zeros((2, 1, 4)),
+        state,
+        rwkv7.PathConfig(2, rwkv7.CMIX_ROWS2_NOFC),
+        v_first=None,
+        final=False,
+        all_logits=False,
+        slot_indices=slot_indices,
+    )
+
+    assert calls == [
+        ("fused_cmix", torch.Size([6, 4]), [3, 1]),
+        ("cmix_path", rwkv7.CMIX_ROWS2_NOFC),
+        ("advance", [3, 1], 1),
+    ]
+
+
+def test_rwkv7_forward_layer_range_uses_slot_fused_tmix_for_batched_decode(
+    monkeypatch,
+):
+    monkeypatch.setattr(rwkv7, "C", 4)
+    calls: list[Any] = []
+
+    def fused_cmix(x, residual, shift_state, weight, bias, x_k, slot_indices):
+        calls.append(("fused_cmix", slot_indices.tolist()))
+        return x + residual, torch.ones_like(x)
+
+    def fused_tmix(
+        x,
+        residual,
+        shift_state,
+        weight,
+        bias,
+        x_r,
+        x_w,
+        x_k,
+        x_v,
+        x_a,
+        x_g,
+        slot_indices,
+    ):
+        calls.append(("fused_tmix", x.shape[0], slot_indices.tolist()))
+        mixed = tuple(torch.full_like(x, fill_value=float(i)) for i in range(6))
+        return (x + residual, *mixed)
+
+    def advance_slots(elapsed, slot_indices, amount):
+        calls.append(("advance", slot_indices.tolist(), amount))
+
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "add_layer_norm_cmix_mix_f16_slots",
+        fused_cmix,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "add_layer_norm_tmix_mix6_f16_slots",
+        fused_tmix,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "advance_i32_slots",
+        advance_slots,
+        raising=False,
+    )
+
+    model = _new_rwkv7_forward_test_model()
+    model.start_layer = 0
+    model.end_layer = 2
+    model.z = {}
+    for layer in range(2):
+        model.z.update(
+            {
+                f"blocks.{layer}.ln1.weight": torch.empty(4),
+                f"blocks.{layer}.ln1.bias": torch.empty(4),
+                f"blocks.{layer}.ln2.weight": torch.empty(4),
+                f"blocks.{layer}.ln2.bias": torch.empty(4),
+                f"blocks.{layer}.ffn.x_k": torch.empty(4),
+                f"blocks.{layer}.att.x_r": torch.empty(4),
+                f"blocks.{layer}.att.x_w": torch.empty(4),
+                f"blocks.{layer}.att.x_k": torch.empty(4),
+                f"blocks.{layer}.att.x_v": torch.empty(4),
+                f"blocks.{layer}.att.x_a": torch.empty(4),
+                f"blocks.{layer}.att.x_g": torch.empty(4),
+            }
+        )
+    model.ln = lambda x, weight, bias: x
+    model.add = lambda x, y: x + y
+
+    def add_ln(x, residual, weight, bias):
+        calls.append(("split_add_ln", x.shape[0]))
+        return x + residual, x + residual
+
+    def tmix(
+        layer,
+        x,
+        shift_state,
+        wkv_state,
+        elapsed_t,
+        v_first,
+        p,
+        path,
+        pre_mix=None,
+        *,
+        slot_indices=None,
+    ):
+        calls.append(("tmix", layer, pre_mix is not None, slot_indices.tolist()))
+        return x, v_first
+
+    def cmix_from_mixed(mixed, p, path):
+        return mixed
+
+    model.add_ln = add_ln
+    model.tmix = tmix
+    model.cmix_from_mixed = cmix_from_mixed
+    slot_indices = torch.tensor([3, 1], dtype=torch.int32)
+    state = [
+        torch.zeros((2, 2, 6, 4)),
+        torch.empty((2,)),
+        torch.zeros((6,), dtype=torch.int32),
+    ]
+
+    RWKV7ForCausalLM.forward_layer_range(
+        model,
+        torch.zeros((2, 1, 4)),
+        state,
+        rwkv7.PathConfig(2, rwkv7.CMIX_ROWS2_NOFC),
+        v_first=None,
+        final=False,
+        all_logits=False,
+        slot_indices=slot_indices,
+    )
+
+    assert calls == [
+        ("tmix", 0, False, [3, 1]),
+        ("fused_cmix", [3, 1]),
+        ("fused_tmix", 2, [3, 1]),
+        ("tmix", 1, True, [3, 1]),
+        ("fused_cmix", [3, 1]),
+        ("advance", [3, 1], 1),
+    ]
+
+
+>>>>>>> origin/rwkv
 def _rwkv7_vllm_config(
     *,
     enforce_eager: bool,
@@ -152,6 +414,33 @@ def _new_rwkv7_model_state(
     )
 
 
+<<<<<<< HEAD
+=======
+def _rwkv7_input_batch(
+    state: RWKV7ModelState,
+    *,
+    idx_mapping_np: np.ndarray,
+    query_start_loc: torch.Tensor,
+    is_prefilling_np: np.ndarray,
+    **kwargs: Any,
+) -> SimpleNamespace:
+    req_id_by_slot = {
+        req_slot: req_id for req_id, req_slot in state.req_id_to_index.items()
+    }
+    req_slots = np.asarray(idx_mapping_np, dtype=np.int32)
+    query_start_loc = query_start_loc.to(dtype=torch.int32, device="cpu")
+    return SimpleNamespace(
+        req_ids=[req_id_by_slot[int(req_slot)] for req_slot in req_slots],
+        idx_mapping_np=req_slots,
+        num_reqs=len(req_slots),
+        query_start_loc=query_start_loc,
+        query_start_loc_np=query_start_loc.numpy().copy(),
+        is_prefilling_np=np.asarray(is_prefilling_np, dtype=np.bool_),
+        **kwargs,
+    )
+
+
+>>>>>>> origin/rwkv
 def _assert_same_storage_view(actual: torch.Tensor, expected: torch.Tensor) -> None:
     assert actual.shape == expected.shape
     assert actual.stride() == expected.stride()
@@ -159,6 +448,17 @@ def _assert_same_storage_view(actual: torch.Tensor, expected: torch.Tensor) -> N
     assert actual.untyped_storage().data_ptr() == expected.untyped_storage().data_ptr()
 
 
+<<<<<<< HEAD
+=======
+def _assert_no_varlen_prefill_inputs(inputs: dict[str, Any]) -> None:
+    assert "rwkv_prefill_query_start_loc" not in inputs
+    assert "rwkv_prefill_slot_indices" not in inputs
+    assert "rwkv_prefill_token_positions" not in inputs
+    assert "rwkv_prefill_req_id" not in inputs
+    assert "rwkv_prefill_max_t" not in inputs
+
+
+>>>>>>> origin/rwkv
 def test_rwkv7_rejects_torch_compile():
     with pytest.raises(ValueError, match="RWKV7 does not support torch.compile"):
         RWKV7ForCausalLM(
@@ -342,6 +642,21 @@ def test_rwkv7_config_disables_prefix_caching():
     assert vllm_config.cache_config.enable_prefix_caching is False
 
 
+<<<<<<< HEAD
+=======
+def test_rwkv7_allows_chunked_prefill_without_kv_cache():
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            runner_type="generate",
+            architectures=["RWKV7ForCausalLM"],
+            hf_config=SimpleNamespace(architectures=[]),
+        )
+    )
+
+    assert _supports_no_kv_cache_chunked_prefill(vllm_config)
+
+
+>>>>>>> origin/rwkv
 def test_rwkv7_config_rejects_decode_budget_below_max_running_reqs():
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=False),
@@ -392,6 +707,7 @@ def test_rwkv7_config_preserves_disabled_cudagraph():
     assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
 
 
+<<<<<<< HEAD
 def test_rwkv7_config_rejects_invalid_albatross_knob(monkeypatch):
     import vllm.model_executor.models.config as model_config
 
@@ -415,6 +731,75 @@ def test_rwkv7_select_path_treats_batched_rkv_as_enabled(monkeypatch):
 
 
 def test_rwkv7_dummy_inputs_decode_capture_advertises_compact_rows():
+=======
+@pytest.mark.parametrize(
+    ("mode", "state_dtype", "allow_fp16_accumulation", "accumulation_policy"),
+    [
+        ("fp32io16", torch.float32, False, "fp32"),
+        ("fp16", torch.float16, True, "fp16"),
+    ],
+)
+def test_rwkv7_execution_profile_is_coherent(
+    mode,
+    state_dtype,
+    allow_fp16_accumulation,
+    accumulation_policy,
+):
+    profile = rwkv7.resolve_execution_profile(mode)
+
+    assert profile.wkv_mode == mode
+    assert profile.wkv_state_dtype == state_dtype
+    assert profile.allow_fp16_accumulation is allow_fp16_accumulation
+    assert profile.gemm_accumulation_policy == accumulation_policy
+
+
+def test_rwkv7_execution_profile_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="VLLM_RWKV7_WKV_MODE"):
+        rwkv7.resolve_execution_profile("legacy")
+
+
+@pytest.mark.parametrize("mode", ["fp32io16", "fp16"])
+def test_rwkv7_passes_profile_accumulation_to_custom_op(monkeypatch, mode):
+    calls: list[Any] = []
+
+    def linear_f16(x, weight, allow):
+        calls.append(("linear_f16", allow))
+        return torch.empty((x.size(0), weight.size(1)))
+
+    monkeypatch.setattr(torch.ops.rwkv7_v3a_ops, "linear_f16", linear_f16)
+    profile = rwkv7.resolve_execution_profile(mode)
+    model = _new_rwkv7_forward_test_model(
+        allow_fp16_accumulation=profile.allow_fp16_accumulation
+    )
+    x = torch.empty((2, 4))
+
+    model.linear(x, torch.empty((4, 3)))
+
+    assert calls == [("linear_f16", profile.allow_fp16_accumulation)]
+
+
+def test_rwkv7_model_exposes_no_legacy_execution_paths():
+    for name in (
+        "_get_cpu_embedding_cache",
+        "_copy_cpu_embedding_to_device",
+        "prepare_cudagraph_embedding",
+        "linear_orig_layout",
+        "_linear_f16_orig",
+        "_linear_f16_orig_lt_cfg",
+        "linear_t_orig",
+    ):
+        assert not hasattr(RWKV7ForCausalLM, name)
+
+    for name in (
+        "parse_orig_linear_groups",
+        "use_orig_linear",
+        "is_orig_linear_weight",
+    ):
+        assert not hasattr(rwkv7, name)
+
+
+def test_rwkv7_dummy_inputs_decode_capture_advertises_contiguous_rows():
+>>>>>>> origin/rwkv
     state = object.__new__(RWKV7ModelState)
     state.num_layers = 2
     state.max_num_reqs = 4
@@ -426,6 +811,11 @@ def test_rwkv7_dummy_inputs_decode_capture_advertises_compact_rows():
     state.wkv_state = torch.zeros((2, 4, 2, 4, 4), dtype=torch.float32)
     state.elapsed = torch.zeros((4,), dtype=torch.int32)
     state.execution_idx_mapping = torch.arange(4, dtype=torch.int32)
+<<<<<<< HEAD
+=======
+    state.decode_slot_indices = torch.empty((4,), dtype=torch.int32)
+    state.decode_token_positions = torch.empty((4,), dtype=torch.long)
+>>>>>>> origin/rwkv
 
     inputs = state.prepare_dummy_inputs(num_reqs=3, num_tokens=3)
 
@@ -447,6 +837,12 @@ def test_rwkv7_dummy_inputs_decode_capture_uses_persistent_state_buffers():
     state.shift_state = torch.ones((2, 2, 4, 8), dtype=torch.float16)
     state.wkv_state = torch.ones((2, 4, 2, 4, 4), dtype=torch.float32)
     state.elapsed = torch.ones((4,), dtype=torch.int32)
+<<<<<<< HEAD
+=======
+    state.execution_idx_mapping = torch.arange(4, dtype=torch.int32)
+    state.decode_slot_indices = torch.empty((4,), dtype=torch.int32)
+    state.decode_token_positions = torch.empty((4,), dtype=torch.long)
+>>>>>>> origin/rwkv
 
     inputs = state.prepare_dummy_inputs(num_reqs=3, num_tokens=3)
 
@@ -458,6 +854,7 @@ def test_rwkv7_dummy_inputs_decode_capture_uses_persistent_state_buffers():
     assert inputs["rwkv_decode_batch_size"] == 3
     assert inputs["rwkv_decode_rows"] == [0, 1, 2]
     assert inputs["rwkv_decode_token_positions"] == [0, 1, 2]
+<<<<<<< HEAD
 
 
 def test_rwkv7_embed_uses_cached_device_buffer_during_cuda_graph_capture(
@@ -582,6 +979,9 @@ def test_rwkv7_prepare_cudagraph_inputs_rejects_non_dense_decode_positions():
         )
 
     assert seen == []
+=======
+    assert inputs["slot_indices"] is None
+>>>>>>> origin/rwkv
 
 
 def test_rwkv7_load_weights_preprocesses_full_raw_weights(monkeypatch):
@@ -596,7 +996,10 @@ def test_rwkv7_load_weights_preprocesses_full_raw_weights(monkeypatch):
         calls.append(set(z))
         z["processed"] = torch.tensor([3.0])
         self.z = z
+<<<<<<< HEAD
         self.emb_cache = {}
+=======
+>>>>>>> origin/rwkv
 
     monkeypatch.setattr(RWKV7ForCausalLM, "_preprocess_weights", fake_preprocess)
 
@@ -609,7 +1012,10 @@ def test_rwkv7_load_weights_preprocesses_full_raw_weights(monkeypatch):
     torch.testing.assert_close(model.z["emb.weight"], raw_weights["emb.weight"])
     torch.testing.assert_close(model.z["head.weight"], raw_weights["head.weight"])
     torch.testing.assert_close(model.z["processed"], torch.tensor([3.0]))
+<<<<<<< HEAD
     assert model.emb_cache == {}
+=======
+>>>>>>> origin/rwkv
 
 
 def test_rwkv7_default_loader_validation_uses_raw_weight_names():
@@ -752,7 +1158,10 @@ def test_rwkv7_online_weight_update_restores_old_weights_after_partial_preproces
 
     def fail_after_partial_preprocess(self, z):
         self.z = {"partial": torch.tensor([9.0])}
+<<<<<<< HEAD
         self.emb_cache = {}
+=======
+>>>>>>> origin/rwkv
         raise RuntimeError("post preprocess failure")
 
     monkeypatch.setattr(
@@ -769,6 +1178,7 @@ def test_rwkv7_online_weight_update_restores_old_weights_after_partial_preproces
     assert not hasattr(model, "_pending_weight_update")
 
 
+<<<<<<< HEAD
 def test_rwkv7_online_weight_update_cpu_copies_pending_tensors(monkeypatch):
     model = _new_rwkv7_for_weight_tests()
     model.raw_weight_names = {"emb.weight"}
@@ -794,6 +1204,8 @@ def test_rwkv7_online_weight_update_cpu_copies_pending_tensors(monkeypatch):
     assert captured["emb.weight"].item() == 1.0
 
 
+=======
+>>>>>>> origin/rwkv
 def test_rwkv7_online_weight_update_cuda_stages_pending_tensors_on_device(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for CUDA staging")
@@ -1047,7 +1459,11 @@ def test_rwkv7_compute_logits_all_gathers_tensor_parallel_vocab(monkeypatch):
     ]
 
 
+<<<<<<< HEAD
 def test_rwkv7_compute_sampling_logits_uses_packed_decode_view():
+=======
+def test_rwkv7_compute_sampling_logits_uses_packed_decode_view(monkeypatch):
+>>>>>>> origin/rwkv
     model = _new_rwkv7_forward_test_model()
     hidden_states = torch.arange(20, dtype=torch.float32).reshape(5, 4)
     logits_indices = torch.arange(3, dtype=torch.int64)
@@ -1061,6 +1477,18 @@ def test_rwkv7_compute_sampling_logits_uses_packed_decode_view():
         return expected_logits
 
     model.compute_logits = compute_logits
+<<<<<<< HEAD
+=======
+
+    def fail_arange(*_args, **_kwargs):
+        pytest.fail("sampling logits fast path must not allocate expected indices")
+
+    def fail_sync_guard(*_args, **_kwargs):
+        pytest.fail("sampling logits fast path must not run tensor equality guards")
+
+    monkeypatch.setattr(torch, "arange", fail_arange)
+    monkeypatch.setattr(torch, "equal", fail_sync_guard)
+>>>>>>> origin/rwkv
     input_batch = SimpleNamespace(
         num_reqs=3,
         num_draft_tokens=0,
@@ -1069,6 +1497,10 @@ def test_rwkv7_compute_sampling_logits_uses_packed_decode_view():
         query_start_loc_np=np.array([0, 1, 2, 3], dtype=np.int32),
         is_prefilling_np=np.zeros(3, dtype=np.bool_),
         logits_indices=logits_indices,
+<<<<<<< HEAD
+=======
+        rwkv_sampling_logits_contiguous=True,
+>>>>>>> origin/rwkv
     )
 
     logits = model.compute_sampling_logits(hidden_states, logits_indices, input_batch)
@@ -1118,6 +1550,22 @@ def test_rwkv7_compute_sampling_logits_uses_packed_decode_view():
             ),
         ),
         (
+<<<<<<< HEAD
+=======
+            "metadata_declines",
+            torch.tensor([0, 1], dtype=torch.int64),
+            SimpleNamespace(
+                num_reqs=2,
+                num_draft_tokens=0,
+                num_scheduled_tokens=np.ones(2, dtype=np.int32),
+                query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+                query_start_loc_np=np.array([0, 1, 2], dtype=np.int32),
+                is_prefilling_np=np.zeros(2, dtype=np.bool_),
+                rwkv_sampling_logits_contiguous=False,
+            ),
+        ),
+        (
+>>>>>>> origin/rwkv
             "missing_prefill_metadata",
             torch.tensor([0, 1], dtype=torch.int64),
             SimpleNamespace(
@@ -1167,7 +1615,10 @@ def test_rwkv7_tensor_parallel_embedding_masks_remote_tokens(monkeypatch):
     model.tp_size = 2
     model.tp_rank = 0
     model.vocab_size = 5
+<<<<<<< HEAD
     model.emb_cpu = False
+=======
+>>>>>>> origin/rwkv
     model.z = {
         "emb.weight": torch.tensor(
             [
@@ -1221,6 +1672,7 @@ def test_rwkv7_model_state_lifecycle_resets_reused_rows():
     assert state.elapsed[row].item() == 0
 
 
+<<<<<<< HEAD
 def test_rwkv7_model_state_rejects_permuted_decode_schedule():
     state = _new_rwkv7_model_state(max_num_reqs=4)
     state.add_request(0, _new_request("req-0"))
@@ -1228,6 +1680,15 @@ def test_rwkv7_model_state_rejects_permuted_decode_schedule():
     decode_batch = SimpleNamespace(
         idx_mapping_np=np.array([0, 1], dtype=np.int32),
         num_reqs=2,
+=======
+def test_rwkv7_model_state_allows_permuted_decode_schedule_with_slots():
+    state = _new_rwkv7_model_state(max_num_reqs=4)
+    state.add_request(0, _new_request("req-0"))
+    state.add_request(1, _new_request("req-1"))
+    decode_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
@@ -1238,18 +1699,34 @@ def test_rwkv7_model_state_rejects_permuted_decode_schedule():
     state.wkv_state[:, 1].fill_(20)
     state.elapsed[:2] = torch.tensor([10, 20], dtype=torch.int32)
 
+<<<<<<< HEAD
     input_batch = SimpleNamespace(
         idx_mapping_np=np.array([1, 0], dtype=np.int32),
         num_reqs=2,
+=======
+    input_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([1, 0], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
 
+<<<<<<< HEAD
     with pytest.raises(RuntimeError, match="resident-row order"):
         state.prepare_inputs(input_batch, req_states=None)
 
     assert state.req_slot_to_row[:2] == [0, 1]
     assert state.row_to_req_slot[:2] == [0, 1]
+=======
+    inputs = state.prepare_inputs(input_batch, req_states=None)
+
+    assert state.req_slot_to_row[:2] == [0, 1]
+    assert state.row_to_req_slot[:2] == [0, 1]
+    assert inputs["idx_mapping"].tolist() == [1, 0]
+    assert inputs["rwkv_decode_rows"] == [1, 0]
+    assert inputs["slot_indices"].tolist() == [1, 0]
+>>>>>>> origin/rwkv
     assert torch.all(state.shift_state[:, :, 0] == 10)
     assert torch.all(state.shift_state[:, :, 1] == 20)
     assert torch.all(state.wkv_state[:, 0] == 10)
@@ -1262,9 +1739,15 @@ def test_rwkv7_model_state_sorts_decode_wave_by_resident_row():
     for req_slot in range(4):
         state.add_request(req_slot, _new_request(f"req-{req_slot}"))
 
+<<<<<<< HEAD
     decode_batch = SimpleNamespace(
         idx_mapping_np=np.array([0, 1, 2, 3], dtype=np.int32),
         num_reqs=4,
+=======
+    decode_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([0, 1, 2, 3], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32),
         is_prefilling_np=np.array([False, False, False, False], dtype=np.bool_),
     )
@@ -1305,6 +1788,7 @@ def test_rwkv7_model_state_sort_keeps_one_token_prefill_after_decode():
     assert sorted_req_ids == ["req-0", "req-1", "req-2"]
 
 
+<<<<<<< HEAD
 def test_rwkv7_model_state_reports_current_decode_context_size_not_capacity():
     state = _new_rwkv7_model_state(max_num_reqs=4)
     state.add_request(0, _new_request("req-0"))
@@ -1313,10 +1797,22 @@ def test_rwkv7_model_state_reports_current_decode_context_size_not_capacity():
         num_reqs=1,
         query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         is_prefilling_np=np.array([False], dtype=np.bool_),
+=======
+def test_rwkv7_model_state_uses_contiguous_decode_path_for_prefix_rows():
+    state = _new_rwkv7_model_state(max_num_reqs=4)
+    state.add_request(0, _new_request("req-0"))
+    state.add_request(1, _new_request("req-1"))
+    input_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        is_prefilling_np=np.array([False, False], dtype=np.bool_),
+>>>>>>> origin/rwkv
     )
 
     inputs = state.prepare_inputs(input_batch, req_states=None)
 
+<<<<<<< HEAD
     assert inputs["rwkv_decode_batch_size"] == 1
     assert inputs["rwkv_decode_rows"] == [0]
     assert inputs["rwkv_decode_token_positions"] == [0]
@@ -1329,6 +1825,32 @@ def test_rwkv7_model_state_compacts_steady_decode_after_row_removal():
     decode_batch = SimpleNamespace(
         idx_mapping_np=np.array([0, 1], dtype=np.int32),
         num_reqs=2,
+=======
+    assert inputs["rwkv_decode_batch_size"] == 2
+    assert inputs["rwkv_decode_rows"] == [0, 1]
+    assert inputs["rwkv_decode_token_positions"] == [0, 1]
+    assert inputs["slot_indices"] is None
+
+
+def test_rwkv7_model_state_exposes_no_legacy_state_movement_path():
+    for name in (
+        "_state_row_nbytes",
+        "_sync_decode_rows_to_resident_rows",
+        "_fill_decode_row_hole",
+        "_move_decode_row",
+        "_compact_decode_rows_into_free_prefix",
+    ):
+        assert not hasattr(RWKV7ModelState, name)
+
+
+def test_rwkv7_model_state_keeps_steady_decode_slot_after_row_removal():
+    state = _new_rwkv7_model_state(max_num_reqs=4)
+    state.add_request(0, _new_request("req-0"))
+    state.add_request(1, _new_request("req-1"))
+    decode_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
@@ -1338,6 +1860,7 @@ def test_rwkv7_model_state_compacts_steady_decode_after_row_removal():
     state.elapsed[1] = 40
     state.remove_request("req-0")
 
+<<<<<<< HEAD
     assert state.req_slot_to_row[:2] == [-1, 0]
     assert state.row_to_req_slot[:2] == [1, -1]
     assert torch.all(state.shift_state[:, :, 0] == 20)
@@ -1348,6 +1871,18 @@ def test_rwkv7_model_state_compacts_steady_decode_after_row_removal():
     decode_batch = SimpleNamespace(
         idx_mapping_np=np.array([1], dtype=np.int32),
         num_reqs=1,
+=======
+    assert state.req_slot_to_row[:2] == [-1, 1]
+    assert state.row_to_req_slot[:2] == [-1, 1]
+    assert torch.count_nonzero(state.shift_state[:, :, 0]) == 0
+    assert torch.all(state.shift_state[:, :, 1] == 20)
+    assert torch.count_nonzero(state.wkv_state[:, 0]) == 0
+    assert torch.all(state.wkv_state[:, 1] == 30)
+    assert state.elapsed.tolist()[:2] == [0, 40]
+    decode_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([1], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         is_prefilling_np=np.array([False], dtype=np.bool_),
     )
@@ -1355,6 +1890,7 @@ def test_rwkv7_model_state_compacts_steady_decode_after_row_removal():
     inputs = state.prepare_inputs(decode_batch, req_states=None)
 
     assert inputs["rwkv_decode_batch_size"] == 1
+<<<<<<< HEAD
     assert inputs["idx_mapping"].tolist() == [0]
     assert inputs["rwkv_decode_rows"] == [0]
     assert inputs["rwkv_decode_token_positions"] == [0]
@@ -1366,15 +1902,88 @@ def test_rwkv7_model_state_compacts_steady_decode_after_row_removal():
         "decode_compactions": 0,
         "decode_compaction_rows": 0,
     }
+=======
+    assert inputs["idx_mapping"].tolist() == [1]
+    assert inputs["rwkv_decode_rows"] == [1]
+    assert inputs["rwkv_decode_token_positions"].tolist() == [0]
+    assert inputs["slot_indices"].tolist() == [1]
+    assert inputs["shift_state"].data_ptr() == state.shift_state.data_ptr()
+    assert inputs["wkv_state"].data_ptr() == state.wkv_state.data_ptr()
+    assert inputs["elapsed"].data_ptr() == state.elapsed.data_ptr()
+
+
+def test_rwkv7_model_state_keeps_slots_after_generic_input_batch_condense():
+    state = _new_rwkv7_model_state(
+        max_num_reqs=4,
+        hidden_size=3,
+        head_size=1,
+        num_attention_heads=1,
+    )
+    input_batch = LegacyInputBatch(
+        max_num_reqs=4,
+        max_model_len=16,
+        max_num_batched_tokens=16,
+        device=torch.device("cpu"),
+        vocab_size=128,
+        block_sizes=[1],
+        kernel_block_sizes=[1],
+        max_num_blocks_per_req=[16],
+    )
+    for req_slot in range(3):
+        req_id = f"req-{req_slot}"
+        assert input_batch.add_request(_new_cached_request_state(req_id)) == req_slot
+        state.add_request(req_slot, _new_request(req_id))
+
+    first_decode_batch = SimpleNamespace(
+        req_ids=["req-0", "req-1", "req-2"],
+        idx_mapping_np=np.array([0, 1, 2], dtype=np.int32),
+        num_reqs=3,
+        query_start_loc=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        query_start_loc_np=np.array([0, 1, 2, 3], dtype=np.int32),
+        is_prefilling_np=np.array([False, False, False], dtype=np.bool_),
+    )
+    state.prepare_inputs(first_decode_batch, req_states=None)
+    state.shift_state[:, :, 2].fill_(20)
+    state.wkv_state[:, 2].fill_(30)
+    state.elapsed[2] = 40
+
+    input_batch.remove_request("req-1")
+    state.remove_request("req-1")
+    input_batch.condense()
+    assert input_batch.req_ids == ["req-0", "req-2"]
+    assert input_batch.req_id_to_index == {"req-0": 0, "req-2": 1}
+
+    input_batch.idx_mapping_np = np.array([0, 1], dtype=np.int32)
+    input_batch.query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32)
+    input_batch.query_start_loc_np = np.array([0, 1, 2], dtype=np.int32)
+    input_batch.is_prefilling_np = np.array([False, False], dtype=np.bool_)
+    inputs = state.prepare_inputs(input_batch, req_states=None)
+
+    assert state.req_id_to_index == {"req-0": 0, "req-2": 2}
+    assert state.req_slot_to_row[:3] == [0, -1, 2]
+    assert state.row_to_req_slot[:3] == [0, -1, 2]
+    assert inputs["idx_mapping"].tolist() == [0, 2]
+    assert inputs["rwkv_decode_rows"] == [0, 2]
+    assert inputs["slot_indices"].tolist() == [0, 2]
+    assert torch.all(state.shift_state[:, :, 2] == 20)
+    assert torch.all(state.wkv_state[:, 2] == 30)
+    assert state.elapsed.tolist()[:3] == [0, 0, 40]
+>>>>>>> origin/rwkv
 
 
 def test_rwkv7_model_state_keeps_decode_prefix_when_prefill_reuses_free_row():
     state = _new_rwkv7_model_state(max_num_reqs=4)
     state.add_request(0, _new_request("decode-low"))
     state.add_request(1, _new_request("decode-high"))
+<<<<<<< HEAD
     decode_batch = SimpleNamespace(
         idx_mapping_np=np.array([0, 1], dtype=np.int32),
         num_reqs=2,
+=======
+    decode_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
@@ -1387,12 +1996,21 @@ def test_rwkv7_model_state_keeps_decode_prefix_when_prefill_reuses_free_row():
     state.add_request(2, _new_request("prefill-low"))
     decode_row = state.req_slot_to_row[1]
     prefill_row = state.req_slot_to_row[2]
+<<<<<<< HEAD
     assert decode_row == 0
     assert prefill_row == 1
 
     mixed_batch = SimpleNamespace(
         idx_mapping_np=np.array([1, 2], dtype=np.int32),
         num_reqs=2,
+=======
+    assert decode_row == 1
+    assert prefill_row == 0
+
+    mixed_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([1, 2], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 1, 4], dtype=torch.int32),
         is_prefilling_np=np.array([False, True], dtype=np.bool_),
         num_scheduled_tokens=np.array([1, 3], dtype=np.int32),
@@ -1402,6 +2020,7 @@ def test_rwkv7_model_state_keeps_decode_prefix_when_prefill_reuses_free_row():
 
     inputs = state.prepare_inputs(mixed_batch, req_states=None)
 
+<<<<<<< HEAD
     assert inputs["idx_mapping"].tolist() == [0, 1]
     assert inputs["rwkv_decode_batch_size"] == 1
     assert inputs["rwkv_decode_rows"] == [0]
@@ -1409,17 +2028,33 @@ def test_rwkv7_model_state_keeps_decode_prefix_when_prefill_reuses_free_row():
     assert inputs["rwkv_prefill_rows"] == [prefill_row]
     assert inputs["rwkv_prefill_groups"] == [(1, 2, 3, 1, 4, prefill_row)]
     assert inputs["prefill_idx_mapping"].tolist() == [-1, -1]
+=======
+    assert inputs["idx_mapping"].tolist() == [1, 0]
+    assert inputs["rwkv_decode_batch_size"] == 1
+    assert inputs["rwkv_decode_rows"] == [1]
+    assert inputs["rwkv_decode_token_positions"].tolist() == [0]
+    assert inputs["slot_indices"].tolist() == [1]
+    assert inputs["rwkv_prefill_rows"] == [prefill_row]
+    assert inputs["rwkv_prefill_groups"] == [(1, 2, 3, 1, 4, prefill_row)]
+    _assert_no_varlen_prefill_inputs(inputs)
+>>>>>>> origin/rwkv
     assert inputs["shift_state"].data_ptr() == state.shift_state.data_ptr()
     assert inputs["wkv_state"].data_ptr() == state.wkv_state.data_ptr()
     assert inputs["elapsed"].data_ptr() == state.elapsed.data_ptr()
     assert inputs["prefill_shift_state"].data_ptr() == state.shift_state.data_ptr()
     assert inputs["prefill_wkv_state"].data_ptr() == state.wkv_state.data_ptr()
     assert inputs["prefill_elapsed"].data_ptr() == state.elapsed.data_ptr()
+<<<<<<< HEAD
     assert state.num_decode_rows == 1
     assert state.decode_req_slots == {1}
     assert state._prefill_decode_rows == [prefill_row]
     assert state.req_slot_to_row[:3] == [-1, decode_row, prefill_row]
     assert state.row_to_req_slot[:3] == [1, 2, -1]
+=======
+    assert state.decode_req_slots == {1}
+    assert state.req_slot_to_row[:3] == [-1, decode_row, prefill_row]
+    assert state.row_to_req_slot[:3] == [2, 1, -1]
+>>>>>>> origin/rwkv
     assert 2 in state.free_rows
     assert torch.count_nonzero(state.shift_state[:, :, prefill_row]) == 0
     assert torch.all(state.shift_state[:, :, decode_row] == 20)
@@ -1427,10 +2062,17 @@ def test_rwkv7_model_state_keeps_decode_prefix_when_prefill_reuses_free_row():
     assert torch.count_nonzero(state.wkv_state[:, prefill_row]) == 0
     assert torch.all(state.wkv_state[:, decode_row] == 20)
     assert torch.count_nonzero(state.wkv_state[:, 2]) == 0
+<<<<<<< HEAD
     assert state.elapsed.tolist()[:3] == [20, 0, 0]
 
 
 def test_rwkv7_prepare_permuted_decode_rejects_before_forward():
+=======
+    assert state.elapsed.tolist()[:3] == [0, 20, 0]
+
+
+def test_rwkv7_prepare_permuted_decode_returns_slot_indices_before_forward():
+>>>>>>> origin/rwkv
     state = _new_rwkv7_model_state(
         max_num_reqs=2,
         hidden_size=3,
@@ -1444,25 +2086,47 @@ def test_rwkv7_prepare_permuted_decode_rejects_before_forward():
     state.wkv_state[:, 0].fill_(30)
     state.wkv_state[:, 1].fill_(40)
     state.elapsed[:2] = torch.tensor([50, 60], dtype=torch.int32)
+<<<<<<< HEAD
     decode_batch = SimpleNamespace(
         idx_mapping_np=np.array([0, 1], dtype=np.int32),
         num_reqs=2,
+=======
+    decode_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
     state.prepare_inputs(decode_batch, req_states=None)
+<<<<<<< HEAD
     input_batch = SimpleNamespace(
         idx_mapping_np=np.array([1, 0], dtype=np.int32),
         num_reqs=2,
+=======
+    input_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([1, 0], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
 
+<<<<<<< HEAD
     with pytest.raises(RuntimeError, match="resident-row order"):
         state.prepare_inputs(input_batch, req_states=None)
 
     assert state.req_slot_to_row[:2] == [0, 1]
     assert state.row_to_req_slot[:2] == [0, 1]
+=======
+    inputs = state.prepare_inputs(input_batch, req_states=None)
+
+    assert state.req_slot_to_row[:2] == [0, 1]
+    assert state.row_to_req_slot[:2] == [0, 1]
+    assert inputs["idx_mapping"].tolist() == [1, 0]
+    assert inputs["rwkv_decode_rows"] == [1, 0]
+    assert inputs["slot_indices"].tolist() == [1, 0]
+>>>>>>> origin/rwkv
     assert torch.all(state.shift_state[:, :, 0] == 10)
     assert torch.all(state.shift_state[:, :, 1] == 20)
     assert torch.all(state.wkv_state[:, 0] == 30)
@@ -1470,7 +2134,11 @@ def test_rwkv7_prepare_permuted_decode_rejects_before_forward():
     assert state.elapsed.tolist() == [50, 60]
 
 
+<<<<<<< HEAD
 def test_rwkv7_model_state_rejects_decode_blocked_by_resident_prefill():
+=======
+def test_rwkv7_model_state_keeps_decode_and_resident_prefill_slots_separate():
+>>>>>>> origin/rwkv
     state = _new_rwkv7_model_state(max_num_reqs=4)
     state.add_request(0, _new_request("req-0"))
     state.add_request(1, _new_request("req-1"))
@@ -1479,9 +2147,15 @@ def test_rwkv7_model_state_rejects_decode_blocked_by_resident_prefill():
     state.wkv_state[:, 0].fill_(10)
     state.wkv_state[:, 1].fill_(20)
     state.elapsed[:2] = torch.tensor([10, 20], dtype=torch.int32)
+<<<<<<< HEAD
     input_batch = SimpleNamespace(
         idx_mapping_np=np.array([0, 1], dtype=np.int32),
         num_reqs=2,
+=======
+    input_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 3, 4], dtype=torch.int32),
         is_prefilling_np=np.array([True, False], dtype=np.bool_),
         num_scheduled_tokens=np.array([3, 1], dtype=np.int32),
@@ -1489,11 +2163,25 @@ def test_rwkv7_model_state_rejects_decode_blocked_by_resident_prefill():
         prefill_len_np=np.array([3, 1], dtype=np.int32),
     )
 
+<<<<<<< HEAD
     with pytest.raises(RuntimeError, match="cannot compact decode rows"):
         state.prepare_inputs(input_batch, req_states=None)
 
     assert state.req_slot_to_row[:2] == [0, 1]
     assert state.row_to_req_slot[:2] == [0, 1]
+=======
+    inputs = state.prepare_inputs(input_batch, req_states=None)
+
+    assert state.req_slot_to_row[:2] == [0, 1]
+    assert state.row_to_req_slot[:2] == [0, 1]
+    assert inputs["idx_mapping"].tolist() == [0, 1]
+    assert inputs["rwkv_decode_batch_size"] == 1
+    assert inputs["rwkv_decode_rows"] == [1]
+    assert inputs["slot_indices"].tolist() == [1]
+    assert inputs["rwkv_prefill_rows"] == [0]
+    assert inputs["rwkv_prefill_groups"] == [(0, 1, 3, 0, 3, 0)]
+    _assert_no_varlen_prefill_inputs(inputs)
+>>>>>>> origin/rwkv
     assert torch.all(state.shift_state[:, :, 0] == 10)
     assert torch.all(state.shift_state[:, :, 1] == 20)
     assert torch.all(state.wkv_state[:, 0] == 10)
@@ -1505,24 +2193,40 @@ def test_rwkv7_model_state_rejects_partial_live_decode_wave():
     state = _new_rwkv7_model_state(max_num_reqs=4)
     state.add_request(0, _new_request("req-0"))
     state.add_request(1, _new_request("req-1"))
+<<<<<<< HEAD
     decode_batch = SimpleNamespace(
         idx_mapping_np=np.array([0, 1], dtype=np.int32),
         num_reqs=2,
+=======
+    decode_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
     state.prepare_inputs(decode_batch, req_states=None)
 
+<<<<<<< HEAD
     input_batch = SimpleNamespace(
         idx_mapping_np=np.array([0], dtype=np.int32),
         num_reqs=1,
+=======
+    input_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([0], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         is_prefilling_np=np.array([False], dtype=np.bool_),
     )
 
     with pytest.raises(RuntimeError, match="all live decode rows"):
         state.prepare_inputs(input_batch, req_states=None)
+<<<<<<< HEAD
     assert state.num_decode_rows == 2
+=======
+    assert len(state.decode_req_slots) == 2
+>>>>>>> origin/rwkv
     assert state.req_slot_to_row[:2] == [0, 1]
 
 
@@ -1530,34 +2234,60 @@ def test_rwkv7_model_state_does_not_park_unscheduled_decode_rows():
     state = _new_rwkv7_model_state(max_num_reqs=4)
     state.add_request(0, _new_request("req-0"))
     state.add_request(1, _new_request("req-1"))
+<<<<<<< HEAD
     decode_batch = SimpleNamespace(
         idx_mapping_np=np.array([0, 1], dtype=np.int32),
         num_reqs=2,
+=======
+    decode_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
     state.prepare_inputs(decode_batch, req_states=None)
+<<<<<<< HEAD
     input_batch = SimpleNamespace(
         idx_mapping_np=np.array([1], dtype=np.int32),
         num_reqs=1,
+=======
+    input_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([1], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         is_prefilling_np=np.array([False], dtype=np.bool_),
     )
 
     with pytest.raises(RuntimeError, match="all live decode rows"):
         state.prepare_inputs(input_batch, req_states=None)
+<<<<<<< HEAD
     assert state.num_decode_rows == 2
     assert state.req_slot_to_row[:2] == [0, 1]
 
 
 def test_rwkv7_model_state_rejects_permuted_decode_with_resident_prefill():
+=======
+    assert len(state.decode_req_slots) == 2
+    assert state.req_slot_to_row[:2] == [0, 1]
+
+
+def test_rwkv7_model_state_allows_permuted_decode_with_resident_prefill():
+>>>>>>> origin/rwkv
     state = _new_rwkv7_model_state(max_num_reqs=4)
     state.add_request(0, _new_request("req-0"))
     state.add_request(1, _new_request("req-1"))
     state.add_request(2, _new_request("req-2"))
+<<<<<<< HEAD
     decode_batch = SimpleNamespace(
         idx_mapping_np=np.array([0, 1], dtype=np.int32),
         num_reqs=2,
+=======
+    decode_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
@@ -1569,9 +2299,15 @@ def test_rwkv7_model_state_rejects_permuted_decode_with_resident_prefill():
     state.wkv_state[:, 1].fill_(20)
     state.wkv_state[:, 2].fill_(30)
     state.elapsed[:3] = torch.tensor([10, 20, 30], dtype=torch.int32)
+<<<<<<< HEAD
     input_batch = SimpleNamespace(
         idx_mapping_np=np.array([1, 0, 2], dtype=np.int32),
         num_reqs=3,
+=======
+    input_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([1, 0, 2], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 1, 2, 5], dtype=torch.int32),
         is_prefilling_np=np.array([False, False, True], dtype=np.bool_),
         num_scheduled_tokens=np.array([1, 1, 3], dtype=np.int32),
@@ -1579,16 +2315,29 @@ def test_rwkv7_model_state_rejects_permuted_decode_with_resident_prefill():
         prefill_len_np=np.array([1, 1, 3], dtype=np.int32),
     )
 
+<<<<<<< HEAD
     with pytest.raises(RuntimeError, match="resident-row order"):
         state.prepare_inputs(input_batch, req_states=None)
 
+=======
+    inputs = state.prepare_inputs(input_batch, req_states=None)
+
+    assert inputs["idx_mapping"].tolist() == [1, 0, 2]
+    assert inputs["rwkv_decode_rows"] == [1, 0]
+    assert inputs["slot_indices"].tolist() == [1, 0]
+    assert inputs["rwkv_prefill_rows"] == [2]
+>>>>>>> origin/rwkv
     assert torch.all(state.shift_state[:, :, 0] == 10)
     assert torch.all(state.shift_state[:, :, 1] == 20)
     assert torch.all(state.shift_state[:, :, 2] == 30)
     assert state.elapsed.tolist()[:3] == [10, 20, 30]
 
 
+<<<<<<< HEAD
 def test_rwkv7_model_state_compacts_prefill_to_decode_transition():
+=======
+def test_rwkv7_model_state_keeps_prefill_to_decode_slot_stable():
+>>>>>>> origin/rwkv
     state = _new_rwkv7_model_state(
         max_num_reqs=4,
         hidden_size=3,
@@ -1600,9 +2349,15 @@ def test_rwkv7_model_state_compacts_prefill_to_decode_transition():
     state.remove_request("req-1")
     assert state.req_slot_to_row[:3] == [0, -1, 2]
 
+<<<<<<< HEAD
     decode_batch = SimpleNamespace(
         idx_mapping_np=np.array([0], dtype=np.int32),
         num_reqs=1,
+=======
+    decode_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([0], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         is_prefilling_np=np.array([False], dtype=np.bool_),
     )
@@ -1611,9 +2366,15 @@ def test_rwkv7_model_state_compacts_prefill_to_decode_transition():
     state.wkv_state[:, 2].fill_(21)
     state.elapsed[2] = 22
 
+<<<<<<< HEAD
     prefill_to_decode_batch = SimpleNamespace(
         idx_mapping_np=np.array([2], dtype=np.int32),
         num_reqs=1,
+=======
+    prefill_to_decode_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([2], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
         is_prefilling_np=np.array([True], dtype=np.bool_),
         num_scheduled_tokens=np.array([2], dtype=np.int32),
@@ -1628,12 +2389,21 @@ def test_rwkv7_model_state_compacts_prefill_to_decode_transition():
     )
 
     assert state.decode_req_slots == {0, 2}
+<<<<<<< HEAD
     assert state.req_slot_to_row[:3] == [0, -1, 1]
     assert state.row_to_req_slot[:3] == [0, 2, -1]
     assert 2 in state.free_rows
     assert torch.all(state.shift_state[:, :, 1] == 20)
     assert torch.all(state.wkv_state[:, 1] == 21)
     assert state.elapsed.tolist()[:3] == [0, 22, 0]
+=======
+    assert state.req_slot_to_row[:3] == [0, -1, 2]
+    assert state.row_to_req_slot[:3] == [0, -1, 2]
+    assert 1 in state.free_rows
+    assert torch.all(state.shift_state[:, :, 2] == 20)
+    assert torch.all(state.wkv_state[:, 2] == 21)
+    assert state.elapsed.tolist()[:3] == [0, 0, 22]
+>>>>>>> origin/rwkv
 
 
 def _fragmented_mixed_rwkv7_inputs() -> tuple[RWKV7ModelState, dict[str, Any]]:
@@ -1647,17 +2417,29 @@ def _fragmented_mixed_rwkv7_inputs() -> tuple[RWKV7ModelState, dict[str, Any]]:
         state.add_request(req_slot, _new_request(f"req-{req_slot}"))
     state.remove_request("req-1")
 
+<<<<<<< HEAD
     decode_batch = SimpleNamespace(
         idx_mapping_np=np.array([0], dtype=np.int32),
         num_reqs=1,
+=======
+    decode_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([0], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         is_prefilling_np=np.array([False], dtype=np.bool_),
     )
     state.prepare_inputs(decode_batch, req_states=None)
 
+<<<<<<< HEAD
     prefill_to_decode_batch = SimpleNamespace(
         idx_mapping_np=np.array([2], dtype=np.int32),
         num_reqs=1,
+=======
+    prefill_to_decode_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([2], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
         is_prefilling_np=np.array([True], dtype=np.bool_),
         num_scheduled_tokens=np.array([2], dtype=np.int32),
@@ -1670,6 +2452,7 @@ def _fragmented_mixed_rwkv7_inputs() -> tuple[RWKV7ModelState, dict[str, Any]]:
         torch.tensor([1], dtype=torch.int32),
     )
 
+<<<<<<< HEAD
     assert state.req_slot_to_row[:4] == [0, -1, 1, 3]
     assert state.row_to_req_slot[:4] == [0, 2, -1, 3]
     assert state.decode_req_slots == {0, 2}
@@ -1685,6 +2468,21 @@ def _fragmented_mixed_rwkv7_inputs() -> tuple[RWKV7ModelState, dict[str, Any]]:
     mixed_batch = SimpleNamespace(
         idx_mapping_np=np.array([0, 2, 3], dtype=np.int32),
         num_reqs=3,
+=======
+    assert state.req_slot_to_row[:4] == [0, -1, 2, 3]
+    assert state.row_to_req_slot[:4] == [0, -1, 2, 3]
+    assert state.decode_req_slots == {0, 2}
+    state.shift_state[:, :, 0].fill_(10)
+    state.shift_state[:, :, 2].fill_(20)
+    state.shift_state[:, :, 3].fill_(30)
+    state.wkv_state[:, 0].fill_(11)
+    state.wkv_state[:, 2].fill_(21)
+    state.wkv_state[:, 3].fill_(31)
+    state.elapsed[:4] = torch.tensor([12, 0, 22, 32], dtype=torch.int32)
+    mixed_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([0, 2, 3], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 1, 2, 5], dtype=torch.int32),
         is_prefilling_np=np.array([False, False, True], dtype=np.bool_),
         num_scheduled_tokens=np.array([1, 1, 3], dtype=np.int32),
@@ -1695,6 +2493,7 @@ def _fragmented_mixed_rwkv7_inputs() -> tuple[RWKV7ModelState, dict[str, Any]]:
     return state, state.prepare_inputs(mixed_batch, req_states=None)
 
 
+<<<<<<< HEAD
 def test_rwkv7_model_state_keeps_prefill_transition_compaction_before_forward():
     state, inputs = _fragmented_mixed_rwkv7_inputs()
 
@@ -1742,6 +2541,25 @@ def test_rwkv7_model_state_reports_zero_steady_decode_copies():
         "decode_compactions": 0,
         "decode_compaction_rows": 0,
     }
+=======
+def test_rwkv7_model_state_keeps_prefill_transition_slots_before_forward():
+    state, inputs = _fragmented_mixed_rwkv7_inputs()
+
+    assert inputs["rwkv_decode_batch_size"] == 2
+    assert inputs["rwkv_decode_rows"] == [0, 2]
+    assert inputs["rwkv_decode_token_positions"].tolist() == [0, 1]
+    assert inputs["idx_mapping"].tolist() == [0, 2, 3]
+    assert inputs["slot_indices"].tolist() == [0, 2]
+    assert inputs["rwkv_prefill_rows"] == [3]
+    assert inputs["rwkv_prefill_groups"] == [(2, 3, 3, 2, 5, 3)]
+    _assert_no_varlen_prefill_inputs(inputs)
+    assert state.req_slot_to_row[:4] == [0, -1, 2, 3]
+    assert state.row_to_req_slot[:4] == [0, -1, 2, 3]
+    assert torch.all(state.shift_state[:, :, 0] == 10)
+    assert torch.all(state.shift_state[:, :, 2] == 20)
+    assert torch.all(state.shift_state[:, :, 3] == 30)
+    assert state.elapsed.tolist()[:4] == [12, 0, 22, 32]
+>>>>>>> origin/rwkv
 
 
 def test_rwkv7_model_state_prefill_uses_resident_state():
@@ -1750,9 +2568,15 @@ def test_rwkv7_model_state_prefill_uses_resident_state():
     state.shift_state.fill_(7)
     state.wkv_state.fill_(8)
     state.elapsed.fill_(9)
+<<<<<<< HEAD
     input_batch = SimpleNamespace(
         idx_mapping_np=np.array([2], dtype=np.int32),
         num_reqs=1,
+=======
+    input_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([2], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
         is_prefilling_np=np.array([True], dtype=np.bool_),
         num_scheduled_tokens=np.array([3], dtype=np.int32),
@@ -1768,6 +2592,10 @@ def test_rwkv7_model_state_prefill_uses_resident_state():
     assert inputs["elapsed"].data_ptr() == state.elapsed.data_ptr()
     assert inputs["rwkv_prefill_rows"] == [0]
     assert inputs["rwkv_prefill_groups"] == [(0, 1, 3, 0, 3, 0)]
+<<<<<<< HEAD
+=======
+    _assert_no_varlen_prefill_inputs(inputs)
+>>>>>>> origin/rwkv
     assert torch.all(state.shift_state == 7)
     assert torch.all(state.wkv_state == 8)
     assert torch.all(state.elapsed == 9)
@@ -1785,9 +2613,15 @@ def test_rwkv7_model_state_keeps_resident_prefill_row_when_decode_row_starts():
     state.wkv_state[:, 0].fill_(7)
     state.wkv_state[:, 1].fill_(9)
     state.elapsed[:2] = torch.tensor([11, 13], dtype=torch.int32)
+<<<<<<< HEAD
     input_batch = SimpleNamespace(
         idx_mapping_np=np.array([2], dtype=np.int32),
         num_reqs=1,
+=======
+    input_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([2], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
         is_prefilling_np=np.array([True], dtype=np.bool_),
         num_scheduled_tokens=np.array([3], dtype=np.int32),
@@ -1823,9 +2657,15 @@ def test_rwkv7_model_state_prefill_becomes_decode_without_resident_copy():
     state.add_request(1, _new_request("req-1"))
     state.add_request(2, _new_request("req-2"))
     row = state.req_slot_to_row[2]
+<<<<<<< HEAD
     input_batch = SimpleNamespace(
         idx_mapping_np=np.array([2], dtype=np.int32),
         num_reqs=1,
+=======
+    input_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([2], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
         is_prefilling_np=np.array([True], dtype=np.bool_),
         num_scheduled_tokens=np.array([3], dtype=np.int32),
@@ -1841,7 +2681,11 @@ def test_rwkv7_model_state_prefill_becomes_decode_without_resident_copy():
     state.postprocess_state(inputs["idx_mapping"], torch.tensor([1], dtype=torch.int32))
 
     assert 2 in state.decode_req_slots
+<<<<<<< HEAD
     assert state.num_decode_rows == 1
+=======
+    assert len(state.decode_req_slots) == 1
+>>>>>>> origin/rwkv
     assert state.req_slot_to_row[2] == row
     assert state.row_to_req_slot[row] == 2
     assert torch.all(state.shift_state[:, :, row] == 11)
@@ -1853,9 +2697,15 @@ def test_rwkv7_model_state_prefill_becomes_decode_without_resident_copy():
 def test_rwkv7_model_state_reports_pending_prefill_state_postprocess():
     state = _new_rwkv7_model_state(max_num_reqs=4)
     state.add_request(0, _new_request("req-0"))
+<<<<<<< HEAD
     input_batch = SimpleNamespace(
         idx_mapping_np=np.array([0], dtype=np.int32),
         num_reqs=1,
+=======
+    input_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([0], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
         is_prefilling_np=np.array([True], dtype=np.bool_),
         num_scheduled_tokens=np.array([3], dtype=np.int32),
@@ -1978,9 +2828,15 @@ def test_rwkv7_model_state_remove_decode_row_keeps_other_resident_rows_stable():
     state = _new_rwkv7_model_state(max_num_reqs=5)
     for req_slot in range(4):
         state.add_request(req_slot, _new_request(f"req-{req_slot}"))
+<<<<<<< HEAD
     input_batch = SimpleNamespace(
         idx_mapping_np=np.array([0, 1], dtype=np.int32),
         num_reqs=2,
+=======
+    input_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
@@ -1997,6 +2853,7 @@ def test_rwkv7_model_state_remove_decode_row_keeps_other_resident_rows_stable():
 
     state.remove_request("req-0")
 
+<<<<<<< HEAD
     assert state.num_decode_rows == 1
     assert state.req_slot_to_row[:4] == [-1, 0, 2, 3]
     assert state.row_to_req_slot[:4] == [1, -1, 2, 3]
@@ -2010,15 +2867,36 @@ def test_rwkv7_model_state_remove_decode_row_keeps_other_resident_rows_stable():
     assert torch.all(state.wkv_state[:, 2] == 30)
     assert torch.all(state.wkv_state[:, 3] == 40)
     assert state.elapsed.tolist()[:4] == [20, 0, 30, 40]
+=======
+    assert len(state.decode_req_slots) == 1
+    assert state.req_slot_to_row[:4] == [-1, 1, 2, 3]
+    assert state.row_to_req_slot[:4] == [-1, 1, 2, 3]
+    assert 0 in state.free_rows
+    assert torch.count_nonzero(state.shift_state[:, :, 0]) == 0
+    assert torch.all(state.shift_state[:, :, 1] == 20)
+    assert torch.all(state.shift_state[:, :, 2] == 30)
+    assert torch.all(state.shift_state[:, :, 3] == 40)
+    assert torch.count_nonzero(state.wkv_state[:, 0]) == 0
+    assert torch.all(state.wkv_state[:, 1] == 20)
+    assert torch.all(state.wkv_state[:, 2] == 30)
+    assert torch.all(state.wkv_state[:, 3] == 40)
+    assert state.elapsed.tolist()[:4] == [0, 20, 30, 40]
+>>>>>>> origin/rwkv
 
 
 def test_rwkv7_model_state_remove_prefill_row_preserves_decode_prefix():
     state = _new_rwkv7_model_state(max_num_reqs=5)
     for req_slot in range(4):
         state.add_request(req_slot, _new_request(f"req-{req_slot}"))
+<<<<<<< HEAD
     input_batch = SimpleNamespace(
         idx_mapping_np=np.array([0, 1], dtype=np.int32),
         num_reqs=2,
+=======
+    input_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         is_prefilling_np=np.array([False, False], dtype=np.bool_),
     )
@@ -2035,7 +2913,11 @@ def test_rwkv7_model_state_remove_prefill_row_preserves_decode_prefix():
 
     state.remove_request("req-2")
 
+<<<<<<< HEAD
     assert state.num_decode_rows == 2
+=======
+    assert len(state.decode_req_slots) == 2
+>>>>>>> origin/rwkv
     assert state.req_slot_to_row[:4] == [0, 1, -1, 3]
     assert state.row_to_req_slot[:4] == [0, 1, -1, 3]
     assert 2 in state.free_rows
@@ -2096,8 +2978,25 @@ def test_rwkv7_model_state_dummy_batch_uses_scratch_state():
     assert torch.all(state.elapsed == 3)
 
 
+<<<<<<< HEAD
 def test_rwkv7_uses_default_vllm_sampler():
     assert RWKV7ModelState.custom_sampler(SimpleNamespace(), SimpleNamespace()) is None
+=======
+def test_rwkv7_model_state_requires_rapid_sampler():
+    state = object.__new__(RWKV7ModelState)
+    sampler = SimpleNamespace(use_rapid=True, require_rapid=False)
+
+    assert state.custom_sampler(sampler) == (sampler, None)
+    assert sampler.require_rapid is True
+
+
+def test_rwkv7_model_state_rejects_unavailable_rapid_sampler():
+    state = object.__new__(RWKV7ModelState)
+    sampler = SimpleNamespace(use_rapid=False, require_rapid=False)
+
+    with pytest.raises(RuntimeError, match="requires rapid-sampling"):
+        state.custom_sampler(sampler)
+>>>>>>> origin/rwkv
 
 
 def test_rwkv7_dummy_inputs_cover_all_tokens():
@@ -2139,7 +3038,11 @@ def test_rwkv7_vllm_forward_groups_equal_length_prefill_requests(monkeypatch):
     monkeypatch.setattr(rwkv7, "DTYPE", torch.float32)
     monkeypatch.setattr(rwkv7, "first_device", lambda: torch.device("cpu"))
 
+<<<<<<< HEAD
     calls = []
+=======
+    calls: list[tuple[Any, ...]] = []
+>>>>>>> origin/rwkv
     decode_state_ptrs = []
 
     def forward_tokens(tokens, state):
@@ -2211,6 +3114,7 @@ def test_rwkv7_vllm_forward_groups_equal_length_prefill_requests(monkeypatch):
     assert elapsed.tolist() == [1, 1, 2, 2]
 
 
+<<<<<<< HEAD
 def test_rwkv7_model_state_reports_equal_length_prefill_groups():
     state = _new_rwkv7_model_state(max_num_reqs=4)
     for req_slot in range(4):
@@ -2218,6 +3122,15 @@ def test_rwkv7_model_state_reports_equal_length_prefill_groups():
     input_batch = SimpleNamespace(
         idx_mapping_np=np.array([0, 1, 2, 3], dtype=np.int32),
         num_reqs=4,
+=======
+def test_rwkv7_model_state_reports_equal_length_prefill_group():
+    state = _new_rwkv7_model_state(max_num_reqs=4)
+    for req_slot in range(4):
+        state.add_request(req_slot, _new_request(f"req-{req_slot}"))
+    input_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([0, 1, 2, 3], dtype=np.int32),
+>>>>>>> origin/rwkv
         query_start_loc=torch.tensor([0, 1, 2, 4, 6], dtype=torch.int32),
         is_prefilling_np=np.array([False, False, True, True], dtype=np.bool_),
         num_scheduled_tokens=np.array([1, 1, 2, 2], dtype=np.int32),
@@ -2228,9 +3141,33 @@ def test_rwkv7_model_state_reports_equal_length_prefill_groups():
     inputs = state.prepare_inputs(input_batch, req_states=None)
 
     assert inputs["rwkv_prefill_groups"] == [(2, 4, 2, 2, 6, 2)]
+<<<<<<< HEAD
 
 
 def test_rwkv7_vllm_forward_uses_dense_decode_input_view_for_compact_rows(
+=======
+    _assert_no_varlen_prefill_inputs(inputs)
+
+
+def test_rwkv7_model_state_rejects_grouped_prefill_fallback_on_fast_path():
+    state = _new_rwkv7_model_state(max_num_reqs=2)
+    state.add_request(0, _new_request("req-0"))
+    input_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([0], dtype=np.int32),
+        query_start_loc=torch.tensor([0, 0], dtype=torch.int32),
+        is_prefilling_np=np.array([True], dtype=np.bool_),
+        num_scheduled_tokens=np.array([0], dtype=np.int32),
+        num_computed_prefill_tokens_np=np.array([0], dtype=np.int32),
+        prefill_len_np=np.array([1], dtype=np.int32),
+    )
+
+    with pytest.raises(RuntimeError, match="fast prefill requires"):
+        state.prepare_inputs(input_batch, req_states=None)
+
+
+def test_rwkv7_vllm_forward_uses_dense_decode_input_view_for_contiguous_rows(
+>>>>>>> origin/rwkv
     monkeypatch,
 ):
     monkeypatch.setattr(rwkv7, "C", 3)
@@ -2260,7 +3197,11 @@ def test_rwkv7_vllm_forward_uses_dense_decode_input_view_for_compact_rows(
     model = _new_rwkv7_forward_test_model(
         forward_tokens=forward_tokens,
         forward_all_hidden=lambda *args: pytest.fail(
+<<<<<<< HEAD
             "pure compact decode must not run prefill path"
+=======
+            "pure contiguous decode must not run prefill path"
+>>>>>>> origin/rwkv
         ),
     )
 
@@ -2306,7 +3247,11 @@ def test_rwkv7_vllm_forward_rejects_permuted_decode_rows(monkeypatch):
     wkv_state = torch.zeros((1, 2, 1, 1, 1), dtype=torch.float32)
     elapsed = torch.zeros((2,), dtype=torch.int32)
 
+<<<<<<< HEAD
     with pytest.raises(RuntimeError, match="compact prefix rows"):
+=======
+    with pytest.raises(RuntimeError, match="contiguous prefix rows"):
+>>>>>>> origin/rwkv
         RWKV7ForCausalLM.forward(
             model,
             torch.tensor([10, 20], dtype=torch.int64),
@@ -2327,6 +3272,80 @@ def test_rwkv7_vllm_forward_rejects_permuted_decode_rows(monkeypatch):
     assert elapsed.tolist() == [0, 0]
 
 
+<<<<<<< HEAD
+=======
+def test_rwkv7_vllm_forward_uses_slot_indices_for_permuted_decode_rows(
+    monkeypatch,
+):
+    monkeypatch.setattr(rwkv7, "C", 3)
+    monkeypatch.setattr(rwkv7, "DTYPE", torch.float32)
+    monkeypatch.setattr(rwkv7, "first_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(
+        RWKV7ForCausalLM,
+        "_contiguous_decode_token_range",
+        staticmethod(
+            lambda *args: pytest.fail("slot decode must not require contiguous rows")
+        ),
+    )
+
+    seen = []
+    input_ids = torch.tensor([10, 20], dtype=torch.int64)
+    shift_state = torch.zeros((1, 2, 3, 3), dtype=torch.float32)
+    wkv_state = torch.zeros((1, 3, 1, 1, 1), dtype=torch.float32)
+    elapsed = torch.zeros((3,), dtype=torch.int32)
+    slot_indices = torch.tensor([2, 0], dtype=torch.int32)
+
+    def forward_tokens(tokens, state, *, slot_indices=None):
+        assert slot_indices is not None
+        seen.append((tokens.tolist(), slot_indices.tolist()))
+        assert tuple(tensor.data_ptr() for tensor in state) == (
+            shift_state.data_ptr(),
+            wkv_state.data_ptr(),
+            elapsed.data_ptr(),
+        )
+        for row in slot_indices.tolist():
+            shift_state[:, :, row].add_(1)
+            wkv_state[:, row].add_(2)
+            elapsed[row].add_(3)
+        return torch.tensor(
+            [[201.0, 202.0, 203.0], [101.0, 102.0, 103.0]],
+            dtype=torch.float32,
+        )
+
+    model = _new_rwkv7_forward_test_model(
+        forward_tokens=forward_tokens,
+        forward_all_hidden=lambda *args: pytest.fail(
+            "pure slot decode must not run prefill path"
+        ),
+    )
+
+    out = RWKV7ForCausalLM.forward(
+        model,
+        input_ids,
+        positions=None,
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        idx_mapping=torch.tensor([2, 0], dtype=torch.int32),
+        shift_state=shift_state,
+        wkv_state=wkv_state,
+        elapsed=elapsed,
+        rwkv_decode_batch_size=2,
+        rwkv_decode_rows=[2, 0],
+        rwkv_decode_token_positions=[1, 0],
+        slot_indices=slot_indices,
+    )
+
+    assert seen == [([[20], [10]], [2, 0])]
+    assert out.tolist() == [[101.0, 102.0, 103.0], [201.0, 202.0, 203.0]]
+    assert torch.all(shift_state[:, :, 0] == 1)
+    assert torch.count_nonzero(shift_state[:, :, 1]) == 0
+    assert torch.all(shift_state[:, :, 2] == 1)
+    assert torch.all(wkv_state[:, 0] == 2)
+    assert torch.count_nonzero(wkv_state[:, 1]) == 0
+    assert torch.all(wkv_state[:, 2] == 2)
+    assert elapsed.tolist() == [3, 0, 3]
+
+
+>>>>>>> origin/rwkv
 def test_rwkv7_vllm_forward_rejects_non_prefix_decode_rows_before_gather(
     monkeypatch,
 ):
@@ -2342,7 +3361,11 @@ def test_rwkv7_vllm_forward_rejects_non_prefix_decode_rows_before_gather(
         forward_all_hidden=lambda *args: pytest.fail("decode must stay T=1"),
     )
 
+<<<<<<< HEAD
     with pytest.raises(RuntimeError, match="compact prefix rows"):
+=======
+    with pytest.raises(RuntimeError, match="contiguous prefix rows"):
+>>>>>>> origin/rwkv
         RWKV7ForCausalLM.forward(
             model,
             torch.tensor([10, 20], dtype=torch.int64),
@@ -2358,12 +3381,21 @@ def test_rwkv7_vllm_forward_rejects_non_prefix_decode_rows_before_gather(
         )
 
 
+<<<<<<< HEAD
 def test_rwkv7_compact_decode_token_range_rejects_non_prefix_rows():
     with pytest.raises(RuntimeError, match="compact prefix rows"):
         RWKV7ForCausalLM._compact_decode_token_range(2, [1, 2], [0, 1])
 
 
 def test_rwkv7_vllm_forward_resident_row_without_decode_metadata_uses_singleton_prefill(
+=======
+def test_rwkv7_contiguous_decode_token_range_rejects_non_prefix_rows():
+    with pytest.raises(RuntimeError, match="contiguous prefix rows"):
+        RWKV7ForCausalLM._contiguous_decode_token_range(2, [1, 2], [0, 1])
+
+
+def test_rwkv7_vllm_forward_uses_grouped_singleton_prefill(
+>>>>>>> origin/rwkv
     monkeypatch,
 ):
     monkeypatch.setattr(rwkv7, "C", 3)
@@ -2401,6 +3433,12 @@ def test_rwkv7_vllm_forward_resident_row_without_decode_metadata_uses_singleton_
         shift_state=shift_state,
         wkv_state=wkv_state,
         elapsed=elapsed,
+<<<<<<< HEAD
+=======
+        rwkv_prefill_token_ranges=[(0, 0, 1)],
+        rwkv_prefill_rows=[1],
+        rwkv_prefill_groups=[(0, 1, 1, 0, 1, 1)],
+>>>>>>> origin/rwkv
     )
 
     assert seen == [([[20]], shift_state[:, :, 1:2, :].storage_offset())]
@@ -2466,6 +3504,10 @@ def test_rwkv7_vllm_forward_passes_resident_state_to_single_prefill(monkeypatch)
         rwkv_decode_token_positions=[0, 1],
         rwkv_prefill_token_ranges=[(2, 2, 5)],
         rwkv_prefill_rows=[2],
+<<<<<<< HEAD
+=======
+        rwkv_prefill_groups=[(2, 3, 3, 2, 5, 2)],
+>>>>>>> origin/rwkv
     )
 
     assert calls == [
@@ -2486,7 +3528,107 @@ def test_rwkv7_vllm_forward_passes_resident_state_to_single_prefill(monkeypatch)
     assert elapsed.tolist() == [1, 1, 2]
 
 
+<<<<<<< HEAD
 def test_rwkv7_vllm_forward_uses_compact_mixed_decode_state_without_gather(
+=======
+def test_rwkv7_vllm_forward_uses_varlen_prefill_metadata(monkeypatch):
+    monkeypatch.setattr(rwkv7, "C", 3)
+    monkeypatch.setattr(rwkv7, "DTYPE", torch.float32)
+    monkeypatch.setattr(rwkv7, "first_device", lambda: torch.device("cpu"))
+
+    calls: list[tuple[Any, ...]] = []
+    shift_state = torch.zeros((1, 2, 4, 3), dtype=torch.float32)
+    wkv_state = torch.zeros((1, 4, 1, 1, 1), dtype=torch.float32)
+    elapsed = torch.zeros((4,), dtype=torch.int32)
+    input_ids = torch.tensor([10, 20, 21, 30, 31, 32], dtype=torch.int64)
+    query_start_loc = torch.tensor([0, 1, 3, 6], dtype=torch.int32)
+
+    def forward_tokens(tokens, state, *, slot_indices=None):
+        calls.append(("decode", tokens.tolist(), slot_indices.tolist()))
+        return tokens.to(torch.float32).expand(tokens.shape[0], 3)
+
+    def forward_varlen_hidden(
+        tokens,
+        state,
+        *,
+        query_start_loc,
+        slot_indices,
+        req_id,
+        max_t,
+    ):
+        calls.append(
+            (
+                "varlen",
+                tokens.tolist(),
+                query_start_loc.tolist(),
+                slot_indices.tolist(),
+                req_id.tolist(),
+                max_t,
+            )
+        )
+        assert tuple(tensor.data_ptr() for tensor in state) == (
+            shift_state.data_ptr(),
+            wkv_state.data_ptr(),
+            elapsed.data_ptr(),
+        )
+        for row, amount in zip(slot_indices.tolist(), [2, 3]):
+            shift_state[:, :, row].fill_(amount)
+            wkv_state[:, row].fill_(amount + 10)
+            elapsed[row] = amount
+        return tokens.to(torch.float32).unsqueeze(-1).expand(tokens.shape[0], 3)
+
+    model = _new_rwkv7_forward_test_model(
+        forward_tokens=forward_tokens,
+        forward_varlen_hidden=forward_varlen_hidden,
+        forward_all_hidden=lambda *args: pytest.fail(
+            "varlen metadata must bypass grouped prefill fallback"
+        ),
+    )
+
+    out = RWKV7ForCausalLM.forward(
+        model,
+        input_ids,
+        positions=None,
+        query_start_loc=query_start_loc,
+        idx_mapping=torch.tensor([1, 2, 0], dtype=torch.int32),
+        shift_state=shift_state,
+        wkv_state=wkv_state,
+        elapsed=elapsed,
+        rwkv_decode_batch_size=1,
+        rwkv_decode_rows=[1],
+        rwkv_decode_token_positions=[0],
+        rwkv_prefill_token_ranges=[(1, 1, 3), (2, 3, 6)],
+        rwkv_prefill_rows=[2, 0],
+        rwkv_prefill_groups=[(99, 100, 1, 99, 100, 0)],
+        rwkv_prefill_query_start_loc=torch.tensor([0, 2, 5], dtype=torch.int32),
+        rwkv_prefill_slot_indices=torch.tensor([2, 0], dtype=torch.int32),
+        rwkv_prefill_token_positions=torch.tensor([1, 2, 3, 4, 5], dtype=torch.long),
+        rwkv_prefill_req_id=torch.tensor([0, 0, 1, 1, 1], dtype=torch.int32),
+        rwkv_prefill_max_t=3,
+        slot_indices=torch.tensor([1], dtype=torch.int32),
+    )
+
+    assert calls == [
+        ("decode", [[10]], [1]),
+        ("varlen", [20, 21, 30, 31, 32], [0, 2, 5], [2, 0], [0, 0, 1, 1, 1], 3),
+    ]
+    assert out.tolist() == [
+        [10.0, 10.0, 10.0],
+        [20.0, 20.0, 20.0],
+        [21.0, 21.0, 21.0],
+        [30.0, 30.0, 30.0],
+        [31.0, 31.0, 31.0],
+        [32.0, 32.0, 32.0],
+    ]
+    assert torch.all(shift_state[:, :, 0] == 3)
+    assert torch.all(shift_state[:, :, 2] == 2)
+    assert torch.all(wkv_state[:, 0] == 13)
+    assert torch.all(wkv_state[:, 2] == 12)
+    assert elapsed.tolist() == [3, 0, 2, 0]
+
+
+def test_rwkv7_vllm_forward_uses_slot_mapped_mixed_decode_state_without_gather(
+>>>>>>> origin/rwkv
     monkeypatch,
 ):
     monkeypatch.setattr(rwkv7, "C", 3)
@@ -2500,6 +3642,7 @@ def test_rwkv7_vllm_forward_uses_compact_mixed_decode_state_without_gather(
     monkeypatch.setattr(torch, "index_select", forbid_index_select)
     calls = []
 
+<<<<<<< HEAD
     def forward_tokens(tokens, model_state):
         calls.append(("tokens", tokens.tolist()))
         _assert_same_storage_view(model_state[0], state.shift_state[:, :, :2, :])
@@ -2512,6 +3655,24 @@ def test_rwkv7_vllm_forward_uses_compact_mixed_decode_state_without_gather(
 
     def forward_all_hidden(tokens, model_state):
         calls.append(("all_hidden", tokens.tolist()))
+=======
+    def forward_tokens(tokens, model_state, *, slot_indices=None):
+        assert slot_indices is not None
+        calls.append(("tokens", tokens.tolist(), slot_indices.tolist()))
+        assert tuple(tensor.data_ptr() for tensor in model_state) == (
+            state.shift_state.data_ptr(),
+            state.wkv_state.data_ptr(),
+            state.elapsed.data_ptr(),
+        )
+        assert torch.all(model_state[0][:, :, 0] == 10)
+        assert torch.count_nonzero(model_state[0][:, :, 1]) == 0
+        assert torch.all(model_state[0][:, :, 2] == 20)
+        assert model_state[2].tolist() == [12, 0, 22, 32]
+        return tokens.to(torch.float32).expand(tokens.shape[0], 3)
+
+    def forward_all_hidden(tokens, model_state):
+        calls.append(("all_hidden", tokens.tolist(), [3]))
+>>>>>>> origin/rwkv
         _assert_same_storage_view(model_state[0], state.shift_state[:, :, 3:4, :])
         _assert_same_storage_view(model_state[1], state.wkv_state[:, 3:4, :, :, :])
         _assert_same_storage_view(model_state[2], state.elapsed[3:4])
@@ -2519,6 +3680,12 @@ def test_rwkv7_vllm_forward_uses_compact_mixed_decode_state_without_gather(
 
     model = _new_rwkv7_forward_test_model(
         forward_tokens=forward_tokens,
+<<<<<<< HEAD
+=======
+        forward_varlen_hidden=lambda *args, **kwargs: pytest.fail(
+            "equal-length mixed prefill should not use varlen metadata"
+        ),
+>>>>>>> origin/rwkv
         forward_all_hidden=forward_all_hidden,
     )
 
@@ -2530,8 +3697,13 @@ def test_rwkv7_vllm_forward_uses_compact_mixed_decode_state_without_gather(
     )
 
     assert calls == [
+<<<<<<< HEAD
         ("tokens", [[10], [20]]),
         ("all_hidden", [[30, 31, 32]]),
+=======
+        ("tokens", [[10], [20]], [0, 2]),
+        ("all_hidden", [[30, 31, 32]], [3]),
+>>>>>>> origin/rwkv
     ]
     assert out.tolist() == [
         [10.0, 10.0, 10.0],
@@ -2638,6 +3810,10 @@ def test_rwkv7_vllm_pp_non_last_stage_returns_v_first(monkeypatch):
         rwkv_decode_token_positions=[0, 1],
         rwkv_prefill_token_ranges=[(2, 2, 4)],
         rwkv_prefill_rows=[2],
+<<<<<<< HEAD
+=======
+        rwkv_prefill_groups=[(2, 3, 2, 2, 4, 2)],
+>>>>>>> origin/rwkv
     )
 
     assert isinstance(out, IntermediateTensors)
@@ -2698,6 +3874,12 @@ def test_rwkv7_vllm_pp_non_last_stage_all_gathers_tp_v_first(monkeypatch):
         shift_state=torch.zeros((1, 2, 1, 4), dtype=torch.float32),
         wkv_state=torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32),
         elapsed=torch.zeros((1,), dtype=torch.int32),
+<<<<<<< HEAD
+=======
+        rwkv_decode_batch_size=1,
+        rwkv_decode_rows=[0],
+        rwkv_decode_token_positions=[0],
+>>>>>>> origin/rwkv
     )
 
     assert isinstance(out, IntermediateTensors)
@@ -2780,6 +3962,10 @@ def test_rwkv7_vllm_pp_last_stage_uses_intermediate_tensors(monkeypatch):
         rwkv_decode_token_positions=[0, 1],
         rwkv_prefill_token_ranges=[(2, 2, 4)],
         rwkv_prefill_rows=[2],
+<<<<<<< HEAD
+=======
+        rwkv_prefill_groups=[(2, 3, 2, 2, 4, 2)],
+>>>>>>> origin/rwkv
     )
 
     assert isinstance(out, torch.Tensor)
@@ -2836,6 +4022,12 @@ def test_rwkv7_vllm_pp_last_stage_slices_full_tp_v_first(monkeypatch):
         shift_state=torch.zeros((1, 2, 1, 4), dtype=torch.float32),
         wkv_state=torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32),
         elapsed=torch.zeros((1,), dtype=torch.int32),
+<<<<<<< HEAD
+=======
+        rwkv_decode_batch_size=1,
+        rwkv_decode_rows=[0],
+        rwkv_decode_token_positions=[0],
+>>>>>>> origin/rwkv
     )
 
     assert isinstance(out, torch.Tensor)

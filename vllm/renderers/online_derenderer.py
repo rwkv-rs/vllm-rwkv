@@ -23,6 +23,7 @@ from vllm.logger import init_logger
 from vllm.parser import Parser, ParserManager
 from vllm.renderers import BaseRenderer
 from vllm.tokenizers import TokenizerLike
+from vllm.tokenizers.rwkv_defaults import resolve_rwkv_tool_parser
 from vllm.utils import random_uuid
 
 logger = init_logger(__name__)

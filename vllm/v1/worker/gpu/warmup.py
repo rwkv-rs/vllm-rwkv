@@ -26,6 +26,11 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 logger = init_logger(__name__)
 
 
+def should_skip_v2_kernel_warmup(model_runner: object) -> bool:
+    model_state = getattr(model_runner, "model_state", None)
+    return model_state.__class__.__name__ == "RWKV7ModelState"
+
+
 def run_mixed_prefill_decode_warmup(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],

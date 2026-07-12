@@ -12,6 +12,7 @@ from vllm.entrypoints.chat_utils import (
     ConversationMessage,
 )
 from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
 )
 from vllm.entrypoints.openai.completion.protocol import (
@@ -41,6 +42,7 @@ from vllm.renderers.inputs.preprocess import (
     parse_model_prompt,
     prompt_to_seq,
 )
+from vllm.tokenizers.rwkv_defaults import resolve_rwkv_tool_parser
 from vllm.utils.mistral import is_mistral_tokenizer, is_mistral_tool_parser
 from vllm.utils.mistral import mt as _mt
 
@@ -140,8 +142,12 @@ class OnlineRenderer:
                 )
             elif request.tool_choice != "auto":
                 # "required" or named tool requires tool parser
+                if isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam):
+                    tool_choice_desc = f'function "{request.tool_choice.function.name}"'
+                else:
+                    tool_choice_desc = f'"{request.tool_choice}"'
                 return self.create_error_response(
-                    f'tool_choice="{request.tool_choice}" requires '
+                    f"tool_choice={tool_choice_desc} requires "
                     "--tool-call-parser to be set"
                 )
 

@@ -242,6 +242,7 @@ def test_sampling_metadata_in_input_batch(device: str, batch_size: int):
         vocab_size=1024,
         block_sizes=[1],
         kernel_block_sizes=[1],
+        max_num_blocks_per_req=[1024],
     )
     reqs: list[CachedRequestState] = []
     req_id_reqs = {}
@@ -336,6 +337,7 @@ def test_swap_states_in_input_batch(device: str, batch_size: int, swap_list: lis
         vocab_size=1024,
         block_sizes=[1],
         kernel_block_sizes=[1],
+        max_num_blocks_per_req=[1024],
     )
     ref_input_batch: InputBatch = InputBatch(
         max_num_reqs=batch_size,
@@ -345,6 +347,7 @@ def test_swap_states_in_input_batch(device: str, batch_size: int, swap_list: lis
         vocab_size=1024,
         block_sizes=[1],
         kernel_block_sizes=[1],
+        max_num_blocks_per_req=[1024],
     )
 
     reqs: list[CachedRequestState] = []
@@ -413,6 +416,7 @@ def test_pooling_prompt_lens_not_aliased(device: str):
         vocab_size=VOCAB_SIZE,
         block_sizes=[16],
         kernel_block_sizes=[16],
+        max_num_blocks_per_req=[64],
         is_pooling_model=True,
     )
 
@@ -448,6 +452,7 @@ def test_placeholder_spec_token_ids_written_verbatim():
         vocab_size=VOCAB_SIZE,
         block_sizes=[16],
         kernel_block_sizes=[16],
+        max_num_blocks_per_req=[1],
     )
     req = CachedRequestState(
         req_id="req",
@@ -495,6 +500,7 @@ def test_pooling_metadata_token_id_buffers(
         vocab_size=VOCAB_SIZE,
         block_sizes=[16],
         kernel_block_sizes=[16],
+        max_num_blocks_per_req=[64],
         is_pooling_model=True,
     )
     req = _construct_pooling_request(0, PoolingParams(**pooling_params))

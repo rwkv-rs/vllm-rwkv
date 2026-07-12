@@ -55,11 +55,13 @@ class RWKV7ModelState(ModelState):
             )
         )
         self.num_heads = int(getattr(model, "tp_num_heads", total_num_heads))
-        wkv_dtype = (
-            torch.float32
-            if getattr(model, "wkv_mode", "fp16") == "fp32io16"
-            else torch.float16
-        )
+        wkv_dtype = getattr(model, "wkv_state_dtype", None)
+        if wkv_dtype is None:
+            wkv_dtype = (
+                torch.float32
+                if getattr(model, "wkv_mode", "fp16") == "fp32io16"
+                else torch.float16
+            )
 
         self.shift_state = torch.zeros(
             (self.num_layers, 2, self.max_num_reqs, self.hidden_size),
@@ -83,16 +85,58 @@ class RWKV7ModelState(ModelState):
         self.execution_idx_mapping = torch.arange(
             self.max_num_reqs, dtype=torch.int32, device=device
         )
+        self.decode_slot_indices = torch.empty(
+            (self.max_num_reqs,), dtype=torch.int32, device=device
+        )
+        self.decode_token_positions = torch.empty(
+            (self.max_num_reqs,), dtype=torch.long, device=device
+        )
+        # Maps request ids to stable RWKV state slots. A vLLM request index can
+        # change after request metadata is condensed, but this slot must not.
         self.req_id_to_index: dict[str, int] = {}
         self.req_slot_to_row = [-1] * self.max_num_reqs
         self.row_to_req_slot = [-1] * self.max_num_reqs
         self.free_rows = set(range(self.max_num_reqs))
         self.decode_req_slots: set[int] = set()
-        self.num_decode_rows = 0
-        self._prefill_decode_rows: list[int] = []
         self._prefill_req_slots: list[int] = []
         self._prefill_becomes_decode: list[bool] = []
-        self.reset_state_movement_stats()
+
+    def _reset_mappings(self) -> None:
+        self.req_slot_to_row = [-1] * self.max_num_reqs
+        self.row_to_req_slot = [-1] * self.max_num_reqs
+        self.free_rows = set(range(self.max_num_reqs))
+        self.decode_req_slots = set()
+        self._prefill_req_slots = []
+        self._prefill_becomes_decode = []
+
+    def _state_slot_for_batch_entry(
+        self,
+        input_batch: InputBatch,
+        batch_idx: int,
+    ) -> int:
+        req_ids = getattr(input_batch, "req_ids", None)
+        if req_ids is None or batch_idx >= len(req_ids):
+            raise RuntimeError("RWKV7 requires request ids for state lookup")
+        req_id = req_ids[batch_idx]
+        if req_id is None:
+            raise RuntimeError("RWKV7 request id cannot be None")
+        req_slot = self.req_id_to_index.get(req_id)
+        if req_slot is None:
+            raise RuntimeError(f"RWKV state for request id {req_id!r} missing")
+        return req_slot
+
+    @staticmethod
+    def _is_contiguous_decode_context(
+        decode_rows: list[int],
+        decode_token_positions: list[int],
+    ) -> bool:
+        if not decode_rows:
+            return False
+        decode_len = len(decode_rows)
+        if decode_rows != list(range(decode_len)):
+            return False
+        start = decode_token_positions[0]
+        return decode_token_positions == list(range(start, start + decode_len))
 
     def _new_dummy_state_tensors(self, num_reqs: int) -> dict[str, torch.Tensor]:
         return {
@@ -113,116 +157,23 @@ class RWKV7ModelState(ModelState):
                 device=self.device,
             ),
             "elapsed": torch.zeros(
-                (num_reqs,), dtype=self.elapsed.dtype, device=self.device
+                (num_reqs,),
+                dtype=self.elapsed.dtype,
+                device=self.device,
             ),
         }
 
-    def _reset_mappings(self) -> None:
-        self.req_slot_to_row = [-1] * self.max_num_reqs
-        self.row_to_req_slot = [-1] * self.max_num_reqs
-        self.free_rows = set(range(self.max_num_reqs))
-        self.decode_req_slots = set()
-        self.num_decode_rows = 0
-        self._prefill_decode_rows = []
-        self._prefill_req_slots = []
-        self._prefill_becomes_decode = []
-
-    def _active_rows(self) -> int:
-        return self.max_num_reqs - len(self.free_rows)
-
-    def _decode_context_size(self, decode_rows: list[int]) -> int:
-        if not decode_rows:
-            return 0
-        return len(decode_rows)
-
-    def reset_state_movement_stats(self) -> None:
-        self._state_movement_stats = {
-            "resident_to_decode_copies": 0,
-            "decode_compactions": 0,
-            "decode_compaction_rows": 0,
-        }
-
-    def get_state_movement_stats(self) -> dict[str, int]:
-        return dict(self._state_movement_stats)
-
-    def _sync_decode_rows_to_resident_rows(
-        self,
-        decode_entries: list[tuple[int, int, int, int]],
-    ) -> list[tuple[int, int, int, int]]:
-        """Expose scheduled decode as compact resident rows."""
-        if not decode_entries:
-            return decode_entries
-
-        req_slots = [req_slot for _batch_idx, req_slot, _row, _start in decode_entries]
-        resident_rows = [row for _batch_idx, _req_slot, row, _start in decode_entries]
-        compact_rows = list(range(len(resident_rows)))
-        sorted_resident_rows = sorted(resident_rows)
-        if resident_rows != sorted_resident_rows:
-            raise RuntimeError(
-                "RWKV7 native decode requires scheduling decode rows in "
-                "resident-row order; scheduled decode rows "
-                f"{resident_rows}"
+    @staticmethod
+    def _set_sampling_logits_fast_path(
+        input_batch: InputBatch,
+        enabled: bool,
+    ) -> None:
+        try:
+            input_batch.rwkv_sampling_logits_contiguous = (  # type: ignore[attr-defined]
+                enabled
             )
-        has_holes = sorted_resident_rows != compact_rows
-
-        if has_holes:
-            scheduled_req_slots = set(req_slots)
-            blocked_rows: list[tuple[int, int]] = []
-            for row in compact_rows:
-                owner = self.row_to_req_slot[row]
-                if owner != -1 and owner not in scheduled_req_slots:
-                    blocked_rows.append((row, owner))
-            if blocked_rows:
-                raise RuntimeError(
-                    "RWKV7 cannot compact decode rows over live "
-                    "prefill/non-decode resident rows "
-                    f"{blocked_rows}; scheduled decode rows {resident_rows}"
-                )
-
-            req_slot_by_row = {
-                row: req_slot for _batch_idx, req_slot, row, _start in decode_entries
-            }
-            compact_row_by_row = {
-                row: compact_row for compact_row, row in enumerate(sorted_resident_rows)
-            }
-            batch_shift_state = self.shift_state[:, :, sorted_resident_rows, :].clone()
-            batch_wkv_state = self.wkv_state[:, sorted_resident_rows, :, :, :].clone()
-            batch_elapsed = self.elapsed[sorted_resident_rows].clone()
-            self.shift_state[:, :, : len(resident_rows), :].copy_(batch_shift_state)
-            self.wkv_state[:, : len(resident_rows), :, :, :].copy_(batch_wkv_state)
-            self.elapsed[: len(resident_rows)].copy_(batch_elapsed)
-            self._state_movement_stats["decode_compactions"] += 1
-            self._state_movement_stats["decode_compaction_rows"] += len(resident_rows)
-
-            affected_rows = set(resident_rows) | set(compact_rows)
-            for row in affected_rows:
-                self.row_to_req_slot[row] = -1
-                self.free_rows.add(row)
-            for source_row in sorted_resident_rows:
-                compact_row = compact_row_by_row[source_row]
-                req_slot = req_slot_by_row[source_row]
-                self.req_slot_to_row[req_slot] = compact_row
-                self.row_to_req_slot[compact_row] = req_slot
-                self.free_rows.discard(compact_row)
-            for row in affected_rows - set(compact_rows):
-                self._zero_row(row)
-
-        self.num_decode_rows = len(self.decode_req_slots)
-
-        return [
-            (
-                batch_idx,
-                req_slot,
-                compact_row_by_row[row] if has_holes else row,
-                start,
-            )
-            for (
-                batch_idx,
-                req_slot,
-                row,
-                start,
-            ) in decode_entries
-        ]
+        except Exception:
+            return
 
     @staticmethod
     def _build_prefill_groups(
@@ -265,6 +216,12 @@ class RWKV7ModelState(ModelState):
     def get_supported_generation_tasks(self) -> tuple[GenerationTask, ...]:
         return ("generate",)
 
+    def custom_sampler(self, sampler: Any) -> tuple[Any, None]:
+        if not sampler.use_rapid:
+            raise RuntimeError("RWKV7 requires rapid-sampling on CUDA.")
+        sampler.require_rapid = True
+        return sampler, None
+
     def sort_scheduled_req_ids(
         self,
         req_ids: list[str],
@@ -273,12 +230,13 @@ class RWKV7ModelState(ModelState):
     ) -> list[str]:
         def key(item: tuple[int, str]) -> tuple[int, int, int]:
             order, req_id = item
-            req_slot = req_states.req_id_to_index.get(req_id)
-            if req_slot is None:
+            current_req_index = req_states.req_id_to_index.get(req_id)
+            req_slot = self.req_id_to_index.get(req_id)
+            if current_req_index is None or req_slot is None:
                 return (num_scheduled_tokens[req_id], 1, order)
             is_prefilling = (
-                req_states.num_computed_prefill_tokens[req_slot]
-                < req_states.prefill_len.np[req_slot]
+                req_states.num_computed_prefill_tokens[current_req_index]
+                < req_states.prefill_len.np[current_req_index]
             )
             row = self.req_slot_to_row[req_slot]
             if (
@@ -317,59 +275,20 @@ class RWKV7ModelState(ModelState):
             self._zero_row(row)
 
     def _remove_decode_row(self, req_index: int, row: int) -> None:
-        if self.num_decode_rows <= 0:
-            raise RuntimeError(
-                f"RWKV7 decode row invariant violated for request slot {req_index}"
-            )
         self.decode_req_slots.remove(req_index)
         self.req_slot_to_row[req_index] = -1
         self.row_to_req_slot[row] = -1
-        self.num_decode_rows = len(self.decode_req_slots)
         self.free_rows.add(row)
         self._zero_row(row)
-        self._fill_decode_row_hole(row)
-
-    def _fill_decode_row_hole(self, row: int) -> None:
-        if not self.decode_req_slots:
-            return
-        source_req_slot = -1
-        source_row = -1
-        for req_slot in self.decode_req_slots:
-            candidate_row = self.req_slot_to_row[req_slot]
-            if candidate_row > row and candidate_row > source_row:
-                source_req_slot = req_slot
-                source_row = candidate_row
-        if source_req_slot == -1:
-            return
-
-        self.shift_state[:, :, row, :].copy_(self.shift_state[:, :, source_row, :])
-        self.wkv_state[:, row, :, :, :].copy_(self.wkv_state[:, source_row, :, :, :])
-        self.elapsed[row].copy_(self.elapsed[source_row])
-        self._zero_row(source_row)
-
-        self.req_slot_to_row[source_req_slot] = row
-        self.row_to_req_slot[row] = source_req_slot
-        self.row_to_req_slot[source_row] = -1
-        self.free_rows.discard(row)
-        self.free_rows.add(source_row)
-
-    def _compact_decode_rows_into_free_prefix(self) -> None:
-        target_width = len(self.decode_req_slots)
-        for row in range(target_width):
-            if self.row_to_req_slot[row] == -1:
-                self._fill_decode_row_hole(row)
 
     def _mark_resident_row_decode(self, req_slot: int) -> int:
         current_row = self.req_slot_to_row[req_slot]
         if current_row == -1:
             raise RuntimeError(f"RWKV state for request slot {req_slot} missing")
         self.decode_req_slots.add(req_slot)
-        self.num_decode_rows = len(self.decode_req_slots)
         return current_row
 
     def _validate_decode_membership(self) -> None:
-        if self.num_decode_rows != len(self.decode_req_slots):
-            raise RuntimeError("RWKV7 decode row accounting is inconsistent")
         for req_slot in self.decode_req_slots:
             row = self.req_slot_to_row[req_slot]
             if row < 0 or row >= self.max_num_reqs:
@@ -405,7 +324,7 @@ class RWKV7ModelState(ModelState):
     def prepare_inputs(
         self, input_batch: InputBatch, req_states: RequestState
     ) -> dict[str, Any]:
-        self._prefill_decode_rows = []
+        self._set_sampling_logits_fast_path(input_batch, False)
         self._prefill_req_slots = []
         self._prefill_becomes_decode = []
         req_ids = getattr(input_batch, "req_ids", None)
@@ -423,14 +342,14 @@ class RWKV7ModelState(ModelState):
 
         query_start_loc_np = getattr(input_batch, "query_start_loc_np", None)
         if query_start_loc_np is None:
-            query_start_loc_np = input_batch.query_start_loc.detach().cpu().numpy()
+            raise RuntimeError("RWKV7 requires CPU query_start_loc metadata")
         is_prefilling_np = getattr(input_batch, "is_prefilling_np", None)
         if is_prefilling_np is None:
-            is_prefilling_np = [False] * input_batch.num_reqs
+            raise RuntimeError("RWKV7 requires CPU prefill metadata")
 
         batch_entries: list[tuple[int, int, bool, int, int]] = []
-        for batch_idx, req_slot_np in enumerate(input_batch.idx_mapping_np):
-            req_slot = int(req_slot_np)
+        for batch_idx in range(len(input_batch.idx_mapping_np)):
+            req_slot = self._state_slot_for_batch_entry(input_batch, batch_idx)
             current_row = self.req_slot_to_row[req_slot]
             if current_row == -1:
                 raise RuntimeError(f"RWKV state for request slot {req_slot} missing")
@@ -482,7 +401,6 @@ class RWKV7ModelState(ModelState):
                 )
         if decode_entries:
             self._validate_decode_membership()
-            decode_entries = self._sync_decode_rows_to_resident_rows(decode_entries)
         scheduled_rows = [
             self.req_slot_to_row[req_slot]
             for _batch_idx, req_slot, _is_prefill, _start, _end in batch_entries
@@ -498,6 +416,34 @@ class RWKV7ModelState(ModelState):
         decode_token_positions = [
             start for _batch_idx, _req_slot, _row, start in decode_entries
         ]
+        use_contiguous_decode = self._is_contiguous_decode_context(
+            source_decode_rows,
+            decode_token_positions,
+        )
+        if decode_entries and not use_contiguous_decode:
+            decode_len = len(decode_entries)
+            self.decode_slot_indices[:decode_len].copy_(
+                torch.tensor(
+                    source_decode_rows,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            )
+            self.decode_token_positions[:decode_len].copy_(
+                torch.tensor(
+                    decode_token_positions,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+            )
+            slot_indices = self.decode_slot_indices[:decode_len]
+            decode_token_position_tensor = self.decode_token_positions[:decode_len]
+        elif decode_entries:
+            slot_indices = None
+            decode_token_position_tensor = decode_token_positions
+        else:
+            slot_indices = None
+            decode_token_position_tensor = None
         if not decode_entries:
             decode_rows = []
             decode_context_size = 0
@@ -508,7 +454,7 @@ class RWKV7ModelState(ModelState):
             }
         else:
             decode_rows = source_decode_rows
-            decode_context_size = self._decode_context_size(decode_rows)
+            decode_context_size = len(decode_rows)
             decode_state_tensors = {
                 "shift_state": self.shift_state,
                 "wkv_state": self.wkv_state,
@@ -516,21 +462,20 @@ class RWKV7ModelState(ModelState):
             }
 
         if not prefill_entries:
+            self._set_sampling_logits_fast_path(
+                input_batch,
+                bool(decode_entries and len(decode_entries) == input_batch.num_reqs),
+            )
             return {
                 "query_start_loc": input_batch.query_start_loc,
                 "idx_mapping": idx_mapping,
                 **decode_state_tensors,
                 "rwkv_decode_batch_size": decode_context_size,
                 "rwkv_decode_rows": decode_rows,
-                "rwkv_decode_token_positions": decode_token_positions,
+                "rwkv_decode_token_positions": decode_token_position_tensor,
+                "slot_indices": slot_indices,
             }
 
-        prefill_idx_mapping = torch.full(
-            (input_batch.num_reqs,),
-            -1,
-            dtype=torch.int32,
-            device=self.device,
-        )
         prefill_rows: list[int] = []
         for (
             _batch_idx,
@@ -538,9 +483,7 @@ class RWKV7ModelState(ModelState):
             _decode_row,
             becomes_decode,
         ) in prefill_entries:
-            decode_row = self.req_slot_to_row[req_slot]
-            prefill_rows.append(decode_row)
-            self._prefill_decode_rows.append(decode_row)
+            prefill_rows.append(self.req_slot_to_row[req_slot])
             self._prefill_req_slots.append(req_slot)
             self._prefill_becomes_decode.append(becomes_decode)
 
@@ -553,15 +496,67 @@ class RWKV7ModelState(ModelState):
             for batch_idx, _req_slot, _row, _becomes_decode in prefill_entries
         ]
         prefill_groups = self._build_prefill_groups(prefill_ranges, prefill_rows)
-
+        prefill_lengths = [end - start for _batch_idx, start, end in prefill_ranges]
+        has_positive_prefill_lengths = all(length > 0 for length in prefill_lengths)
+        grouped_ranges = sum(
+            batch_end - batch_start for batch_start, batch_end, *_ in prefill_groups
+        )
+        can_use_grouped_prefill = (
+            has_positive_prefill_lengths
+            and len(prefill_groups) == 1
+            and grouped_ranges == len(prefill_ranges)
+        )
+        can_use_varlen_prefill = (
+            not can_use_grouped_prefill and has_positive_prefill_lengths
+        )
+        prefill_varlen_inputs: dict[str, Any] = {}
+        if can_use_varlen_prefill:
+            query_offsets = [0]
+            token_positions: list[int] = []
+            req_id: list[int] = []
+            for local_req, ((_batch_idx, start, end), length) in enumerate(
+                zip(prefill_ranges, prefill_lengths)
+            ):
+                token_positions.extend(range(start, end))
+                req_id.extend([local_req] * length)
+                query_offsets.append(query_offsets[-1] + length)
+            prefill_groups = []
+            prefill_varlen_inputs = {
+                "rwkv_prefill_query_start_loc": torch.tensor(
+                    query_offsets,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "rwkv_prefill_slot_indices": torch.tensor(
+                    prefill_rows,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "rwkv_prefill_token_positions": torch.tensor(
+                    token_positions,
+                    dtype=torch.long,
+                    device=self.device,
+                ),
+                "rwkv_prefill_req_id": torch.tensor(
+                    req_id,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "rwkv_prefill_max_t": max(prefill_lengths),
+            }
+        elif not can_use_grouped_prefill:
+            raise RuntimeError(
+                "RWKV7 fast prefill requires one contiguous equal-length "
+                "group or positive-length varlen metadata."
+            )
         if len(prefill_entries) == input_batch.num_reqs:
             return {
                 "query_start_loc": input_batch.query_start_loc,
                 "idx_mapping": idx_mapping,
-                "prefill_idx_mapping": prefill_idx_mapping,
                 "rwkv_prefill_token_ranges": prefill_ranges,
                 "rwkv_prefill_rows": prefill_rows,
                 "rwkv_prefill_groups": prefill_groups,
+                **prefill_varlen_inputs,
                 "shift_state": self.shift_state,
                 "wkv_state": self.wkv_state,
                 "elapsed": self.elapsed,
@@ -572,11 +567,12 @@ class RWKV7ModelState(ModelState):
             **decode_state_tensors,
             "rwkv_decode_batch_size": decode_context_size,
             "rwkv_decode_rows": decode_rows,
-            "rwkv_decode_token_positions": decode_token_positions,
+            "rwkv_decode_token_positions": decode_token_position_tensor,
+            "slot_indices": slot_indices,
             "rwkv_prefill_token_ranges": prefill_ranges,
             "rwkv_prefill_rows": prefill_rows,
             "rwkv_prefill_groups": prefill_groups,
-            "prefill_idx_mapping": prefill_idx_mapping,
+            **prefill_varlen_inputs,
         }
         if decode_entries:
             mixed_inputs.update(
@@ -594,20 +590,17 @@ class RWKV7ModelState(ModelState):
         num_sampled: torch.Tensor | int,
         num_computed_tokens: torch.Tensor | None = None,
     ) -> None:
-        if not self._prefill_decode_rows:
+        if not self._prefill_req_slots:
             return
         for scratch_row, req_slot in enumerate(self._prefill_req_slots):
             if self._prefill_becomes_decode[scratch_row]:
                 self._mark_resident_row_decode(req_slot)
-        self.num_decode_rows = len(self.decode_req_slots)
-        self._compact_decode_rows_into_free_prefix()
         self._validate_decode_membership()
-        self._prefill_decode_rows = []
         self._prefill_req_slots = []
         self._prefill_becomes_decode = []
 
     def has_pending_postprocess_state(self) -> bool:
-        return bool(self._prefill_decode_rows)
+        return bool(self._prefill_req_slots)
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         lengths = torch.full(
@@ -620,7 +613,9 @@ class RWKV7ModelState(ModelState):
         query_start_loc = torch.empty((num_reqs + 1,), dtype=torch.int32)
         query_start_loc[0] = 0
         query_start_loc[1:] = lengths.cumsum(dim=0)
-        idx_mapping = torch.arange(num_reqs, dtype=torch.int32)
+        idx_mapping = self.execution_idx_mapping[:num_reqs]
+        # Full CUDAGraph replay binds captured state pointers, so decode capture
+        # uses resident buffers. Request-level dummy profiling uses scratch.
         state_tensors = {
             "shift_state": self.shift_state,
             "wkv_state": self.wkv_state,
@@ -634,6 +629,7 @@ class RWKV7ModelState(ModelState):
                 "rwkv_decode_batch_size": num_reqs,
                 "rwkv_decode_rows": list(range(num_reqs)),
                 "rwkv_decode_token_positions": list(range(num_reqs)),
+                "slot_indices": None,
             }
         return {
             "query_start_loc": query_start_loc,

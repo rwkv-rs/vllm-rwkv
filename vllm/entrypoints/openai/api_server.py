@@ -11,7 +11,7 @@ import socket
 import tempfile
 import warnings
 from argparse import Namespace
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any, cast
 
@@ -22,6 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.datastructures import State
 
 import vllm.envs as envs
+from vllm.build_profile import get_build_profile_metadata
 from vllm.config import ModelConfig, VllmConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient
@@ -32,7 +33,6 @@ from vllm.entrypoints.openai.engine.protocol import GenerationError
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.elastic_ep.middleware import ScalingMiddleware
-from vllm.entrypoints.serve.sagemaker.api_router import sagemaker_standards_bootstrap
 from vllm.entrypoints.serve.tokenize.serving import ServingTokenization
 from vllm.entrypoints.serve.utils.api_utils import (
     cli_env_setup,
@@ -51,7 +51,11 @@ from vllm.entrypoints.serve.utils.server_utils import (
     log_response,
     validation_exception_handler,
 )
-from vllm.exceptions import VLLMUnprocessableEntityError, VLLMValidationError
+from vllm.exceptions import (
+    VLLMNotFoundError,
+    VLLMUnprocessableEntityError,
+    VLLMValidationError,
+)
 from vllm.logger import init_logger
 from vllm.reasoning import ReasoningParserManager
 from vllm.renderers.online_derenderer import OnlineDerenderer
@@ -66,12 +70,53 @@ from vllm.utils.system_utils import decorate_logs, set_ulimit
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.version import __version__ as VLLM_VERSION
 
+sagemaker_standards_bootstrap: Callable[[FastAPI], FastAPI] | None = None
+if get_build_profile_metadata().profile == "full":
+    from vllm.entrypoints.serve.sagemaker.api_router import (
+        sagemaker_standards_bootstrap,
+    )
+
 prometheus_multiproc_dir: tempfile.TemporaryDirectory
 
 # Cannot use __name__ (https://github.com/vllm-project/vllm/pull/4765)
 logger = init_logger("vllm.entrypoints.openai.api_server")
 
 _FALLBACK_SUPPORTED_TASKS: tuple[SupportedTask, ...] = ("generate",)
+
+
+def _attach_endpoint_plugins(
+    app: FastAPI, supported_tasks: tuple["SupportedTask", ...]
+) -> None:
+    """Phase A of endpoint plugin wiring: discover, gate and attach routes.
+
+    Attached last after all core routers. This is so endpoint plugin routes can
+    shadow core routes with the same path (see `EndpointPlugin.attach_router`
+    docstring). No-ops when no plugins are discovered/allowlisted.
+    """
+    from vllm.plugins import load_endpoint_plugins
+
+    endpoint_plugins = load_endpoint_plugins(supported_tasks)
+    for plugin in endpoint_plugins:
+        plugin.attach_router(app)
+    app.state.endpoint_plugins = endpoint_plugins
+
+
+async def _init_endpoint_plugins_state(
+    engine_client: EngineClient | None, state: State, args: Namespace
+) -> None:
+    """Phase B of endpoint plugin wiring: initialize per app plugin state.
+
+    `state.endpoint_plugins` is set by `_attach_endpoint_plugins` (Phase A)
+    in `build_app`. Some `init_app_state` callers (e.g. `run_batch.py`)
+    build their own bare `State` without going through `build_app`. As a result
+    `endpoint_plugins` may be absent and are treated that the same as "none attached".
+
+    `engine_client` is `None` for the CPU only render server which has no
+    engine (see `init_render_app_state`). Plugins must handle a `None`
+    `engine_client` themselves (see `EndpointPlugin.init_state`).
+    """
+    for plugin in getattr(state, "endpoint_plugins", []):
+        await plugin.init_state(engine_client, state, args)
 
 
 @asynccontextmanager
@@ -159,6 +204,7 @@ def build_app(
     supported_tasks: tuple["SupportedTask", ...] | None = None,
     model_config: ModelConfig | None = None,
 ) -> FastAPI:
+    build_profile = get_build_profile_metadata()
     if supported_tasks is None:
         warnings.warn(
             "The 'supported_tasks' parameter was not provided to "
@@ -189,11 +235,12 @@ def build_app(
 
     register_models_api_router(app)
 
-    from vllm.entrypoints.serve.sagemaker.api_router import (
-        attach_router as register_sagemaker_api_router,
-    )
+    if build_profile.profile == "full":
+        from vllm.entrypoints.serve.sagemaker.api_router import (
+            attach_router as register_sagemaker_api_router,
+        )
 
-    register_sagemaker_api_router(app, supported_tasks, model_config)
+        register_sagemaker_api_router(app, supported_tasks, model_config)
 
     if envs.VLLM_SERVER_DEV_MODE:
         from vllm.entrypoints.serve import register_vllm_dev_api_routers
@@ -205,7 +252,7 @@ def build_app(
             register_generate_api_routers,
         )
 
-        register_generate_api_routers(app)
+        register_generate_api_routers(app, build_profile)
 
         from vllm.entrypoints.serve.elastic_ep.api_router import (
             attach_router as elastic_ep_attach_router,
@@ -230,6 +277,12 @@ def build_app(
 
         register_pooling_api_routers(app, supported_tasks, model_config)
 
+    # Endpoint plugins are attached last so their routes are registered after all core
+    # routers. This runs even for the CPU only render server. A plugin eligible for
+    # the `render` task still gets its routes registered. It receives
+    # `engine_client=None` at Phase B (see `_init_endpoint_plugins_state`).
+    _attach_endpoint_plugins(app, supported_tasks)
+
     app.root_path = args.root_path
     app.add_middleware(
         CORSMiddleware,
@@ -244,8 +297,18 @@ def build_app(
     app.exception_handler(EngineGenerateError)(engine_error_handler)
     app.exception_handler(EngineDeadError)(engine_error_handler)
     app.exception_handler(GenerationError)(generation_error_handler)
+    # Register specific exception types so they are handled by
+    # ExceptionMiddleware (inside the Prometheus middleware) rather than
+    # ServerErrorMiddleware (outside it). Without this, these exceptions
+    # propagate through Prometheus as unhandled and get recorded as 5xx
+    # even though they result in 4xx responses to the client.
     app.exception_handler(VLLMValidationError)(exception_handler)
     app.exception_handler(VLLMUnprocessableEntityError)(exception_handler)
+    app.exception_handler(VLLMNotFoundError)(exception_handler)
+    app.exception_handler(ValueError)(exception_handler)
+    app.exception_handler(TypeError)(exception_handler)
+    app.exception_handler(OverflowError)(exception_handler)
+    app.exception_handler(NotImplementedError)(exception_handler)
     app.exception_handler(Exception)(exception_handler)
 
     # Ensure --api-key option from CLI takes precedence over VLLM_API_KEY
@@ -290,7 +353,9 @@ def build_app(
                 f"Invalid middleware {middleware}. Must be a function or a class."
             )
 
-    app = sagemaker_standards_bootstrap(app)
+    if build_profile.profile == "full":
+        assert sagemaker_standards_bootstrap is not None
+        app = sagemaker_standards_bootstrap(app)
     return app
 
 
@@ -301,6 +366,7 @@ async def init_app_state(
     supported_tasks: tuple["SupportedTask", ...] | None = None,
 ) -> None:
     vllm_config = engine_client.vllm_config
+    build_profile = get_build_profile_metadata()
 
     if args.tool_call_parser is not None:
         from vllm.parser.metrics import init_parser_metrics
@@ -398,7 +464,12 @@ async def init_app_state(
         from vllm.entrypoints.generate.api_router import init_generate_state
 
         await init_generate_state(
-            engine_client, state, args, request_logger, supported_tasks
+            engine_client,
+            state,
+            args,
+            request_logger,
+            supported_tasks,
+            build_profile,
         )
 
         from vllm.entrypoints.scale_out.factories import init_scale_out_state
@@ -416,6 +487,8 @@ async def init_app_state(
         from vllm.entrypoints.pooling.factories import init_pooling_state
 
         init_pooling_state(engine_client, state, args, request_logger, supported_tasks)
+
+    await _init_endpoint_plugins_state(engine_client, state, args)
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
@@ -507,6 +580,10 @@ async def init_render_app_state(
     state.args = args
     state.enable_server_load_tracking = False
     state.server_load_metrics = 0
+
+    # No `EngineClient` exists for the render server, so plugins get `None` and
+    # must handle it themselves (see `EndpointPlugin.init_state`).
+    await _init_endpoint_plugins_state(None, state, args)
 
 
 def create_server_socket(

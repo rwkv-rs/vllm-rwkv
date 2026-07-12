@@ -196,18 +196,24 @@ class RepetitionDetectionParams:
             )
         if self.mode not in ("consecutive", "occurrence"):
             raise ValueError(
-                "mode must be either 'consecutive' or 'occurrence', "
-                f"got {self.mode!r}."
+                f"mode must be either 'consecutive' or 'occurrence', got {self.mode!r}."
             )
         if self.occurrence_rules is not None:
             if self.mode != "occurrence":
-                raise ValueError("occurrence_rules can only be used with mode='occurrence'.")
+                raise ValueError(
+                    "occurrence_rules can only be used with mode='occurrence'."
+                )
             normalized_rules = []
             for ngram_size, min_count in self.occurrence_rules:
                 if ngram_size <= 0:
-                    raise ValueError(f"occurrence rule ngram_size must be positive, got {ngram_size}.")
+                    raise ValueError(
+                        "occurrence rule ngram_size must be positive, "
+                        f"got {ngram_size}."
+                    )
                 if min_count < 2:
-                    raise ValueError(f"occurrence rule min_count must be >= 2, got {min_count}.")
+                    raise ValueError(
+                        f"occurrence rule min_count must be >= 2, got {min_count}."
+                    )
                 normalized_rules.append((int(ngram_size), int(min_count)))
             if not normalized_rules:
                 raise ValueError("occurrence_rules must contain at least one rule.")
@@ -808,6 +814,7 @@ class SamplingParams(
         self._validate_logits_processors(model_config)
         self._validate_allowed_token_ids(tokenizer)
         self._validate_spec_decode(speculative_config)
+        self._validate_diffusion(model_config)
         self._validate_structured_outputs(
             model_config, structured_outputs_config, tokenizer
         )
@@ -939,6 +946,28 @@ class SamplingParams(
             raise ValueError(
                 "The min_p and logit_bias sampling parameters "
                 "are not yet supported with speculative decoding."
+            )
+
+    def _validate_diffusion(self, model_config: ModelConfig) -> None:
+        if not model_config.is_diffusion:
+            return
+
+        # Diffusion models denoise a whole canvas per step with a fixed
+        # temperature schedule, so per-request sampling parameters are not
+        # supported. Penalties are ignored by the sampler with a warning.
+        if (
+            self.temperature != 1.0
+            or self.min_p > _SAMPLING_EPS
+            or self.seed is not None
+            or self.min_tokens > 0
+            or self.logit_bias
+            or self.bad_words
+            or self.allowed_token_ids
+        ):
+            raise ValueError(
+                "The temperature, min_p, seed, min_tokens, logit_bias, "
+                "bad_words, and allowed_token_ids sampling parameters "
+                "are not yet supported with diffusion models."
             )
 
     def _validate_structured_outputs(

@@ -990,7 +990,6 @@ def test_rwkv7_openai_server_matches_albatross_greedy(
         with _temporary_env(rwkv7_execution_mode.env):
             env = os.environ.copy()
             env.setdefault("VLLM_RWKV7_WKV_MODE", "fp32io16")
-            env.setdefault("VLLM_RWKV7_EMB_DEVICE", "cpu")
             process = subprocess.Popen(
                 server_args,
                 env=env,
