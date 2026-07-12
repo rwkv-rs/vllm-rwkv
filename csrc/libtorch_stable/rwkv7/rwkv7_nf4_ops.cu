@@ -474,10 +474,10 @@ __global__ void dequant_nf4_to_f16_kernel(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// OPTIMIZED: M=1 GEMV — 16-wide block kernel (uint2 vectorized load)
-// Each thread processes 1 full block (16 K elements, 8 packed bytes) per iteration
-// Uses uint2 load (8 bytes = 16 weights) + hoisted block scale
-// 32 threads (1 warp) → no shared memory needed for reduction
+// OPTIMIZED v2: M=1 GEMV — shared mem byte→__half2 LUT + __hfma2
+// 256-entry shared memory LUT: byte → __half2 (two E2M1 values packed)
+// __hfma2 block accumulation: 8 __hfma2 instead of 16 fmaf
+// Block scale applied once per block; FP32 cross-block accumulation
 // ═══════════════════════════════════════════════════════════════
 template <int OutTile>
 __global__ __launch_bounds__(32, 1) void linear_nvfp4_orig_row1_blk16_f16_kernel(
@@ -491,6 +491,16 @@ __global__ __launch_bounds__(32, 1) void linear_nvfp4_orig_row1_blk16_f16_kernel
   const int n0 = blockIdx.x * OutTile;
   const int KB = K >> 4;
   const int K2 = K >> 1;
+
+  __shared__ __half2 byte_lut[256];
+  for (int i = threadIdx.x; i < 256; i += 32) {
+    unsigned short lo = e2m1_raw[i & 0xF];
+    unsigned short hi = e2m1_raw[(i >> 4) & 0xF];
+    uint32_t bits = lo | (static_cast<uint32_t>(hi) << 16);
+    byte_lut[i] = *reinterpret_cast<__half2*>(&bits);
+  }
+  __syncthreads();
+
   float acc[OutTile];
 #pragma unroll
   for (int j = 0; j < OutTile; ++j) {
@@ -498,35 +508,32 @@ __global__ __launch_bounds__(32, 1) void linear_nvfp4_orig_row1_blk16_f16_kernel
   }
   for (int kb = threadIdx.x; kb < KB; kb += 32) {
     const int k = kb << 4;
-    const float2 x0 = __half22float2(*reinterpret_cast<const __half2*>(x + k));
-    const float2 x1 = __half22float2(*reinterpret_cast<const __half2*>(x + k + 2));
-    const float2 x2 = __half22float2(*reinterpret_cast<const __half2*>(x + k + 4));
-    const float2 x3 = __half22float2(*reinterpret_cast<const __half2*>(x + k + 6));
-    const float2 x4 = __half22float2(*reinterpret_cast<const __half2*>(x + k + 8));
-    const float2 x5 = __half22float2(*reinterpret_cast<const __half2*>(x + k + 10));
-    const float2 x6 = __half22float2(*reinterpret_cast<const __half2*>(x + k + 12));
-    const float2 x7 = __half22float2(*reinterpret_cast<const __half2*>(x + k + 14));
+    const __half2* x2 = reinterpret_cast<const __half2*>(x + k);
+    const __half2 xv0 = x2[0], xv1 = x2[1], xv2 = x2[2], xv3 = x2[3];
+    const __half2 xv4 = x2[4], xv5 = x2[5], xv6 = x2[6], xv7 = x2[7];
 #pragma unroll
     for (int j = 0; j < OutTile; ++j) {
       const float bs = float(b_scale[static_cast<int64_t>(n0 + j) * KB + kb]) * t_scale;
       const uint2 packed = *reinterpret_cast<const uint2*>(
           w_nf4 + static_cast<int64_t>(n0 + j) * K2 + (kb << 3));
-      acc[j] = fmaf(x0.x, e2m1_decode_f(packed.x & 0xF) * bs, acc[j]);
-      acc[j] = fmaf(x0.y, e2m1_decode_f((packed.x >> 4) & 0xF) * bs, acc[j]);
-      acc[j] = fmaf(x1.x, e2m1_decode_f((packed.x >> 8) & 0xF) * bs, acc[j]);
-      acc[j] = fmaf(x1.y, e2m1_decode_f((packed.x >> 12) & 0xF) * bs, acc[j]);
-      acc[j] = fmaf(x2.x, e2m1_decode_f((packed.x >> 16) & 0xF) * bs, acc[j]);
-      acc[j] = fmaf(x2.y, e2m1_decode_f((packed.x >> 20) & 0xF) * bs, acc[j]);
-      acc[j] = fmaf(x3.x, e2m1_decode_f((packed.x >> 24) & 0xF) * bs, acc[j]);
-      acc[j] = fmaf(x3.y, e2m1_decode_f(packed.x >> 28) * bs, acc[j]);
-      acc[j] = fmaf(x4.x, e2m1_decode_f(packed.y & 0xF) * bs, acc[j]);
-      acc[j] = fmaf(x4.y, e2m1_decode_f((packed.y >> 4) & 0xF) * bs, acc[j]);
-      acc[j] = fmaf(x5.x, e2m1_decode_f((packed.y >> 8) & 0xF) * bs, acc[j]);
-      acc[j] = fmaf(x5.y, e2m1_decode_f((packed.y >> 12) & 0xF) * bs, acc[j]);
-      acc[j] = fmaf(x6.x, e2m1_decode_f((packed.y >> 16) & 0xF) * bs, acc[j]);
-      acc[j] = fmaf(x6.y, e2m1_decode_f((packed.y >> 20) & 0xF) * bs, acc[j]);
-      acc[j] = fmaf(x7.x, e2m1_decode_f((packed.y >> 24) & 0xF) * bs, acc[j]);
-      acc[j] = fmaf(x7.y, e2m1_decode_f(packed.y >> 28) * bs, acc[j]);
+      const __half2 wv0 = byte_lut[packed.x & 0xFF];
+      const __half2 wv1 = byte_lut[(packed.x >> 8) & 0xFF];
+      const __half2 wv2 = byte_lut[(packed.x >> 16) & 0xFF];
+      const __half2 wv3 = byte_lut[packed.x >> 24];
+      const __half2 wv4 = byte_lut[packed.y & 0xFF];
+      const __half2 wv5 = byte_lut[(packed.y >> 8) & 0xFF];
+      const __half2 wv6 = byte_lut[(packed.y >> 16) & 0xFF];
+      const __half2 wv7 = byte_lut[packed.y >> 24];
+      __half2 acc_h = __hfma2(wv0, xv0, __float2half2_rn(0.0f));
+      acc_h = __hfma2(wv1, xv1, acc_h);
+      acc_h = __hfma2(wv2, xv2, acc_h);
+      acc_h = __hfma2(wv3, xv3, acc_h);
+      acc_h = __hfma2(wv4, xv4, acc_h);
+      acc_h = __hfma2(wv5, xv5, acc_h);
+      acc_h = __hfma2(wv6, xv6, acc_h);
+      acc_h = __hfma2(wv7, xv7, acc_h);
+      const float2 bs_sum = __half22float2(acc_h);
+      acc[j] = fmaf(bs_sum.x + bs_sum.y, bs, acc[j]);
     }
   }
 #pragma unroll
@@ -537,14 +544,6 @@ __global__ __launch_bounds__(32, 1) void linear_nvfp4_orig_row1_blk16_f16_kernel
     }
   }
 }
-
-// ═══════════════════════════════════════════════════════════════
-// OPTIMIZED: M=2 GEMV — 16-wide block kernel (uint2 vectorized load)
-// Same approach as M=1 but with 2 accumulation sets
-// ═══════════════════════════════════════════════════════════════
-template <int OutTile>
-__global__ __launch_bounds__(32, 1) void linear_nvfp4_orig_row2_blk16_f16_kernel(
-    int K,
     int N,
     const dtype* __restrict__ x,
     const uint8_t* __restrict__ w_nf4,
@@ -1243,6 +1242,7 @@ at::Tensor linear_nvfp4_orig_row1_blk16_f16_cuda(
     at::Tensor x, at::Tensor w_nf4, at::Tensor b_scale, double t_scale, int64_t out_tile) {
   if (out_tile == 1) return linear_nvfp4_orig_row1_blk16_f16_cuda_impl<1>(x, w_nf4, b_scale, t_scale);
   if (out_tile == 2) return linear_nvfp4_orig_row1_blk16_f16_cuda_impl<2>(x, w_nf4, b_scale, t_scale);
+  if (out_tile == 4) return linear_nvfp4_orig_row1_blk16_f16_cuda_impl<4>(x, w_nf4, b_scale, t_scale);
   TORCH_CHECK(false, "unsupported linear_nvfp4_orig_row1_blk16 out_tile");
 }
 

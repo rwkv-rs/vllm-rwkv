@@ -2001,24 +2001,24 @@ class RWKV7ForCausalLM(nn.Module):
             xc = x.contiguous()
             if path.rows == 1:
                 return torch.ops.rwkv7_nf4_ops.linear_nvfp4_orig_row1_blk16_f16(
-                    xc, weight, b_scale, t_scale, 2
+                    xc, weight, b_scale, t_scale, 4
                 )
             if path.rows == 2:
                 return torch.ops.rwkv7_nf4_ops.linear_nvfp4_orig_row2_blk16_f16(
-                    xc, weight, b_scale, t_scale, 2
+                    xc, weight, b_scale, t_scale, 4
                 )
             # rows 3-12: use NF4 GEMM kernel
             if path.rows <= 12:
                 if group == "att_c2c":
                     if C <= 1024:
                         return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_f16(
-                            xc, weight, b_scale, t_scale, 2, 2
+                            xc, weight, b_scale, t_scale, 4, 2
                         )
                     return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_f16(
                         xc, weight, b_scale, t_scale, 3, 2
                     )
                 return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_f16(
-                    xc, weight, b_scale, t_scale, 2, 4
+                    xc, weight, b_scale, t_scale, 4, 4
                 )
             # rows > 12: dequant to fp16 and fall through
             w_fp16 = torch.ops.rwkv7_nf4_ops.dequant_nf4_to_f16(
