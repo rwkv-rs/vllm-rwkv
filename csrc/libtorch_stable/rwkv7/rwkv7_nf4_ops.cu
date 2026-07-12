@@ -200,6 +200,95 @@ __global__ __launch_bounds__(Threads, 1) void linear_nf4_orig_row1_exact4_f16_ke
 }
 
 // ═══════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════
+// FUSED v2: 3-way r/k/v M=1 GEMV — single kernel launch for r, k, v
+// blockIdx.z selects which of r/k/v to compute (0=r, 1=k, 2=v)
+// Uses shared mem byte→__half2 LUT + __hfma2 (same optimization as row1)
+// ═══════════════════════════════════════════════════════════════
+template <int OutTile>
+__global__ __launch_bounds__(32, 1) void linear_nvfp4_rkv_orig_row1_blk16_f16_kernel(
+    int K, int N,
+    const dtype* __restrict__ x_r,
+    const dtype* __restrict__ x_k,
+    const dtype* __restrict__ x_v,
+    const uint8_t* __restrict__ w_r,
+    const uint8_t* __restrict__ w_k,
+    const uint8_t* __restrict__ w_v,
+    const __nv_fp8_e4m3* __restrict__ bs_r,
+    const __nv_fp8_e4m3* __restrict__ bs_k,
+    const __nv_fp8_e4m3* __restrict__ bs_v,
+    float ts_r, float ts_k, float ts_v,
+    dtype* __restrict__ y_r,
+    dtype* __restrict__ y_k,
+    dtype* __restrict__ y_v) {
+  const dtype* x;
+  const uint8_t* w_nf4;
+  const __nv_fp8_e4m3* b_scale;
+  float t_scale;
+  dtype* y;
+  if (blockIdx.z == 0) { x = x_r; w_nf4 = w_r; b_scale = bs_r; t_scale = ts_r; y = y_r; }
+  else if (blockIdx.z == 1) { x = x_k; w_nf4 = w_k; b_scale = bs_k; t_scale = ts_k; y = y_k; }
+  else { x = x_v; w_nf4 = w_v; b_scale = bs_v; t_scale = ts_v; y = y_v; }
+
+  const int n0 = blockIdx.x * OutTile;
+  const int KB = K >> 4;
+  const int K2 = K >> 1;
+
+  __shared__ __half2 byte_lut[256];
+  for (int i = threadIdx.x; i < 256; i += 32) {
+    unsigned short lo = e2m1_raw[i & 0xF];
+    unsigned short hi = e2m1_raw[(i >> 4) & 0xF];
+    uint32_t bits = lo | (static_cast<uint32_t>(hi) << 16);
+    byte_lut[i] = *reinterpret_cast<__half2*>(&bits);
+  }
+  __syncthreads();
+
+  float acc[OutTile];
+#pragma unroll
+  for (int j = 0; j < OutTile; ++j) {
+    acc[j] = 0.0f;
+  }
+  for (int kb = threadIdx.x; kb < KB; kb += 32) {
+    const int k = kb << 4;
+    const __half2* x2 = reinterpret_cast<const __half2*>(x + k);
+    const __half2 xv0 = x2[0], xv1 = x2[1], xv2 = x2[2], xv3 = x2[3];
+    const __half2 xv4 = x2[4], xv5 = x2[5], xv6 = x2[6], xv7 = x2[7];
+#pragma unroll
+    for (int j = 0; j < OutTile; ++j) {
+      const float bs = float(b_scale[static_cast<int64_t>(n0 + j) * KB + kb]) * t_scale;
+      const uint2 packed = *reinterpret_cast<const uint2*>(
+          w_nf4 + static_cast<int64_t>(n0 + j) * K2 + (kb << 3));
+      const __half2 wv0 = byte_lut[packed.x & 0xFF];
+      const __half2 wv1 = byte_lut[(packed.x >> 8) & 0xFF];
+      const __half2 wv2 = byte_lut[(packed.x >> 16) & 0xFF];
+      const __half2 wv3 = byte_lut[packed.x >> 24];
+      const __half2 wv4 = byte_lut[packed.y & 0xFF];
+      const __half2 wv5 = byte_lut[(packed.y >> 8) & 0xFF];
+      const __half2 wv6 = byte_lut[packed.y >> 16];
+      const __half2 wv7 = byte_lut[packed.y >> 24];
+      __half2 acc_h = __hfma2(wv0, xv0, __float2half2_rn(0.0f));
+      acc_h = __hfma2(wv1, xv1, acc_h);
+      acc_h = __hfma2(wv2, xv2, acc_h);
+      acc_h = __hfma2(wv3, xv3, acc_h);
+      acc_h = __hfma2(wv4, xv4, acc_h);
+      acc_h = __hfma2(wv5, xv5, acc_h);
+      acc_h = __hfma2(wv6, xv6, acc_h);
+      acc_h = __hfma2(wv7, xv7, acc_h);
+      const float2 bs_sum = __half22float2(acc_h);
+      acc[j] = fmaf(bs_sum.x + bs_sum.y, bs, acc[j]);
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < OutTile; ++j) {
+    const float v = warp_sum(acc[j]);
+    if (threadIdx.x == 0) {
+      y[n0 + j] = __float2half_rn(v);
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // M=2 GEMV: x[2,K] @ w[N,K]^T -> y[2,N]
 // 2-wide K loop (same as v3a linear_orig_row2_exact_f16_kernel)
 // ═══════════════════════════════════════════════════════════════
@@ -1238,6 +1327,57 @@ at::Tensor linear_nf4_orig_rows_exact_f16_cuda(
 }
 
 // Optimized blk16 entry points (uint2 vectorized, 1-warp, always K%16==0)
+
+// ═══════════════════════════════════════════════════════════════
+// RKV fused: 3-way M=1 GEMV host wrapper
+// ═══════════════════════════════════════════════════════════════
+template <int OutTile>
+std::vector<at::Tensor> linear_nvfp4_rkv_orig_row1_blk16_f16_cuda_impl(
+    at::Tensor x_r, at::Tensor x_k, at::Tensor x_v,
+    at::Tensor w_r, at::Tensor w_k, at::Tensor w_v,
+    at::Tensor bs_r, at::Tensor bs_k, at::Tensor bs_v,
+    double ts_r, double ts_k, double ts_v) {
+  const int64_t k64 = x_r.size(-1);
+  const int64_t n64 = w_r.size(0);
+  TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_nvfp4 rkv K/N too large");
+  TORCH_CHECK((n64 % OutTile) == 0, "linear_nvfp4 rkv requires N divisible by out_tile");
+  TORCH_CHECK((k64 % 16) == 0, "linear_nvfp4 rkv blk16 requires K divisible by 16");
+  const int K = static_cast<int>(k64);
+  const int N = static_cast<int>(n64);
+  const int64_t m64 = x_r.numel() / k64;
+  TORCH_CHECK(m64 == 1, "linear_nvfp4 rkv row1 requires one row");
+  auto y_r = at::empty({n64}, x_r.options());
+  auto y_k = at::empty({n64}, x_k.options());
+  auto y_v = at::empty({n64}, x_v.options());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dim3 grid(N / OutTile, 1, 3);
+  linear_nvfp4_rkv_orig_row1_blk16_f16_kernel<OutTile><<<grid, 32, 0, stream>>>(
+      K, N,
+      reinterpret_cast<const dtype*>(x_r.data_ptr()),
+      reinterpret_cast<const dtype*>(x_k.data_ptr()),
+      reinterpret_cast<const dtype*>(x_v.data_ptr()),
+      w_r.data_ptr<uint8_t>(), w_k.data_ptr<uint8_t>(), w_v.data_ptr<uint8_t>(),
+      reinterpret_cast<const __nv_fp8_e4m3*>(bs_r.data_ptr()),
+      reinterpret_cast<const __nv_fp8_e4m3*>(bs_k.data_ptr()),
+      reinterpret_cast<const __nv_fp8_e4m3*>(bs_v.data_ptr()),
+      static_cast<float>(ts_r), static_cast<float>(ts_k), static_cast<float>(ts_v),
+      reinterpret_cast<dtype*>(y_r.data_ptr()),
+      reinterpret_cast<dtype*>(y_k.data_ptr()),
+      reinterpret_cast<dtype*>(y_v.data_ptr()));
+  return {y_r, y_k, y_v};
+}
+
+std::vector<at::Tensor> linear_nvfp4_rkv_orig_row1_blk16_f16_cuda(
+    at::Tensor x_r, at::Tensor x_k, at::Tensor x_v,
+    at::Tensor w_r, at::Tensor w_k, at::Tensor w_v,
+    at::Tensor bs_r, at::Tensor bs_k, at::Tensor bs_v,
+    double ts_r, double ts_k, double ts_v, int out_tile) {
+  if (out_tile == 1) return linear_nvfp4_rkv_orig_row1_blk16_f16_cuda_impl<1>(x_r, x_k, x_v, w_r, w_k, w_v, bs_r, bs_k, bs_v, ts_r, ts_k, ts_v);
+  if (out_tile == 2) return linear_nvfp4_rkv_orig_row1_blk16_f16_cuda_impl<2>(x_r, x_k, x_v, w_r, w_k, w_v, bs_r, bs_k, bs_v, ts_r, ts_k, ts_v);
+  if (out_tile == 4) return linear_nvfp4_rkv_orig_row1_blk16_f16_cuda_impl<4>(x_r, x_k, x_v, w_r, w_k, w_v, bs_r, bs_k, bs_v, ts_r, ts_k, ts_v);
+  TORCH_CHECK(false, "unsupported linear_nvfp4_rkv_orig_row1_blk16 out_tile");
+}
+
 at::Tensor linear_nvfp4_orig_row1_blk16_f16_cuda(
     at::Tensor x, at::Tensor w_nf4, at::Tensor b_scale, double t_scale, int64_t out_tile) {
   if (out_tile == 1) return linear_nvfp4_orig_row1_blk16_f16_cuda_impl<1>(x, w_nf4, b_scale, t_scale);

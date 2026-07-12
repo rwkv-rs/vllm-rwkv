@@ -1649,11 +1649,15 @@ class RWKV7ForCausalLM(nn.Module):
                 local_c = rkv.shape[-1]
                 r, k, v = [t.view(B, T, local_c) for t in rkv.unbind(0)]
             else:
-                r = self.linear_orig_layout(
-                    xr, z[p + "receptance.weight"], path, "att_c2c"
-                )
-                k = self.linear_orig_layout(xk, z[p + "key.weight"], path, "att_c2c")
-                v = self.linear_orig_layout(xv, z[p + "value.weight"], path, "att_c2c")
+                wr = z[p + "receptance.weight"]
+                wk_ = z[p + "key.weight"]
+                wv_ = z[p + "value.weight"]
+                if wr.dtype == torch.uint8 and path.rows == 1:
+                    r, k, v = self.linear_rkv_fused(xr, xk, xv, wr, wk_, wv_, path)
+                else:
+                    r = self.linear_orig_layout(xr, wr, path, "att_c2c")
+                    k = self.linear_orig_layout(xk, wk_, path, "att_c2c")
+                    v = self.linear_orig_layout(xv, wv_, path, "att_c2c")
         else:
             if path.use_batched_rkv:
                 flat = torch.stack(
@@ -1663,11 +1667,15 @@ class RWKV7ForCausalLM(nn.Module):
                 local_c = rkv.shape[-1]
                 r, k, v = [t.view(B, T, local_c) for t in rkv.unbind(0)]
             else:
-                r = self.linear_orig_layout(
-                    xr, z[p + "receptance.weight"], path, "att_c2c"
-                )
-                k = self.linear_orig_layout(xk, z[p + "key.weight"], path, "att_c2c")
-                v = self.linear_orig_layout(xv, z[p + "value.weight"], path, "att_c2c")
+                wr = z[p + "receptance.weight"]
+                wk_ = z[p + "key.weight"]
+                wv_ = z[p + "value.weight"]
+                if wr.dtype == torch.uint8 and path.rows == 1:
+                    r, k, v = self.linear_rkv_fused(xr, xk, xv, wr, wk_, wv_, path)
+                else:
+                    r = self.linear_orig_layout(xr, wr, path, "att_c2c")
+                    k = self.linear_orig_layout(xk, wk_, path, "att_c2c")
+                    v = self.linear_orig_layout(xv, wv_, path, "att_c2c")
         local_c = r.shape[-1]
         local_h = local_c // N
 
@@ -1987,6 +1995,23 @@ class RWKV7ForCausalLM(nn.Module):
         return self.linear_orig_layout(
             x, z["head.weight"], PathConfig(rows, False, CMIX_DENSE), "head"
         )
+
+    def linear_rkv_fused(
+        self, xr, xk, xv, wr, wk, wv, path
+    ):
+        """Fused r/k/v GEMV for NVFP4 (rows=1): single kernel launch."""
+        bs_r = self.nf4_block_scales[id(wr)]
+        bs_k = self.nf4_block_scales[id(wk)]
+        bs_v = self.nf4_block_scales[id(wv)]
+        ts_r = self.nf4_tensor_scales.get(id(wr), 1.0)
+        ts_k = self.nf4_tensor_scales.get(id(wk), 1.0)
+        ts_v = self.nf4_tensor_scales.get(id(wv), 1.0)
+        out_tile = 4 if path.rows == 1 else 2
+        r, k, v = torch.ops.rwkv7_nf4_ops.linear_nvfp4_rkv_orig_row1_blk16_f16(
+            xr.contiguous(), xk.contiguous(), xv.contiguous(),
+            wr, wk, wv, bs_r, bs_k, bs_v, ts_r, ts_k, ts_v, out_tile
+        )
+        return r, k, v
 
     def linear_orig_layout(
         self, x: torch.Tensor, weight: torch.Tensor, path: PathConfig, group: str

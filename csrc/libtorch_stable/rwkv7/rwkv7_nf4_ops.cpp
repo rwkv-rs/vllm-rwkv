@@ -4,6 +4,12 @@
 // CUDA kernel declarations (defined in .cu)
 at::Tensor linear_nf4_orig_rows_exact_f16_cuda(
     at::Tensor x, at::Tensor w_nf4, at::Tensor b_scale, double t_scale, int64_t threads, int64_t out_tile, bool use4);
+std::vector<at::Tensor> linear_nvfp4_rkv_orig_row1_blk16_f16_cuda(
+    at::Tensor x_r, at::Tensor x_k, at::Tensor x_v,
+    at::Tensor w_r, at::Tensor w_k, at::Tensor w_v,
+    at::Tensor bs_r, at::Tensor bs_k, at::Tensor bs_v,
+    double ts_r, double ts_k, double ts_v, int out_tile);
+
 at::Tensor linear_nvfp4_orig_row1_blk16_f16_cuda(
     at::Tensor x, at::Tensor w_nf4, at::Tensor b_scale, double t_scale, int64_t out_tile);
 at::Tensor linear_nvfp4_orig_row2_blk16_f16_cuda(
@@ -55,6 +61,15 @@ torch::Tensor linear_nf4_orig_rows_exact_f16(
   TORCH_CHECK(b_scale.size(1) == K / 16, "b_scale K/16 mismatch");
   TORCH_CHECK((K % 16) == 0, "K must be divisible by 16");
   return linear_nf4_orig_rows_exact_f16_cuda(x, w_nf4, b_scale, t_scale, threads, out_tile, use4);
+}
+
+std::vector<torch::Tensor> linear_nvfp4_rkv_orig_row1_blk16_f16(
+    torch::Tensor x_r, torch::Tensor x_k, torch::Tensor x_v,
+    torch::Tensor w_r, torch::Tensor w_k, torch::Tensor w_v,
+    torch::Tensor bs_r, torch::Tensor bs_k, torch::Tensor bs_v,
+    double ts_r, double ts_k, double ts_v, int64_t out_tile) {
+  return linear_nvfp4_rkv_orig_row1_blk16_f16_cuda(
+      x_r, x_k, x_v, w_r, w_k, w_v, bs_r, bs_k, bs_v, ts_r, ts_k, ts_v, out_tile);
 }
 
 torch::Tensor linear_nvfp4_orig_row1_blk16_f16(
@@ -163,7 +178,8 @@ TORCH_LIBRARY(rwkv7_nf4_ops, m) {
 
 TORCH_LIBRARY_IMPL(rwkv7_nf4_ops, CUDA, m) {
   m.impl("linear_nf4_orig_rows_exact_f16", &linear_nf4_orig_rows_exact_f16);
-  m.impl("linear_nvfp4_orig_row1_blk16_f16", &linear_nvfp4_orig_row1_blk16_f16);
+    m.impl("linear_nvfp4_rkv_orig_row1_blk16_f16", &linear_nvfp4_rkv_orig_row1_blk16_f16);
+m.impl("linear_nvfp4_orig_row1_blk16_f16", &linear_nvfp4_orig_row1_blk16_f16);
   m.impl("linear_nvfp4_orig_row2_blk16_f16", &linear_nvfp4_orig_row2_blk16_f16);
   m.impl("linear_nf4_orig_rows_f16", &linear_nf4_orig_rows_f16);
   m.impl("dequant_nf4_to_f16", &dequant_nf4_to_f16);
