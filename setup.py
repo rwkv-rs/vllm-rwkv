@@ -204,7 +204,12 @@ def bundle_tcmalloc(build_lib: str) -> None:
 
 class CMakeExtension(Extension):
     def __init__(self, name: str, cmake_lists_dir: str = ".", **kwa) -> None:
-        super().__init__(name, sources=[], py_limited_api=not is_freethreaded(), **kwa)
+        py_limited_api = not is_freethreaded()
+        if VLLM_BUILD_PROFILE == "rwkv" and name == "vllm._rapid_sampling":
+            # sampling.cpp includes torch/extension.h, which requires the full
+            # Python C API and cannot be compiled with Py_LIMITED_API.
+            py_limited_api = False
+        super().__init__(name, sources=[], py_limited_api=py_limited_api, **kwa)
         self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
 
 
@@ -1221,6 +1226,7 @@ if _build_custom_ops():
         ext_modules.append(CMakeExtension(name="vllm._C_stable_libtorch"))
         ext_modules.append(CMakeExtension(name="vllm._moe_C_stable_libtorch"))
     if _is_cuda():
+        ext_modules.append(CMakeExtension(name="vllm._rapid_sampling"))
         ext_modules.append(CMakeExtension(name="vllm.rwkv7_ops"))
 
 if VLLM_BUILD_PROFILE == "rwkv":

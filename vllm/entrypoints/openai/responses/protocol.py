@@ -66,6 +66,7 @@ from vllm.logger import init_logger
 from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
 from vllm.sampling_params import (
     RAPID_PENALTY_DECAY_DEFAULT,
+    RepetitionDetectionParams,
     RequestOutputKind,
     SamplingParams,
     StructuredOutputsParams,
@@ -273,6 +274,10 @@ class ResponsesRequest(OpenAIBaseModel):
 
     repetition_penalty: float | None = None
     penalty_decay: float | None = None
+    repetition_detection: RepetitionDetectionParams | None = Field(
+        default=None,
+        description="Parameters for detecting repetitive N-gram patterns in output.",
+    )
     seed: int | None = Field(None, ge=_INT64_MIN, le=_INT64_MAX)
     stop: str | list[str] | None = []
     ignore_eos: bool = False
@@ -286,6 +291,12 @@ class ResponsesRequest(OpenAIBaseModel):
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None,
         description="KVTransfer parameters used for disaggregated serving.",
+    )
+    ec_transfer_params: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "ECTransfer parameters used for encoder-cache disaggregated serving."
+        ),
     )
     chat_template_kwargs: dict[str, Any] | None = Field(
         default=None,
@@ -425,6 +436,8 @@ class ResponsesRequest(OpenAIBaseModel):
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
         if self.kv_transfer_params:
             extra_args["kv_transfer_params"] = self.kv_transfer_params
+        if self.ec_transfer_params:
+            extra_args["ec_transfer_params"] = self.ec_transfer_params
 
         return SamplingParams.from_optional(
             temperature=temperature,
@@ -437,6 +450,7 @@ class ResponsesRequest(OpenAIBaseModel):
             presence_penalty=presence_penalty,
             repetition_penalty=repetition_penalty,
             penalty_decay=penalty_decay,
+            repetition_detection=self.repetition_detection,
             seed=self.seed,
             ignore_eos=self.ignore_eos,
             stop_token_ids=stop_token_ids,
@@ -693,6 +707,9 @@ class ResponsesResponse(OpenAIBaseModel):
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
     )
+    ec_transfer_params: dict[str, Any] | None = Field(
+        default=None, description="ECTransfer parameters."
+    )
 
     # --8<-- [start:responses-response-extra-params]
     # These are populated when enable_response_messages is set to True
@@ -738,6 +755,7 @@ class ResponsesResponse(OpenAIBaseModel):
         input_messages: ResponseInputOutputMessage | None = None,
         output_messages: ResponseInputOutputMessage | None = None,
         kv_transfer_params: dict[str, Any] | None = None,
+        ec_transfer_params: dict[str, Any] | None = None,
     ) -> "ResponsesResponse":
         incomplete_details: IncompleteDetails | None = None
         if status == "incomplete":
@@ -776,6 +794,7 @@ class ResponsesResponse(OpenAIBaseModel):
             user=request.user,
             usage=usage,
             kv_transfer_params=kv_transfer_params,
+            ec_transfer_params=ec_transfer_params,
         )
 
 

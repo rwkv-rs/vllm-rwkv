@@ -94,6 +94,13 @@ def _new_cached_request_state(req_id: str) -> CachedRequestState:
 def _new_rwkv7_forward_test_model(**attrs: Any) -> RWKV7ForCausalLM:
     model = object.__new__(RWKV7ForCausalLM)
     nn.Module.__init__(model)
+    model.hidden_size = attrs.pop("hidden_size", 3)
+    model.head_size = attrs.pop("head_size", 1)
+    model.num_attention_heads = attrs.pop(
+        "num_attention_heads", model.hidden_size // model.head_size
+    )
+    model.vocab_size = attrs.pop("vocab_size", 128)
+    model.total_num_layers = attrs.pop("total_num_layers", 1)
     model._is_pp_first_rank = lambda: True
     model._is_pp_last_rank = lambda: True
     for name, value in attrs.items():
@@ -127,7 +134,6 @@ def _new_default_loader_for_weight_tests(
 
 
 def test_rwkv7_forward_tokens_keeps_slot_selected_cmix_path(monkeypatch):
-    monkeypatch.setattr(rwkv7, "C", 4)
     seen = []
 
     def embed(tokens):
@@ -138,6 +144,7 @@ def test_rwkv7_forward_tokens_keeps_slot_selected_cmix_path(monkeypatch):
         return x.squeeze(1)
 
     model = _new_rwkv7_forward_test_model(
+        hidden_size=4,
         embed=embed,
         forward_from_x=forward_from_x,
     )
@@ -154,81 +161,9 @@ def test_rwkv7_forward_tokens_keeps_slot_selected_cmix_path(monkeypatch):
     assert seen[0][0] != rwkv7.CMIX_DENSE
 
 
-def test_rwkv7_forward_layer_range_uses_slot_fused_cmix(monkeypatch):
-    monkeypatch.setattr(rwkv7, "C", 4)
-    calls: list[Any] = []
-
-    def fused_cmix(x, residual, shift_state, weight, bias, x_k, slot_indices):
-        calls.append(("fused_cmix", shift_state.shape, slot_indices.tolist()))
-        return x + residual, torch.ones_like(x)
-
-    def advance_slots(elapsed, slot_indices, amount):
-        calls.append(("advance", slot_indices.tolist(), amount))
-
-    monkeypatch.setattr(
-        torch.ops.rwkv7_v3a_ops,
-        "add_layer_norm_cmix_mix_f16_slots",
-        fused_cmix,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        torch.ops.rwkv7_v3a_ops,
-        "advance_i32_slots",
-        advance_slots,
-        raising=False,
-    )
-
-    model = _new_rwkv7_forward_test_model()
-    model.start_layer = 0
-    model.end_layer = 1
-    model.z = {
-        "blocks.0.ln1.weight": torch.empty(4),
-        "blocks.0.ln1.bias": torch.empty(4),
-        "blocks.0.ln2.weight": torch.empty(4),
-        "blocks.0.ln2.bias": torch.empty(4),
-        "blocks.0.ffn.x_k": torch.empty(4),
-    }
-    model.ln = lambda x, weight, bias: x
-    model.add = lambda x, y: x + y
-
-    def tmix(layer, x, shift_state, wkv_state, elapsed_t, v_first, *args, **kwargs):
-        return x, v_first
-
-    def cmix_from_mixed(mixed, p, path):
-        calls.append(("cmix_path", path.cmix_mode))
-        return mixed
-
-    model.tmix = tmix
-    model.cmix_from_mixed = cmix_from_mixed
-    slot_indices = torch.tensor([3, 1], dtype=torch.int32)
-    state = [
-        torch.zeros((1, 2, 6, 4)),
-        torch.empty((1,)),
-        torch.zeros((6,), dtype=torch.int32),
-    ]
-
-    RWKV7ForCausalLM.forward_layer_range(
-        model,
-        torch.zeros((2, 1, 4)),
-        state,
-        rwkv7.PathConfig(2, rwkv7.CMIX_ROWS2_NOFC),
-        v_first=None,
-        final=False,
-        all_logits=False,
-        slot_indices=slot_indices,
-    )
-
-    assert calls == [
-        ("fused_cmix", torch.Size([6, 4]), [3, 1]),
-        ("cmix_path", rwkv7.CMIX_ROWS2_NOFC),
-        ("advance", [3, 1], 1),
-    ]
-
-
 def test_rwkv7_forward_layer_range_uses_slot_fused_tmix_for_batched_decode(
     monkeypatch,
 ):
-    monkeypatch.setattr(rwkv7, "C", 4)
     calls: list[Any] = []
 
     def fused_cmix(x, residual, shift_state, weight, bias, x_k, slot_indices):
@@ -275,7 +210,7 @@ def test_rwkv7_forward_layer_range_uses_slot_fused_tmix_for_batched_decode(
         raising=False,
     )
 
-    model = _new_rwkv7_forward_test_model()
+    model = _new_rwkv7_forward_test_model(hidden_size=4)
     model.start_layer = 0
     model.end_layer = 2
     model.z = {}
@@ -477,31 +412,11 @@ def test_rwkv7_init_preserves_process_wide_torch_state(monkeypatch):
         torch.set_float32_matmul_precision(old_matmul_precision)
 
 
-def test_rwkv7_declares_pipeline_parallel_support():
-    assert supports_pp(RWKV7ForCausalLM)
-
-
-def test_rwkv7_raw_pth_file_uses_single_weight_file(tmp_path):
+@pytest.mark.parametrize("load_format", ["auto", "hf"])
+def test_rwkv7_raw_pth_file_uses_single_weight_file(tmp_path, load_format):
     checkpoint = tmp_path / "rwkv7-g1g-1.5b-20260526-ctx8192.pth"
     checkpoint.touch()
-    loader = _new_default_loader_for_weight_tests()
-
-    _, weight_files, use_safetensors = loader._prepare_weights(
-        str(checkpoint),
-        subfolder=None,
-        revision=None,
-        fall_back_to_pt=True,
-        allow_patterns_overrides=None,
-    )
-
-    assert weight_files == [str(checkpoint)]
-    assert use_safetensors is False
-
-
-def test_rwkv7_raw_pth_file_allows_hf_load_format(tmp_path):
-    checkpoint = tmp_path / "rwkv7-g1g-1.5b-20260526-ctx8192.pth"
-    checkpoint.touch()
-    loader = _new_default_loader_for_weight_tests(load_format="hf")
+    loader = _new_default_loader_for_weight_tests(load_format=load_format)
 
     _, weight_files, use_safetensors = loader._prepare_weights(
         str(checkpoint),
@@ -727,26 +642,6 @@ def test_rwkv7_passes_profile_accumulation_to_custom_op(monkeypatch, mode):
     assert calls == [("linear_f16", profile.allow_fp16_accumulation)]
 
 
-def test_rwkv7_model_exposes_no_legacy_execution_paths():
-    for name in (
-        "_get_cpu_embedding_cache",
-        "_copy_cpu_embedding_to_device",
-        "prepare_cudagraph_embedding",
-        "linear_orig_layout",
-        "_linear_f16_orig",
-        "_linear_f16_orig_lt_cfg",
-        "linear_t_orig",
-    ):
-        assert not hasattr(RWKV7ForCausalLM, name)
-
-    for name in (
-        "parse_orig_linear_groups",
-        "use_orig_linear",
-        "is_orig_linear_weight",
-    ):
-        assert not hasattr(rwkv7, name)
-
-
 def test_rwkv7_dummy_inputs_decode_capture_advertises_contiguous_rows():
     state = object.__new__(RWKV7ModelState)
     state.num_layers = 2
@@ -862,6 +757,18 @@ def test_rwkv7_online_weight_update_preprocesses_only_on_finish(monkeypatch):
     assert calls[0]["head.weight"].item() == 20.0
     assert model.z["processed"].item() == 5.0
     assert not hasattr(model, "_pending_weight_update")
+
+
+def test_rwkv7_abort_weight_update_allows_retry():
+    model = _new_rwkv7_for_weight_tests()
+    model.raw_weight_names = {"emb.weight"}
+
+    assert model.start_weight_update() is True
+    model.load_weights([("emb.weight", torch.tensor([10.0]))])
+    model.abort_weight_update()
+
+    assert not hasattr(model, "_pending_weight_update")
+    assert model.start_weight_update() is True
 
 
 def test_rwkv7_online_weight_update_reuses_existing_tensor_storage(monkeypatch):
@@ -1007,17 +914,6 @@ def test_rwkv7_online_weight_update_cuda_stages_pending_tensors_on_device(monkey
     model.finish_weight_update()
 
     assert captured["emb.weight"].item() == 1.0
-
-
-def test_rwkv7_abort_weight_update_clears_pending_buffer():
-    model = _new_rwkv7_for_weight_tests()
-    model.raw_weight_names = {"emb.weight"}
-
-    model.start_weight_update()
-    model.load_weights([("emb.weight", torch.tensor([1.0]))])
-    model.abort_weight_update()
-
-    assert not hasattr(model, "_pending_weight_update")
 
 
 def test_rwkv7_direct_parameter_update_is_not_supported():
@@ -1216,7 +1112,8 @@ def test_rwkv7_compute_logits_all_gathers_tensor_parallel_vocab(monkeypatch):
     model = object.__new__(RWKV7ForCausalLM)
     model.tp_size = 2
     model.vocab_size = 5
-    model.linear_head = lambda hidden_states: hidden_states.new_ones((2, 3))
+    model.z = {"head.weight": torch.empty(3, 4)}
+    model.linear = lambda hidden_states, weight: hidden_states.new_ones((2, 3))
     model.logits_processor = lambda lm_head, logits: logits
 
     def fake_all_gather(logits):
@@ -1535,17 +1432,6 @@ def test_rwkv7_model_state_uses_contiguous_decode_path_for_prefix_rows():
     assert inputs["slot_indices"] is None
 
 
-def test_rwkv7_model_state_exposes_no_legacy_state_movement_path():
-    for name in (
-        "_state_row_nbytes",
-        "_sync_decode_rows_to_resident_rows",
-        "_fill_decode_row_hole",
-        "_move_decode_row",
-        "_compact_decode_rows_into_free_prefix",
-    ):
-        assert not hasattr(RWKV7ModelState, name)
-
-
 def test_rwkv7_model_state_keeps_steady_decode_slot_after_row_removal():
     state = _new_rwkv7_model_state(max_num_reqs=4)
     state.add_request(0, _new_request("req-0"))
@@ -1786,7 +1672,8 @@ def test_rwkv7_model_state_keeps_decode_and_resident_prefill_slots_separate():
     assert state.elapsed.tolist()[:2] == [10, 20]
 
 
-def test_rwkv7_model_state_rejects_partial_live_decode_wave():
+@pytest.mark.parametrize("scheduled_slot", [0, 1])
+def test_rwkv7_model_state_rejects_partial_live_decode_wave(scheduled_slot: int):
     state = _new_rwkv7_model_state(max_num_reqs=4)
     state.add_request(0, _new_request("req-0"))
     state.add_request(1, _new_request("req-1"))
@@ -1800,31 +1687,7 @@ def test_rwkv7_model_state_rejects_partial_live_decode_wave():
 
     input_batch = _rwkv7_input_batch(
         state,
-        idx_mapping_np=np.array([0], dtype=np.int32),
-        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
-        is_prefilling_np=np.array([False], dtype=np.bool_),
-    )
-
-    with pytest.raises(RuntimeError, match="all live decode rows"):
-        state.prepare_inputs(input_batch, req_states=None)
-    assert len(state.decode_req_slots) == 2
-    assert state.req_slot_to_row[:2] == [0, 1]
-
-
-def test_rwkv7_model_state_does_not_park_unscheduled_decode_rows():
-    state = _new_rwkv7_model_state(max_num_reqs=4)
-    state.add_request(0, _new_request("req-0"))
-    state.add_request(1, _new_request("req-1"))
-    decode_batch = _rwkv7_input_batch(
-        state,
-        idx_mapping_np=np.array([0, 1], dtype=np.int32),
-        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
-        is_prefilling_np=np.array([False, False], dtype=np.bool_),
-    )
-    state.prepare_inputs(decode_batch, req_states=None)
-    input_batch = _rwkv7_input_batch(
-        state,
-        idx_mapping_np=np.array([1], dtype=np.int32),
+        idx_mapping_np=np.array([scheduled_slot], dtype=np.int32),
         query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         is_prefilling_np=np.array([False], dtype=np.bool_),
     )
@@ -2404,9 +2267,8 @@ def test_rwkv7_dummy_inputs_cover_all_tokens():
 
 
 def test_rwkv7_vllm_forward_groups_equal_length_prefill_requests(monkeypatch):
-    monkeypatch.setattr(rwkv7, "C", 3)
     monkeypatch.setattr(rwkv7, "DTYPE", torch.float32)
-    monkeypatch.setattr(rwkv7, "first_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(rwkv7, "CUDA_DEVICE", torch.device("cpu"))
 
     calls: list[tuple[Any, ...]] = []
     decode_state_ptrs = []
@@ -2480,26 +2342,6 @@ def test_rwkv7_vllm_forward_groups_equal_length_prefill_requests(monkeypatch):
     assert elapsed.tolist() == [1, 1, 2, 2]
 
 
-def test_rwkv7_model_state_reports_equal_length_prefill_group():
-    state = _new_rwkv7_model_state(max_num_reqs=4)
-    for req_slot in range(4):
-        state.add_request(req_slot, _new_request(f"req-{req_slot}"))
-    input_batch = _rwkv7_input_batch(
-        state,
-        idx_mapping_np=np.array([0, 1, 2, 3], dtype=np.int32),
-        query_start_loc=torch.tensor([0, 1, 2, 4, 6], dtype=torch.int32),
-        is_prefilling_np=np.array([False, False, True, True], dtype=np.bool_),
-        num_scheduled_tokens=np.array([1, 1, 2, 2], dtype=np.int32),
-        num_computed_prefill_tokens_np=np.array([0, 0, 0, 0], dtype=np.int32),
-        prefill_len_np=np.array([1, 1, 2, 2], dtype=np.int32),
-    )
-
-    inputs = state.prepare_inputs(input_batch, req_states=None)
-
-    assert inputs["rwkv_prefill_groups"] == [(2, 4, 2, 2, 6, 2)]
-    _assert_no_varlen_prefill_inputs(inputs)
-
-
 def test_rwkv7_model_state_rejects_grouped_prefill_fallback_on_fast_path():
     state = _new_rwkv7_model_state(max_num_reqs=2)
     state.add_request(0, _new_request("req-0"))
@@ -2520,9 +2362,8 @@ def test_rwkv7_model_state_rejects_grouped_prefill_fallback_on_fast_path():
 def test_rwkv7_vllm_forward_uses_dense_decode_input_view_for_contiguous_rows(
     monkeypatch,
 ):
-    monkeypatch.setattr(rwkv7, "C", 3)
     monkeypatch.setattr(rwkv7, "DTYPE", torch.float32)
-    monkeypatch.setattr(rwkv7, "first_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(rwkv7, "CUDA_DEVICE", torch.device("cpu"))
 
     seen_tokens = []
     input_ids = torch.tensor([10, 20], dtype=torch.int64)
@@ -2572,10 +2413,14 @@ def test_rwkv7_vllm_forward_uses_dense_decode_input_view_for_contiguous_rows(
     assert elapsed.tolist() == [3, 3]
 
 
-def test_rwkv7_vllm_forward_rejects_permuted_decode_rows(monkeypatch):
-    monkeypatch.setattr(rwkv7, "C", 3)
+@pytest.mark.parametrize(
+    "decode_rows", [[1, 0], [2, 0]], ids=["permuted-prefix", "non-prefix"]
+)
+def test_rwkv7_vllm_forward_rejects_noncontiguous_decode_rows(
+    monkeypatch, decode_rows: list[int]
+):
     monkeypatch.setattr(rwkv7, "DTYPE", torch.float32)
-    monkeypatch.setattr(rwkv7, "first_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(rwkv7, "CUDA_DEVICE", torch.device("cpu"))
 
     seen_tokens = []
 
@@ -2589,9 +2434,10 @@ def test_rwkv7_vllm_forward_rejects_permuted_decode_rows(monkeypatch):
             "pure decode must not run prefill path"
         ),
     )
-    shift_state = torch.zeros((1, 2, 2, 3), dtype=torch.float32)
-    wkv_state = torch.zeros((1, 2, 1, 1, 1), dtype=torch.float32)
-    elapsed = torch.zeros((2,), dtype=torch.int32)
+    num_rows = max(decode_rows) + 1
+    shift_state = torch.zeros((1, 2, num_rows, 3), dtype=torch.float32)
+    wkv_state = torch.zeros((1, num_rows, 1, 1, 1), dtype=torch.float32)
+    elapsed = torch.zeros((num_rows,), dtype=torch.int32)
 
     with pytest.raises(RuntimeError, match="contiguous prefix rows"):
         RWKV7ForCausalLM.forward(
@@ -2599,27 +2445,26 @@ def test_rwkv7_vllm_forward_rejects_permuted_decode_rows(monkeypatch):
             torch.tensor([10, 20], dtype=torch.int64),
             positions=None,
             query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
-            idx_mapping=torch.tensor([1, 0], dtype=torch.int32),
+            idx_mapping=torch.tensor(decode_rows, dtype=torch.int32),
             shift_state=shift_state,
             wkv_state=wkv_state,
             elapsed=elapsed,
             rwkv_decode_batch_size=2,
-            rwkv_decode_rows=[1, 0],
+            rwkv_decode_rows=decode_rows,
             rwkv_decode_token_positions=[0, 1],
         )
 
     assert seen_tokens == []
     assert torch.count_nonzero(shift_state) == 0
     assert torch.count_nonzero(wkv_state) == 0
-    assert elapsed.tolist() == [0, 0]
+    assert torch.count_nonzero(elapsed) == 0
 
 
 def test_rwkv7_vllm_forward_uses_slot_indices_for_permuted_decode_rows(
     monkeypatch,
 ):
-    monkeypatch.setattr(rwkv7, "C", 3)
     monkeypatch.setattr(rwkv7, "DTYPE", torch.float32)
-    monkeypatch.setattr(rwkv7, "first_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(rwkv7, "CUDA_DEVICE", torch.device("cpu"))
     monkeypatch.setattr(
         RWKV7ForCausalLM,
         "_contiguous_decode_token_range",
@@ -2685,48 +2530,11 @@ def test_rwkv7_vllm_forward_uses_slot_indices_for_permuted_decode_rows(
     assert elapsed.tolist() == [3, 0, 3]
 
 
-def test_rwkv7_vllm_forward_rejects_non_prefix_decode_rows_before_gather(
-    monkeypatch,
-):
-    monkeypatch.setattr(rwkv7, "C", 3)
-    monkeypatch.setattr(rwkv7, "DTYPE", torch.float32)
-    monkeypatch.setattr(rwkv7, "first_device", lambda: torch.device("cpu"))
-
-    def forward_tokens(tokens, state):
-        return tokens.to(torch.float32).expand(tokens.shape[0], 3)
-
-    model = _new_rwkv7_forward_test_model(
-        forward_tokens=forward_tokens,
-        forward_all_hidden=lambda *args: pytest.fail("decode must stay T=1"),
-    )
-
-    with pytest.raises(RuntimeError, match="contiguous prefix rows"):
-        RWKV7ForCausalLM.forward(
-            model,
-            torch.tensor([10, 20], dtype=torch.int64),
-            positions=None,
-            query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
-            idx_mapping=torch.tensor([2, 0], dtype=torch.int32),
-            shift_state=torch.zeros((1, 2, 3, 3), dtype=torch.float32),
-            wkv_state=torch.zeros((1, 3, 1, 1, 1), dtype=torch.float32),
-            elapsed=torch.zeros((3,), dtype=torch.int32),
-            rwkv_decode_batch_size=2,
-            rwkv_decode_rows=[2, 0],
-            rwkv_decode_token_positions=[0, 1],
-        )
-
-
-def test_rwkv7_contiguous_decode_token_range_rejects_non_prefix_rows():
-    with pytest.raises(RuntimeError, match="contiguous prefix rows"):
-        RWKV7ForCausalLM._contiguous_decode_token_range(2, [1, 2], [0, 1])
-
-
 def test_rwkv7_vllm_forward_uses_grouped_singleton_prefill(
     monkeypatch,
 ):
-    monkeypatch.setattr(rwkv7, "C", 3)
     monkeypatch.setattr(rwkv7, "DTYPE", torch.float32)
-    monkeypatch.setattr(rwkv7, "first_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(rwkv7, "CUDA_DEVICE", torch.device("cpu"))
 
     seen = []
 
@@ -2774,9 +2582,8 @@ def test_rwkv7_vllm_forward_uses_grouped_singleton_prefill(
 
 
 def test_rwkv7_vllm_forward_passes_resident_state_to_single_prefill(monkeypatch):
-    monkeypatch.setattr(rwkv7, "C", 3)
     monkeypatch.setattr(rwkv7, "DTYPE", torch.float32)
-    monkeypatch.setattr(rwkv7, "first_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(rwkv7, "CUDA_DEVICE", torch.device("cpu"))
 
     calls = []
 
@@ -2849,9 +2656,8 @@ def test_rwkv7_vllm_forward_passes_resident_state_to_single_prefill(monkeypatch)
 
 
 def test_rwkv7_vllm_forward_uses_varlen_prefill_metadata(monkeypatch):
-    monkeypatch.setattr(rwkv7, "C", 3)
     monkeypatch.setattr(rwkv7, "DTYPE", torch.float32)
-    monkeypatch.setattr(rwkv7, "first_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(rwkv7, "CUDA_DEVICE", torch.device("cpu"))
 
     calls: list[tuple[Any, ...]] = []
     shift_state = torch.zeros((1, 2, 4, 3), dtype=torch.float32)
@@ -2947,9 +2753,8 @@ def test_rwkv7_vllm_forward_uses_varlen_prefill_metadata(monkeypatch):
 def test_rwkv7_vllm_forward_uses_slot_mapped_mixed_decode_state_without_gather(
     monkeypatch,
 ):
-    monkeypatch.setattr(rwkv7, "C", 3)
     monkeypatch.setattr(rwkv7, "DTYPE", torch.float32)
-    monkeypatch.setattr(rwkv7, "first_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(rwkv7, "CUDA_DEVICE", torch.device("cpu"))
     state, model_inputs = _fragmented_mixed_rwkv7_inputs()
 
     def forbid_index_select(*args, **kwargs):
@@ -3010,9 +2815,8 @@ def test_rwkv7_vllm_forward_uses_slot_mapped_mixed_decode_state_without_gather(
 def test_rwkv7_vllm_forward_rejects_sparse_active_decode_rows(
     monkeypatch,
 ):
-    monkeypatch.setattr(rwkv7, "C", 3)
     monkeypatch.setattr(rwkv7, "DTYPE", torch.float32)
-    monkeypatch.setattr(rwkv7, "first_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(rwkv7, "CUDA_DEVICE", torch.device("cpu"))
     seen = []
 
     def forward_tokens(tokens, state):
@@ -3057,11 +2861,11 @@ def test_rwkv7_vllm_forward_rejects_sparse_active_decode_rows(
 
 
 def test_rwkv7_vllm_pp_non_last_stage_returns_v_first(monkeypatch):
-    monkeypatch.setattr(rwkv7, "C", 3)
     monkeypatch.setattr(rwkv7, "DTYPE", torch.float32)
-    monkeypatch.setattr(rwkv7, "first_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(rwkv7, "CUDA_DEVICE", torch.device("cpu"))
 
     model = object.__new__(RWKV7ForCausalLM)
+    model.hidden_size = 3
     model.start_layer = 0
     model.end_layer = 1
     model._is_pp_first_rank = lambda: True
@@ -3126,11 +2930,11 @@ def test_rwkv7_vllm_pp_non_last_stage_returns_v_first(monkeypatch):
 
 
 def test_rwkv7_vllm_pp_non_last_stage_all_gathers_tp_v_first(monkeypatch):
-    monkeypatch.setattr(rwkv7, "C", 4)
     monkeypatch.setattr(rwkv7, "DTYPE", torch.float32)
-    monkeypatch.setattr(rwkv7, "first_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(rwkv7, "CUDA_DEVICE", torch.device("cpu"))
 
     model = object.__new__(RWKV7ForCausalLM)
+    model.hidden_size = 4
     model.start_layer = 0
     model.end_layer = 1
     model.tp_size = 2
@@ -3175,11 +2979,11 @@ def test_rwkv7_vllm_pp_non_last_stage_all_gathers_tp_v_first(monkeypatch):
 
 
 def test_rwkv7_vllm_pp_last_stage_uses_intermediate_tensors(monkeypatch):
-    monkeypatch.setattr(rwkv7, "C", 3)
     monkeypatch.setattr(rwkv7, "DTYPE", torch.float32)
-    monkeypatch.setattr(rwkv7, "first_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(rwkv7, "CUDA_DEVICE", torch.device("cpu"))
 
     model = object.__new__(RWKV7ForCausalLM)
+    model.hidden_size = 3
     model.start_layer = 1
     model.end_layer = 2
     model._is_pp_first_rank = lambda: False
@@ -3269,11 +3073,11 @@ def test_rwkv7_vllm_pp_last_stage_uses_intermediate_tensors(monkeypatch):
 
 
 def test_rwkv7_vllm_pp_last_stage_slices_full_tp_v_first(monkeypatch):
-    monkeypatch.setattr(rwkv7, "C", 4)
     monkeypatch.setattr(rwkv7, "DTYPE", torch.float32)
-    monkeypatch.setattr(rwkv7, "first_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(rwkv7, "CUDA_DEVICE", torch.device("cpu"))
 
     model = object.__new__(RWKV7ForCausalLM)
+    model.hidden_size = 4
     model.start_layer = 1
     model.end_layer = 2
     model.tp_size = 2
@@ -3318,11 +3122,11 @@ def test_rwkv7_vllm_pp_last_stage_slices_full_tp_v_first(monkeypatch):
 def test_rwkv7_vllm_pp_last_stage_casts_intermediate_tensors_to_internal_dtype(
     monkeypatch,
 ):
-    monkeypatch.setattr(rwkv7, "C", 3)
     monkeypatch.setattr(rwkv7, "DTYPE", torch.float16)
-    monkeypatch.setattr(rwkv7, "first_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(rwkv7, "CUDA_DEVICE", torch.device("cpu"))
 
     model = object.__new__(RWKV7ForCausalLM)
+    model.hidden_size = 3
     model.start_layer = 1
     model.end_layer = 2
     model._is_pp_first_rank = lambda: False

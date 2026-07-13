@@ -73,6 +73,8 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
     init_info_cls: type[TInitInfo]
     update_info_cls: type[TUpdateInfo]
 
+    supports_draft_weight_update: bool = True
+
     def __init__(
         self,
         config: WeightTransferConfig,
@@ -95,6 +97,22 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
         self.model_config = vllm_config.model_config
         self.device = device
         self.model = model
+        self._default_model_config = self.model_config
+        self._default_model = model
+
+    def set_weight_update_target(
+        self,
+        model: torch.nn.Module,
+        model_config: Any,
+    ) -> None:
+        """Set the model that will receive the active weight update."""
+        self.model = model
+        self.model_config = model_config
+
+    def reset_weight_update_target(self) -> None:
+        """Restore weight updates to the engine's default target model."""
+        self.model = self._default_model
+        self.model_config = self._default_model_config
         self._model_handles_weight_update = False
 
     def _abort_model_weight_update(self) -> None:

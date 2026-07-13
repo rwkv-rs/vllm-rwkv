@@ -116,9 +116,6 @@ markers = [
 [tool.ty.src]
 respect-ignore-files = true
 
-[tool.ty.environment]
-python = "../../../.venv"
-
 [tool.typos.files]
 # these files may be written in non english words
 extend-exclude = ["tests/models/fixtures/*", "tests/prompts/*", "tests/tokenizers_/*",

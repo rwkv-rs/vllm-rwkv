@@ -27,7 +27,7 @@ logger = init_logger(__name__)
 
 HEAD_SIZE = 64
 DTYPE = torch.float16
-L, C, H, N, V = 0, 0, 0, HEAD_SIZE, 0
+CUDA_DEVICE = torch.device("cuda")
 LOWRANK_SUFFIXES = (
     "att.w1",
     "att.w2",
@@ -79,14 +79,6 @@ def resolve_execution_profile(wkv_mode: str) -> RWKV7ExecutionProfile:
     )
 
 
-EXECUTION_PROFILE = resolve_execution_profile(envs.VLLM_RWKV7_WKV_MODE)
-WKV_MODE = EXECUTION_PROFILE.wkv_mode
-
-
-def first_device() -> torch.device:
-    return torch.device("cuda")
-
-
 @dataclass(frozen=True)
 class PathConfig:
     rows: int
@@ -111,12 +103,12 @@ def is_lowrank_weight(key: str) -> bool:
     return key.endswith(LOWRANK_SUFFIXES)
 
 
-def can_use_lowrank_fused(rows: int) -> bool:
-    return C >= LOWRANK_FUSED_MIN_C and rows <= LOWRANK_IN_ROWS_T
+def can_use_lowrank_fused(hidden_size: int, rows: int) -> bool:
+    return hidden_size >= LOWRANK_FUSED_MIN_C and rows <= LOWRANK_IN_ROWS_T
 
 
-def can_use_lowrank_out_fused(rows: int) -> bool:
-    return C >= LOWRANK_FUSED_MIN_C and rows <= LOWRANK_OUT_ROWS_T
+def can_use_lowrank_out_fused(hidden_size: int, rows: int) -> bool:
+    return hidden_size >= LOWRANK_FUSED_MIN_C and rows <= LOWRANK_OUT_ROWS_T
 
 
 class RWKV7ForCausalLM(nn.Module):
@@ -125,7 +117,6 @@ class RWKV7ForCausalLM(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         """Create the RWKV7 inference module; weights are loaded by vLLM."""
-        global L, C, H, N, V
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.vllm_config = vllm_config
@@ -133,15 +124,19 @@ class RWKV7ForCausalLM(nn.Module):
         self.prefix = prefix
         self._validate_torch_compile_unsupported()
 
-        C = int(getattr(self.config, "hidden_size", 0))
-        V = int(getattr(self.config, "vocab_size", 0))
-        N = int(getattr(self.config, "head_size", HEAD_SIZE))
-        if C and N:
-            H = C // N
+        hidden_size = int(getattr(self.config, "hidden_size", 0))
+        vocab_size = int(getattr(self.config, "vocab_size", 0))
+        head_size = int(getattr(self.config, "head_size", HEAD_SIZE))
+        if hidden_size and head_size:
+            num_attention_heads = hidden_size // head_size
         else:
-            H = int(getattr(self.config, "num_attention_heads", 0))
-            N = C // H if C and H else HEAD_SIZE
-        L = int(
+            num_attention_heads = int(getattr(self.config, "num_attention_heads", 0))
+            head_size = (
+                hidden_size // num_attention_heads
+                if hidden_size and num_attention_heads
+                else HEAD_SIZE
+            )
+        num_hidden_layers = int(
             getattr(
                 self.config,
                 "num_hidden_layers",
@@ -149,26 +144,30 @@ class RWKV7ForCausalLM(nn.Module):
             )
         )
 
+        self.hidden_size = hidden_size
+        self.head_size = head_size
+        self.num_attention_heads = num_attention_heads
+        self.vocab_size = vocab_size
         self.z: dict[str, torch.Tensor] = {}
         self.raw_weight_names: set[str] | None = None
-        self.total_num_layers = L
+        self.total_num_layers = num_hidden_layers
         self.start_layer, self.end_layer = self._get_layer_range()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
-        if H % self.tp_size != 0:
+        if num_attention_heads % self.tp_size != 0:
             raise ValueError(
-                f"RWKV7 requires num_attention_heads ({H}) to be divisible "
+                "RWKV7 requires num_attention_heads "
+                f"({num_attention_heads}) to be divisible "
                 f"by tensor_parallel_size ({self.tp_size})."
             )
-        self.tp_num_heads = H // self.tp_size
-        self.tp_hidden_size = self.tp_num_heads * N
-        self.vocab_size = V
-        self.vocab_size_padded = self._get_padded_vocab_size(V)
-        self.execution_profile = EXECUTION_PROFILE
-        self.wkv_mode = EXECUTION_PROFILE.wkv_mode
-        self.wkv_state_dtype = EXECUTION_PROFILE.wkv_state_dtype
-        self.allow_fp16_accumulation = EXECUTION_PROFILE.allow_fp16_accumulation
-        self.logits_processor = LogitsProcessor(V, logits_as_input=True)
+        self.tp_num_heads = num_attention_heads // self.tp_size
+        self.tp_hidden_size = self.tp_num_heads * head_size
+        self.vocab_size_padded = self._get_padded_vocab_size(vocab_size)
+        self.execution_profile = resolve_execution_profile(envs.VLLM_RWKV7_WKV_MODE)
+        self.wkv_mode = self.execution_profile.wkv_mode
+        self.wkv_state_dtype = self.execution_profile.wkv_state_dtype
+        self.allow_fp16_accumulation = self.execution_profile.allow_fp16_accumulation
+        self.logits_processor = LogitsProcessor(vocab_size, logits_as_input=True)
         self.register_buffer("_dummy_param", torch.empty(0), persistent=False)
 
     def _get_layer_range(self) -> tuple[int, int]:
@@ -192,7 +191,7 @@ class RWKV7ForCausalLM(nn.Module):
         dtype: torch.dtype,
         device: torch.device,
     ) -> IntermediateTensors:
-        hidden_size = int(getattr(self.config, "hidden_size", C))
+        hidden_size = self.hidden_size
         return IntermediateTensors(
             {
                 "hidden_states": torch.zeros(
@@ -211,7 +210,7 @@ class RWKV7ForCausalLM(nn.Module):
         return ((vocab_size + tp_size - 1) // tp_size) * tp_size
 
     def _tp_vocab_range(self, vocab_size: int | None = None) -> tuple[int, int, int]:
-        vocab_size = V if vocab_size is None else vocab_size
+        vocab_size = self.vocab_size if vocab_size is None else vocab_size
         tp_size = getattr(self, "tp_size", 1)
         tp_rank = getattr(self, "tp_rank", 0)
         padded_vocab_size = self._get_padded_vocab_size(vocab_size)
@@ -295,8 +294,10 @@ class RWKV7ForCausalLM(nn.Module):
 
     def _is_weight_needed_on_rank(self, key: str) -> bool:
         start_layer = getattr(self, "start_layer", 0)
-        end_layer = getattr(self, "end_layer", getattr(self, "total_num_layers", L))
-        total_layers = getattr(self, "total_num_layers", L)
+        end_layer = getattr(
+            self, "end_layer", getattr(self, "total_num_layers", 0)
+        )
+        total_layers = getattr(self, "total_num_layers", 0)
         if start_layer == 0 and end_layer >= total_layers:
             return True
         if key == "emb.weight" or key.startswith("blocks.0.ln0."):
@@ -424,7 +425,14 @@ class RWKV7ForCausalLM(nn.Module):
         else:
             self.z = z
         torch.accelerator.synchronize()
-        logger.info("RWKV7 weights are ready L=%d C=%d H=%d N=%d V=%d", L, C, H, N, V)
+        logger.info(
+            "RWKV7 weights are ready L=%d C=%d H=%d N=%d V=%d",
+            self.total_num_layers,
+            self.hidden_size,
+            self.num_attention_heads,
+            self.head_size,
+            self.vocab_size,
+        )
 
     def _validate_raw_weight_shapes(self, z: dict[str, torch.Tensor]) -> None:
         r_k = z["blocks.0.att.r_k"].squeeze()
@@ -451,25 +459,34 @@ class RWKV7ForCausalLM(nn.Module):
 
     def _preprocess_weights(self, z: dict[str, torch.Tensor]) -> None:
         """Apply the albatross faster3a weight layout preprocessing."""
-        global L, C, H, N, V
         self._validate_raw_weight_shapes(z)
-        H, N = z["blocks.0.att.r_k"].shape
-        C, V = H * N, z["emb.weight"].shape[0]
-        assert N == HEAD_SIZE
-        if H % getattr(self, "tp_size", 1) != 0:
+        num_attention_heads, head_size = z["blocks.0.att.r_k"].shape
+        hidden_size = num_attention_heads * head_size
+        vocab_size = z["emb.weight"].shape[0]
+        assert head_size == HEAD_SIZE
+        self.num_attention_heads = num_attention_heads
+        self.head_size = head_size
+        self.hidden_size = hidden_size
+        self.vocab_size = vocab_size
+        if num_attention_heads % getattr(self, "tp_size", 1) != 0:
             raise ValueError(
-                f"RWKV7 requires num_attention_heads ({H}) to be divisible "
+                "RWKV7 requires num_attention_heads "
+                f"({num_attention_heads}) to be divisible "
                 f"by tensor_parallel_size ({getattr(self, 'tp_size', 1)})."
             )
         max_layer = max(int(k.split(".")[1]) for k in z if k.startswith("blocks."))
-        L = max_layer + 1
-        self.total_num_layers = L
+        self.total_num_layers = max_layer + 1
         self.start_layer, self.end_layer = self._get_layer_range()
-        self.tp_num_heads = H // getattr(self, "tp_size", 1)
-        self.tp_hidden_size = self.tp_num_heads * N
-        self.vocab_size = V
-        self.vocab_size_padded = self._get_padded_vocab_size(V)
-        logger.info("Detected RWKV7 model C=%d H=%d N=%d V=%d", C, H, N, V)
+        self.tp_num_heads = num_attention_heads // getattr(self, "tp_size", 1)
+        self.tp_hidden_size = self.tp_num_heads * head_size
+        self.vocab_size_padded = self._get_padded_vocab_size(vocab_size)
+        logger.info(
+            "Detected RWKV7 model C=%d H=%d N=%d V=%d",
+            hidden_size,
+            num_attention_heads,
+            head_size,
+            vocab_size,
+        )
         logger.info(
             "RWKV7 cmix no-fc path: rows<=%d row20_t<=%d",
             CMIX_NOFC_MAX_ROWS,
@@ -481,8 +498,8 @@ class RWKV7ForCausalLM(nn.Module):
         ln0_b_src = z["blocks.0.ln0.bias"].squeeze()
         logger.info(
             "Preprocessing RWKV7 weights with profile=%s and GEMM accumulation=%s",
-            EXECUTION_PROFILE.wkv_mode,
-            EXECUTION_PROFILE.gemm_accumulation_policy,
+            self.execution_profile.wkv_mode,
+            self.execution_profile.gemm_accumulation_policy,
         )
         for key in list(z.keys()):
             if not self._is_weight_needed_on_rank(key):
@@ -490,7 +507,7 @@ class RWKV7ForCausalLM(nn.Module):
                 continue
             value = z[key].squeeze()
             value = self._shard_weight_for_tp(key, value)
-            dev = first_device()
+            dev = CUDA_DEVICE
             is_lowrank = is_lowrank_weight(key)
             if not is_lowrank and (
                 "key.weight" in key
@@ -509,11 +526,13 @@ class RWKV7ForCausalLM(nn.Module):
             else:
                 z[key] = value
         if self._is_weight_needed_on_rank("emb.weight"):
-            emb_dev = first_device()
+            emb_dev = CUDA_DEVICE
             ln0_w_bf16 = ln0_w_src.to(device=emb_dev).contiguous()
             ln0_b_bf16 = ln0_b_src.to(device=emb_dev).contiguous()
-            vocab_start, vocab_end, vocab_per_rank = self._tp_vocab_range(V)
-            emb = torch.zeros((vocab_per_rank, C), dtype=DTYPE, device=emb_dev)
+            vocab_start, vocab_end, vocab_per_rank = self._tp_vocab_range(vocab_size)
+            emb = torch.zeros(
+                (vocab_per_rank, hidden_size), dtype=DTYPE, device=emb_dev
+            )
             if vocab_end > vocab_start:
                 local = torch.ops.rwkv7_v3a_ops.emb_ln0_bf16_to_f16(
                     emb_src[vocab_start:vocab_end].to(device=emb_dev).contiguous(),
@@ -525,12 +544,22 @@ class RWKV7ForCausalLM(nn.Module):
 
     def zero_state(self, B: int) -> list[torch.Tensor]:
         """Create RWKV recurrent state tensors for a batch."""
-        local_heads = getattr(self, "tp_num_heads", H)
+        local_heads = getattr(self, "tp_num_heads", self.num_attention_heads)
         return [
-            torch.zeros((L, 2, B, C), dtype=DTYPE, device="cuda"),
             torch.zeros(
-                (L, B, local_heads, N, N),
-                dtype=EXECUTION_PROFILE.wkv_state_dtype,
+                (self.total_num_layers, 2, B, self.hidden_size),
+                dtype=DTYPE,
+                device="cuda",
+            ),
+            torch.zeros(
+                (
+                    self.total_num_layers,
+                    B,
+                    local_heads,
+                    self.head_size,
+                    self.head_size,
+                ),
+                dtype=self.wkv_state_dtype,
                 device="cuda",
             ),
             torch.zeros((B,), dtype=torch.int32, device="cuda"),
@@ -606,7 +635,7 @@ class RWKV7ForCausalLM(nn.Module):
 
         assert input_ids is not None
         hidden_states = torch.empty(
-            (input_ids.shape[0], C), dtype=DTYPE, device=first_device()
+            (input_ids.shape[0], self.hidden_size), dtype=DTYPE, device=CUDA_DEVICE
         )
         if (
             rwkv_decode_rows is not None
@@ -637,7 +666,7 @@ class RWKV7ForCausalLM(nn.Module):
                         tokens,
                         state,
                         slot_indices=slot_indices[:decode_batch_size],
-                    ).view(decode_batch_size, C)
+                    ).view(decode_batch_size, self.hidden_size)
                     hidden_states.index_copy_(0, hidden_position_tensor, out)
                 else:
                     decode_position_list = self._decode_token_positions_list(
@@ -652,8 +681,12 @@ class RWKV7ForCausalLM(nn.Module):
                         wkv_state[:, :decode_batch_size, :, :, :],
                         elapsed[:decode_batch_size],
                     ]
-                    out = self.forward_tokens(tokens, state).view(decode_batch_size, C)
-                    hidden_states[start:end] = out.view(decode_batch_size, C)
+                    out = self.forward_tokens(tokens, state).view(
+                        decode_batch_size, self.hidden_size
+                    )
+                    hidden_states[start:end] = out.view(
+                        decode_batch_size, self.hidden_size
+                    )
 
             prefill_ranges = rwkv_prefill_token_ranges or []
             prefill_rows = rwkv_prefill_rows or []
@@ -709,10 +742,12 @@ class RWKV7ForCausalLM(nn.Module):
                 ]
                 if query_len == 1:
                     out = self.forward_tokens(tokens, state)
-                    hidden_states[start:end] = out.view(batch_size, C)
+                    hidden_states[start:end] = out.view(batch_size, self.hidden_size)
                 else:
                     out = self.forward_all_hidden(tokens, state)
-                    hidden_states[start:end] = out.view(batch_size * query_len, C)
+                    hidden_states[start:end] = out.view(
+                        batch_size * query_len, self.hidden_size
+                    )
             if prefill_groups:
                 return hidden_states
             if prefill_ranges:
@@ -763,19 +798,19 @@ class RWKV7ForCausalLM(nn.Module):
                 dtype=DTYPE
             )
             incoming_v_first = intermediate_tensors["v_first"].to(dtype=DTYPE)
-            if incoming_v_first.shape[-1] == C:
+            if incoming_v_first.shape[-1] == self.hidden_size:
                 incoming_v_first = self._tp_hidden_slice(incoming_v_first, -1)
             total_tokens = incoming_hidden_states.shape[0]
 
         hidden_states = torch.empty(
-            (total_tokens, C), dtype=DTYPE, device=first_device()
+            (total_tokens, self.hidden_size), dtype=DTYPE, device=CUDA_DEVICE
         )
         v_first_states = None
         if not is_last_pp_rank:
             v_first_states = torch.empty(
-                (total_tokens, C),
+                (total_tokens, self.hidden_size),
                 dtype=DTYPE,
-                device=first_device(),
+                device=CUDA_DEVICE,
             )
 
         if (
@@ -811,13 +846,13 @@ class RWKV7ForCausalLM(nn.Module):
                         assert incoming_v_first is not None
                         x = incoming_hidden_states.index_select(
                             0, decode_position_tensor
-                        ).view(decode_batch_size, 1, C)
+                        ).view(decode_batch_size, 1, self.hidden_size)
                         group_v_first = incoming_v_first.index_select(
                             0, decode_position_tensor
                         ).view(
                             decode_batch_size,
                             1,
-                            getattr(self, "tp_hidden_size", C),
+                            getattr(self, "tp_hidden_size", self.hidden_size),
                         )
                     state = [shift_state, wkv_state, elapsed]
                     decode_slot_indices = slot_indices[:decode_batch_size]
@@ -837,12 +872,12 @@ class RWKV7ForCausalLM(nn.Module):
                         assert incoming_hidden_states is not None
                         assert incoming_v_first is not None
                         x = incoming_hidden_states[start:end].view(
-                            decode_batch_size, 1, C
+                            decode_batch_size, 1, self.hidden_size
                         )
                         group_v_first = incoming_v_first[start:end].view(
                             decode_batch_size,
                             1,
-                            getattr(self, "tp_hidden_size", C),
+                            getattr(self, "tp_hidden_size", self.hidden_size),
                         )
                     state = [
                         shift_state[:, :, :decode_batch_size, :],
@@ -865,9 +900,11 @@ class RWKV7ForCausalLM(nn.Module):
                     last_indices=None,
                     **forward_kwargs,
                 )
-                out = out.view(decode_batch_size, C)
+                out = out.view(decode_batch_size, self.hidden_size)
                 if decode_position_tensor is None:
-                    hidden_states[start:end] = out.view(decode_batch_size, C)
+                    hidden_states[start:end] = out.view(
+                        decode_batch_size, self.hidden_size
+                    )
                 else:
                     hidden_states.index_copy_(0, decode_position_tensor, out)
                 if v_first_states is not None:
@@ -876,10 +913,12 @@ class RWKV7ForCausalLM(nn.Module):
                         out_v_first = group_v_first
                     if getattr(self, "tp_size", 1) > 1:
                         out_v_first = tensor_model_parallel_all_gather(out_v_first)
-                    out_v_first = out_v_first.view(decode_batch_size, C)
+                    out_v_first = out_v_first.view(
+                        decode_batch_size, self.hidden_size
+                    )
                     if decode_position_tensor is None:
                         v_first_states[start:end] = out_v_first.view(
-                            decode_batch_size, C
+                            decode_batch_size, self.hidden_size
                         )
                     else:
                         v_first_states.index_copy_(
@@ -912,17 +951,17 @@ class RWKV7ForCausalLM(nn.Module):
                         device=input_ids.device
                     )
                     tokens = input_ids.index_select(0, input_position_tensor)
-                    x = self.embed(tokens).view(tokens.numel(), C)
+                    x = self.embed(tokens).view(tokens.numel(), self.hidden_size)
                     group_v_first = None
                 else:
                     assert incoming_hidden_states is not None
                     assert incoming_v_first is not None
                     x = incoming_hidden_states.index_select(
                         0, hidden_position_tensor
-                    ).view(-1, C)
+                    ).view(-1, self.hidden_size)
                     group_v_first = incoming_v_first.index_select(
                         0, hidden_position_tensor
-                    ).view(-1, getattr(self, "tp_hidden_size", C))
+                    ).view(-1, getattr(self, "tp_hidden_size", self.hidden_size))
                 state = [prefill_shift_state, prefill_wkv_state, prefill_elapsed]
                 out, out_v_first = self.forward_varlen_layer_range(
                     x,
@@ -942,7 +981,9 @@ class RWKV7ForCausalLM(nn.Module):
                     if getattr(self, "tp_size", 1) > 1:
                         out_v_first = tensor_model_parallel_all_gather(out_v_first)
                     v_first_states.index_copy_(
-                        0, hidden_position_tensor, out_v_first.view(-1, C)
+                        0,
+                        hidden_position_tensor,
+                        out_v_first.view(-1, self.hidden_size),
                     )
                 if not is_last_pp_rank:
                     assert v_first_states is not None
@@ -969,11 +1010,13 @@ class RWKV7ForCausalLM(nn.Module):
                 else:
                     assert incoming_hidden_states is not None
                     assert incoming_v_first is not None
-                    x = incoming_hidden_states[start:end].view(batch_size, query_len, C)
+                    x = incoming_hidden_states[start:end].view(
+                        batch_size, query_len, self.hidden_size
+                    )
                     group_v_first = incoming_v_first[start:end].view(
                         batch_size,
                         query_len,
-                        getattr(self, "tp_hidden_size", C),
+                        getattr(self, "tp_hidden_size", self.hidden_size),
                     )
                 state = [
                     prefill_shift_state[:, :, row_start:row_end, :],
@@ -990,7 +1033,9 @@ class RWKV7ForCausalLM(nn.Module):
                     all_logits=True,
                     last_indices=None,
                 )
-                hidden_states[start:end] = out.view(batch_size * query_len, C)
+                hidden_states[start:end] = out.view(
+                    batch_size * query_len, self.hidden_size
+                )
                 if v_first_states is not None:
                     if out_v_first is None:
                         assert group_v_first is not None
@@ -998,7 +1043,7 @@ class RWKV7ForCausalLM(nn.Module):
                     if getattr(self, "tp_size", 1) > 1:
                         out_v_first = tensor_model_parallel_all_gather(out_v_first)
                     v_first_states[start:end] = out_v_first.view(
-                        batch_size * query_len, C
+                        batch_size * query_len, self.hidden_size
                     )
             if prefill_groups:
                 if not is_last_pp_rank:
@@ -1030,22 +1075,36 @@ class RWKV7ForCausalLM(nn.Module):
         tokens: torch.Tensor,
         state: list[torch.Tensor],
         *,
+        all_logits: bool = False,
+        last_indices: torch.Tensor | None = None,
         slot_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if tokens.dim() == 1:
             tokens = tokens.unsqueeze(0)
-        B, T = tokens.shape
-        path = select_path(B, T)
+        batch_size, token_count = tokens.shape
         x = self.embed(tokens)
-        return self.forward_from_x(x, state, path, slot_indices=slot_indices)
+        path = select_path(batch_size, token_count)
+        if not all_logits and last_indices is None:
+            return self.forward_from_x(x, state, path, slot_indices=slot_indices)
+        return self.forward_from_x(
+            x,
+            state,
+            path,
+            all_logits=all_logits,
+            last_indices=last_indices,
+            slot_indices=slot_indices,
+        )
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed(input_ids)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        logits = self.linear_head(hidden_states)
+        logits = self.linear(hidden_states, self.z["head.weight"])
         logits = self.logits_processor(None, logits)
         if logits is not None and getattr(self, "tp_size", 1) > 1:
             logits = tensor_model_parallel_all_gather(logits)
             if logits is not None:
-                logits = logits[..., : getattr(self, "vocab_size", V)]
+                logits = logits[..., : self.vocab_size]
         return logits
 
     def compute_sampling_logits(
@@ -1122,9 +1181,6 @@ class RWKV7ForCausalLM(nn.Module):
 
         return self.compute_logits(hidden_states[:num_reqs])
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed(input_ids)
-
     @staticmethod
     def _decode_token_positions_length(
         decode_positions: torch.Tensor | list[int] | None,
@@ -1197,7 +1253,7 @@ class RWKV7ForCausalLM(nn.Module):
         if getattr(self, "tp_size", 1) == 1:
             return self.z["emb.weight"][tokens]
         vocab_start, vocab_end, vocab_per_rank = self._tp_vocab_range(
-            getattr(self, "vocab_size", V)
+            self.vocab_size
         )
         mask = (tokens < vocab_start) | (tokens >= vocab_end)
         local = (tokens - vocab_start).clamp(min=0, max=vocab_per_rank - 1)
@@ -1242,7 +1298,7 @@ class RWKV7ForCausalLM(nn.Module):
         z = self.z
         B, T, _ = x.shape
         start_layer = getattr(self, "start_layer", 0)
-        end_layer = getattr(self, "end_layer", L)
+        end_layer = getattr(self, "end_layer", self.total_num_layers)
 
         def advance_elapsed() -> None:
             if slot_indices is None:
@@ -1385,24 +1441,13 @@ class RWKV7ForCausalLM(nn.Module):
     def forward_all_logits(
         self, tokens: torch.Tensor, state: list[torch.Tensor]
     ) -> torch.Tensor:
-        if tokens.dim() == 1:
-            tokens = tokens.unsqueeze(0)
-        B, T = tokens.shape
-        path = select_path(B, T)
-        x = self.embed(tokens)
-        hidden_states = self.forward_from_x(x, state, path, all_logits=True)
-        return self.compute_logits(hidden_states)
+        return self.compute_logits(self.forward_tokens(tokens, state, all_logits=True))
 
     def forward_all_hidden(
         self, tokens: torch.Tensor, state: list[torch.Tensor]
     ) -> torch.Tensor:
         """Return hidden states for every input position."""
-        if tokens.dim() == 1:
-            tokens = tokens.unsqueeze(0)
-        B, T = tokens.shape
-        path = select_path(B, T)
-        x = self.embed(tokens)
-        return self.forward_from_x(x, state, path, all_logits=True)
+        return self.forward_tokens(tokens, state, all_logits=True)
 
     def forward_varlen_hidden(
         self,
@@ -1415,7 +1460,7 @@ class RWKV7ForCausalLM(nn.Module):
         max_t: int,
     ) -> torch.Tensor:
         tokens = tokens.reshape(-1)
-        x = self.embed(tokens).view(tokens.numel(), C)
+        x = self.embed(tokens).view(tokens.numel(), self.hidden_size)
         out, _ = self.forward_varlen_layer_range(
             x,
             state,
@@ -1444,7 +1489,7 @@ class RWKV7ForCausalLM(nn.Module):
         total_tokens = x.shape[0]
         path = PathConfig(total_tokens, CMIX_DENSE)
         start_layer = getattr(self, "start_layer", 0)
-        end_layer = getattr(self, "end_layer", L)
+        end_layer = getattr(self, "end_layer", self.total_num_layers)
 
         def advance_elapsed() -> None:
             torch.ops.rwkv7_v3a_ops.advance_i32_varlen(
@@ -1515,13 +1560,170 @@ class RWKV7ForCausalLM(nn.Module):
         state: list[torch.Tensor],
         last_indices: torch.Tensor,
     ) -> torch.Tensor:
-        if tokens.dim() == 1:
-            tokens = tokens.unsqueeze(0)
-        B, T = tokens.shape
-        path = select_path(B, T)
-        x = self.embed(tokens)
-        hidden_states = self.forward_from_x(x, state, path, last_indices=last_indices)
-        return self.compute_logits(hidden_states)
+        return self.compute_logits(
+            self.forward_tokens(tokens, state, last_indices=last_indices)
+        )
+
+    def _project_tmix(
+        self,
+        layer: int,
+        xr: torch.Tensor,
+        xw: torch.Tensor,
+        xk: torch.Tensor,
+        xv: torch.Tensor,
+        xa: torch.Tensor,
+        xg: torch.Tensor,
+        v_first: torch.Tensor,
+        p: str,
+        path: PathConfig,
+        *,
+        batch_size: int,
+        time_steps: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Share the layout-independent time-mix projection pipeline."""
+        z = self.z
+        ops = torch.ops.rwkv7_fast_ops_fp16
+        r = self.linear(xr, z[p + "receptance.weight"])
+        k = self.linear(xk, z[p + "key.weight"])
+        v = self.linear(xv, z[p + "value.weight"])
+        local_c = r.shape[-1]
+        local_h = local_c // self.head_size
+        use_lowrank_in = can_use_lowrank_fused(self.hidden_size, path.rows)
+        use_lowrank_out = can_use_lowrank_out_fused(self.hidden_size, path.rows)
+
+        v1 = None
+        if use_lowrank_in and use_lowrank_out and layer != 0:
+            w1, a1, g1, v1 = torch.ops.rwkv7_v3a_ops.linear_wagv_rank_in_f16(
+                xw.contiguous(),
+                xa.contiguous(),
+                xg.contiguous(),
+                xv.contiguous(),
+                z[p + "w1.t"],
+                z[p + "a1.t"],
+                z[p + "g1.t"],
+                z[p + "v1.t"],
+            )
+        elif use_lowrank_in:
+            w1, a1, g1 = torch.ops.rwkv7_v3a_ops.linear_wag_rank_in_f16(
+                xw.contiguous(),
+                xa.contiguous(),
+                xg.contiguous(),
+                z[p + "w1.t"],
+                z[p + "a1.t"],
+                z[p + "g1.t"],
+            )
+        else:
+            w1 = self.linear_rank_in(
+                xw, z.get(p + "w1"), z.get(p + "w1.t"), path.rows
+            )
+            a1 = self.linear_rank_in(
+                xa, z.get(p + "a1"), z.get(p + "a1.t"), path.rows
+            )
+            g1 = self.linear_rank_in(
+                xg, z.get(p + "g1"), z.get(p + "g1.t"), path.rows
+            )
+
+        v_done = False
+        if use_lowrank_out and layer != 0 and v1 is not None:
+            w, a, g, v = torch.ops.rwkv7_v3a_ops.linear_wagv_rank_out_f16(
+                w1.contiguous(),
+                a1.contiguous(),
+                g1.contiguous(),
+                v1.contiguous(),
+                z[p + "w2.t"],
+                z[p + "a2.t"],
+                z[p + "g2.t"],
+                z[p + "v2.t"],
+                v.contiguous(),
+                v_first.contiguous(),
+                z[p + "v0"],
+            )
+            v_done = True
+        elif use_lowrank_out:
+            w, a, g = torch.ops.rwkv7_v3a_ops.linear_wag_rank_out_f16(
+                w1.contiguous(),
+                a1.contiguous(),
+                g1.contiguous(),
+                z[p + "w2.t"],
+                z[p + "a2.t"],
+                z[p + "g2.t"],
+            )
+        else:
+            w = self.linear_rank_out_act(
+                w1, z.get(p + "w2"), z.get(p + "w2.t"), path.rows, 1
+            )
+            a = self.linear_rank_out(
+                a1, z.get(p + "a2"), z.get(p + "a2.t"), path.rows
+            )
+            g = self.linear_rank_out_act(
+                g1, z.get(p + "g2"), z.get(p + "g2.t"), path.rows, 2
+            )
+
+        value_shape = (batch_size, time_steps, local_c)
+        k3, neg_kk3, kka3 = ops.tmix_kk_a_gate(
+            batch_size,
+            time_steps,
+            local_c,
+            local_h,
+            k.reshape(value_shape).contiguous(),
+            z[p + "k_k"],
+            z[p + "a0"],
+            a.reshape(value_shape).contiguous(),
+            z[p + "k_a"],
+        )
+        if k.dim() == 2:
+            k = k3.reshape(-1, local_c)
+            neg_kk = neg_kk3.reshape(-1, local_c)
+            kka = kka3.reshape(-1, local_c)
+        else:
+            k, neg_kk, kka = k3, neg_kk3, kka3
+
+        if layer == 0:
+            v_first = v
+        elif not v_done:
+            if use_lowrank_out:
+                if v1 is None:
+                    v1 = self.linear_rank_in(
+                        xv, z.get(p + "v1"), z.get(p + "v1.t"), path.rows
+                    )
+                v = torch.ops.rwkv7_v3a_ops.linear_t_vres_f16(
+                    v1.contiguous(),
+                    z[p + "v2.t"],
+                    v.contiguous(),
+                    v_first.contiguous(),
+                    z[p + "v0"],
+                )
+            else:
+                v12 = self.linear_rank_out(
+                    self.linear_rank_in(
+                        xv, z.get(p + "v1"), z.get(p + "v1.t"), path.rows
+                    ),
+                    z.get(p + "v2"),
+                    z.get(p + "v2.t"),
+                    path.rows,
+                )
+                v = ops.tmix_vres_gate(
+                    batch_size,
+                    time_steps,
+                    local_c,
+                    v.reshape(value_shape).contiguous(),
+                    v_first.reshape(value_shape).contiguous(),
+                    z[p + "v0"],
+                    v12.reshape(value_shape).contiguous(),
+                )
+                if v.dim() == 3 and xv.dim() == 2:
+                    v = v.reshape(-1, local_c)
+
+        return r, w, k, v, neg_kk, kka, g, v_first
 
     def tmix_varlen(
         self,
@@ -1546,7 +1748,7 @@ class RWKV7ForCausalLM(nn.Module):
         xr, xw, xk, xv, xa, xg = ops.tmix_mix6_varlen(
             B,
             total_tokens,
-            C,
+            self.hidden_size,
             x.contiguous(),
             shift_state[0],
             slot_indices,
@@ -1560,131 +1762,25 @@ class RWKV7ForCausalLM(nn.Module):
             req_id,
         )
 
-        r = self.linear(xr, z[p + "receptance.weight"])
-        k = self.linear(xk, z[p + "key.weight"])
-        v = self.linear(xv, z[p + "value.weight"])
-        local_c = r.shape[-1]
-        local_h = local_c // N
-
-        v1 = None
-        if (
-            can_use_lowrank_fused(path.rows)
-            and can_use_lowrank_out_fused(path.rows)
-            and layer != 0
-        ):
-            w1, a1, g1, v1 = torch.ops.rwkv7_v3a_ops.linear_wagv_rank_in_f16(
-                xw.contiguous(),
-                xa.contiguous(),
-                xg.contiguous(),
-                xv.contiguous(),
-                z[p + "w1.t"],
-                z[p + "a1.t"],
-                z[p + "g1.t"],
-                z[p + "v1.t"],
-            )
-        elif can_use_lowrank_fused(path.rows):
-            w1, a1, g1 = torch.ops.rwkv7_v3a_ops.linear_wag_rank_in_f16(
-                xw.contiguous(),
-                xa.contiguous(),
-                xg.contiguous(),
-                z[p + "w1.t"],
-                z[p + "a1.t"],
-                z[p + "g1.t"],
-            )
-        else:
-            w1 = self.linear_rank_in(xw, z.get(p + "w1"), z.get(p + "w1.t"), path.rows)
-            a1 = self.linear_rank_in(xa, z.get(p + "a1"), z.get(p + "a1.t"), path.rows)
-            g1 = self.linear_rank_in(xg, z.get(p + "g1"), z.get(p + "g1.t"), path.rows)
-
-        v_done = False
-        if (
-            can_use_lowrank_out_fused(path.rows)
-            and layer != 0
-            and v1 is not None
-        ):
-            w, a, g, v = torch.ops.rwkv7_v3a_ops.linear_wagv_rank_out_f16(
-                w1.contiguous(),
-                a1.contiguous(),
-                g1.contiguous(),
-                v1.contiguous(),
-                z[p + "w2.t"],
-                z[p + "a2.t"],
-                z[p + "g2.t"],
-                z[p + "v2.t"],
-                v.contiguous(),
-                v_first.contiguous(),
-                z[p + "v0"],
-            )
-            v_done = True
-        elif can_use_lowrank_out_fused(path.rows):
-            w, a, g = torch.ops.rwkv7_v3a_ops.linear_wag_rank_out_f16(
-                w1.contiguous(),
-                a1.contiguous(),
-                g1.contiguous(),
-                z[p + "w2.t"],
-                z[p + "a2.t"],
-                z[p + "g2.t"],
-            )
-        else:
-            w = self.linear_rank_out_act(
-                w1, z.get(p + "w2"), z.get(p + "w2.t"), path.rows, 1
-            )
-            a = self.linear_rank_out(a1, z.get(p + "a2"), z.get(p + "a2.t"), path.rows)
-            g = self.linear_rank_out_act(
-                g1, z.get(p + "g2"), z.get(p + "g2.t"), path.rows, 2
-            )
-
-        k3, neg_kk3, kka3 = ops.tmix_kk_a_gate(
-            total_tokens,
-            1,
-            local_c,
-            local_h,
-            k.view(total_tokens, 1, local_c).contiguous(),
-            z[p + "k_k"],
-            z[p + "a0"],
-            a.view(total_tokens, 1, local_c).contiguous(),
-            z[p + "k_a"],
+        r, w, k, v, neg_kk, kka, g, v_first = self._project_tmix(
+            layer,
+            xr,
+            xw,
+            xk,
+            xv,
+            xa,
+            xg,
+            v_first,
+            p,
+            path,
+            batch_size=total_tokens,
+            time_steps=1,
         )
-        k = k3.view(total_tokens, local_c)
-        neg_kk = neg_kk3.view(total_tokens, local_c)
-        kka = kka3.view(total_tokens, local_c)
-
-        if layer == 0:
-            v_first = v
-        elif not v_done:
-            if can_use_lowrank_out_fused(path.rows):
-                if v1 is None:
-                    v1 = self.linear_rank_in(
-                        xv, z.get(p + "v1"), z.get(p + "v1.t"), path.rows
-                    )
-                v = torch.ops.rwkv7_v3a_ops.linear_t_vres_f16(
-                    v1.contiguous(),
-                    z[p + "v2.t"],
-                    v.contiguous(),
-                    v_first.contiguous(),
-                    z[p + "v0"],
-                )
-            else:
-                v12 = self.linear_rank_out(
-                    self.linear_rank_in(
-                        xv, z.get(p + "v1"), z.get(p + "v1.t"), path.rows
-                    ),
-                    z.get(p + "v2"),
-                    z.get(p + "v2.t"),
-                    path.rows,
-                )
-                v = ops.tmix_vres_gate(
-                    total_tokens,
-                    1,
-                    local_c,
-                    v.view(total_tokens, 1, local_c).contiguous(),
-                    v_first.view(total_tokens, 1, local_c).contiguous(),
-                    z[p + "v0"],
-                    v12.view(total_tokens, 1, local_c).contiguous(),
-                ).view(total_tokens, local_c)
+        local_c = r.shape[-1]
+        local_h = local_c // self.head_size
 
         y = torch.empty_like(r)
-        if WKV_MODE == "fp32io16":
+        if self.wkv_mode == "fp32io16":
             w_raw = ops.add_vec(local_c, w.contiguous(), z[p + "w0"])
             torch.ops.rwkv7_wkv_fp32_v2.forward_varlen(
                 B,
@@ -1777,7 +1873,7 @@ class RWKV7ForCausalLM(nn.Module):
         mixed = ops.cmix_mix_varlen(
             B,
             total_tokens,
-            C,
+            self.hidden_size,
             x.contiguous(),
             shift_state[1],
             slot_indices,
@@ -1786,8 +1882,10 @@ class RWKV7ForCausalLM(nn.Module):
             req_id,
         )
         dense_path = PathConfig(path.rows, CMIX_DENSE)
-        return self.cmix_from_mixed(mixed.view(total_tokens, 1, C), p, dense_path).view(
-            total_tokens, C
+        return self.cmix_from_mixed(
+            mixed.view(total_tokens, 1, self.hidden_size), p, dense_path
+        ).view(
+            total_tokens, self.hidden_size
         )
 
     def tmix(
@@ -1812,7 +1910,7 @@ class RWKV7ForCausalLM(nn.Module):
             xr, xw, xk, xv, xa, xg = ops.tmix_mix6_slot(
                 B,
                 T,
-                C,
+                self.hidden_size,
                 x.contiguous(),
                 shift_state[0],
                 slot_indices,
@@ -1827,7 +1925,7 @@ class RWKV7ForCausalLM(nn.Module):
             xr, xw, xk, xv, xa, xg = ops.tmix_mix6(
                 B,
                 T,
-                C,
+                self.hidden_size,
                 x.contiguous(),
                 shift_state[0],
                 z[p + "x_r"],
@@ -1837,126 +1935,25 @@ class RWKV7ForCausalLM(nn.Module):
                 z[p + "x_a"],
                 z[p + "x_g"],
             )
-        r = self.linear(xr, z[p + "receptance.weight"])
-        k = self.linear(xk, z[p + "key.weight"])
-        v = self.linear(xv, z[p + "value.weight"])
-        local_c = r.shape[-1]
-        local_h = local_c // N
-
-        v1 = None
-        if (
-            can_use_lowrank_fused(path.rows)
-            and can_use_lowrank_out_fused(path.rows)
-            and layer != 0
-        ):
-            w1, a1, g1, v1 = torch.ops.rwkv7_v3a_ops.linear_wagv_rank_in_f16(
-                xw.contiguous(),
-                xa.contiguous(),
-                xg.contiguous(),
-                xv.contiguous(),
-                z[p + "w1.t"],
-                z[p + "a1.t"],
-                z[p + "g1.t"],
-                z[p + "v1.t"],
-            )
-        elif can_use_lowrank_fused(path.rows):
-            w1, a1, g1 = torch.ops.rwkv7_v3a_ops.linear_wag_rank_in_f16(
-                xw.contiguous(),
-                xa.contiguous(),
-                xg.contiguous(),
-                z[p + "w1.t"],
-                z[p + "a1.t"],
-                z[p + "g1.t"],
-            )
-        else:
-            w1 = self.linear_rank_in(xw, z.get(p + "w1"), z.get(p + "w1.t"), path.rows)
-            a1 = self.linear_rank_in(xa, z.get(p + "a1"), z.get(p + "a1.t"), path.rows)
-            g1 = self.linear_rank_in(xg, z.get(p + "g1"), z.get(p + "g1.t"), path.rows)
-        v_done = False
-        if (
-            can_use_lowrank_out_fused(path.rows)
-            and layer != 0
-            and v1 is not None
-        ):
-            w, a, g, v = torch.ops.rwkv7_v3a_ops.linear_wagv_rank_out_f16(
-                w1.contiguous(),
-                a1.contiguous(),
-                g1.contiguous(),
-                v1.contiguous(),
-                z[p + "w2.t"],
-                z[p + "a2.t"],
-                z[p + "g2.t"],
-                z[p + "v2.t"],
-                v.contiguous(),
-                v_first.contiguous(),
-                z[p + "v0"],
-            )
-            v_done = True
-        elif can_use_lowrank_out_fused(path.rows):
-            w, a, g = torch.ops.rwkv7_v3a_ops.linear_wag_rank_out_f16(
-                w1.contiguous(),
-                a1.contiguous(),
-                g1.contiguous(),
-                z[p + "w2.t"],
-                z[p + "a2.t"],
-                z[p + "g2.t"],
-            )
-        else:
-            w = self.linear_rank_out_act(
-                w1, z.get(p + "w2"), z.get(p + "w2.t"), path.rows, 1
-            )
-            a = self.linear_rank_out(a1, z.get(p + "a2"), z.get(p + "a2.t"), path.rows)
-            g = self.linear_rank_out_act(
-                g1, z.get(p + "g2"), z.get(p + "g2.t"), path.rows, 2
-            )
-        k, neg_kk, kka = ops.tmix_kk_a_gate(
-            B,
-            T,
-            local_c,
-            local_h,
-            k.contiguous(),
-            z[p + "k_k"],
-            z[p + "a0"],
-            a.contiguous(),
-            z[p + "k_a"],
+        r, w, k, v, neg_kk, kka, g, v_first = self._project_tmix(
+            layer,
+            xr,
+            xw,
+            xk,
+            xv,
+            xa,
+            xg,
+            v_first,
+            p,
+            path,
+            batch_size=B,
+            time_steps=T,
         )
-
-        if layer == 0:
-            v_first = v
-        elif not v_done:
-            if can_use_lowrank_out_fused(path.rows):
-                if v1 is None:
-                    v1 = self.linear_rank_in(
-                        xv, z.get(p + "v1"), z.get(p + "v1.t"), path.rows
-                    )
-                v = torch.ops.rwkv7_v3a_ops.linear_t_vres_f16(
-                    v1.contiguous(),
-                    z[p + "v2.t"],
-                    v.contiguous(),
-                    v_first.contiguous(),
-                    z[p + "v0"],
-                )
-            else:
-                v12 = self.linear_rank_out(
-                    self.linear_rank_in(
-                        xv, z.get(p + "v1"), z.get(p + "v1.t"), path.rows
-                    ),
-                    z.get(p + "v2"),
-                    z.get(p + "v2.t"),
-                    path.rows,
-                )
-                v = ops.tmix_vres_gate(
-                    B,
-                    T,
-                    local_c,
-                    v.contiguous(),
-                    v_first.contiguous(),
-                    z[p + "v0"],
-                    v12.contiguous(),
-                )
+        local_c = r.shape[-1]
+        local_h = local_c // self.head_size
 
         y = torch.empty_like(r)
-        if WKV_MODE == "fp32io16":
+        if self.wkv_mode == "fp32io16":
             w_raw = ops.add_vec(local_c, w.contiguous(), z[p + "w0"])
             if slot_indices is None:
                 torch.ops.rwkv7_wkv_fp32_v2.forward(
@@ -2092,11 +2089,19 @@ class RWKV7ForCausalLM(nn.Module):
 
         if slot_indices is not None:
             mixed = ops.cmix_mix_slot(
-                B, T, C, x.contiguous(), shift_state[1], slot_indices, z[p + "x_k"]
+                B,
+                T,
+                self.hidden_size,
+                x.contiguous(),
+                shift_state[1],
+                slot_indices,
+                z[p + "x_k"],
             )
             return self.cmix_from_mixed(mixed, p, path)
 
-        mixed = ops.cmix_mix(B, T, C, x.contiguous(), shift_state[1], z[p + "x_k"])
+        mixed = ops.cmix_mix(
+            B, T, self.hidden_size, x.contiguous(), shift_state[1], z[p + "x_k"]
+        )
         return self.cmix_from_mixed(mixed, p, path)
 
     def cmix_from_mixed(
@@ -2109,7 +2114,7 @@ class RWKV7ForCausalLM(nn.Module):
         if path.cmix_mode == CMIX_B1T1_NOFC:
             return self._tp_all_reduce(
                 ops.cmix_sparse_down_relu_one(
-                    C,
+                    self.hidden_size,
                     z[p + "value.weight"].size(0),
                     hid.view(-1).contiguous(),
                     z[p + "value.weight"],
@@ -2117,15 +2122,29 @@ class RWKV7ForCausalLM(nn.Module):
             )
         if path.cmix_mode == CMIX_ROWS2_NOFC:
             F = z[p + "value.weight"].size(0)
-            if path.rows >= CMIX_NOFC_T512_MIN_ROWS and C % 512 == 0 and F % 512 == 0:
+            if (
+                path.rows >= CMIX_NOFC_T512_MIN_ROWS
+                and self.hidden_size % 512 == 0
+                and F % 512 == 0
+            ):
                 return self._tp_all_reduce(
                     ops.cmix_sparse_down_relu_rows_t512(
-                        B, T, C, F, hid.contiguous(), z[p + "value.weight"]
+                        B,
+                        T,
+                        self.hidden_size,
+                        F,
+                        hid.contiguous(),
+                        z[p + "value.weight"],
                     )
                 )
             return self._tp_all_reduce(
                 ops.cmix_sparse_down_relu_rows(
-                    B, T, C, F, hid.contiguous(), z[p + "value.weight"]
+                    B,
+                    T,
+                    self.hidden_size,
+                    F,
+                    hid.contiguous(),
+                    z[p + "value.weight"],
                 )
             )
 
@@ -2139,9 +2158,6 @@ class RWKV7ForCausalLM(nn.Module):
             x.contiguous(), weight, self.allow_fp16_accumulation
         )
 
-    def linear_head(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x, self.z["head.weight"])
-
     def linear_rank_in(
         self, x: torch.Tensor, weight: torch.Tensor, weight_t: torch.Tensor, rows: int
     ) -> torch.Tensor:
@@ -2152,7 +2168,7 @@ class RWKV7ForCausalLM(nn.Module):
     def linear_rank_out(
         self, x: torch.Tensor, weight: torch.Tensor, weight_t: torch.Tensor, rows: int
     ) -> torch.Tensor:
-        if C >= LOWRANK_FUSED_MIN_C and rows <= LOWRANK_OUT_ROWS_T:
+        if self.hidden_size >= LOWRANK_FUSED_MIN_C and rows <= LOWRANK_OUT_ROWS_T:
             return torch.ops.rwkv7_v3a_ops.linear_t_f16(x.contiguous(), weight_t)
         return self.linear(x, weight)
 
@@ -2164,7 +2180,7 @@ class RWKV7ForCausalLM(nn.Module):
         rows: int,
         act: int,
     ) -> torch.Tensor:
-        if C >= LOWRANK_FUSED_MIN_C and rows <= LOWRANK_OUT_ROWS_T:
+        if self.hidden_size >= LOWRANK_FUSED_MIN_C and rows <= LOWRANK_OUT_ROWS_T:
             return torch.ops.rwkv7_v3a_ops.linear_t_act_f16(
                 x.contiguous(), weight_t, act
             )

@@ -328,7 +328,7 @@ class RWKV7ModelState(ModelState):
         self._prefill_req_slots = []
         self._prefill_becomes_decode = []
         req_ids = getattr(input_batch, "req_ids", None)
-        is_dummy_batch = req_ids and all(
+        is_dummy_batch = bool(req_ids) and all(
             req_id not in self.req_id_to_index for req_id in req_ids
         )
         if is_dummy_batch:
@@ -444,22 +444,13 @@ class RWKV7ModelState(ModelState):
         else:
             slot_indices = None
             decode_token_position_tensor = None
-        if not decode_entries:
-            decode_rows = []
-            decode_context_size = 0
-            decode_state_tensors = {
-                "shift_state": self.shift_state,
-                "wkv_state": self.wkv_state,
-                "elapsed": self.elapsed,
-            }
-        else:
-            decode_rows = source_decode_rows
-            decode_context_size = len(decode_rows)
-            decode_state_tensors = {
-                "shift_state": self.shift_state,
-                "wkv_state": self.wkv_state,
-                "elapsed": self.elapsed,
-            }
+        decode_rows = source_decode_rows if decode_entries else []
+        decode_context_size = len(decode_rows)
+        decode_state_tensors = {
+            "shift_state": self.shift_state,
+            "wkv_state": self.wkv_state,
+            "elapsed": self.elapsed,
+        }
 
         if not prefill_entries:
             self._set_sampling_logits_fast_path(

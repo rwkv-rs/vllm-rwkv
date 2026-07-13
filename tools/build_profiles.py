@@ -8,7 +8,7 @@ import os
 from collections.abc import Iterable
 
 BUILD_PROFILES = ("full", "rwkv")
-RWKV_EXTENSION_NAMES = ("vllm.rwkv7_ops",)
+RWKV_EXTENSION_NAMES = ("vllm._rapid_sampling", "vllm.rwkv7_ops")
 
 
 def _validate_profile(profile: str) -> None:

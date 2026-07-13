@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib
 import secrets
-from pathlib import Path
-from typing import cast
 
 import torch
 import torch.nn as nn
@@ -113,10 +112,28 @@ def rapid_sampler_supported() -> bool:
             if capability is None
             else f"unsupported compute capability {capability.as_version_str()}"
         )
-        raise RuntimeError(
-            "Rapid top-p/top-k sampling unavailable: "
-            f"{unsupported_reason}. Set VLLM_USE_RAPID_SAMPLER=0 to disable it."
+        message = f"Rapid top-p/top-k sampling unavailable: {unsupported_reason}."
+        if envs.is_set("VLLM_USE_RAPID_SAMPLER"):
+            raise RuntimeError(
+                f"{message} Unset VLLM_USE_RAPID_SAMPLER=1 to use another sampler."
+            )
+        logger.warning_once("%s Falling back to the native sampler.", message)
+        return False
+
+    try:
+        _load_rapid_sampler_module()
+    except ImportError as exc:
+        message = "Rapid top-p/top-k sampling native extension is unavailable."
+        if envs.is_set("VLLM_USE_RAPID_SAMPLER"):
+            raise RuntimeError(
+                f"{message} Build vllm._rapid_sampling or unset "
+                "VLLM_USE_RAPID_SAMPLER=1."
+            ) from exc
+        logger.warning_once(
+            "%s Falling back to the native sampler.",
+            message,
         )
+        return False
 
     logger.info_once("Using rapid-sampling for top-p & top-k sampling.")
     return True
@@ -252,33 +269,17 @@ class TopKTopPSampler(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Rapid-sampling implementation for top-k and top-p sampling."""
         if generators:
-            raise RuntimeError(
-                "rapid-sampling does not support per-request generators. "
-                "Set VLLM_USE_RAPID_SAMPLER=0 to use the native seeded path."
-            )
+            return self.forward_native(logits, generators, k, p)
         if self.use_fp64_gumbel:
-            raise RuntimeError(
-                "rapid-sampling does not support fp64 Gumbel sampling. "
-                "Set VLLM_USE_RAPID_SAMPLER=0 to use the native fp64 path."
-            )
+            return self.forward_native(logits, generators, k, p)
         scalar_top_k = _rapid_scalar(k, logits.shape[-1])
         scalar_top_p = _rapid_scalar(p, 1.0)
         if scalar_top_k is None or scalar_top_p is None:
-            raise RuntimeError(
-                "rapid-sampling without penalties only supports uniform scalar "
-                "top_k/top_p. Refusing to use the native sampler fallback; "
-                "set VLLM_USE_RAPID_SAMPLER=0 to opt out explicitly."
-            )
+            return self.forward_native(logits, generators, k, p)
         if not rapid_sample_input_supported(logits):
-            message = (
-                "rapid-sampling requires CUDA float32 logits with vocab size "
-                "in (0, 1048576] and divisible by 4. Set "
-                "VLLM_USE_RAPID_SAMPLER=0 to use another sampler."
-            )
-            raise RuntimeError(message)
-        assert self.logprobs_mode not in ("processed_logits", "processed_logprobs"), (
-            "rapid-sampling does not support returning logits/logprobs"
-        )
+            return self.forward_native(logits, generators, k, p)
+        if self.logprobs_mode in ("processed_logits", "processed_logprobs"):
+            return self.forward_native(logits, generators, k, p)
         return rapid_sample(logits, scalar_top_k, scalar_top_p), None
 
     def forward_cpu(
@@ -579,19 +580,12 @@ def random_sample(
 def _load_rapid_sampler_module():
     global _RAPID_SAMPLER_MODULE
     if _RAPID_SAMPLER_MODULE is None:
-        from torch.utils.cpp_extension import load
-
-        source_dir = Path(__file__).with_name("rapid_sampling")
-        _RAPID_SAMPLER_MODULE = load(
-            name="vllm_rapid_sampling",
-            sources=[
-                str(source_dir / "sampling.cpp"),
-                str(source_dir / "sampling.cu"),
-            ],
-            extra_cflags=["-O3"],
-            extra_cuda_cflags=["-O3", "--extra-device-vectorization", "-Xptxas=-O3"],
-            verbose=False,
-        )
+        try:
+            _RAPID_SAMPLER_MODULE = importlib.import_module("vllm._rapid_sampling")
+        except ImportError:
+            _RAPID_SAMPLER_MODULE = False
+    if _RAPID_SAMPLER_MODULE is False:
+        raise ImportError("vllm._rapid_sampling is not installed")
     return _RAPID_SAMPLER_MODULE
 
 
@@ -606,7 +600,7 @@ def _rapid_vector(
         return torch.full((batch_size,), default, dtype=dtype, device=device)
     if isinstance(value, (int, float)):
         return torch.full((batch_size,), value, dtype=dtype, device=device)
-    tensor = cast(torch.Tensor, value)
+    tensor = value
     if tensor.numel() == 1 and batch_size != 1:
         tensor = tensor.expand(batch_size)
     assert tensor.shape == (batch_size,), (
@@ -758,13 +752,6 @@ def rapid_sample(
             int(scalar_top_k),
             float(scalar_top_p),
         ).view(-1)
-
-    raise RuntimeError(
-        "rapid-sampling without penalties only supports uniform scalar "
-        "temperature/top_k/top_p. Use the native sampler for mixed per-request "
-        "sampling parameters."
-    )
-
 
 def flashinfer_sample(
     logits: torch.Tensor,

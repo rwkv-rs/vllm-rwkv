@@ -90,7 +90,7 @@ class Sampler:
             or sampling_params.penalty_decay != RAPID_PENALTY_DECAY_DEFAULT
         )
         if self.use_rapid and (self.rapid_penalties is not None or use_rapid_penalty):
-            self._reset_rapid_penalty_row(req_idx)
+            self._ensure_rapid_penalties()[req_idx].zero_()
         if use_rapid_penalty:
             self._seed_rapid_prompt_penalties(req_idx, prompt_len, sampling_params)
         self.sampling_states.add_request(req_idx, sampling_params)
@@ -110,9 +110,6 @@ class Sampler:
                 device=self.req_states.device,
             )
         return self.rapid_penalties
-
-    def _reset_rapid_penalty_row(self, req_idx: int) -> None:
-        self._ensure_rapid_penalties()[req_idx].zero_()
 
     def _seed_rapid_prompt_penalties(
         self,

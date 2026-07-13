@@ -94,7 +94,8 @@ def load_build_profile_metadata(path: Path = _PROFILE_PATH) -> BuildProfileMetad
     )
     if profile == "rwkv" and (
         metadata.unrestricted
-        or metadata.configured_targets != ("rwkv7_ops",)
+        or metadata.configured_targets
+        != ("_rapid_sampling", "rwkv7_ops")
         or metadata.external_projects
     ):
         raise RuntimeError(f"Inconsistent RWKV build profile metadata in {path}")

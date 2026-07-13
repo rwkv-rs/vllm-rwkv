@@ -270,12 +270,7 @@ def _render_tool_definitions(tools: list[dict[str, Any]]) -> list[str]:
 
 
 def _json_text(value: Any) -> str:
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except json.JSONDecodeError:
-            value = normalize_rwkv_message_content(value)
-    return json.dumps(value, ensure_ascii=False, indent=2)
+    return json.dumps(_json_value(value), ensure_ascii=False, indent=2)
 
 
 def _json_value(value: Any) -> Any:

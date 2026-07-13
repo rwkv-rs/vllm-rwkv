@@ -29,16 +29,6 @@ def _new_rapid_sampler(
     return sampler
 
 
-def test_worker_sampler_clears_rapid_penalty_row_for_reused_slot():
-    rapid_penalties = torch.ones(2, 8, dtype=torch.float32)
-    sampler = _new_rapid_sampler(rapid_penalties=rapid_penalties)
-
-    sampler._reset_rapid_penalty_row(1)
-
-    assert torch.count_nonzero(rapid_penalties[1]) == 0
-    assert torch.all(rapid_penalties[0] == 1)
-
-
 def test_worker_sampler_seeds_rapid_repetition_penalty_from_prompt():
     all_token_ids = torch.tensor(
         [
@@ -62,6 +52,25 @@ def test_worker_sampler_seeds_rapid_repetition_penalty_from_prompt():
     assert torch.isclose(rapid_penalties[0, 2], torch.tensor(1.2))
     assert torch.isclose(rapid_penalties[0, 5], torch.tensor(1.2))
     assert torch.count_nonzero(rapid_penalties[0]) == 2
+
+
+def test_worker_sampler_clears_rapid_penalties_when_reusing_slot():
+    rapid_penalties = torch.full((1, 8), 3.0)
+    sampler = _new_rapid_sampler(rapid_penalties=rapid_penalties)
+    sampler.use_rapid = True
+    sampler.require_rapid = False
+    for name in (
+        "sampling_states",
+        "penalties_state",
+        "logit_bias_state",
+        "bad_words_state",
+        "logprob_token_ids_state",
+    ):
+        setattr(sampler, name, SimpleNamespace(add_request=lambda *args: None))
+
+    sampler.add_request(0, 0, SamplingParams())
+
+    assert torch.count_nonzero(rapid_penalties) == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="UVA tensors require CUDA")

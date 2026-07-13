@@ -471,6 +471,34 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   if(VLLM_RWKV_ONLY_BUILD)
     target_compile_definitions(rwkv7_ops PRIVATE VLLM_RWKV_RUNTIME_OPS)
   endif()
+
+  set(RAPID_SAMPLING_CUDA_SRC
+    "vllm/v1/sample/ops/rapid_sampling/sampling.cu")
+  set(RAPID_SAMPLING_EXT_SRC
+    "vllm/v1/sample/ops/rapid_sampling/sampling.cpp"
+    ${RAPID_SAMPLING_CUDA_SRC})
+  set_source_files_properties(${RAPID_SAMPLING_CUDA_SRC}
+    PROPERTIES COMPILE_FLAGS "-O3 --extra-device-vectorization -Xptxas -O3")
+  set_gencode_flags_for_srcs(
+    SRCS "${RAPID_SAMPLING_CUDA_SRC}"
+    CUDA_ARCHS "${CUDA_ARCHS}")
+
+  define_extension_target(
+    _rapid_sampling
+    DESTINATION vllm
+    LANGUAGE CUDA
+    SOURCES ${RAPID_SAMPLING_EXT_SRC}
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES ${VLLM_GPU_ARCHES}
+    WITH_SOABI)
+  find_library(TORCH_PYTHON_LIBRARY
+    NAMES torch_python
+    PATHS "${TORCH_INSTALL_PREFIX}/lib"
+    NO_DEFAULT_PATH)
+  if(NOT TORCH_PYTHON_LIBRARY)
+    message(FATAL_ERROR "libtorch_python is required by _rapid_sampling")
+  endif()
+  target_link_libraries(_rapid_sampling PRIVATE "${TORCH_PYTHON_LIBRARY}")
 endif()
 
 #
