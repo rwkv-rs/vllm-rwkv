@@ -216,11 +216,10 @@ class RWKV7ModelState(ModelState):
     def get_supported_generation_tasks(self) -> tuple[GenerationTask, ...]:
         return ("generate",)
 
-    def custom_sampler(self, sampler: Any) -> tuple[Any, None]:
-        if not sampler.use_rapid:
-            raise RuntimeError("RWKV7 requires rapid-sampling on CUDA.")
-        sampler.require_rapid = True
-        return sampler, None
+    def custom_sampler(self, sampler: Any) -> tuple[Any, None] | None:
+        # Keep the standard sampler fallback path available for greedy avg@1
+        # requests, which rapid-sampling does not support.
+        return None
 
     def sort_scheduled_req_ids(
         self,
@@ -494,7 +493,6 @@ class RWKV7ModelState(ModelState):
         )
         can_use_grouped_prefill = (
             has_positive_prefill_lengths
-            and len(prefill_groups) == 1
             and grouped_ranges == len(prefill_ranges)
         )
         can_use_varlen_prefill = (

@@ -1292,6 +1292,17 @@ class VllmConfig:
         self._maybe_override_dynamic_sd_cudagraph_mode()
 
         if (
+            self._is_rwkv7_model()
+            and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        ):
+            logger.warning_once(
+                "RWKV7ForCausalLM does not support CUDA Graph replay safely "
+                "with dynamic recurrent state rows. Overriding cudagraph_mode "
+                "to NONE."
+            )
+            self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
+        if (
             self.compilation_config.cudagraph_mode.requires_piecewise_compilation()
             and self.compilation_config.mode != CompilationMode.VLLM_COMPILE
             and not envs.VLLM_USE_BREAKABLE_CUDAGRAPH

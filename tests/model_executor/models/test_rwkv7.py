@@ -13,7 +13,6 @@ import vllm.model_executor.models.rwkv7 as rwkv7
 from vllm.config.compilation import CompilationConfig, CompilationMode, CUDAGraphMode
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.models.config import RWKV7ForCausalLMConfig
-from vllm.model_executor.models.interfaces import supports_pp
 from vllm.model_executor.models.rwkv7 import RWKV7ForCausalLM
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
@@ -514,9 +513,7 @@ def test_rwkv7_config_defaults_to_no_compile():
     RWKV7ForCausalLMConfig.verify_and_update_config(vllm_config)
 
     assert vllm_config.compilation_config.mode == CompilationMode.NONE
-    assert (
-        vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
-    )
+    assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
 
 
 def test_rwkv7_config_disables_prefix_caching():
@@ -568,7 +565,7 @@ def test_rwkv7_config_rejects_decode_budget_below_max_running_reqs():
     "cudagraph_mode",
     [None, CUDAGraphMode.FULL, CUDAGraphMode.FULL_AND_PIECEWISE],
 )
-def test_rwkv7_config_uses_decode_cudagraph(cudagraph_mode):
+def test_rwkv7_config_disables_cudagraph(cudagraph_mode):
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=False),
         compilation_config=CompilationConfig(
@@ -579,9 +576,7 @@ def test_rwkv7_config_uses_decode_cudagraph(cudagraph_mode):
 
     RWKV7ForCausalLMConfig.verify_and_update_config(vllm_config)
 
-    assert (
-        vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
-    )
+    assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
 
 
 def test_rwkv7_config_preserves_disabled_cudagraph():
@@ -1895,6 +1890,31 @@ def test_rwkv7_model_state_prefill_uses_resident_state():
     assert torch.all(state.elapsed == 9)
 
 
+def test_rwkv7_model_state_uses_grouped_prefill_for_ragged_batch():
+    state = _new_rwkv7_model_state(max_num_reqs=4)
+    for req_slot in range(3):
+        state.add_request(req_slot, _new_request(f"req-{req_slot}"))
+    input_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([0, 1, 2], dtype=np.int32),
+        query_start_loc=torch.tensor([0, 2, 5, 6], dtype=torch.int32),
+        is_prefilling_np=np.array([True, True, True], dtype=np.bool_),
+        num_scheduled_tokens=np.array([2, 3, 1], dtype=np.int32),
+        num_computed_prefill_tokens_np=np.array([0, 0, 0], dtype=np.int32),
+        prefill_len_np=np.array([2, 3, 1], dtype=np.int32),
+    )
+
+    inputs = state.prepare_inputs(input_batch, req_states=None)
+
+    assert inputs["rwkv_prefill_rows"] == [0, 1, 2]
+    assert inputs["rwkv_prefill_groups"] == [
+        (0, 1, 2, 0, 2, 0),
+        (1, 2, 3, 2, 5, 1),
+        (2, 3, 1, 5, 6, 2),
+    ]
+    _assert_no_varlen_prefill_inputs(inputs)
+
+
 def test_rwkv7_model_state_keeps_resident_prefill_row_when_decode_row_starts():
     state = _new_rwkv7_model_state(max_num_reqs=4)
     state.add_request(0, _new_request("req-0"))
@@ -2218,20 +2238,20 @@ def test_rwkv7_model_state_dummy_batch_uses_scratch_state():
     assert torch.all(state.elapsed == 3)
 
 
-def test_rwkv7_model_state_requires_rapid_sampler():
+def test_rwkv7_model_state_allows_native_sampler_fallback():
     state = object.__new__(RWKV7ModelState)
     sampler = SimpleNamespace(use_rapid=True, require_rapid=False)
 
-    assert state.custom_sampler(sampler) == (sampler, None)
-    assert sampler.require_rapid is True
+    assert state.custom_sampler(sampler) is None
+    assert sampler.require_rapid is False
 
 
-def test_rwkv7_model_state_rejects_unavailable_rapid_sampler():
+def test_rwkv7_model_state_allows_unavailable_rapid_sampler():
     state = object.__new__(RWKV7ModelState)
     sampler = SimpleNamespace(use_rapid=False, require_rapid=False)
 
-    with pytest.raises(RuntimeError, match="requires rapid-sampling"):
-        state.custom_sampler(sampler)
+    assert state.custom_sampler(sampler) is None
+    assert sampler.require_rapid is False
 
 
 def test_rwkv7_dummy_inputs_cover_all_tokens():
