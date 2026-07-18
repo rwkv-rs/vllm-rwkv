@@ -1293,14 +1293,14 @@ class VllmConfig:
 
         if (
             self._is_rwkv7_model()
-            and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            and self.compilation_config.cudagraph_mode
+            not in (CUDAGraphMode.NONE, CUDAGraphMode.FULL_DECODE_ONLY)
         ):
             logger.warning_once(
-                "RWKV7ForCausalLM does not support CUDA Graph replay safely "
-                "with dynamic recurrent state rows. Overriding cudagraph_mode "
-                "to NONE."
+                "RWKV7ForCausalLM supports CUDA Graph replay for decode only. "
+                "Overriding cudagraph_mode to FULL_DECODE_ONLY."
             )
-            self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+            self.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
 
         if (
             self.compilation_config.cudagraph_mode.requires_piecewise_compilation()

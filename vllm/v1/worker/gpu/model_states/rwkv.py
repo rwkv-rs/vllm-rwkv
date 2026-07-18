@@ -36,6 +36,8 @@ class RWKV7ModelState(ModelState):
         self.model = model
         self.device = device
         self.max_num_reqs = self.scheduler_config.max_num_seqs
+        self.cudagraph_padding_row = self.max_num_reqs
+        self.num_state_rows = self.max_num_reqs + 1
 
         cfg = self.model_config.hf_config
         total_num_layers = int(
@@ -64,14 +66,14 @@ class RWKV7ModelState(ModelState):
             )
 
         self.shift_state = torch.zeros(
-            (self.num_layers, 2, self.max_num_reqs, self.hidden_size),
+            (self.num_layers, 2, self.num_state_rows, self.hidden_size),
             dtype=torch.float16,
             device=device,
         )
         self.wkv_state = torch.zeros(
             (
                 self.num_layers,
-                self.max_num_reqs,
+                self.num_state_rows,
                 self.num_heads,
                 self.head_size,
                 self.head_size,
@@ -80,7 +82,7 @@ class RWKV7ModelState(ModelState):
             device=device,
         )
         self.elapsed = torch.zeros(
-            (self.max_num_reqs,), dtype=torch.int32, device=device
+            (self.num_state_rows,), dtype=torch.int32, device=device
         )
         self.execution_idx_mapping = torch.arange(
             self.max_num_reqs, dtype=torch.int32, device=device
@@ -326,7 +328,7 @@ class RWKV7ModelState(ModelState):
         self._set_sampling_logits_fast_path(input_batch, False)
         self._prefill_req_slots = []
         self._prefill_becomes_decode = []
-        req_ids = getattr(input_batch, "req_ids", None)
+        req_ids = input_batch.req_ids
         is_dummy_batch = bool(req_ids) and all(
             req_id not in self.req_id_to_index for req_id in req_ids
         )
@@ -415,12 +417,22 @@ class RWKV7ModelState(ModelState):
         decode_token_positions = [
             start for _batch_idx, _req_slot, _row, start in decode_entries
         ]
-        use_contiguous_decode = self._is_contiguous_decode_context(
-            source_decode_rows,
-            decode_token_positions,
+        cudagraph_full_decode = bool(
+            getattr(input_batch, "rwkv_full_cudagraph", False)
         )
-        if decode_entries and not use_contiguous_decode:
+        if cudagraph_full_decode:
+            if prefill_entries:
+                raise RuntimeError("RWKV7 FULL CUDAGraph only supports decode batches")
             decode_len = len(decode_entries)
+            graph_batch_size = input_batch.num_reqs_after_padding
+            if (
+                graph_batch_size < decode_len
+                or input_batch.num_tokens_after_padding != graph_batch_size
+                or decode_token_positions != list(range(decode_len))
+            ):
+                raise RuntimeError(
+                    "RWKV7 FULL CUDAGraph requires padded 1-token decode"
+                )
             self.decode_slot_indices[:decode_len].copy_(
                 torch.tensor(
                     source_decode_rows,
@@ -428,23 +440,53 @@ class RWKV7ModelState(ModelState):
                     device=self.device,
                 )
             )
-            self.decode_token_positions[:decode_len].copy_(
-                torch.tensor(
-                    decode_token_positions,
+            self.decode_slot_indices[decode_len:graph_batch_size].fill_(
+                self.cudagraph_padding_row
+            )
+            self.decode_token_positions[:graph_batch_size].copy_(
+                torch.arange(
+                    graph_batch_size,
                     dtype=torch.long,
                     device=self.device,
                 )
             )
-            slot_indices = self.decode_slot_indices[:decode_len]
-            decode_token_position_tensor = self.decode_token_positions[:decode_len]
-        elif decode_entries:
-            slot_indices = None
-            decode_token_position_tensor = decode_token_positions
+            slot_indices = self.decode_slot_indices[:graph_batch_size]
+            decode_token_position_tensor = self.decode_token_positions[
+                :graph_batch_size
+            ]
+            decode_rows = list(range(graph_batch_size))
+            decode_context_size = graph_batch_size
         else:
-            slot_indices = None
-            decode_token_position_tensor = None
-        decode_rows = source_decode_rows if decode_entries else []
-        decode_context_size = len(decode_rows)
+            use_contiguous_decode = self._is_contiguous_decode_context(
+                source_decode_rows,
+                decode_token_positions,
+            )
+            if decode_entries and not use_contiguous_decode:
+                decode_len = len(decode_entries)
+                self.decode_slot_indices[:decode_len].copy_(
+                    torch.tensor(
+                        source_decode_rows,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                )
+                self.decode_token_positions[:decode_len].copy_(
+                    torch.tensor(
+                        decode_token_positions,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                )
+                slot_indices = self.decode_slot_indices[:decode_len]
+                decode_token_position_tensor = self.decode_token_positions[:decode_len]
+            elif decode_entries:
+                slot_indices = None
+                decode_token_position_tensor = decode_token_positions
+            else:
+                slot_indices = None
+                decode_token_position_tensor = None
+            decode_rows = source_decode_rows if decode_entries else []
+            decode_context_size = len(decode_rows)
         decode_state_tensors = {
             "shift_state": self.shift_state,
             "wkv_state": self.wkv_state,
@@ -611,14 +653,20 @@ class RWKV7ModelState(ModelState):
             "elapsed": self.elapsed,
         }
         if num_tokens == num_reqs:
+            self.decode_slot_indices[:num_reqs].copy_(
+                self.execution_idx_mapping[:num_reqs]
+            )
+            self.decode_token_positions[:num_reqs].copy_(
+                torch.arange(num_reqs, dtype=torch.long, device=self.device)
+            )
             return {
                 "query_start_loc": query_start_loc,
                 "idx_mapping": idx_mapping,
                 **state_tensors,
                 "rwkv_decode_batch_size": num_reqs,
                 "rwkv_decode_rows": list(range(num_reqs)),
-                "rwkv_decode_token_positions": list(range(num_reqs)),
-                "slot_indices": None,
+                "rwkv_decode_token_positions": self.decode_token_positions[:num_reqs],
+                "slot_indices": self.decode_slot_indices[:num_reqs],
             }
         return {
             "query_start_loc": query_start_loc,

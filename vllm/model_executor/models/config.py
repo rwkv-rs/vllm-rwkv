@@ -640,12 +640,19 @@ class RWKV7ForCausalLMConfig(VerifyAndUpdateConfig):
         compilation_config.mode = CompilationMode.NONE
 
         cudagraph_mode = compilation_config.cudagraph_mode
-        if cudagraph_mode not in (None, CUDAGraphMode.NONE):
+        if (
+            vllm_config.model_config.enforce_eager
+            or cudagraph_mode == CUDAGraphMode.NONE
+        ):
+            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+            return
+
+        if cudagraph_mode not in (None, CUDAGraphMode.FULL_DECODE_ONLY):
             logger.warning_once(
-                "RWKV7 does not support CUDA Graph replay safely with dynamic "
-                "recurrent state rows. Overriding cudagraph_mode to NONE."
+                "RWKV7 supports decode-only CUDAGraph with persistent slot "
+                "indices. Overriding cudagraph_mode to FULL_DECODE_ONLY."
             )
-        compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
 
 
 class NemotronHForCausalLMConfig(VerifyAndUpdateConfig):

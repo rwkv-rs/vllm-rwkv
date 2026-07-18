@@ -513,7 +513,10 @@ def test_rwkv7_config_defaults_to_no_compile():
     RWKV7ForCausalLMConfig.verify_and_update_config(vllm_config)
 
     assert vllm_config.compilation_config.mode == CompilationMode.NONE
-    assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+    assert (
+        vllm_config.compilation_config.cudagraph_mode
+        == CUDAGraphMode.FULL_DECODE_ONLY
+    )
 
 
 def test_rwkv7_config_disables_prefix_caching():
@@ -565,7 +568,7 @@ def test_rwkv7_config_rejects_decode_budget_below_max_running_reqs():
     "cudagraph_mode",
     [None, CUDAGraphMode.FULL, CUDAGraphMode.FULL_AND_PIECEWISE],
 )
-def test_rwkv7_config_disables_cudagraph(cudagraph_mode):
+def test_rwkv7_config_uses_decode_only_cudagraph(cudagraph_mode):
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=False),
         compilation_config=CompilationConfig(
@@ -576,7 +579,10 @@ def test_rwkv7_config_disables_cudagraph(cudagraph_mode):
 
     RWKV7ForCausalLMConfig.verify_and_update_config(vllm_config)
 
-    assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+    assert (
+        vllm_config.compilation_config.cudagraph_mode
+        == CUDAGraphMode.FULL_DECODE_ONLY
+    )
 
 
 def test_rwkv7_config_preserves_disabled_cudagraph():
@@ -660,7 +666,8 @@ def test_rwkv7_dummy_inputs_decode_capture_advertises_contiguous_rows():
     assert inputs["query_start_loc"].tolist() == [0, 1, 2, 3]
     assert inputs["rwkv_decode_batch_size"] == 3
     assert inputs["rwkv_decode_rows"] == [0, 1, 2]
-    assert inputs["rwkv_decode_token_positions"] == [0, 1, 2]
+    assert inputs["rwkv_decode_token_positions"].tolist() == [0, 1, 2]
+    assert inputs["slot_indices"].tolist() == [0, 1, 2]
 
 
 def test_rwkv7_dummy_inputs_decode_capture_uses_persistent_state_buffers():
@@ -687,8 +694,12 @@ def test_rwkv7_dummy_inputs_decode_capture_uses_persistent_state_buffers():
     assert inputs["elapsed"] is state.elapsed
     assert inputs["rwkv_decode_batch_size"] == 3
     assert inputs["rwkv_decode_rows"] == [0, 1, 2]
-    assert inputs["rwkv_decode_token_positions"] == [0, 1, 2]
-    assert inputs["slot_indices"] is None
+    _assert_same_storage_view(
+        inputs["rwkv_decode_token_positions"], state.decode_token_positions[:3]
+    )
+    _assert_same_storage_view(inputs["slot_indices"], state.decode_slot_indices[:3])
+    assert inputs["rwkv_decode_token_positions"].tolist() == [0, 1, 2]
+    assert inputs["slot_indices"].tolist() == [0, 1, 2]
 
 
 def test_rwkv7_load_weights_preprocesses_full_raw_weights(monkeypatch):
@@ -977,8 +988,8 @@ def test_rwkv7_model_state_allocates_only_local_pp_layers():
 
     assert state.layer_offset == 1
     assert state.num_layers == 2
-    assert state.shift_state.shape == (2, 2, 3, 64)
-    assert state.wkv_state.shape == (2, 3, 1, 64, 64)
+    assert state.shift_state.shape == (2, 2, 4, 64)
+    assert state.wkv_state.shape == (2, 4, 1, 64, 64)
 
 
 def test_rwkv7_model_state_allocates_only_local_tp_heads():
@@ -1002,8 +1013,8 @@ def test_rwkv7_model_state_allocates_only_local_tp_heads():
     )
 
     assert state.num_heads == 2
-    assert state.shift_state.shape == (2, 2, 3, 256)
-    assert state.wkv_state.shape == (2, 3, 2, 64, 64)
+    assert state.shift_state.shape == (2, 2, 4, 256)
+    assert state.wkv_state.shape == (2, 4, 2, 64, 64)
 
 
 def test_rwkv7_pipeline_rank_keeps_only_stage_weights():
@@ -1429,6 +1440,43 @@ def test_rwkv7_model_state_uses_contiguous_decode_path_for_prefix_rows():
     assert inputs["slot_indices"] is None
 
 
+def test_rwkv7_full_cudagraph_uses_slots_and_padding_state_row():
+    state = _new_rwkv7_model_state(max_num_reqs=4)
+    for req_slot in range(3):
+        state.add_request(req_slot, _new_request(f"req-{req_slot}"))
+    state.prepare_inputs(
+        _rwkv7_input_batch(
+            state,
+            idx_mapping_np=np.array([0, 1, 2], dtype=np.int32),
+            query_start_loc=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+            is_prefilling_np=np.array([False, False, False], dtype=np.bool_),
+        ),
+        req_states=None,
+    )
+    state.remove_request("req-1")
+
+    input_batch = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([0, 2], dtype=np.int32),
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        is_prefilling_np=np.array([False, False], dtype=np.bool_),
+        num_reqs_after_padding=4,
+        num_tokens_after_padding=4,
+        rwkv_full_cudagraph=True,
+    )
+
+    inputs = state.prepare_inputs(input_batch, req_states=None)
+
+    assert state.shift_state.shape[2] == 5
+    assert state.wkv_state.shape[1] == 5
+    assert state.elapsed.shape == (5,)
+    assert inputs["idx_mapping"].tolist() == [0, 2]
+    assert inputs["rwkv_decode_batch_size"] == 4
+    assert inputs["rwkv_decode_rows"] == [0, 1, 2, 3]
+    assert inputs["rwkv_decode_token_positions"].tolist() == [0, 1, 2, 3]
+    assert inputs["slot_indices"].tolist() == [0, 2, 4, 4]
+
+
 def test_rwkv7_model_state_keeps_steady_decode_slot_after_row_removal():
     state = _new_rwkv7_model_state(max_num_reqs=4)
     state.add_request(0, _new_request("req-0"))
@@ -1629,7 +1677,7 @@ def test_rwkv7_prepare_permuted_decode_returns_slot_indices_before_forward():
     assert torch.all(state.shift_state[:, :, 1] == 20)
     assert torch.all(state.wkv_state[:, 0] == 30)
     assert torch.all(state.wkv_state[:, 1] == 40)
-    assert state.elapsed.tolist() == [50, 60]
+    assert state.elapsed.tolist()[:2] == [50, 60]
 
 
 def test_rwkv7_model_state_keeps_decode_and_resident_prefill_slots_separate():
