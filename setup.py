@@ -1268,6 +1268,7 @@ package_data = {
         "entrypoints/serve/instrumentator/static/*.js",
         "entrypoints/serve/instrumentator/static/*.css",
         "distributed/kv_transfer/kv_connector/v1/hf3fs/utils/*.cpp",
+        "third_party/flash_linear_attention/LICENSE",
         "v1/sample/ops/rapid_sampling/*.cpp",
         "v1/sample/ops/rapid_sampling/*.cu",
         # DeepGEMM JIT include headers (vendored via cmake)
@@ -1350,7 +1351,7 @@ setup(
         "bench": ["pandas", "matplotlib", "seaborn", "datasets", "scipy", "plotly"],
         "tensorizer": ["tensorizer==2.10.1"],
         "fastsafetensors": ["fastsafetensors >= 0.3.2"],
-        "instanttensor": ["instanttensor >= 0.1.5"],
+        "instanttensor": ["instanttensor >= 0.1.9"],
         "runai": ["runai-model-streamer[s3,gcs,azure] >= 0.15.7"],
         "audio": [
             "av",
