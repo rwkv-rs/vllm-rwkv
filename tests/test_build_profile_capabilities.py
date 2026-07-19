@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -71,7 +72,7 @@ def make_config(
 
 RWKV_METADATA = BuildProfileMetadata(
     profile="rwkv",
-    configured_targets=("_rapid_sampling", "rwkv7_ops"),
+    configured_targets=("_rapid_sampling", "cumem_allocator", "rwkv7_ops"),
     external_projects=(),
     unrestricted=False,
     supported_architectures=("RWKV7ForCausalLM",),
@@ -86,6 +87,8 @@ RWKV_METADATA = BuildProfileMetadata(
         "stop",
         "prometheus_metrics",
         "rapid_sampling",
+        "sleep_mode",
+        "cumem_allocator",
     ),
     supported_tensor_parallel_sizes=(1,),
     supported_pipeline_parallel_sizes=(1,),
@@ -109,6 +112,21 @@ def test_rwkv_profile_accepts_declared_configuration() -> None:
     validate_build_profile_capabilities(make_config(), RWKV_METADATA)
 
 
+def test_rwkv_profile_accepts_sleep_mode_and_cumem_allocator() -> None:
+    validate_build_profile_capabilities(
+        make_config(sleep_mode=True, cumem_allocator=True), RWKV_METADATA
+    )
+
+
+def test_rwkv_profile_rejects_sleep_mode_without_cumem_target() -> None:
+    metadata = replace(
+        RWKV_METADATA, configured_targets=("_rapid_sampling", "rwkv7_ops")
+    )
+
+    with pytest.raises(ValueError, match=r"sleep mode.*CuMem.*full build"):
+        validate_build_profile_capabilities(make_config(sleep_mode=True), metadata)
+
+
 @pytest.mark.parametrize(
     ("overrides", "reason"),
     [
@@ -120,8 +138,6 @@ def test_rwkv_profile_accepts_declared_configuration() -> None:
         ({"tensor_parallel_size": 2}, "TP=1"),
         ({"pipeline_parallel_size": 2}, "PP=1"),
         ({"load_format": "safetensors"}, "load format"),
-        ({"sleep_mode": True}, "sleep mode"),
-        ({"cumem_allocator": True}, "CuMem"),
         ({"cpu_offload_gb": 1}, "model offload"),
         ({"data_parallel_size": 2}, "DP=1"),
         ({"prefill_context_parallel_size": 2}, "prefill context parallel"),

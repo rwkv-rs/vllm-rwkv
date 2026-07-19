@@ -82,7 +82,7 @@ function(vllm_write_build_profile_manifest)
       "  \"supported_weight_suffixes\": [\".pth\"],\n"
       "  \"supported_device_types\": [\"cuda\"],\n"
       "  \"supported_runner_types\": [\"generate\"],\n"
-      "  \"supported_serving_features\": [\"text_generation\", \"openai_chat\", \"openai_completions\", \"streaming\", \"stop\", \"prometheus_metrics\", \"rapid_sampling\"],\n"
+      "  \"supported_serving_features\": [\"text_generation\", \"openai_chat\", \"openai_completions\", \"streaming\", \"stop\", \"prometheus_metrics\", \"rapid_sampling\", \"sleep_mode\", \"cumem_allocator\"],\n"
       "  \"supported_tensor_parallel_sizes\": [1],\n"
       "  \"supported_pipeline_parallel_sizes\": [1],\n"
       "  \"supported_data_parallel_sizes\": [1]\n")
@@ -387,8 +387,7 @@ set_gencode_flags_for_srcs(
   SRCS "${VLLM_CUMEM_EXT_SRC}"
   CUDA_ARCHS "${CUDA_ARCHS}")
 
-if((VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP") AND
-   NOT VLLM_RWKV_ONLY_BUILD)
+if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   message(STATUS "Enabling cumem allocator extension.")
   if(VLLM_GPU_LANG STREQUAL "CUDA")
     # link against cuda driver library

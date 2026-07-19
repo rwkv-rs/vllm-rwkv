@@ -8,7 +8,7 @@ from vllm.model_executor.layers.quantization.utils import w8a8_utils
 def test_rwkv_profile_skips_unbuilt_stable_cutlass_probes(monkeypatch) -> None:
     metadata = BuildProfileMetadata(
         profile="rwkv",
-        configured_targets=("_rapid_sampling", "rwkv7_ops"),
+        configured_targets=("_rapid_sampling", "cumem_allocator", "rwkv7_ops"),
         external_projects=(),
         unrestricted=False,
     )
