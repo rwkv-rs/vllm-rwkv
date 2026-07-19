@@ -3,6 +3,7 @@
 
 import importlib
 import secrets
+from collections.abc import Sequence
 
 import torch
 import torch.nn as nn
@@ -636,6 +637,17 @@ def _rapid_states(module, logits: torch.Tensor) -> torch.Tensor:
     return states
 
 
+def _format_rapid_sample_result(
+    result: Sequence[torch.Tensor],
+    *,
+    return_logprobs: bool,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    sampled = result[0].view(-1)
+    if return_logprobs:
+        return sampled, result[1].view(-1)
+    return sampled
+
+
 def rapid_sample(
     logits: torch.Tensor,
     k: torch.Tensor | int | None,
@@ -646,8 +658,14 @@ def rapid_sample(
     repetition_penalties: torch.Tensor | None = None,
     penalty_decays: torch.Tensor | None = None,
     penalty_indices: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Sample from logits using the rapid-sampling CUDA extension."""
+    return_logprobs: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Sample with rapid CUDA and optionally return sampled-token logprobs.
+
+    The optional logprob comes from the exact temperature/top-k/top-p support
+    used by the sampling kernel. Recomputing it with a separate top-p
+    implementation can exclude a sampled token at a threshold tie.
+    """
     assert rapid_sample_input_supported(logits)
     assert logits.dtype == torch.float32
 
@@ -666,13 +684,17 @@ def rapid_sample(
             )
         module = _load_rapid_sampler_module()
         states = _rapid_states(module, logits)
-        return module.batch_sampling_temperature_topk_topp(
-            logits,
-            states,
-            float(scalar_temperature),
-            int(scalar_top_k),
-            float(scalar_top_p),
-        ).view(-1)
+        return _format_rapid_sample_result(
+            module.batch_sampling_temperature_topk_topp(
+                logits,
+                states,
+                float(scalar_temperature),
+                int(scalar_top_k),
+                float(scalar_top_p),
+                return_logprobs,
+            ),
+            return_logprobs=return_logprobs,
+        )
 
     module = _load_rapid_sampler_module()
     states = _rapid_states(module, logits)
@@ -727,10 +749,29 @@ def rapid_sample(
                 rows=batch_size,
                 vocab_size=vocab_size,
             )
-            return indexed_sampler(
+            return _format_rapid_sample_result(
+                indexed_sampler(
+                    logits,
+                    penalties,
+                    penalty_indices,
+                    states,
+                    float(scalar_presence_penalty),
+                    float(scalar_repetition_penalty),
+                    float(scalar_penalty_decay),
+                    float(scalar_temperature),
+                    int(scalar_top_k),
+                    float(scalar_top_p),
+                    return_logprobs,
+                ),
+                return_logprobs=return_logprobs,
+            )
+
+        assert penalties.shape[0] == batch_size
+
+        return _format_rapid_sample_result(
+            module.batch_sampling_repetition_temperature_topk_topp(
                 logits,
                 penalties,
-                penalty_indices,
                 states,
                 float(scalar_presence_penalty),
                 float(scalar_repetition_penalty),
@@ -738,21 +779,11 @@ def rapid_sample(
                 float(scalar_temperature),
                 int(scalar_top_k),
                 float(scalar_top_p),
-            ).view(-1)
+                return_logprobs,
+            ),
+            return_logprobs=return_logprobs,
+        )
 
-        assert penalties.shape[0] == batch_size
-
-        return module.batch_sampling_repetition_temperature_topk_topp(
-            logits,
-            penalties,
-            states,
-            float(scalar_presence_penalty),
-            float(scalar_repetition_penalty),
-            float(scalar_penalty_decay),
-            float(scalar_temperature),
-            int(scalar_top_k),
-            float(scalar_top_p),
-        ).view(-1)
 
 def flashinfer_sample(
     logits: torch.Tensor,

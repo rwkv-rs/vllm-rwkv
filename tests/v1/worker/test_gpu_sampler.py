@@ -181,7 +181,7 @@ def test_penalties_state_keeps_mixed_rapid_params_as_vectors():
     assert presence.shape == (2,)
 
 
-def test_rapid_sampler_recomputes_processed_logits_for_logprobs(monkeypatch):
+def test_rapid_sampler_returns_kernel_processed_logprob(monkeypatch):
     sampler = object.__new__(Sampler)
     sampler.use_rapid = True
     sampler.require_rapid = False
@@ -231,15 +231,10 @@ def test_rapid_sampler_recomputes_processed_logits_for_logprobs(monkeypatch):
 
     sampling_param_calls = []
     first_processed_logits = torch.full((1, 4), 1.0)
-    logprob_processed_logits = torch.full((1, 4), 2.0)
 
     def fake_apply_sampling_params(*args, **kwargs):
         sampling_param_calls.append(kwargs)
-        return (
-            first_processed_logits
-            if len(sampling_param_calls) == 1
-            else logprob_processed_logits
-        )
+        return first_processed_logits
 
     sampler.apply_sampling_params = fake_apply_sampling_params
     monkeypatch.setattr(
@@ -248,26 +243,152 @@ def test_rapid_sampler_recomputes_processed_logits_for_logprobs(monkeypatch):
     monkeypatch.setattr(
         sampler_module,
         "rapid_sample",
-        lambda logits, top_k, top_p, temperatures: torch.tensor([3]),
+        lambda logits, top_k, top_p, temperatures, return_logprobs: (
+            torch.tensor([3]),
+            torch.tensor([-0.75]),
+        ),
     )
 
-    sampled, processed_logits = sampler.sample(
-        logits=torch.zeros((1, 4)),
-        expanded_idx_mapping=torch.tensor([0]),
-        idx_mapping_np=np.array([0]),
-        pos=torch.tensor([0]),
-        input_ids=torch.tensor([0]),
-        expanded_local_pos=torch.tensor([0]),
-        return_logprobs=True,
+    sampled, processed_logits, sampled_logprobs, sampled_only_fast_path = (
+        sampler.sample(
+            logits=torch.zeros((1, 4)),
+            expanded_idx_mapping=torch.tensor([0]),
+            idx_mapping_np=np.array([0]),
+            pos=torch.tensor([0]),
+            input_ids=torch.tensor([0]),
+            expanded_local_pos=torch.tensor([0]),
+            return_logprobs=True,
+            sampled_only_logprobs=True,
+        )
     )
 
     assert sampled.tolist() == [3]
-    assert processed_logits is logprob_processed_logits
-    assert len(sampling_param_calls) == 2
+    assert sampled_logprobs.tolist() == [-0.75]
+    assert sampled_only_fast_path is True
+    assert processed_logits is first_processed_logits
+    assert len(sampling_param_calls) == 1
     assert sampling_param_calls[0]["skip_top_k_top_p"] is True
     assert sampling_param_calls[0]["skip_temperature"] is True
-    assert sampling_param_calls[1].get("skip_top_k_top_p", False) is False
-    assert sampling_param_calls[1].get("skip_temperature", False) is False
+
+
+def test_rapid_sampler_output_uses_kernel_sampled_logprob(monkeypatch):
+    sampler = object.__new__(Sampler)
+    sampler.compute_nans = False
+    sampler.logprobs_mode = "processed_logprobs"
+    sampler.sampling_states = SimpleNamespace(
+        max_num_logprobs=lambda idx_mapping_np: 0,
+    )
+    sampler.logprob_token_ids_state = SimpleNamespace(
+        max_num_token_ids=lambda idx_mapping_np: 0,
+    )
+    sampler.req_states = SimpleNamespace(
+        prefill_len=SimpleNamespace(gpu=torch.tensor([0])),
+    )
+    sampler.sample = lambda *args, **kwargs: (
+        torch.tensor([3]),
+        torch.zeros((1, 4)),
+        torch.tensor([-0.75]),
+        True,
+    )
+
+    monkeypatch.setattr(
+        sampler_module,
+        "compute_topk_scores",
+        lambda *args, **kwargs: pytest.fail(
+            "sampled-only rapid path must not recompute native logprobs"
+        ),
+    )
+    monkeypatch.setattr(
+        sampler_module,
+        "compute_token_ranks",
+        lambda logits, token_ids: torch.tensor([2]),
+    )
+    monkeypatch.setattr(
+        sampler_module,
+        "get_num_sampled_and_rejected",
+        lambda *args, **kwargs: (torch.tensor([1]), torch.tensor([0])),
+    )
+
+    input_batch = SimpleNamespace(
+        expanded_idx_mapping=torch.tensor([0]),
+        idx_mapping_np=np.array([0]),
+        cu_num_logits_np=np.array([1]),
+        expanded_local_pos=torch.tensor([0]),
+        positions=torch.tensor([0]),
+        logits_indices=torch.tensor([0]),
+        input_ids=torch.tensor([0]),
+        seq_lens=torch.tensor([1]),
+        cu_num_logits=torch.tensor([0, 1]),
+        idx_mapping=torch.tensor([0]),
+        num_reqs=1,
+    )
+
+    output = sampler(torch.zeros((1, 4)), input_batch)
+
+    assert output.sampled_token_ids.tolist() == [[3]]
+    assert output.logprobs_tensors is not None
+    assert output.logprobs_tensors.logprob_token_ids.tolist() == [[3]]
+    assert output.logprobs_tensors.logprobs.tolist() == [[-0.75]]
+    assert output.logprobs_tensors.selected_token_ranks.tolist() == [2]
+
+
+def test_rapid_sampled_only_output_preserves_expanded_row_layout(monkeypatch):
+    sampler = object.__new__(Sampler)
+    sampler.compute_nans = False
+    sampler.logprobs_mode = "processed_logprobs"
+    sampler.sampling_states = SimpleNamespace(
+        max_num_logprobs=lambda idx_mapping_np: 0,
+    )
+    sampler.logprob_token_ids_state = SimpleNamespace(
+        max_num_token_ids=lambda idx_mapping_np: 0,
+    )
+    sampler.req_states = SimpleNamespace(
+        prefill_len=SimpleNamespace(gpu=torch.tensor([0, 0])),
+    )
+    sampler.sample = lambda *args, **kwargs: (
+        torch.tensor([1, 2, 3]),
+        torch.zeros((3, 4)),
+        torch.tensor([-0.25, -0.5, -0.75]),
+        True,
+    )
+    monkeypatch.setattr(
+        sampler_module,
+        "compute_topk_scores",
+        lambda *args, **kwargs: pytest.fail(
+            "expanded sampled-only path must not recompute native logprobs"
+        ),
+    )
+    monkeypatch.setattr(
+        sampler_module,
+        "compute_token_ranks",
+        lambda logits, token_ids: torch.tensor([1, 2, 3]),
+    )
+    monkeypatch.setattr(
+        sampler_module,
+        "get_num_sampled_and_rejected",
+        lambda *args, **kwargs: (torch.tensor([2, 1]), torch.tensor([0, 0])),
+    )
+    input_batch = SimpleNamespace(
+        expanded_idx_mapping=torch.tensor([0, 0, 1]),
+        idx_mapping_np=np.array([0, 1]),
+        cu_num_logits_np=np.array([0, 2, 3]),
+        expanded_local_pos=torch.tensor([0, 1, 0]),
+        positions=torch.tensor([0, 1, 0]),
+        logits_indices=torch.tensor([0, 1, 2]),
+        input_ids=torch.tensor([0, 0, 0]),
+        seq_lens=torch.tensor([2, 1]),
+        cu_num_logits=torch.tensor([0, 2, 3]),
+        idx_mapping=torch.tensor([0, 1]),
+        num_reqs=2,
+    )
+
+    output = sampler(torch.zeros((3, 4)), input_batch)
+
+    assert output.sampled_token_ids.tolist() == [[1], [2], [3]]
+    assert output.logprobs_tensors is not None
+    assert output.logprobs_tensors.logprobs.shape == (3, 1)
+    assert output.logprobs_tensors.selected_token_ranks.shape == (3,)
+    assert output.logprobs_tensors.cu_num_generated_tokens == [0, 2, 3]
 
 
 @pytest.mark.parametrize("require_rapid", [False, True])
@@ -371,9 +492,11 @@ def test_rapid_sampler_native_fallback_is_forbidden_when_required(
             sample()
         return
 
-    sampled, processed_logits = sample()
+    sampled, processed_logits, sampled_logprobs, sampled_only_fast_path = sample()
 
     assert sampled.tolist() == [2]
+    assert sampled_logprobs is None
+    assert sampled_only_fast_path is False
     assert processed_logits is native_processed_logits
     assert top_k_calls == [True, False]
     assert len(sampling_param_calls) == 2

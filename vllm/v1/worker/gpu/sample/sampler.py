@@ -7,6 +7,7 @@ import torch
 import vllm.envs as envs
 from vllm.config.model import LogprobsMode
 from vllm.sampling_params import RAPID_PENALTY_DECAY_DEFAULT, SamplingParams
+from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p,
     flashinfer_sample,
@@ -22,6 +23,7 @@ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from vllm.v1.worker.gpu.sample.logprob import (
     LogprobTokenIdsState,
+    compute_token_ranks,
     compute_topk_scores,
 )
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
@@ -160,8 +162,18 @@ class Sampler:
         num_nans = get_num_nans(logits) if self.compute_nans else None
 
         return_logprobs = self.returns_logprobs(idx_mapping_np)
+        max_num_logprobs = self.sampling_states.max_num_logprobs(idx_mapping_np)
+        max_per_req_token_ids = self.logprob_token_ids_state.max_num_token_ids(
+            idx_mapping_np
+        )
+        sampled_only_logprobs = max_num_logprobs == 0 and max_per_req_token_ids == 0
 
-        sampled, processed_logits = self.sample(
+        (
+            sampled,
+            processed_logits,
+            rapid_sampled_logprobs,
+            rapid_sampled_only_fast_path,
+        ) = self.sample(
             logits,
             expanded_idx_mapping,
             idx_mapping_np,
@@ -169,28 +181,46 @@ class Sampler:
             input_ids,
             expanded_local_pos,
             return_logprobs=return_logprobs,
+            sampled_only_logprobs=sampled_only_logprobs,
         )
 
         if return_logprobs:
-            if self.logprobs_mode in ("processed_logprobs", "processed_logits"):
-                logits = processed_logits
-            max_num_logprobs = self.sampling_states.max_num_logprobs(idx_mapping_np)
-            max_per_req_token_ids = self.logprob_token_ids_state.max_num_token_ids(
-                idx_mapping_np
-            )
             expanded_logits = logits.shape[0] != idx_mapping_np.shape[0]
             cu_num_logits = cu_num_logits_np.tolist() if expanded_logits else None
-            num_logprobs = max_num_logprobs if max_num_logprobs != NO_LOGPROBS else 0
-            logprobs_tensors = compute_topk_scores(
-                logits,
-                num_logprobs,
-                sampled,
-                cu_num_logits,
-                logprob_token_ids_state=self.logprob_token_ids_state,
-                expanded_idx_mapping=input_batch.expanded_idx_mapping,
-                max_per_req_token_ids=max_per_req_token_ids,
-                logits_mode=self.logprobs_mode in ("raw_logits", "processed_logits"),
-            )
+            if rapid_sampled_only_fast_path:
+                assert rapid_sampled_logprobs is not None
+                logprobs_tensors = LogprobsTensors(
+                    logprob_token_ids=sampled.unsqueeze(-1),
+                    logprobs=rapid_sampled_logprobs.unsqueeze(-1),
+                    selected_token_ranks=compute_token_ranks(
+                        processed_logits,
+                        sampled,
+                    ),
+                    cu_num_generated_tokens=cu_num_logits,
+                )
+            else:
+                if self.logprobs_mode in ("processed_logprobs", "processed_logits"):
+                    logits = processed_logits
+                num_logprobs = (
+                    max_num_logprobs if max_num_logprobs != NO_LOGPROBS else 0
+                )
+                logprobs_tensors = compute_topk_scores(
+                    logits,
+                    num_logprobs,
+                    sampled,
+                    cu_num_logits,
+                    logprob_token_ids_state=self.logprob_token_ids_state,
+                    expanded_idx_mapping=input_batch.expanded_idx_mapping,
+                    max_per_req_token_ids=max_per_req_token_ids,
+                    logits_mode=self.logprobs_mode
+                    in ("raw_logits", "processed_logits"),
+                )
+            if rapid_sampled_logprobs is not None and not rapid_sampled_only_fast_path:
+                assert (
+                    rapid_sampled_logprobs.shape
+                    == logprobs_tensors.logprobs[:, 0].shape
+                )
+                logprobs_tensors.logprobs[:, 0].copy_(rapid_sampled_logprobs)
         else:
             logprobs_tensors = None
 
@@ -299,17 +329,19 @@ class Sampler:
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
         return_logprobs: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        sampled_only_logprobs: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, bool]:
         use_rapid = self.use_rapid
         rapid_sampler_forced = self.require_rapid or (
-            envs.is_set("VLLM_USE_RAPID_SAMPLER")
-            and envs.VLLM_USE_RAPID_SAMPLER
+            envs.is_set("VLLM_USE_RAPID_SAMPLER") and envs.VLLM_USE_RAPID_SAMPLER
         )
         if self.require_rapid and not use_rapid:
             raise RuntimeError("RWKV7 requires rapid-sampling on CUDA.")
         needs_processed_logprobs = (
             return_logprobs and self.logprobs_mode == "processed_logprobs"
         )
+        rapid_sampled_logprobs = None
+        rapid_sampled_only_fast_path = False
 
         def use_native_sampling_params():
             native_processed_logits = self.apply_sampling_params(
@@ -379,12 +411,7 @@ class Sampler:
         )
         if use_rapid:
             rapid_incompatibility = None
-            if needs_processed_logprobs and rapid_penalty_active:
-                rapid_incompatibility = (
-                    "rapid-sampling does not support returning processed logprobs "
-                    "when rapid penalties are active."
-                )
-            elif self.sampling_states.any_greedy(idx_mapping_np):
+            if self.sampling_states.any_greedy(idx_mapping_np):
                 rapid_incompatibility = (
                     "rapid-sampling does not support greedy requests. Set "
                     "VLLM_USE_RAPID_SAMPLER=0 to use the native greedy path."
@@ -444,7 +471,7 @@ class Sampler:
                     idx_mapping_np,
                     scalar_if_uniform=True,
                 )
-                sampled = rapid_sample(
+                rapid_result = rapid_sample(
                     processed_logits,
                     top_k,
                     top_p,
@@ -454,20 +481,34 @@ class Sampler:
                     repetition_penalties=repetition_penalties,
                     penalty_decays=penalty_decays,
                     penalty_indices=expanded_idx_mapping,
-                ).to(torch.int64)
-            else:
-                sampled = rapid_sample(
-                    processed_logits, top_k, top_p, temperatures=temperatures
-                ).to(torch.int64)
-            if needs_processed_logprobs:
-                processed_logits = self.apply_sampling_params(
-                    logits,
-                    expanded_idx_mapping,
-                    idx_mapping_np,
-                    pos,
-                    input_ids,
-                    expanded_local_pos,
+                    return_logprobs=needs_processed_logprobs,
                 )
+            else:
+                rapid_result = rapid_sample(
+                    processed_logits,
+                    top_k,
+                    top_p,
+                    temperatures=temperatures,
+                    return_logprobs=needs_processed_logprobs,
+                )
+            if needs_processed_logprobs:
+                sampled, rapid_sampled_logprobs = rapid_result
+            else:
+                sampled = rapid_result
+            sampled = sampled.to(torch.int64)
+            if needs_processed_logprobs:
+                rapid_sampled_only_fast_path = (
+                    sampled_only_logprobs and not rapid_penalty_active
+                )
+                if not rapid_sampled_only_fast_path:
+                    processed_logits = self.apply_sampling_params(
+                        logits,
+                        expanded_idx_mapping,
+                        idx_mapping_np,
+                        pos,
+                        input_ids,
+                        expanded_local_pos,
+                    )
         elif use_flashinfer:
             sampled = flashinfer_sample(processed_logits, top_k, top_p).to(torch.int64)
         else:
@@ -481,4 +522,9 @@ class Sampler:
                 apply_temperature=False,
                 use_fp64=self.use_fp64_gumbel,
             )
-        return sampled, processed_logits
+        return (
+            sampled,
+            processed_logits,
+            rapid_sampled_logprobs,
+            rapid_sampled_only_fast_path,
+        )

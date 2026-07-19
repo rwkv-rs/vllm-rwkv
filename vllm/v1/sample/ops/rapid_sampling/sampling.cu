@@ -6,6 +6,7 @@
 #include <cuda_fp16.h>
 #include <curand_kernel.h>
 #include <stdexcept>
+#include <vector>
 typedef curandStatePhilox4_32_10_t RAND;
 
 template <typename T, typename ReduceOp>
@@ -158,6 +159,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
         const int* __restrict__ penalty_indices,  // optional (B,), maps batch
                                                   // row to penalties row
         int* __restrict__ outputs,                // (B,)
+        float* __restrict__ output_logprobs,      // (B,)
         RAND* __restrict__ states,                // random state, typedef
                                     // curandStatePhilox4_32_10_t RAND;
         float* __restrict__ probs,  // probs (in L2 cache)
@@ -182,6 +184,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
   const int penalty_row = penalty_indices == nullptr ? b : penalty_indices[b];
   penalties += penalty_row * V;    // penalty rows V
   outputs += b;                    // B
+  if (output_logprobs != nullptr) output_logprobs += b;  // B
   states += b;                     // B
   probs += (b * T + (T - 1)) * V;  // B T V
 
@@ -424,10 +427,17 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
 
   // write idn
   __shared__ int out_id;
-  if (u != u_) out_id = (idn < V) ? idn : 0;
+  __shared__ float out_logprob;
+  if (u != u_) {
+    out_id = (idn < V) ? idn : 0;
+    if (output_logprobs != nullptr) out_logprob = logf(o) - logf(sum_p);
+  }
   __syncthreads();
   idn = out_id;
-  if (t == 0) *outputs = idn;
+  if (t == 0) {
+    *outputs = idn;
+    if (output_logprobs != nullptr) *output_logprobs = out_logprob;
+  }
   // 7. Update penalties
   for (int i = t; i < V4; i += d) {
     p4 = ((float4*)penalties)[i];
@@ -444,10 +454,10 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
   }
 }
 
-at::Tensor batch_sampling_repetition_temperature_topk_topp(
+std::vector<at::Tensor> batch_sampling_repetition_temperature_topk_topp(
     at::Tensor& logits, at::Tensor& penalties, at::Tensor& states,
     double presence_penalty, double repetition_penalty, double penalty_decay,
-    double temperature, int64_t top_k, double top_p) {
+    double temperature, int64_t top_k, double top_p, bool return_logprobs) {
   int B, T, V;
   if (logits.dtype() != at::kFloat) {
     throw std::invalid_argument(
@@ -495,20 +505,30 @@ at::Tensor batch_sampling_repetition_temperature_topk_topp(
   }
   auto out =
       at::empty({B}, at::TensorOptions().dtype(at::kInt).device(at::kCUDA));
+  std::vector<at::Tensor> outputs = {out};
+  float* output_logprobs = nullptr;
+  if (return_logprobs) {
+    auto out_logprobs =
+        at::empty({B}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
+    output_logprobs = (float*)out_logprobs.data_ptr();
+    outputs.push_back(out_logprobs);
+  }
 
   batch_sampling_repetition_temperature_topk_topp_kernel<<<B, 1024, 0,
                                                            stream>>>(
       B, T, V, (float*)logits.data_ptr(), (float*)penalties.data_ptr(), nullptr,
-      (int*)out.data_ptr(), (RAND*)states.data_ptr(), (float*)probs.data_ptr(),
+      (int*)out.data_ptr(), output_logprobs,
+      (RAND*)states.data_ptr(), (float*)probs.data_ptr(),
       (float)presence_penalty, (float)repetition_penalty, (float)penalty_decay,
       (float)log2e_inv_temp, (int)top_k, (float)top_p);
-  return out;
+  return outputs;
 }
 
-at::Tensor batch_sampling_repetition_temperature_topk_topp_indexed(
+std::vector<at::Tensor> batch_sampling_repetition_temperature_topk_topp_indexed(
     at::Tensor& logits, at::Tensor& penalties, at::Tensor& penalty_indices,
     at::Tensor& states, double presence_penalty, double repetition_penalty,
-    double penalty_decay, double temperature, int64_t top_k, double top_p) {
+    double penalty_decay, double temperature, int64_t top_k, double top_p,
+    bool return_logprobs) {
   int B, T, V;
   if (logits.dtype() != at::kFloat) {
     throw std::invalid_argument(
@@ -580,15 +600,24 @@ at::Tensor batch_sampling_repetition_temperature_topk_topp_indexed(
   }
   auto out =
       at::empty({B}, at::TensorOptions().dtype(at::kInt).device(at::kCUDA));
+  std::vector<at::Tensor> outputs = {out};
+  float* output_logprobs = nullptr;
+  if (return_logprobs) {
+    auto out_logprobs =
+        at::empty({B}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
+    output_logprobs = (float*)out_logprobs.data_ptr();
+    outputs.push_back(out_logprobs);
+  }
 
   batch_sampling_repetition_temperature_topk_topp_kernel<<<B, 1024, 0,
                                                            stream>>>(
       B, T, V, (float*)logits.data_ptr(), (float*)penalties.data_ptr(),
       (int*)penalty_indices.data_ptr(), (int*)out.data_ptr(),
-      (RAND*)states.data_ptr(), (float*)probs.data_ptr(),
+      output_logprobs, (RAND*)states.data_ptr(),
+      (float*)probs.data_ptr(),
       (float)presence_penalty, (float)repetition_penalty, (float)penalty_decay,
       (float)log2e_inv_temp, (int)top_k, (float)top_p);
-  return out;
+  return outputs;
 }
 
 __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
@@ -601,6 +630,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
                                            // logits[:, T-1, :] is read. This
                                            // avoids another copying operation
         int* __restrict__ outputs,         // (B,)
+        float* __restrict__ output_logprobs,  // (B,)
         RAND* __restrict__ states,         // random state, typedef
                                            // curandStatePhilox4_32_10_t RAND;
         float* __restrict__ probs,         // probs (in L2 cache)
@@ -620,6 +650,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
 
   logits += (b * T + (T - 1)) * V;  // B T V
   outputs += b;                     // B
+  if (output_logprobs != nullptr) output_logprobs += b;  // B
   states += b;                      // B
   probs += (b * T + (T - 1)) * V;   // B T V
 
@@ -848,10 +879,17 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
 
   // write idn
   __shared__ int out_id;
-  if (u != u_) out_id = (idn < V) ? idn : 0;
+  __shared__ float out_logprob;
+  if (u != u_) {
+    out_id = (idn < V) ? idn : 0;
+    if (output_logprobs != nullptr) out_logprob = logf(o) - logf(sum_p);
+  }
   __syncthreads();
   idn = out_id;
-  if (t == 0) *outputs = idn;
+  if (t == 0) {
+    *outputs = idn;
+    if (output_logprobs != nullptr) *output_logprobs = out_logprob;
+  }
 }
 
 __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
@@ -864,6 +902,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
                                            // logits[:, T-1, :] is read. This
                                            // avoids another copying operation
         int* __restrict__ outputs,         // (B,)
+        float* __restrict__ output_logprobs,  // (B,)
         RAND* __restrict__ states,         // random state, typedef
                                            // curandStatePhilox4_32_10_t RAND;
         float* __restrict__ probs,         // probs (in L2 cache)
@@ -882,6 +921,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
 
   logits += (b * T + (T - 1)) * V;  // B T V
   outputs += b;                     // B
+  if (output_logprobs != nullptr) output_logprobs += b;  // B
   states += b;                      // B
   probs += (b * T + (T - 1)) * V;   // B T V
 
@@ -1070,16 +1110,22 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
 
   // write idn
   __shared__ int out_id;
-  if (u != u_) out_id = (idn < V) ? idn : 0;
+  __shared__ float out_logprob;
+  if (u != u_) {
+    out_id = (idn < V) ? idn : 0;
+    if (output_logprobs != nullptr) out_logprob = logf(o) - logf(sum_p);
+  }
   __syncthreads();
   idn = out_id;
-  if (t == 0) *outputs = idn;
+  if (t == 0) {
+    *outputs = idn;
+    if (output_logprobs != nullptr) *output_logprobs = out_logprob;
+  }
 }
 
-at::Tensor batch_sampling_temperature_topk_topp(at::Tensor& logits,
-                                                at::Tensor& states,
-                                                double temperature,
-                                                int64_t top_k, double top_p) {
+std::vector<at::Tensor> batch_sampling_temperature_topk_topp(
+    at::Tensor& logits, at::Tensor& states, double temperature, int64_t top_k,
+    double top_p, bool return_logprobs) {
   int B, T, V;
   if (logits.dtype() != at::kFloat) {
     throw std::invalid_argument(
@@ -1129,14 +1175,24 @@ at::Tensor batch_sampling_temperature_topk_topp(at::Tensor& logits,
   }
   auto out =
       at::empty({B}, at::TensorOptions().dtype(at::kInt).device(at::kCUDA));
+  std::vector<at::Tensor> outputs = {out};
+  float* output_logprobs = nullptr;
+  if (return_logprobs) {
+    auto out_logprobs =
+        at::empty({B}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
+    output_logprobs = (float*)out_logprobs.data_ptr();
+    outputs.push_back(out_logprobs);
+  }
   if (temperature == 1 && top_k == V)
     batch_sampling_topp_kernel<<<B, 1024, 0, stream>>>(
         B, T, V, (float*)logits.data_ptr(), (int*)out.data_ptr(),
-        (RAND*)states.data_ptr(), (float*)probs.data_ptr(), (float)top_p);
+        output_logprobs, (RAND*)states.data_ptr(),
+        (float*)probs.data_ptr(), (float)top_p);
   else
     batch_sampling_temperature_topk_topp_kernel<<<B, 1024, 0, stream>>>(
         B, T, V, (float*)logits.data_ptr(), (int*)out.data_ptr(),
-        (RAND*)states.data_ptr(), (float*)probs.data_ptr(),
+        output_logprobs, (RAND*)states.data_ptr(),
+        (float*)probs.data_ptr(),
         (float)log2e_inv_temp, (int)top_k, (float)top_p);
-  return out;
+  return outputs;
 }

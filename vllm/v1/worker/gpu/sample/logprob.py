@@ -106,6 +106,27 @@ def compute_token_logprobs(
     return logprobs
 
 
+def compute_token_ranks(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+) -> torch.Tensor:
+    batch_size, vocab_size = logits.shape
+    token_ranks = torch.empty(
+        batch_size,
+        dtype=torch.int64,
+        device=logits.device,
+    )
+    _ranks_kernel[(batch_size,)](
+        token_ranks,
+        logits,
+        logits.stride(0),
+        token_ids,
+        vocab_size,
+        BLOCK_SIZE=8192,  # type: ignore
+    )
+    return token_ranks
+
+
 def compute_topk_scores(
     logits: torch.Tensor,
     num_logprobs: int,
@@ -168,15 +189,7 @@ def compute_topk_scores(
             scores = compute_token_logprobs(logits, logprob_token_ids)
         scores = scores.masked_fill(~valid_mask, float("-inf"))
 
-    token_ranks = torch.empty(batch_size, dtype=torch.int64, device=logits.device)
-    _ranks_kernel[(batch_size,)](
-        token_ranks,
-        logits,
-        logits.stride(0),
-        sampled_token_ids,
-        vocab_size,
-        BLOCK_SIZE=8192,  # type: ignore
-    )
+    token_ranks = compute_token_ranks(logits, sampled_token_ids)
     return LogprobsTensors(
         logprob_token_ids=logprob_token_ids,
         logprobs=scores,
