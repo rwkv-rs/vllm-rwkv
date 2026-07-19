@@ -890,7 +890,7 @@ def test_rwkv7_online_weight_update_restores_old_weights_after_partial_preproces
     assert not hasattr(model, "_pending_weight_update")
 
 
-def test_rwkv7_online_weight_update_cuda_stages_pending_tensors_on_device(monkeypatch):
+def test_rwkv7_online_weight_update_cuda_snapshots_pending_tensors_on_cpu(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for CUDA staging")
 
@@ -910,7 +910,7 @@ def test_rwkv7_online_weight_update_cuda_stages_pending_tensors_on_device(monkey
     pending = model._pending_weight_update["emb.weight"]
     source.fill_(99.0)
 
-    assert pending.device.type == "cuda"
+    assert pending.device.type == "cpu"
     assert pending.data_ptr() != source.data_ptr()
 
     model.finish_weight_update()

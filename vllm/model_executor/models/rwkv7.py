@@ -333,9 +333,10 @@ class RWKV7ForCausalLM(nn.Module):
             for name, weight in weights:
                 loaded_names.add(name)
                 detached = weight.detach()
-                pending[name] = (
-                    detached.clone() if detached.is_cuda else detached.cpu().clone()
-                )
+                # Keep the transactional snapshot off GPU. Holding the old
+                # kernel-layout weights, a full raw CUDA snapshot, and the new
+                # preprocessed weights at once exceeds colocated RL memory.
+                pending[name] = detached.to(device="cpu", copy=True)
             return loaded_names
 
         z = {name: weight.detach().cpu() for name, weight in weights}
