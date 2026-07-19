@@ -410,6 +410,12 @@ class Sampler:
             or self.sampling_states.any_explicit_seed(idx_mapping_np)
         )
         if use_rapid:
+            # The rapid CUDA kernel consumes FP32 logits. RWKV fp32io16 emits
+            # FP16 logits, so promote only at this sampling boundary. FP16 and
+            # BF16 values are represented exactly in FP32.
+            if processed_logits.dtype in (torch.float16, torch.bfloat16):
+                processed_logits = processed_logits.float()
+
             rapid_incompatibility = None
             if self.sampling_states.any_greedy(idx_mapping_np):
                 rapid_incompatibility = (
@@ -427,7 +433,8 @@ class Sampler:
                 )
             elif not rapid_sample_input_supported(processed_logits):
                 rapid_incompatibility = (
-                    "rapid-sampling requires CUDA float32 logits with vocab size "
+                    "rapid-sampling requires CUDA float16, bfloat16, or float32 "
+                    "logits with vocab size "
                     "in (0, 1048576] and divisible by 4. Set "
                     "VLLM_USE_RAPID_SAMPLER=0 to use another sampler."
                 )

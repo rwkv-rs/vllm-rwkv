@@ -181,7 +181,10 @@ def test_penalties_state_keeps_mixed_rapid_params_as_vectors():
     assert presence.shape == (2,)
 
 
-def test_rapid_sampler_returns_kernel_processed_logprob(monkeypatch):
+@pytest.mark.parametrize(
+    "processed_dtype", [torch.float16, torch.bfloat16, torch.float32]
+)
+def test_rapid_sampler_returns_kernel_processed_logprob(monkeypatch, processed_dtype):
     sampler = object.__new__(Sampler)
     sampler.use_rapid = True
     sampler.require_rapid = False
@@ -230,7 +233,7 @@ def test_rapid_sampler_returns_kernel_processed_logprob(monkeypatch):
     sampler.penalties_state = FakePenaltiesState()
 
     sampling_param_calls = []
-    first_processed_logits = torch.full((1, 4), 1.0)
+    first_processed_logits = torch.full((1, 4), 1.0, dtype=processed_dtype)
 
     def fake_apply_sampling_params(*args, **kwargs):
         sampling_param_calls.append(kwargs)
@@ -240,14 +243,12 @@ def test_rapid_sampler_returns_kernel_processed_logprob(monkeypatch):
     monkeypatch.setattr(
         sampler_module, "rapid_sample_input_supported", lambda logits: True
     )
-    monkeypatch.setattr(
-        sampler_module,
-        "rapid_sample",
-        lambda logits, top_k, top_p, temperatures, return_logprobs: (
-            torch.tensor([3]),
-            torch.tensor([-0.75]),
-        ),
-    )
+
+    def fake_rapid_sample(logits, top_k, top_p, temperatures, return_logprobs):
+        assert logits.dtype == torch.float32
+        return torch.tensor([3]), torch.tensor([-0.75])
+
+    monkeypatch.setattr(sampler_module, "rapid_sample", fake_rapid_sample)
 
     sampled, processed_logits, sampled_logprobs, sampled_only_fast_path = (
         sampler.sample(
@@ -265,7 +266,10 @@ def test_rapid_sampler_returns_kernel_processed_logprob(monkeypatch):
     assert sampled.tolist() == [3]
     assert sampled_logprobs.tolist() == [-0.75]
     assert sampled_only_fast_path is True
-    assert processed_logits is first_processed_logits
+    assert processed_logits.dtype == torch.float32
+    assert torch.equal(processed_logits, first_processed_logits.float())
+    if processed_dtype == torch.float32:
+        assert processed_logits is first_processed_logits
     assert len(sampling_param_calls) == 1
     assert sampling_param_calls[0]["skip_top_k_top_p"] is True
     assert sampling_param_calls[0]["skip_temperature"] is True
