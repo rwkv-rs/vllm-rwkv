@@ -110,3 +110,47 @@ def test_run_config_rejects_legacy_indexed_penalty_provider() -> None:
             warmup_iters=0,
             benchmark_iters=1,
         )
+
+
+def test_run_config_compares_rapid_logprob_with_token_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = rapid_bench.BenchmarkConfig(
+        batch_size=2,
+        vocab_size=8,
+        top_p=0.8,
+        top_k=-1,
+        logit_type=1,
+    )
+    logits = torch.zeros((2, 8), dtype=torch.float32)
+    return_logprob_flags = []
+
+    monkeypatch.setattr(rapid_bench, "create_logits", lambda _config, seed: logits)
+    monkeypatch.setattr(rapid_bench, "rapid_sample_input_supported", lambda _: True)
+
+    def fake_rapid_sample(logits, top_k, top_p, *, return_logprobs=False):
+        return_logprob_flags.append(return_logprobs)
+        tokens = torch.zeros((2,), dtype=torch.int32)
+        if return_logprobs:
+            return tokens, torch.zeros((2,), dtype=torch.float32)
+        return tokens
+
+    monkeypatch.setattr(rapid_bench, "rapid_sample", fake_rapid_sample)
+    timings = iter((0.10, 0.11))
+    monkeypatch.setattr(
+        rapid_bench,
+        "benchmark_cuda_call",
+        lambda fn, warmup_iters, benchmark_iters: (fn(), next(timings))[1],
+    )
+
+    result = rapid_bench.run_config(
+        config,
+        providers=["rapid", "rapid_logprob"],
+        warmup_iters=0,
+        benchmark_iters=1,
+    )
+
+    assert return_logprob_flags == [False, True]
+    assert result["rapid_ms"] == pytest.approx(0.10)
+    assert result["rapid_logprob_ms"] == pytest.approx(0.11)
+    assert result["rapid_logprob_over_rapid"] == pytest.approx(1.1)

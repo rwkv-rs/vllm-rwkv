@@ -1,16 +1,17 @@
 #include <torch/extension.h>
-at::Tensor batch_sampling_repetition_temperature_topk_topp(
+#include <vector>
+std::vector<at::Tensor> batch_sampling_repetition_temperature_topk_topp(
     at::Tensor& logits, at::Tensor& penalties, at::Tensor& states,
     double presence_penalty, double repetition_penalty, double penalty_decay,
-    double temperature, int64_t top_k, double top_p);
-at::Tensor batch_sampling_repetition_temperature_topk_topp_indexed(
+    double temperature, int64_t top_k, double top_p, bool return_logprobs);
+std::vector<at::Tensor> batch_sampling_repetition_temperature_topk_topp_indexed(
     at::Tensor& logits, at::Tensor& penalties, at::Tensor& penalty_indices,
     at::Tensor& states, double presence_penalty, double repetition_penalty,
-    double penalty_decay, double temperature, int64_t top_k, double top_p);
-at::Tensor batch_sampling_temperature_topk_topp(at::Tensor& logits,
-                                                at::Tensor& states,
-                                                double temperature,
-                                                int64_t top_k, double top_p);
+    double penalty_decay, double temperature, int64_t top_k, double top_p,
+    bool return_logprobs);
+std::vector<at::Tensor> batch_sampling_temperature_topk_topp(
+    at::Tensor& logits, at::Tensor& states, double temperature, int64_t top_k,
+    double top_p, bool return_logprobs);
 at::Tensor setup_rand(int64_t seed, int64_t B);
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("setup_rand", setup_rand);

@@ -36,7 +36,13 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
 )  # noqa: E402
 
 SUPPORTED_PROVIDERS = frozenset(
-    {"rapid", "flashinfer", "rapid_penalty", "rapid_penalty_indexed"}
+    {
+        "rapid",
+        "rapid_logprob",
+        "flashinfer",
+        "rapid_penalty",
+        "rapid_penalty_indexed",
+    }
 )
 
 
@@ -160,6 +166,19 @@ def run_config(
             benchmark_iters,
         )
 
+    if "rapid_logprob" in providers:
+        rapid_top_k, rapid_top_p = make_rapid_args(config)
+        result["rapid_logprob_ms"] = benchmark_cuda_call(
+            lambda: rapid_sample(
+                logits,
+                rapid_top_k,
+                rapid_top_p,
+                return_logprobs=True,
+            ),
+            warmup_iters,
+            benchmark_iters,
+        )
+
     if "rapid_penalty" in providers:
         rapid_top_k, rapid_top_p = make_rapid_args(config)
         penalties = torch.zeros_like(logits)
@@ -231,6 +250,9 @@ def run_config(
             )
 
     rapid_ms = result.get("rapid_ms")
+    rapid_logprob_ms = result.get("rapid_logprob_ms")
+    if isinstance(rapid_ms, float) and isinstance(rapid_logprob_ms, float):
+        result["rapid_logprob_over_rapid"] = rapid_logprob_ms / rapid_ms
     flashinfer_ms = result.get("flashinfer_ms")
     if isinstance(rapid_ms, float) and isinstance(flashinfer_ms, float):
         result["flashinfer_over_rapid"] = flashinfer_ms / rapid_ms
@@ -273,6 +295,7 @@ def print_result(result: dict) -> None:
     ]
     for key in (
         "rapid_ms",
+        "rapid_logprob_ms",
         "rapid_penalty_ms",
         "rapid_penalty_indexed_ms",
         "flashinfer_ms",
@@ -285,6 +308,8 @@ def print_result(result: dict) -> None:
                 parts.append(f"{key}=skipped")
     if "flashinfer_over_rapid" in result:
         parts.append(f"flashinfer/rapid={result['flashinfer_over_rapid']:.2f}x")
+    if "rapid_logprob_over_rapid" in result:
+        parts.append(f"rapid_logprob/rapid={result['rapid_logprob_over_rapid']:.2f}x")
     print("  " + ", ".join(parts))
 
 
