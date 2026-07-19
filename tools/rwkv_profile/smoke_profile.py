@@ -44,13 +44,17 @@ def main() -> None:
     assert metadata.profile == "rwkv", metadata
     assert "rwkv7_ops" in metadata.configured_targets, metadata
     assert "_rapid_sampling" in metadata.configured_targets, metadata
+    assert "cumem_allocator" in metadata.configured_targets, metadata
     assert "_C_stable_libtorch" not in metadata.configured_targets, metadata
     assert not metadata.external_projects, metadata
     assert "rapid_sampling" in metadata.supported_serving_features, metadata
     assert "openai_chat" in metadata.supported_serving_features, metadata
+    assert "sleep_mode" in metadata.supported_serving_features, metadata
+    assert "cumem_allocator" in metadata.supported_serving_features, metadata
 
     assert importlib.util.find_spec("vllm._C_stable_libtorch") is None
     import vllm._rapid_sampling  # noqa: F401
+    import vllm.cumem_allocator  # noqa: F401
     import vllm.rwkv7_ops  # noqa: F401
 
     import vllm.platforms.cuda  # noqa: F401

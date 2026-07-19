@@ -95,7 +95,7 @@ def load_build_profile_metadata(path: Path = _PROFILE_PATH) -> BuildProfileMetad
     if profile == "rwkv" and (
         metadata.unrestricted
         or metadata.configured_targets
-        != ("_rapid_sampling", "rwkv7_ops")
+        != ("_rapid_sampling", "cumem_allocator", "rwkv7_ops")
         or metadata.external_projects
     ):
         raise RuntimeError(f"Inconsistent RWKV build profile metadata in {path}")
@@ -159,9 +159,10 @@ def validate_build_profile_capabilities(
         reasons.append("does not support speculative decoding")
     if getattr(vllm_config, "lora_config", None) is not None:
         reasons.append("does not support LoRA")
-    if getattr(model_config, "enable_sleep_mode", False) or getattr(
-        model_config, "enable_cumem_allocator", False
-    ):
+    if (
+        getattr(model_config, "enable_sleep_mode", False)
+        or getattr(model_config, "enable_cumem_allocator", False)
+    ) and not metadata.has_target("cumem_allocator"):
         reasons.append("does not support sleep mode or the CuMem allocator")
 
     offload_config = getattr(vllm_config, "offload_config", None)

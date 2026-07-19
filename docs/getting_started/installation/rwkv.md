@@ -2,8 +2,9 @@
 
 The opt-in `rwkv` build profile is a reduced CUDA artifact for dense RWKV7 raw
 `.pth` checkpoints. It supports the built-in RWKV tokenizer, text
-chat/completions, streaming, stop handling, Prometheus metrics, and rapid
-sampling with TP=1, PP=1, and DP=1.
+chat/completions, streaming, stop handling, Prometheus metrics, rapid sampling,
+and sleep/wake GPU-memory release through the CuMem allocator with TP=1, PP=1,
+and DP=1.
 
 Install the explicit dependency set and disable dependency/build isolation when
 installing the source tree:
@@ -36,6 +37,7 @@ runner, and TP/PP/DP boundaries that were actually configured.
 | Dense RWKV7 raw `.pth` | yes | yes |
 | Built-in RWKV tokenizer and text OpenAI API | yes | yes |
 | Rapid sampler first-use JIT | yes | yes |
+| Sleep mode and CuMem allocator | yes | yes |
 | Other architectures or weight formats | no | yes |
 | Quantization, multimodal, speculative decoding, LoRA | no | yes |
 | Responses, Anthropic, generative-scoring, MCP routes | no | yes |

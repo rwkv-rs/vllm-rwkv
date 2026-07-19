@@ -21,7 +21,7 @@ def _metadata(*, unrestricted: bool) -> BuildProfileMetadata:
     return BuildProfileMetadata(
         profile="full" if unrestricted else "rwkv",
         configured_targets=(
-            () if unrestricted else ("_rapid_sampling", "rwkv7_ops")
+            () if unrestricted else ("_rapid_sampling", "cumem_allocator", "rwkv7_ops")
         ),
         external_projects=(),
         unrestricted=unrestricted,
