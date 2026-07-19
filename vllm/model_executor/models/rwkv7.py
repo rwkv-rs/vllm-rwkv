@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only RWKV7 model."""
 
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -88,13 +89,9 @@ class PathConfig:
 def select_path(B: int, T: int) -> PathConfig:
     """All B/T dependent fast-path choices live here."""
     rows = B * T
-    use_nofc = rows <= CMIX_NOFC_MAX_ROWS or (
-        rows == 20 and CMIX_NOFC_ROW20_MAX_T >= T
-    )
+    use_nofc = rows <= CMIX_NOFC_MAX_ROWS or (rows == 20 and CMIX_NOFC_ROW20_MAX_T >= T)
     cmix_mode = (
-        CMIX_B1T1_NOFC
-        if rows == 1
-        else (CMIX_ROWS2_NOFC if use_nofc else CMIX_DENSE)
+        CMIX_B1T1_NOFC if rows == 1 else (CMIX_ROWS2_NOFC if use_nofc else CMIX_DENSE)
     )
     return PathConfig(rows=rows, cmix_mode=cmix_mode)
 
@@ -150,6 +147,7 @@ class RWKV7ForCausalLM(nn.Module):
         self.vocab_size = vocab_size
         self.z: dict[str, torch.Tensor] = {}
         self.raw_weight_names: set[str] | None = None
+        self.raw_weight_shapes: dict[str, tuple[int, ...]] | None = None
         self.total_num_layers = num_hidden_layers
         self.start_layer, self.end_layer = self._get_layer_range()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -294,9 +292,7 @@ class RWKV7ForCausalLM(nn.Module):
 
     def _is_weight_needed_on_rank(self, key: str) -> bool:
         start_layer = getattr(self, "start_layer", 0)
-        end_layer = getattr(
-            self, "end_layer", getattr(self, "total_num_layers", 0)
-        )
+        end_layer = getattr(self, "end_layer", getattr(self, "total_num_layers", 0))
         total_layers = getattr(self, "total_num_layers", 0)
         if start_layer == 0 and end_layer >= total_layers:
             return True
@@ -332,16 +328,59 @@ class RWKV7ForCausalLM(nn.Module):
             loaded_names = set()
             for name, weight in weights:
                 loaded_names.add(name)
-                detached = weight.detach()
-                # Keep the transactional snapshot off GPU. Holding the old
-                # kernel-layout weights, a full raw CUDA snapshot, and the new
-                # preprocessed weights at once exceeds colocated RL memory.
-                pending[name] = detached.to(device="cpu", copy=True)
+                if self._weight_update_error is not None:
+                    pending.setdefault(name, None)
+                    continue
+                try:
+                    if (
+                        self.raw_weight_names is None
+                        or name not in self.raw_weight_names
+                    ):
+                        raise ValueError(
+                            f"RWKV7 weight update received unexpected key {name!r}"
+                        )
+                    if name in pending:
+                        raise ValueError(
+                            f"RWKV7 weight update received duplicate key {name!r}"
+                        )
+
+                    detached = weight.detach()
+                    expected_shape = (
+                        getattr(self, "raw_weight_shapes", None) or {}
+                    ).get(name)
+                    if self._streaming_weight_update and expected_shape is None:
+                        raise RuntimeError(
+                            f"RWKV7 streaming update has no raw shape for {name!r}"
+                        )
+                    actual_shape = tuple(detached.shape)
+                    if expected_shape is not None and actual_shape != expected_shape:
+                        raise ValueError(
+                            "RWKV7 raw weight shape mismatch for "
+                            f"{name}: expected {expected_shape}, got {actual_shape}"
+                        )
+
+                    if self._streaming_weight_update:
+                        if (
+                            name in self._embedding_update_keys()
+                            and self._is_weight_needed_on_rank(name)
+                        ):
+                            pending[name] = detached.to(device="cpu", copy=True)
+                        else:
+                            self._copy_raw_weight_to_runtime(name, detached)
+                            pending[name] = None
+                    else:
+                        pending[name] = detached.to(device="cpu", copy=True)
+                except Exception as exc:
+                    self._record_weight_update_error(exc)
+                    pending.setdefault(name, None)
             return loaded_names
 
         z = {name: weight.detach().cpu() for name, weight in weights}
         raw_weight_names = set(z.keys())
         self.raw_weight_names = raw_weight_names
+        self.raw_weight_shapes = {
+            name: tuple(weight.shape) for name, weight in z.items()
+        }
         self._preprocess_weights(z)
         self._commit_preprocessed_weights(z)
         return raw_weight_names
@@ -350,7 +389,18 @@ class RWKV7ForCausalLM(nn.Module):
         """Handle checkpoint-format dense weight update chunks internally."""
         if hasattr(self, "_pending_weight_update"):
             raise RuntimeError("RWKV7 weight update is already active")
-        self._pending_weight_update: dict[str, torch.Tensor] = {}
+        streaming_weight_update = self._can_stream_weight_update()
+        if (
+            os.getenv("VLLM_RWKV7_STRICT_STREAMING_WEIGHT_UPDATE") == "1"
+            and not streaming_weight_update
+        ):
+            raise RuntimeError(
+                "strict RWKV7 online publication requires in-place streaming "
+                "weight update capability; full-model staging is forbidden"
+            )
+        self._streaming_weight_update = streaming_weight_update
+        self._pending_weight_update: dict[str, torch.Tensor | None] = {}
+        self._weight_update_error: Exception | None = None
         return True
 
     def finish_weight_update(self) -> None:
@@ -363,6 +413,8 @@ class RWKV7ForCausalLM(nn.Module):
                     "RWKV7 online weight update requires a previous full "
                     "checkpoint load to establish raw weight names."
                 )
+            if self._weight_update_error is not None:
+                raise self._weight_update_error
             received = set(pending.keys())
             missing = self.raw_weight_names - received
             unexpected = received - self.raw_weight_names
@@ -371,24 +423,159 @@ class RWKV7ForCausalLM(nn.Module):
                     "RWKV7 weight update key mismatch: "
                     f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
                 )
-            z = dict(pending)
-            old_z = self.z
-            try:
-                self._preprocess_weights(z)
-                self._commit_preprocessed_weights(
-                    z,
-                    reuse_existing_tensors=True,
-                    existing_z=old_z,
-                )
-            except Exception:
-                self.z = old_z
-                raise
+            if self._streaming_weight_update:
+                self._finish_streaming_weight_update(pending)
+                torch.accelerator.synchronize()
+                logger.info("RWKV7 streaming weight update is ready")
+            else:
+                z = {
+                    name: value for name, value in pending.items() if value is not None
+                }
+                old_z = self.z
+                try:
+                    self._preprocess_weights(z)
+                    self._commit_preprocessed_weights(
+                        z,
+                        reuse_existing_tensors=True,
+                        existing_z=old_z,
+                    )
+                except Exception:
+                    self.z = old_z
+                    raise
         finally:
             self.abort_weight_update()
 
     def abort_weight_update(self) -> None:
-        if hasattr(self, "_pending_weight_update"):
-            del self._pending_weight_update
+        for name in (
+            "_pending_weight_update",
+            "_streaming_weight_update",
+            "_weight_update_error",
+        ):
+            if hasattr(self, name):
+                delattr(self, name)
+
+    def _record_weight_update_error(self, error: Exception) -> None:
+        if self._weight_update_error is None:
+            self._weight_update_error = error
+
+    @staticmethod
+    def _embedding_update_keys() -> frozenset[str]:
+        return frozenset(
+            {
+                "emb.weight",
+                "blocks.0.ln0.weight",
+                "blocks.0.ln0.bias",
+            }
+        )
+
+    def _runtime_keys_for_raw_weight(self, key: str) -> tuple[str, ...]:
+        if not self._is_weight_needed_on_rank(key):
+            return ()
+        if is_lowrank_weight(key):
+            return key, key + ".t"
+        return (key,)
+
+    def _can_stream_weight_update(self) -> bool:
+        """Return whether every local raw weight has a runtime destination."""
+        if self.raw_weight_names is None or not self.z:
+            return False
+        raw_shapes = getattr(self, "raw_weight_shapes", None)
+        if raw_shapes is None or set(raw_shapes) != self.raw_weight_names:
+            return False
+        return all(
+            runtime_key in self.z
+            for raw_key in self.raw_weight_names
+            for runtime_key in self._runtime_keys_for_raw_weight(raw_key)
+        )
+
+    def _runtime_views_for_raw_weight(
+        self, key: str, weight: torch.Tensor
+    ) -> tuple[tuple[str, torch.Tensor], ...]:
+        if not self._is_weight_needed_on_rank(key):
+            return ()
+        value = self._shard_weight_for_tp(key, weight.squeeze())
+        lowrank = is_lowrank_weight(key)
+        if not lowrank and (
+            "key.weight" in key
+            or "value.weight" in key
+            or "receptance.weight" in key
+            or "output.weight" in key
+            or "head.weight" in key
+        ):
+            value = value.t()
+        if key.endswith("att.r_k"):
+            value = value.flatten()
+        if lowrank:
+            return ((key, value), (key + ".t", value.t()))
+        return ((key, value),)
+
+    def _copy_raw_weight_to_runtime(self, key: str, weight: torch.Tensor) -> None:
+        with torch.no_grad():
+            for runtime_key, value in self._runtime_views_for_raw_weight(key, weight):
+                destination = self.z.get(runtime_key)
+                if destination is None:
+                    raise RuntimeError(
+                        f"RWKV7 streaming update has no destination for {runtime_key!r}"
+                    )
+                if destination.shape != value.shape:
+                    raise ValueError(
+                        "RWKV7 streaming weight shape mismatch for "
+                        f"{runtime_key}: expected {tuple(destination.shape)}, "
+                        f"got {tuple(value.shape)}"
+                    )
+                destination.copy_(value)
+
+    def _finish_streaming_weight_update(
+        self, pending: dict[str, torch.Tensor | None]
+    ) -> None:
+        if not self._is_weight_needed_on_rank("emb.weight"):
+            return
+        embedding_inputs = self._embedding_update_keys()
+        if not embedding_inputs.issubset(pending):
+            missing = sorted(embedding_inputs - pending.keys())
+            raise ValueError(
+                f"RWKV7 streaming embedding update is incomplete: missing={missing}"
+            )
+        emb_src = pending["emb.weight"]
+        ln0_w_src = pending["blocks.0.ln0.weight"]
+        ln0_b_src = pending["blocks.0.ln0.bias"]
+        assert emb_src is not None and ln0_w_src is not None and ln0_b_src is not None
+
+        self._copy_raw_weight_to_runtime("blocks.0.ln0.weight", ln0_w_src)
+        self._copy_raw_weight_to_runtime("blocks.0.ln0.bias", ln0_b_src)
+
+        destination = self.z["emb.weight"]
+        vocab_start, vocab_end, _ = self._tp_vocab_range(self.vocab_size)
+        local_rows = vocab_end - vocab_start
+        if (
+            destination.shape[0] < local_rows
+            or destination.shape[1] != self.hidden_size
+        ):
+            raise ValueError(
+                "RWKV7 streaming embedding destination shape mismatch: "
+                f"destination={tuple(destination.shape)}, rows={local_rows}, "
+                f"hidden_size={self.hidden_size}"
+            )
+        device = destination.device
+        emb_input = (
+            emb_src.squeeze()[vocab_start:vocab_end]
+            .to(device=device, non_blocking=False)
+            .contiguous()
+        )
+        ln0_w = ln0_w_src.squeeze().to(device=device, non_blocking=False).contiguous()
+        ln0_b = ln0_b_src.squeeze().to(device=device, non_blocking=False).contiguous()
+        transformed = torch.ops.rwkv7_v3a_ops.emb_ln0_bf16_to_f16(
+            emb_input, ln0_w, ln0_b
+        )
+        if transformed.shape != destination[:local_rows].shape:
+            raise ValueError(
+                "RWKV7 streaming embedding transform shape mismatch: "
+                f"expected {tuple(destination[:local_rows].shape)}, "
+                f"got {tuple(transformed.shape)}"
+            )
+        with torch.no_grad():
+            destination.zero_()
+            destination[:local_rows].copy_(transformed)
 
     def get_parameter(self, target: str) -> nn.Parameter:
         if target == "_dummy_param":
@@ -914,9 +1101,7 @@ class RWKV7ForCausalLM(nn.Module):
                         out_v_first = group_v_first
                     if getattr(self, "tp_size", 1) > 1:
                         out_v_first = tensor_model_parallel_all_gather(out_v_first)
-                    out_v_first = out_v_first.view(
-                        decode_batch_size, self.hidden_size
-                    )
+                    out_v_first = out_v_first.view(decode_batch_size, self.hidden_size)
                     if decode_position_tensor is None:
                         v_first_states[start:end] = out_v_first.view(
                             decode_batch_size, self.hidden_size
@@ -1253,9 +1438,7 @@ class RWKV7ForCausalLM(nn.Module):
             tokens = tokens.to(self.z["emb.weight"].device, non_blocking=True)
         if getattr(self, "tp_size", 1) == 1:
             return self.z["emb.weight"][tokens]
-        vocab_start, vocab_end, vocab_per_rank = self._tp_vocab_range(
-            self.vocab_size
-        )
+        vocab_start, vocab_end, vocab_per_rank = self._tp_vocab_range(self.vocab_size)
         mask = (tokens < vocab_start) | (tokens >= vocab_end)
         local = (tokens - vocab_start).clamp(min=0, max=vocab_per_rank - 1)
         out = self.z["emb.weight"][local]
@@ -1623,15 +1806,9 @@ class RWKV7ForCausalLM(nn.Module):
                 z[p + "g1.t"],
             )
         else:
-            w1 = self.linear_rank_in(
-                xw, z.get(p + "w1"), z.get(p + "w1.t"), path.rows
-            )
-            a1 = self.linear_rank_in(
-                xa, z.get(p + "a1"), z.get(p + "a1.t"), path.rows
-            )
-            g1 = self.linear_rank_in(
-                xg, z.get(p + "g1"), z.get(p + "g1.t"), path.rows
-            )
+            w1 = self.linear_rank_in(xw, z.get(p + "w1"), z.get(p + "w1.t"), path.rows)
+            a1 = self.linear_rank_in(xa, z.get(p + "a1"), z.get(p + "a1.t"), path.rows)
+            g1 = self.linear_rank_in(xg, z.get(p + "g1"), z.get(p + "g1.t"), path.rows)
 
         v_done = False
         if use_lowrank_out and layer != 0 and v1 is not None:
@@ -1662,9 +1839,7 @@ class RWKV7ForCausalLM(nn.Module):
             w = self.linear_rank_out_act(
                 w1, z.get(p + "w2"), z.get(p + "w2.t"), path.rows, 1
             )
-            a = self.linear_rank_out(
-                a1, z.get(p + "a2"), z.get(p + "a2.t"), path.rows
-            )
+            a = self.linear_rank_out(a1, z.get(p + "a2"), z.get(p + "a2.t"), path.rows)
             g = self.linear_rank_out_act(
                 g1, z.get(p + "g2"), z.get(p + "g2.t"), path.rows, 2
             )
@@ -1885,9 +2060,7 @@ class RWKV7ForCausalLM(nn.Module):
         dense_path = PathConfig(path.rows, CMIX_DENSE)
         return self.cmix_from_mixed(
             mixed.view(total_tokens, 1, self.hidden_size), p, dense_path
-        ).view(
-            total_tokens, self.hidden_size
-        )
+        ).view(total_tokens, self.hidden_size)
 
     def tmix(
         self,

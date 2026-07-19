@@ -13,7 +13,6 @@ import vllm.model_executor.models.rwkv7 as rwkv7
 from vllm.config.compilation import CompilationConfig, CompilationMode, CUDAGraphMode
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.models.config import RWKV7ForCausalLMConfig
-from vllm.model_executor.models.interfaces import supports_pp
 from vllm.model_executor.models.rwkv7 import RWKV7ForCausalLM
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
@@ -916,6 +915,445 @@ def test_rwkv7_online_weight_update_cuda_snapshots_pending_tensors_on_cpu(monkey
     model.finish_weight_update()
 
     assert captured["emb.weight"].item() == 1.0
+
+
+def test_rwkv7_streaming_update_copies_regular_and_derived_weights_in_place():
+    model = _new_rwkv7_for_weight_tests()
+    model.total_num_layers = 1
+    model.start_layer = 0
+    model.end_layer = 1
+    model.tp_size = 1
+    model.tp_rank = 0
+    model.raw_weight_names = {
+        "emb.weight",
+        "blocks.0.ln0.weight",
+        "blocks.0.ln0.bias",
+        "head.weight",
+        "blocks.0.att.w1",
+    }
+    model.raw_weight_shapes = {
+        "emb.weight": (2, 2),
+        "blocks.0.ln0.weight": (2,),
+        "blocks.0.ln0.bias": (2,),
+        "head.weight": (2, 2),
+        "blocks.0.att.w1": (2, 3),
+    }
+    model.z = {
+        "emb.weight": torch.zeros((2, 2)),
+        "blocks.0.ln0.weight": torch.zeros(2),
+        "blocks.0.ln0.bias": torch.zeros(2),
+        "head.weight": torch.zeros((2, 2)),
+        "blocks.0.att.w1": torch.zeros((2, 3)),
+        "blocks.0.att.w1.t": torch.zeros((3, 2)),
+    }
+    head_destination = model.z["head.weight"]
+    lowrank_destination = model.z["blocks.0.att.w1"]
+    lowrank_t_destination = model.z["blocks.0.att.w1.t"]
+    head = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    lowrank = torch.arange(6, dtype=torch.float32).view(2, 3)
+
+    assert model.start_weight_update() is True
+    assert model._streaming_weight_update is True
+    model.load_weights([("head.weight", head), ("blocks.0.att.w1", lowrank)])
+
+    assert model.z["head.weight"] is head_destination
+    assert model.z["blocks.0.att.w1"] is lowrank_destination
+    assert model.z["blocks.0.att.w1.t"] is lowrank_t_destination
+    torch.testing.assert_close(head_destination, head.t())
+    torch.testing.assert_close(lowrank_destination, lowrank)
+    torch.testing.assert_close(lowrank_t_destination, lowrank.t())
+    assert model._pending_weight_update["head.weight"] is None
+    assert model._pending_weight_update["blocks.0.att.w1"] is None
+    model.abort_weight_update()
+
+
+def test_rwkv7_streaming_update_stages_only_embedding_dependencies(monkeypatch):
+    model = _new_rwkv7_for_weight_tests()
+    model.hidden_size = 2
+    model.total_num_layers = 1
+    model.start_layer = 0
+    model.end_layer = 1
+    model.tp_size = 1
+    model.tp_rank = 0
+    model.vocab_size = 2
+    model.raw_weight_names = {
+        "emb.weight",
+        "blocks.0.ln0.weight",
+        "blocks.0.ln0.bias",
+    }
+    model.raw_weight_shapes = {
+        "emb.weight": (2, 2),
+        "blocks.0.ln0.weight": (2,),
+        "blocks.0.ln0.bias": (2,),
+    }
+    model.z = {
+        "emb.weight": torch.zeros((2, 2)),
+        "blocks.0.ln0.weight": torch.zeros(2),
+        "blocks.0.ln0.bias": torch.zeros(2),
+    }
+    emb = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    ln0_w = torch.tensor([2.0, 3.0])
+    ln0_b = torch.tensor([5.0, 7.0])
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "emb_ln0_bf16_to_f16",
+        lambda value, weight, bias: value * weight + bias,
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+    model.start_weight_update()
+    model.load_weights(
+        [
+            ("emb.weight", emb),
+            ("blocks.0.ln0.weight", ln0_w),
+            ("blocks.0.ln0.bias", ln0_b),
+        ]
+    )
+
+    assert all(value is not None for value in model._pending_weight_update.values())
+    assert all(
+        value.device.type == "cpu"
+        for value in model._pending_weight_update.values()
+        if value is not None
+    )
+
+    model.finish_weight_update()
+
+    torch.testing.assert_close(model.z["emb.weight"], emb * ln0_w + ln0_b)
+    torch.testing.assert_close(model.z["blocks.0.ln0.weight"], ln0_w)
+    torch.testing.assert_close(model.z["blocks.0.ln0.bias"], ln0_b)
+
+
+def test_rwkv7_streaming_validation_error_is_delayed_until_finish(monkeypatch):
+    model = _new_rwkv7_for_weight_tests()
+    model.total_num_layers = 1
+    model.start_layer = 0
+    model.end_layer = 1
+    model.tp_size = 1
+    model.tp_rank = 0
+    model.raw_weight_names = {
+        "emb.weight",
+        "blocks.0.ln0.weight",
+        "blocks.0.ln0.bias",
+        "head.weight",
+    }
+    model.raw_weight_shapes = {
+        "emb.weight": (2, 2),
+        "blocks.0.ln0.weight": (2,),
+        "blocks.0.ln0.bias": (2,),
+        "head.weight": (2, 2),
+    }
+    model.z = {
+        "emb.weight": torch.zeros((2, 2)),
+        "blocks.0.ln0.weight": torch.zeros(2),
+        "blocks.0.ln0.bias": torch.zeros(2),
+        "head.weight": torch.zeros((2, 2)),
+    }
+    old_head = model.z["head.weight"].clone()
+
+    model.start_weight_update()
+    loaded = set()
+    for bucket in (
+        [("head.weight", torch.zeros((1, 4)))],
+        [("emb.weight", torch.zeros((2, 2)))],
+        [("blocks.0.ln0.weight", torch.zeros(2))],
+        [("blocks.0.ln0.bias", torch.zeros(2))],
+    ):
+        loaded.update(model.load_weights(bucket))
+
+    assert loaded == model.raw_weight_names
+    assert set(model._pending_weight_update) == model.raw_weight_names
+    torch.testing.assert_close(model.z["head.weight"], old_head)
+    with pytest.raises(ValueError, match="raw weight shape mismatch"):
+        model.finish_weight_update()
+    assert not hasattr(model, "_pending_weight_update")
+
+
+def test_rwkv7_streaming_update_matches_tp2_runtime_layouts():
+    model = _new_rwkv7_for_weight_tests()
+    model.hidden_size = 4
+    model.total_num_layers = 1
+    model.start_layer = 0
+    model.end_layer = 1
+    model.tp_size = 2
+    model.tp_rank = 1
+    model.tp_hidden_size = 2
+    model.vocab_size = 3
+    model.raw_weight_names = {
+        "emb.weight",
+        "blocks.0.ln0.weight",
+        "blocks.0.ln0.bias",
+        "head.weight",
+        "blocks.0.att.r_k",
+        "blocks.0.att.output.weight",
+        "blocks.0.ffn.key.weight",
+    }
+    model.raw_weight_shapes = {
+        "emb.weight": (3, 4),
+        "blocks.0.ln0.weight": (4,),
+        "blocks.0.ln0.bias": (4,),
+        "head.weight": (3, 4),
+        "blocks.0.att.r_k": (4, 2),
+        "blocks.0.att.output.weight": (4, 4),
+        "blocks.0.ffn.key.weight": (4, 6),
+    }
+    model.z = {
+        "emb.weight": torch.zeros((2, 4)),
+        "blocks.0.ln0.weight": torch.zeros(4),
+        "blocks.0.ln0.bias": torch.zeros(4),
+        "head.weight": torch.zeros((4, 2)),
+        "blocks.0.att.r_k": torch.zeros(4),
+        "blocks.0.att.output.weight": torch.zeros((2, 4)),
+        "blocks.0.ffn.key.weight": torch.zeros((6, 2)),
+    }
+    head = torch.arange(12, dtype=torch.float32).view(3, 4)
+    r_k = torch.arange(8, dtype=torch.float32).view(4, 2)
+    output = torch.arange(16, dtype=torch.float32).view(4, 4)
+    ffn_key = torch.arange(24, dtype=torch.float32).view(4, 6)
+
+    model.start_weight_update()
+    assert model._streaming_weight_update is True
+    model.load_weights(
+        [
+            ("head.weight", head),
+            ("blocks.0.att.r_k", r_k),
+            ("blocks.0.att.output.weight", output),
+            ("blocks.0.ffn.key.weight", ffn_key),
+        ]
+    )
+
+    expected_head_shard = torch.zeros((2, 4))
+    expected_head_shard[0].copy_(head[2])
+    torch.testing.assert_close(model.z["head.weight"], expected_head_shard.t())
+    torch.testing.assert_close(model.z["blocks.0.att.r_k"], r_k[2:4].flatten())
+    torch.testing.assert_close(
+        model.z["blocks.0.att.output.weight"],
+        output[:, 2:4].t(),
+    )
+    torch.testing.assert_close(
+        model.z["blocks.0.ffn.key.weight"],
+        ffn_key[2:4].t(),
+    )
+    model.abort_weight_update()
+
+
+def test_rwkv7_strict_online_update_forbids_full_model_staging(monkeypatch):
+    model = _new_rwkv7_for_weight_tests()
+    model.raw_weight_names = {"emb.weight"}
+    model.raw_weight_shapes = None
+    monkeypatch.setenv("VLLM_RWKV7_STRICT_STREAMING_WEIGHT_UPDATE", "1")
+
+    with pytest.raises(RuntimeError, match="streaming weight update capability"):
+        model.start_weight_update()
+
+    assert not hasattr(model, "_streaming_weight_update")
+    assert not hasattr(model, "_pending_weight_update")
+    assert not hasattr(model, "_weight_update_error")
+
+
+def test_rwkv7_streaming_update_skips_off_rank_embedding_on_pp_last(monkeypatch):
+    model = _new_rwkv7_for_weight_tests()
+    model.hidden_size = 2
+    model.total_num_layers = 2
+    model.start_layer = 1
+    model.end_layer = 2
+    model.tp_size = 1
+    model.tp_rank = 0
+    model.raw_weight_names = {
+        "emb.weight",
+        "blocks.0.ln0.weight",
+        "blocks.0.ln0.bias",
+        "head.weight",
+    }
+    model.raw_weight_shapes = {
+        "emb.weight": (2, 2),
+        "blocks.0.ln0.weight": (2,),
+        "blocks.0.ln0.bias": (2,),
+        "head.weight": (2, 2),
+    }
+    model.z = {"head.weight": torch.zeros((2, 2))}
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+    model.start_weight_update()
+    assert model._streaming_weight_update is True
+    model.load_weights(
+        [
+            ("emb.weight", torch.ones((2, 2))),
+            ("blocks.0.ln0.weight", torch.ones(2)),
+            ("blocks.0.ln0.bias", torch.ones(2)),
+            ("head.weight", torch.tensor([[1.0, 2.0], [3.0, 4.0]])),
+        ]
+    )
+
+    assert all(value is None for value in model._pending_weight_update.values())
+    model.finish_weight_update()
+    torch.testing.assert_close(
+        model.z["head.weight"],
+        torch.tensor([[1.0, 3.0], [2.0, 4.0]]),
+    )
+
+
+def test_rwkv7_streaming_update_drains_after_non_validation_error(monkeypatch):
+    model = _new_rwkv7_for_weight_tests()
+    model.total_num_layers = 1
+    model.start_layer = 0
+    model.end_layer = 1
+    model.tp_size = 1
+    model.tp_rank = 0
+    model.raw_weight_names = {
+        "emb.weight",
+        "blocks.0.ln0.weight",
+        "blocks.0.ln0.bias",
+        "head.weight",
+    }
+    model.raw_weight_shapes = {
+        "emb.weight": (2, 2),
+        "blocks.0.ln0.weight": (2,),
+        "blocks.0.ln0.bias": (2,),
+        "head.weight": (2, 2),
+    }
+    model.z = {
+        "emb.weight": torch.zeros((2, 2)),
+        "blocks.0.ln0.weight": torch.zeros(2),
+        "blocks.0.ln0.bias": torch.zeros(2),
+        "head.weight": torch.zeros((2, 2)),
+    }
+    monkeypatch.setattr(
+        model,
+        "_copy_raw_weight_to_runtime",
+        lambda name, weight: (_ for _ in ()).throw(OSError("copy failed")),
+    )
+
+    model.start_weight_update()
+    for bucket in (
+        [("head.weight", torch.zeros((2, 2)))],
+        [("emb.weight", torch.zeros((2, 2)))],
+        [("blocks.0.ln0.weight", torch.zeros(2))],
+        [("blocks.0.ln0.bias", torch.zeros(2))],
+    ):
+        model.load_weights(bucket)
+
+    assert set(model._pending_weight_update) == model.raw_weight_names
+    with pytest.raises(OSError, match="copy failed"):
+        model.finish_weight_update()
+
+
+def test_rwkv7_streaming_update_matches_fresh_preprocess_for_all_runtime_keys(
+    monkeypatch,
+):
+    monkeypatch.setattr(rwkv7, "CUDA_DEVICE", torch.device("cpu"))
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "emb_ln0_bf16_to_f16",
+        lambda value, weight, bias: value * weight + bias,
+    )
+
+    def new_model():
+        model = _new_rwkv7_for_weight_tests()
+        model.config = SimpleNamespace(
+            hidden_size=128,
+            vocab_size=2,
+            head_size=64,
+            num_hidden_layers=1,
+        )
+        model.hidden_size = 128
+        model.head_size = 64
+        model.num_attention_heads = 2
+        model.vocab_size = 2
+        model.total_num_layers = 1
+        model.start_layer = 0
+        model.end_layer = 1
+        model.tp_size = 1
+        model.tp_rank = 0
+        model.tp_hidden_size = 128
+        model.execution_profile = rwkv7.resolve_execution_profile("fp16")
+        model._get_layer_range = lambda: (0, 1)
+        return model
+
+    old_raw = {
+        "emb.weight": torch.arange(256, dtype=torch.float32).view(2, 128),
+        "blocks.0.ln0.weight": torch.ones(128),
+        "blocks.0.ln0.bias": torch.zeros(128),
+        "blocks.0.att.r_k": torch.arange(128, dtype=torch.float32).view(2, 64),
+        "blocks.0.att.w1": torch.arange(384, dtype=torch.float32).view(128, 3),
+        "blocks.0.att.output.weight": torch.arange(16384, dtype=torch.float32).view(
+            128, 128
+        ),
+        "blocks.0.ffn.key.weight": torch.arange(32768, dtype=torch.float32).view(
+            128, 256
+        ),
+        "head.weight": torch.arange(256, dtype=torch.float32).view(2, 128),
+    }
+    new_raw = {name: value + 1 for name, value in old_raw.items()}
+
+    model = new_model()
+    old_runtime = {name: value.clone() for name, value in old_raw.items()}
+    model._preprocess_weights(old_runtime)
+    model.z = old_runtime
+    model.raw_weight_names = set(old_raw)
+    model.raw_weight_shapes = {
+        name: tuple(value.shape) for name, value in old_raw.items()
+    }
+    old_storage = {name: value.data_ptr() for name, value in model.z.items()}
+
+    expected_model = new_model()
+    expected_runtime = {name: value.clone() for name, value in new_raw.items()}
+    expected_model._preprocess_weights(expected_runtime)
+
+    model.start_weight_update()
+    assert model._streaming_weight_update is True
+    for item in new_raw.items():
+        model.load_weights([item])
+    model.finish_weight_update()
+
+    assert set(model.z) == set(expected_runtime)
+    for name, expected in expected_runtime.items():
+        assert model.z[name].data_ptr() == old_storage[name]
+        torch.testing.assert_close(model.z[name], expected)
+
+
+def test_rwkv7_streaming_update_skips_off_rank_weights_on_pp_middle(monkeypatch):
+    model = _new_rwkv7_for_weight_tests()
+    model.total_num_layers = 3
+    model.start_layer = 1
+    model.end_layer = 2
+    model.tp_size = 1
+    model.tp_rank = 0
+    model.raw_weight_names = {
+        "emb.weight",
+        "blocks.0.ln0.weight",
+        "blocks.0.ln0.bias",
+        "blocks.1.ffn.key.weight",
+        "head.weight",
+    }
+    model.raw_weight_shapes = {
+        "emb.weight": (2, 2),
+        "blocks.0.ln0.weight": (2,),
+        "blocks.0.ln0.bias": (2,),
+        "blocks.1.ffn.key.weight": (2, 2),
+        "head.weight": (2, 2),
+    }
+    model.z = {"blocks.1.ffn.key.weight": torch.zeros((2, 2))}
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+    model.start_weight_update()
+    assert model._streaming_weight_update is True
+    for item in (
+        ("emb.weight", torch.ones((2, 2))),
+        ("blocks.0.ln0.weight", torch.ones(2)),
+        ("blocks.0.ln0.bias", torch.ones(2)),
+        ("blocks.1.ffn.key.weight", torch.tensor([[1.0, 2.0], [3.0, 4.0]])),
+        ("head.weight", torch.ones((2, 2))),
+    ):
+        model.load_weights([item])
+
+    assert all(value is None for value in model._pending_weight_update.values())
+    model.finish_weight_update()
+    torch.testing.assert_close(
+        model.z["blocks.1.ffn.key.weight"],
+        torch.tensor([[1.0, 3.0], [2.0, 4.0]]),
+    )
 
 
 def test_rwkv7_direct_parameter_update_is_not_supported():
@@ -2872,8 +3310,8 @@ def test_rwkv7_vllm_pp_non_last_stage_returns_v_first(monkeypatch):
     model.end_layer = 1
     model._is_pp_first_rank = lambda: True
     model._is_pp_last_rank = lambda: False
-    model.embed = (
-        lambda tokens: tokens.to(torch.float32).unsqueeze(-1).expand(-1, -1, 3)
+    model.embed = lambda tokens: (
+        tokens.to(torch.float32).unsqueeze(-1).expand(-1, -1, 3)
     )
     seen_groups = []
 
@@ -2944,8 +3382,8 @@ def test_rwkv7_vllm_pp_non_last_stage_all_gathers_tp_v_first(monkeypatch):
     model.tp_hidden_size = 2
     model._is_pp_first_rank = lambda: True
     model._is_pp_last_rank = lambda: False
-    model.embed = (
-        lambda tokens: tokens.to(torch.float32).unsqueeze(-1).expand(-1, -1, 4)
+    model.embed = lambda tokens: (
+        tokens.to(torch.float32).unsqueeze(-1).expand(-1, -1, 4)
     )
 
     def fake_all_gather(value):
