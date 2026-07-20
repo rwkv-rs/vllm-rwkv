@@ -58,6 +58,7 @@ class Sampler:
         self.use_flashinfer = not self.use_rapid and flashinfer_sampler_supported()
         self.require_rapid = False
         self.rapid_penalties: torch.Tensor | None = None
+        self.rapid_sampler_states: dict[tuple[int, int], torch.Tensor] = {}
 
     def add_request(
         self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
@@ -291,8 +292,7 @@ class Sampler:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         use_rapid = self.use_rapid
         rapid_sampler_forced = self.require_rapid or (
-            envs.is_set("VLLM_USE_RAPID_SAMPLER")
-            and envs.VLLM_USE_RAPID_SAMPLER
+            envs.is_set("VLLM_USE_RAPID_SAMPLER") and envs.VLLM_USE_RAPID_SAMPLER
         )
         if self.require_rapid and not use_rapid:
             raise RuntimeError("RWKV7 requires rapid-sampling on CUDA.")
@@ -440,10 +440,15 @@ class Sampler:
                     repetition_penalties=repetition_penalties,
                     penalty_decays=penalty_decays,
                     penalty_indices=expanded_idx_mapping,
+                    state_cache=self.rapid_sampler_states,
                 ).to(torch.int64)
             else:
                 sampled = rapid_sample(
-                    processed_logits, top_k, top_p, temperatures=temperatures
+                    processed_logits,
+                    top_k,
+                    top_p,
+                    temperatures=temperatures,
+                    state_cache=self.rapid_sampler_states,
                 ).to(torch.int64)
             if needs_processed_logprobs:
                 processed_logits = self.apply_sampling_params(

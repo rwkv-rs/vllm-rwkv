@@ -335,9 +335,7 @@ def test_rapid_sampler_falls_back_for_per_request_generators(
 
     assert called
     assert processed is None
-    assert torch.equal(
-        tokens, torch.ones(2, dtype=torch.int32, device=logits.device)
-    )
+    assert torch.equal(tokens, torch.ones(2, dtype=torch.int32, device=logits.device))
 
 
 @pytest.mark.skipif(
@@ -349,7 +347,8 @@ def test_rapid_sampler_handles_unfiltered_sampling_without_native_fallback(
 ):
     from vllm.v1.sample.ops import topk_topp_sampler
 
-    def fake_rapid_sample(logits, k, p):
+    def fake_rapid_sample(logits, k, p, **kwargs):
+        assert "state_cache" in kwargs
         assert k == logits.shape[-1]
         assert p == pytest.approx(1.0)
         return torch.full(
@@ -457,7 +456,6 @@ def test_rapid_sample_rejects_vector_tensor_params_without_penalties(
         "_load_rapid_sampler_module",
         lambda: FakeRapidModule(),
     )
-
     with pytest.raises(RuntimeError, match="uniform scalar"):
         topk_topp_sampler.rapid_sample(
             logits,
@@ -535,7 +533,7 @@ def test_rapid_sample_requires_indexed_penalty_kernel(
     monkeypatch.setattr(
         topk_topp_sampler,
         "_rapid_states",
-        lambda module, logits: torch.empty(2, dtype=torch.uint8),
+        lambda module, logits, state_cache=None: torch.empty(2, dtype=torch.uint8),
     )
 
     with pytest.raises(RuntimeError, match="indexed penalty kernel"):
@@ -579,7 +577,7 @@ def test_rapid_sample_rejects_mixed_penalty_params(
     monkeypatch.setattr(
         topk_topp_sampler,
         "_rapid_states",
-        lambda module, logits: fake_states,
+        lambda module, logits, state_cache=None: fake_states,
     )
 
     with pytest.raises(
@@ -595,6 +593,57 @@ def test_rapid_sample_rejects_mixed_penalty_params(
             penalty_decays=penalty_decays,
             penalty_indices=penalty_indices,
         )
+
+
+@pytest.mark.skipif(
+    not RAPID_SAMPLER_PLATFORM_SUPPORTED,
+    reason="Rapid sampler requires CUDA compute capability >= 7.",
+)
+def test_rapid_sample_initializes_rng_on_current_stream(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.v1.sample.ops import topk_topp_sampler
+
+    batch_size = 1
+    vocab_size = 65536
+    seed = 2718
+    logits = torch.linspace(
+        -4.0,
+        4.0,
+        vocab_size,
+        device=DEVICE_TYPE,
+        dtype=torch.float32,
+    ).view(batch_size, vocab_size)
+    monkeypatch.setattr(topk_topp_sampler.secrets, "randbits", lambda _: seed)
+
+    reference_cache: dict[tuple[int, int], torch.Tensor] = {}
+    with torch.cuda.stream(torch.cuda.default_stream()):
+        reference = topk_topp_sampler.rapid_sample(
+            logits,
+            vocab_size,
+            1.0,
+            state_cache=reference_cache,
+        )
+    torch.cuda.synchronize()
+
+    sampled_cache: dict[tuple[int, int], torch.Tensor] = {}
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(torch.cuda.default_stream()):
+        torch.cuda._sleep(100_000_000)
+    with torch.cuda.stream(stream):
+        sampled = topk_topp_sampler.rapid_sample(
+            logits,
+            vocab_size,
+            1.0,
+            state_cache=sampled_cache,
+        )
+    torch.cuda.synchronize()
+
+    assert torch.equal(sampled, reference)
+    assert torch.equal(
+        next(iter(sampled_cache.values())),
+        next(iter(reference_cache.values())),
+    )
 
 
 @pytest.mark.skipif(
@@ -990,9 +1039,7 @@ class TestTritonTopkTopp:
     @pytest.mark.parametrize("batch_size", [1, 8, 32, 128, 512, 1024])
     @pytest.mark.parametrize("vocab_size", [1024, 32000, 128256])
     @pytest.mark.parametrize("mode", ["top-k", "top-p", "top-k+top-p"])
-    def test_filters_match_pytorch(
-        self, batch_size: int, vocab_size: int, mode: str
-    ):
+    def test_filters_match_pytorch(self, batch_size: int, vocab_size: int, mode: str):
         logits = torch.randn(
             batch_size, vocab_size, generator=self.generator, dtype=torch.float32
         )
@@ -1002,15 +1049,11 @@ class TestTritonTopkTopp:
             k = torch.randint(
                 1, min(100, vocab_size), (batch_size,), generator=self.generator
             )
-            disabled = torch.randint(
-                0, 4, (batch_size,), generator=self.generator
-            ) == 0
+            disabled = torch.randint(0, 4, (batch_size,), generator=self.generator) == 0
             k.masked_fill_(disabled, vocab_size)
         if mode != "top-k":
             p = torch.rand(batch_size, generator=self.generator) * 0.9 + 0.1
-            disabled = torch.randint(
-                0, 4, (batch_size,), generator=self.generator
-            ) == 0
+            disabled = torch.randint(0, 4, (batch_size,), generator=self.generator) == 0
             p.masked_fill_(disabled, 1.0)
 
         self._compare_results(logits, k, p)
@@ -1190,9 +1233,14 @@ class TestTritonTopkTopp:
                 1, 50, (batch_size,), generator=self.generator, dtype=torch.int32
             )
         )
-        p = None if mode == "top-k" else (
-            torch.rand(batch_size, generator=self.generator, dtype=torch.float32) * 0.9
-            + 0.1
+        p = (
+            None
+            if mode == "top-k"
+            else (
+                torch.rand(batch_size, generator=self.generator, dtype=torch.float32)
+                * 0.9
+                + 0.1
+            )
         )
         result = apply_top_k_top_p_triton(logits.clone(), k, p)
 

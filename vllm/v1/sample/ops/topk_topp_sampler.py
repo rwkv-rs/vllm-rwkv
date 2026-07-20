@@ -21,7 +21,8 @@ if HAS_TRITON:
 logger = init_logger(__name__)
 
 _RAPID_SAMPLER_MODULE = None
-_RAPID_SAMPLER_STATES: dict[tuple[int, int], torch.Tensor] = {}
+RapidSamplerStateCache = dict[tuple[int, int], torch.Tensor]
+_RAPID_SAMPLER_FALLBACK_STATES: dict[tuple[int, int, int], torch.Tensor] = {}
 _RAPID_PENALTY_INDEX_STATS = {
     "indexed_calls": 0,
     "indexed_rows": 0,
@@ -166,6 +167,7 @@ class TopKTopPSampler(nn.Module):
         super().__init__()
         self.logprobs_mode = logprobs_mode
         self.use_fp64_gumbel = use_fp64_gumbel
+        self.rapid_sampler_states: RapidSamplerStateCache = {}
         if current_platform.is_cuda():
             # Optimized samplers don't expose post-top-k/top-p logits/logprobs,
             # so they can't be used when the configured mode requires them.
@@ -280,7 +282,15 @@ class TopKTopPSampler(nn.Module):
             return self.forward_native(logits, generators, k, p)
         if self.logprobs_mode in ("processed_logits", "processed_logprobs"):
             return self.forward_native(logits, generators, k, p)
-        return rapid_sample(logits, scalar_top_k, scalar_top_p), None
+        return (
+            rapid_sample(
+                logits,
+                scalar_top_k,
+                scalar_top_p,
+                state_cache=self.rapid_sampler_states,
+            ),
+            None,
+        )
 
     def forward_cpu(
         self,
@@ -620,18 +630,28 @@ def _rapid_scalar(value: torch.Tensor | int | float | None, default):
     return value.reshape(-1)[0].item()
 
 
-def _rapid_states(module, logits: torch.Tensor) -> torch.Tensor:
+def _rapid_states(
+    module,
+    logits: torch.Tensor,
+    state_cache: RapidSamplerStateCache | None = None,
+) -> torch.Tensor:
     batch_size = logits.shape[0] if logits.dim() >= 2 else 1
     device_idx = logits.device.index
     if device_idx is None:
         device_idx = torch.accelerator.current_device_index()
-    key = (device_idx, batch_size)
-    states = _RAPID_SAMPLER_STATES.get(key)
+    if state_cache is None:
+        stream_id = torch.cuda.current_stream(device_idx).cuda_stream
+        cache = _RAPID_SAMPLER_FALLBACK_STATES
+        key = (device_idx, stream_id, batch_size)
+    else:
+        cache = state_cache
+        key = (device_idx, batch_size)
+    states = cache.get(key)
     if states is None or states.device != logits.device:
         seed = secrets.randbits(63)
         with torch.accelerator.device_index(device_idx):
             states = module.setup_rand(seed, batch_size)
-        _RAPID_SAMPLER_STATES[key] = states
+        cache[key] = states
     return states
 
 
@@ -645,6 +665,7 @@ def rapid_sample(
     repetition_penalties: torch.Tensor | None = None,
     penalty_decays: torch.Tensor | None = None,
     penalty_indices: torch.Tensor | None = None,
+    state_cache: RapidSamplerStateCache | None = None,
 ) -> torch.Tensor:
     """Sample from logits using the rapid-sampling CUDA extension."""
     assert rapid_sample_input_supported(logits)
@@ -664,7 +685,7 @@ def rapid_sample(
                 "per-request sampling parameters."
             )
         module = _load_rapid_sampler_module()
-        states = _rapid_states(module, logits)
+        states = _rapid_states(module, logits, state_cache)
         return module.batch_sampling_temperature_topk_topp(
             logits,
             states,
@@ -672,9 +693,6 @@ def rapid_sample(
             int(scalar_top_k),
             float(scalar_top_p),
         ).view(-1)
-
-    module = _load_rapid_sampler_module()
-    states = _rapid_states(module, logits)
 
     if penalties is not None:
         assert penalties.device == logits.device and penalties.dtype == torch.float32
@@ -707,6 +725,9 @@ def rapid_sample(
                 "temperature/top_k/top_p/presence_penalty/"
                 "repetition_penalty/penalty_decay."
             )
+
+        module = _load_rapid_sampler_module()
+        states = _rapid_states(module, logits, state_cache)
 
         if penalty_indices is not None:
             penalty_indices = _rapid_vector(
@@ -752,6 +773,7 @@ def rapid_sample(
             int(scalar_top_k),
             float(scalar_top_p),
         ).view(-1)
+
 
 def flashinfer_sample(
     logits: torch.Tensor,

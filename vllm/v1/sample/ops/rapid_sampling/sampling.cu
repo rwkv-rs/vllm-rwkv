@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda_fp16.h>
 #include <curand_kernel.h>
 #include <stdexcept>
@@ -138,8 +139,10 @@ at::Tensor setup_rand(int64_t seed, int64_t B) {
   at::Tensor state =
       at::zeros({(long)(B * sizeof(RAND))},
                 at::TensorOptions().dtype(at::kChar).device(at::kCUDA));
-  setup_rand_kernel<<<((int)B), 1>>>((RAND*)(state.data_ptr()),
-                                     (unsigned long long)seed);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  setup_rand_kernel<<<(int)B, 1, 0, stream>>>((RAND*)(state.data_ptr()),
+                                              (unsigned long long)seed);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return state;
 }
 
@@ -502,6 +505,7 @@ at::Tensor batch_sampling_repetition_temperature_topk_topp(
       (int*)out.data_ptr(), (RAND*)states.data_ptr(), (float*)probs.data_ptr(),
       (float)presence_penalty, (float)repetition_penalty, (float)penalty_decay,
       (float)log2e_inv_temp, (int)top_k, (float)top_p);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
 
@@ -588,6 +592,7 @@ at::Tensor batch_sampling_repetition_temperature_topk_topp_indexed(
       (RAND*)states.data_ptr(), (float*)probs.data_ptr(),
       (float)presence_penalty, (float)repetition_penalty, (float)penalty_decay,
       (float)log2e_inv_temp, (int)top_k, (float)top_p);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
 
@@ -1138,5 +1143,6 @@ at::Tensor batch_sampling_temperature_topk_topp(at::Tensor& logits,
         B, T, V, (float*)logits.data_ptr(), (int*)out.data_ptr(),
         (RAND*)states.data_ptr(), (float*)probs.data_ptr(),
         (float)log2e_inv_temp, (int)top_k, (float)top_p);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
