@@ -4,7 +4,7 @@
 set -euo pipefail
 
 if [[ $# -ne 3 ]]; then
-  echo "usage: $0 <full|rwkv> <source-dir> <new-output-dir>" >&2
+  echo "usage: $0 rwkv <source-dir> <new-output-dir>" >&2
   exit 2
 fi
 
@@ -12,8 +12,12 @@ profile=$1
 source_dir=$(realpath "$2")
 output_dir=$3
 
-if [[ "$profile" != "full" && "$profile" != "rwkv" ]]; then
-  echo "profile must be full or rwkv, got: $profile" >&2
+if [[ "$profile" == "full" ]]; then
+  echo "profile full is disabled; only rwkv is supported" >&2
+  exit 2
+fi
+if [[ "$profile" != "rwkv" ]]; then
+  echo "profile must be rwkv, got: $profile" >&2
   exit 2
 fi
 if [[ ! -f "$source_dir/setup.py" ]]; then
@@ -33,18 +37,10 @@ python_bin=${PYTHON_BIN:-python3.12}
 uv venv --python "$python_bin" "$venv" >"$output_dir/logs/venv.log" 2>&1
 
 install_start=$(date +%s%N)
-if [[ "$profile" == "full" ]]; then
-  UV_CACHE_DIR="$output_dir/uv-cache" \
-    uv pip install --python "$venv/bin/python" \
-      -r "$source_dir/requirements/build/cuda.txt" \
-      -r "$source_dir/requirements/cuda.txt" \
-      >"$output_dir/logs/dependency-install.log" 2>&1
-else
-  UV_CACHE_DIR="$output_dir/uv-cache" \
-    uv pip install --python "$venv/bin/python" \
-      -r "$source_dir/requirements/rwkv.txt" \
-      >"$output_dir/logs/dependency-install.log" 2>&1
-fi
+UV_CACHE_DIR="$output_dir/uv-cache" \
+  uv pip install --python "$venv/bin/python" \
+    -r "$source_dir/requirements/rwkv.txt" \
+    >"$output_dir/logs/dependency-install.log" 2>&1
 install_end=$(date +%s%N)
 install_ms=$(((install_end - install_start) / 1000000))
 
