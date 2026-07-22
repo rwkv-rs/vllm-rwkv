@@ -31,12 +31,11 @@ endif()
 
 # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
 set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
-set(VLLM_BUILD_PROFILE "full" CACHE STRING "Native extension build profile")
-set_property(CACHE VLLM_BUILD_PROFILE PROPERTY STRINGS full rwkv)
-if(NOT VLLM_BUILD_PROFILE STREQUAL "full" AND
-   NOT VLLM_BUILD_PROFILE STREQUAL "rwkv")
+set(VLLM_BUILD_PROFILE "rwkv" CACHE STRING "Native extension build profile")
+set_property(CACHE VLLM_BUILD_PROFILE PROPERTY STRINGS rwkv)
+if(NOT VLLM_BUILD_PROFILE STREQUAL "rwkv")
   message(FATAL_ERROR
-    "Invalid VLLM_BUILD_PROFILE='${VLLM_BUILD_PROFILE}'; accepted values: full, rwkv")
+    "VLLM_BUILD_PROFILE='${VLLM_BUILD_PROFILE}' is disabled; only rwkv is supported")
 endif()
 if(VLLM_BUILD_PROFILE STREQUAL "rwkv" AND
    NOT VLLM_TARGET_DEVICE STREQUAL "cuda")

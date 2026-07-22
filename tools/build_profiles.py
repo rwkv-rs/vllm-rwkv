@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable
 
-BUILD_PROFILES = ("full", "rwkv")
+BUILD_PROFILES = ("rwkv",)
 RWKV_EXTENSION_NAMES = (
     "vllm._rapid_sampling",
     "vllm.cumem_allocator",
@@ -16,6 +16,8 @@ RWKV_EXTENSION_NAMES = (
 
 
 def _validate_profile(profile: str) -> None:
+    if profile == "full":
+        raise ValueError("Build profile 'full' is disabled; only rwkv is supported")
     if profile not in BUILD_PROFILES:
         accepted = ", ".join(BUILD_PROFILES)
         raise ValueError(
@@ -24,7 +26,11 @@ def _validate_profile(profile: str) -> None:
 
 
 def resolve_build_profile() -> str:
-    profile = os.getenv("VLLM_BUILD_PROFILE", "full")
+    profile = os.getenv("VLLM_BUILD_PROFILE", "rwkv")
+    if profile == "full":
+        raise ValueError(
+            "VLLM_BUILD_PROFILE=full is disabled; only rwkv is supported"
+        )
     if profile not in BUILD_PROFILES:
         accepted = ", ".join(BUILD_PROFILES)
         raise ValueError(
@@ -36,14 +42,12 @@ def resolve_build_profile() -> str:
 def profile_build_temp(build_temp: str, profile: str) -> str:
     """Return a profile-specific CMake reuse directory."""
     _validate_profile(profile)
-    return build_temp if profile == "full" else f"{build_temp}-rwkv"
+    return f"{build_temp}-rwkv"
 
 
 def select_extension_names(names: Iterable[str], profile: str) -> list[str]:
     _validate_profile(profile)
     names = list(names)
-    if profile == "full":
-        return names
     available = set(names)
     missing = [name for name in RWKV_EXTENSION_NAMES if name not in available]
     if missing:

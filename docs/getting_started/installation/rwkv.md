@@ -1,6 +1,6 @@
-# RWKV-only source build
+# RWKV source build
 
-The opt-in `rwkv` build profile is a reduced CUDA artifact for dense RWKV7 raw
+This checkout supports only the `rwkv` CUDA build profile for dense RWKV7 raw
 `.pth` checkpoints. It supports the built-in RWKV tokenizer, text
 chat/completions, streaming, stop handling, Prometheus metrics, rapid sampling,
 and sleep/wake GPU-memory release through the CuMem allocator with TP=1, PP=1,
@@ -25,44 +25,42 @@ revision's release version). A normal Git checkout does not need this override.
 `--no-deps` avoids resolving a second time after the explicit requirements
 install. The selected RWKV artifact records that same reduced set in its
 package metadata and receives an `rwkv` version label, so dependency-consistency
-checks remain meaningful without changing normal full metadata.
+checks remain meaningful without a second dependency resolution.
 `--no-build-isolation` reuses the build tools declared by
-`requirements/rwkv.txt` and avoids resolving the full `pyproject.toml` build
+`requirements/rwkv.txt` and avoids resolving an unrelated `pyproject.toml` build
 environment. The generated `vllm/_build_profile.json` records the profile,
 native targets, external projects, architecture, weight format, device,
 runner, and TP/PP/DP boundaries that were actually configured.
 
-| Capability | `rwkv` | default `full` |
-| --- | --- | --- |
-| Dense RWKV7 raw `.pth` | yes | yes |
-| Built-in RWKV tokenizer and text OpenAI API | yes | yes |
-| Rapid sampler first-use JIT | yes | yes |
-| Sleep mode and CuMem allocator | yes | yes |
-| Other architectures or weight formats | no | yes |
-| Quantization, multimodal, speculative decoding, LoRA | no | yes |
-| Responses, Anthropic, generative-scoring, MCP routes | no | yes |
-| Structured-output constraints | no | yes |
-| SageMaker container-standard routes | no | yes |
-| TP, PP, or DP greater than one; Ray | no | yes |
-| Generic stable/MoE operators and attention external projects | no | yes |
-| Rust frontend | no | yes |
+| Capability | Supported |
+| --- | --- |
+| Dense RWKV7 raw `.pth` | yes |
+| Built-in RWKV tokenizer and text OpenAI API | yes |
+| Rapid sampler first-use JIT | yes |
+| Sleep mode and CuMem allocator | yes |
+| Other architectures or weight formats | no |
+| Quantization, multimodal, speculative decoding, LoRA | no |
+| Responses, Anthropic, generative-scoring, MCP routes | no |
+| Structured-output constraints | no |
+| SageMaker container-standard routes | no |
+| TP, PP, or DP greater than one; Ray | no |
+| Generic stable/MoE operators and attention external projects | no |
+| Rust frontend | no |
 
-Unsupported configurations fail during `VllmConfig` validation, before engine
-workers start, and request a full build. The profile also rejects precompiled
-full extensions rather than relabeling them as reduced artifacts.
+Unsupported configurations fail during `VllmConfig` validation before engine
+workers start. This checkout rejects precompiled non-RWKV extensions rather
+than relabeling them as reduced artifacts.
 
-To return to normal vLLM compatibility, create a clean environment, install
-`requirements/build/cuda.txt` and `requirements/cuda.txt`, and install with
-`VLLM_BUILD_PROFILE` unset. Unset and explicit `full` are equivalent.
+`VLLM_BUILD_PROFILE` defaults to `rwkv`; setting it to `full` is rejected. For
+another vLLM build profile, use a separate upstream checkout rather than this
+RWKV-only environment.
 
 For clean comparison runs, use:
 
 ```bash
 tools/rwkv_profile/measure_profile.sh rwkv /path/to/clean/source /path/to/new/output
-tools/rwkv_profile/measure_profile.sh full /path/to/other/clean/source /path/to/new/output
 ```
 
 Each output contains dependency and build logs, resolved distributions,
 dependency consistency output, the native target manifest, and size/time
-metrics. Use separate source trees, environments, FetchContent roots, and uv
-caches for the two profiles.
+metrics.
