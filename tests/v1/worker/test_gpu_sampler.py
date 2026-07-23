@@ -16,49 +16,26 @@ from vllm.v1.worker.gpu.sample.states import SamplingStates
 def _new_rapid_sampler(
     *,
     rapid_penalties: torch.Tensor,
-    all_token_ids: torch.Tensor | None = None,
 ) -> Sampler:
     sampler = object.__new__(Sampler)
     sampler.rapid_penalties = rapid_penalties
+    sampler.rapid_penalty_native_fallback = np.zeros(
+        rapid_penalties.shape[0], dtype=bool
+    )
     sampler.req_states = SimpleNamespace(
         max_num_reqs=rapid_penalties.shape[0],
         vocab_size=rapid_penalties.shape[1],
         device=rapid_penalties.device,
-        all_token_ids=SimpleNamespace(gpu=all_token_ids),
     )
     return sampler
 
 
-def test_worker_sampler_seeds_rapid_repetition_penalty_from_prompt():
-    all_token_ids = torch.tensor(
-        [
-            [2, 5, 2, 99],
-            [0, 0, 0, 0],
-        ],
-        dtype=torch.int32,
-    )
-    rapid_penalties = torch.zeros(2, 8, dtype=torch.float32)
-    sampler = _new_rapid_sampler(
-        rapid_penalties=rapid_penalties,
-        all_token_ids=all_token_ids,
-    )
-
-    sampler._seed_rapid_prompt_penalties(
-        req_idx=0,
-        prompt_len=4,
-        sampling_params=SamplingParams(repetition_penalty=1.2),
-    )
-
-    assert torch.isclose(rapid_penalties[0, 2], torch.tensor(1.2))
-    assert torch.isclose(rapid_penalties[0, 5], torch.tensor(1.2))
-    assert torch.count_nonzero(rapid_penalties[0]) == 2
-
-
-def test_worker_sampler_clears_rapid_penalties_when_reusing_slot():
+def test_worker_sampler_accepts_frequency_penalty_for_rapid_sampling():
     rapid_penalties = torch.full((1, 8), 3.0)
     sampler = _new_rapid_sampler(rapid_penalties=rapid_penalties)
     sampler.use_rapid = True
     sampler.require_rapid = False
+    sampler.rapid_penalty_native_fallback[0] = True
     for name in (
         "sampling_states",
         "penalties_state",
@@ -68,9 +45,20 @@ def test_worker_sampler_clears_rapid_penalties_when_reusing_slot():
     ):
         setattr(sampler, name, SimpleNamespace(add_request=lambda *args: None))
 
-    sampler.add_request(0, 0, SamplingParams())
+    sampler.add_request(0, 0, SamplingParams(frequency_penalty=0.5))
 
     assert torch.count_nonzero(rapid_penalties) == 0
+    assert not sampler.rapid_penalty_native_fallback[0]
+
+
+def test_worker_sampler_rejects_repetition_penalty_when_rapid_is_required():
+    sampler = object.__new__(Sampler)
+    sampler.use_rapid = True
+    sampler.require_rapid = True
+    sampler.rapid_penalty_native_fallback = np.zeros(1, dtype=bool)
+
+    with pytest.raises(RuntimeError, match="does not support repetition_penalty"):
+        sampler.add_request(0, 0, SamplingParams(repetition_penalty=1.2))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="UVA tensors require CUDA")
@@ -120,33 +108,33 @@ def test_penalties_state_can_collapse_uniform_rapid_params():
     )
     state = PenaltiesState(req_states)
     state.presence_penalty.np[:3] = 0.2
-    state.repetition_penalty.np[:3] = 1.1
+    state.frequency_penalty.np[:3] = 0.1
     state.penalty_decay.np[:3] = 0.95
     state.presence_penalty.copy_to_uva()
-    state.repetition_penalty.copy_to_uva()
+    state.frequency_penalty.copy_to_uva()
     state.penalty_decay.copy_to_uva()
 
     device = state.presence_penalty.gpu.device
     expanded_idx_mapping = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
     idx_mapping_np = np.array([0, 1, 2])
 
-    presence, repetition, decay = state.rapid_penalty_params(
+    presence, frequency, decay = state.rapid_penalty_params(
         expanded_idx_mapping,
         idx_mapping_np,
         scalar_if_uniform=True,
     )
 
     assert presence == pytest.approx(0.2)
-    assert repetition == pytest.approx(1.1)
+    assert frequency == pytest.approx(0.1)
     assert decay == pytest.approx(0.95)
 
-    vector_presence, vector_repetition, vector_decay = state.rapid_penalty_params(
+    vector_presence, vector_frequency, vector_decay = state.rapid_penalty_params(
         expanded_idx_mapping,
         idx_mapping_np,
     )
 
     assert vector_presence.shape == (3,)
-    assert vector_repetition.shape == (3,)
+    assert vector_frequency.shape == (3,)
     assert vector_decay.shape == (3,)
 
 
@@ -159,24 +147,24 @@ def test_penalties_state_keeps_mixed_rapid_params_as_vectors():
     )
     state = PenaltiesState(req_states)
     state.presence_penalty.np[:2] = [0.2, 0.3]
-    state.repetition_penalty.np[:2] = 1.1
+    state.frequency_penalty.np[:2] = 0.1
     state.penalty_decay.np[:2] = 0.95
     state.presence_penalty.copy_to_uva()
-    state.repetition_penalty.copy_to_uva()
+    state.frequency_penalty.copy_to_uva()
     state.penalty_decay.copy_to_uva()
 
     device = state.presence_penalty.gpu.device
     expanded_idx_mapping = torch.tensor([0, 1], dtype=torch.int32, device=device)
     idx_mapping_np = np.array([0, 1])
 
-    presence, repetition, decay = state.rapid_penalty_params(
+    presence, frequency, decay = state.rapid_penalty_params(
         expanded_idx_mapping,
         idx_mapping_np,
         scalar_if_uniform=True,
     )
 
     assert isinstance(presence, torch.Tensor)
-    assert isinstance(repetition, torch.Tensor)
+    assert isinstance(frequency, torch.Tensor)
     assert isinstance(decay, torch.Tensor)
     assert presence.shape == (2,)
 
@@ -191,6 +179,7 @@ def test_rapid_sampler_returns_kernel_processed_logprob(monkeypatch, processed_d
     sampler.use_flashinfer = False
     sampler.logprobs_mode = "processed_logprobs"
     sampler.rapid_penalties = None
+    sampler.rapid_penalty_native_fallback = np.zeros(1, dtype=bool)
 
     class FakeSamplingStates:
         def get_temperatures(
@@ -223,11 +212,11 @@ def test_rapid_sampler_returns_kernel_processed_logprob(monkeypatch, processed_d
             return False
 
     class FakePenaltiesState:
-        def any_frequency_penalty(self, idx_mapping_np):
+        def any_repetition_penalty(self, idx_mapping_np):
             return False
 
-        def use_rapid_penalty(self, idx_mapping_np):
-            return False
+        def rapid_penalty_mask(self, idx_mapping_np):
+            return np.zeros(len(idx_mapping_np), dtype=bool)
 
     sampler.sampling_states = FakeSamplingStates()
     sampler.penalties_state = FakePenaltiesState()
@@ -407,6 +396,7 @@ def test_rapid_sampler_native_fallback_is_forbidden_when_required(
     sampler.use_flashinfer = False
     sampler.logprobs_mode = "raw_logprobs"
     sampler.rapid_penalties = None
+    sampler.rapid_penalty_native_fallback = np.zeros(1, dtype=bool)
     sampler.use_fp64_gumbel = False
     sampler.require_rapid = require_rapid
 
@@ -446,11 +436,11 @@ def test_rapid_sampler_native_fallback_is_forbidden_when_required(
             return False
 
     class FakePenaltiesState:
-        def any_frequency_penalty(self, idx_mapping_np):
+        def any_repetition_penalty(self, idx_mapping_np):
             return False
 
-        def use_rapid_penalty(self, idx_mapping_np):
-            return False
+        def rapid_penalty_mask(self, idx_mapping_np):
+            return np.zeros(len(idx_mapping_np), dtype=bool)
 
     sampler.sampling_states = FakeSamplingStates()
     sampler.penalties_state = FakePenaltiesState()
@@ -508,3 +498,4 @@ def test_rapid_sampler_native_fallback_is_forbidden_when_required(
     assert sampling_param_calls[0]["skip_temperature"] is True
     assert sampling_param_calls[1].get("skip_top_k_top_p", False) is False
     assert sampling_param_calls[1].get("skip_temperature", False) is False
+

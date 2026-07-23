@@ -29,10 +29,8 @@ from vllm.platforms import current_platform  # noqa: E402
 from vllm.utils.argparse_utils import FlexibleArgumentParser  # noqa: E402
 from vllm.v1.sample.ops.topk_topp_sampler import (
     flashinfer_sample,
-    get_rapid_penalty_index_stats,
     rapid_sample,
     rapid_sample_input_supported,
-    reset_rapid_penalty_index_stats,
 )  # noqa: E402
 
 SUPPORTED_PROVIDERS = frozenset(
@@ -183,7 +181,7 @@ def run_config(
         rapid_top_k, rapid_top_p = make_rapid_args(config)
         penalties = torch.zeros_like(logits)
         presence_penalties = 0.1
-        repetition_penalties = 0.1
+        frequency_penalties = 0.1
         penalty_decays = 0.996
         result["rapid_penalty_ms"] = benchmark_cuda_call(
             lambda: rapid_sample(
@@ -192,7 +190,7 @@ def run_config(
                 rapid_top_p,
                 penalties=penalties,
                 presence_penalties=presence_penalties,
-                repetition_penalties=repetition_penalties,
+                frequency_penalties=frequency_penalties,
                 penalty_decays=penalty_decays,
             ),
             warmup_iters,
@@ -210,9 +208,8 @@ def run_config(
             device="cuda",
         )
         presence_penalties = 0.1
-        repetition_penalties = 0.1
+        frequency_penalties = 0.1
         penalty_decays = 0.996
-        reset_rapid_penalty_index_stats()
         result["rapid_penalty_index_pattern"] = penalty_index_pattern
         result["rapid_penalty_index_rows"] = penalty_rows
         result["rapid_penalty_index_first_values"] = (
@@ -225,14 +222,13 @@ def run_config(
                 rapid_top_p,
                 penalties=penalties,
                 presence_penalties=presence_penalties,
-                repetition_penalties=repetition_penalties,
+                frequency_penalties=frequency_penalties,
                 penalty_decays=penalty_decays,
                 penalty_indices=penalty_indices,
             ),
             warmup_iters,
             benchmark_iters,
         )
-        result["rapid_penalty_index_stats"] = get_rapid_penalty_index_stats()
 
     if "flashinfer" in providers:
         flashinfer_top_k, flashinfer_top_p = make_flashinfer_args(config)
