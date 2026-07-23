@@ -5,10 +5,9 @@ import pytest
 import torch
 
 from benchmarks.kernels import benchmark_rapid_sampling as rapid_bench
-from vllm.v1.sample.ops import topk_topp_sampler
 
 
-def test_run_config_records_indexed_penalty_diagnostics(monkeypatch) -> None:
+def test_run_config_records_indexed_penalty_inputs(monkeypatch) -> None:
     config = rapid_bench.BenchmarkConfig(
         batch_size=3,
         vocab_size=8,
@@ -60,10 +59,6 @@ def test_run_config_records_indexed_penalty_diagnostics(monkeypatch) -> None:
     ):
         assert penalty_indices is penalty_indices_arg
         assert penalties.shape == (config.batch_size * 2, config.vocab_size)
-        topk_topp_sampler._record_rapid_penalty_index_stats(
-            rows=logits.shape[0],
-            vocab_size=logits.shape[1],
-        )
         return real_zeros((config.batch_size,), dtype=torch.int32)
 
     penalty_indices_arg = penalty_indices
@@ -88,11 +83,6 @@ def test_run_config_records_indexed_penalty_diagnostics(monkeypatch) -> None:
     assert result["rapid_penalty_index_rows"] == config.batch_size * 2
     assert result["rapid_penalty_index_first_values"] == [0, 2, 4]
     assert result["rapid_penalty_indexed_ms"] == 0.25
-    assert result["rapid_penalty_index_stats"] == {
-        "indexed_calls": 1,
-        "indexed_rows": 3,
-        "indexed_vocab_elements": 24,
-    }
 
 
 def test_run_config_rejects_legacy_indexed_penalty_provider() -> None:

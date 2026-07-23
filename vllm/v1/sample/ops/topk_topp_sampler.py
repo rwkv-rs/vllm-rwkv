@@ -23,33 +23,6 @@ logger = init_logger(__name__)
 
 _RAPID_SAMPLER_MODULE = None
 _RAPID_SAMPLER_STATES: dict[tuple[int, int], torch.Tensor] = {}
-_RAPID_PENALTY_INDEX_STATS = {
-    "indexed_calls": 0,
-    "indexed_rows": 0,
-    "indexed_vocab_elements": 0,
-}
-
-
-def reset_rapid_penalty_index_stats() -> None:
-    for key in _RAPID_PENALTY_INDEX_STATS:
-        _RAPID_PENALTY_INDEX_STATS[key] = 0
-
-
-def get_rapid_penalty_index_stats() -> dict[str, int]:
-    return dict(_RAPID_PENALTY_INDEX_STATS)
-
-
-def _record_rapid_penalty_index_stats(
-    *,
-    rows: int,
-    vocab_size: int,
-) -> None:
-    elements = rows * vocab_size
-    _RAPID_PENALTY_INDEX_STATS["indexed_calls"] += 1
-    _RAPID_PENALTY_INDEX_STATS["indexed_rows"] += rows
-    _RAPID_PENALTY_INDEX_STATS["indexed_vocab_elements"] += elements
-
-
 def flashinfer_sampler_supported() -> bool:
     """Decide whether FlashInfer's top-p/top-k sampler can be used.
 
@@ -655,7 +628,7 @@ def rapid_sample(
     temperatures: torch.Tensor | float | None = None,
     penalties: torch.Tensor | None = None,
     presence_penalties: torch.Tensor | None = None,
-    repetition_penalties: torch.Tensor | None = None,
+    frequency_penalties: torch.Tensor | None = None,
     penalty_decays: torch.Tensor | None = None,
     penalty_indices: torch.Tensor | None = None,
     return_logprobs: bool = False,
@@ -667,7 +640,6 @@ def rapid_sample(
     implementation can exclude a sampled token at a threshold tie.
     """
     assert rapid_sample_input_supported(logits)
-    assert logits.dtype == torch.float32
 
     logits = logits.contiguous()
     batch_size = logits.shape[0] if logits.dim() >= 2 else 1
@@ -710,31 +682,81 @@ def rapid_sample(
         scalar_top_k = _rapid_scalar(k, vocab_size)
         scalar_top_p = _rapid_scalar(p, 1.0)
         scalar_presence_penalty = _rapid_scalar(presence_penalties, 0.0)
-        scalar_repetition_penalty = _rapid_scalar(repetition_penalties, 1.0)
+        scalar_repetition_penalty = _rapid_scalar(frequency_penalties, 0.0)
         scalar_penalty_decay = _rapid_scalar(
             penalty_decays, RAPID_PENALTY_DECAY_DEFAULT
         )
-        if any(
-            value is None
-            for value in (
-                scalar_temperature,
-                scalar_top_k,
-                scalar_top_p,
-                scalar_presence_penalty,
-                scalar_repetition_penalty,
-                scalar_penalty_decay,
-            )
-        ):
-            raise RuntimeError(
-                "rapid-sampling with penalties only supports uniform scalar "
-                "temperature/top_k/top_p/presence_penalty/"
-                "repetition_penalty/penalty_decay."
+        scalar_params = (
+            scalar_temperature,
+            scalar_top_k,
+            scalar_top_p,
+            scalar_presence_penalty,
+            scalar_repetition_penalty,
+            scalar_penalty_decay,
+        )
+        per_request = any(value is None for value in scalar_params)
+        if per_request and penalty_indices is None:
+            penalty_indices = torch.arange(
+                batch_size, dtype=torch.int32, device=logits.device
             )
 
         if penalty_indices is not None:
             penalty_indices = _rapid_vector(
                 penalty_indices, batch_size, 0, torch.int32, logits.device
             )
+            if per_request:
+                return _format_rapid_sample_result(
+                    module.batch_sampling_repetition_temperature_topk_topp_per_request_indexed(
+                        logits,
+                        penalties,
+                        penalty_indices,
+                        states,
+                        _rapid_vector(
+                            presence_penalties,
+                            batch_size,
+                            0.0,
+                            torch.float32,
+                            logits.device,
+                        ),
+                        _rapid_vector(
+                            frequency_penalties,
+                            batch_size,
+                            0.0,
+                            torch.float32,
+                            logits.device,
+                        ),
+                        _rapid_vector(
+                            penalty_decays,
+                            batch_size,
+                            RAPID_PENALTY_DECAY_DEFAULT,
+                            torch.float32,
+                            logits.device,
+                        ),
+                        _rapid_vector(
+                            temperatures,
+                            batch_size,
+                            1.0,
+                            torch.float32,
+                            logits.device,
+                        ),
+                        _rapid_vector(
+                            k,
+                            batch_size,
+                            vocab_size,
+                            torch.int32,
+                            logits.device,
+                        ),
+                        _rapid_vector(
+                            p,
+                            batch_size,
+                            1.0,
+                            torch.float32,
+                            logits.device,
+                        ),
+                        return_logprobs,
+                    ),
+                    return_logprobs=return_logprobs,
+                )
             indexed_sampler = getattr(
                 module,
                 "batch_sampling_repetition_temperature_topk_topp_indexed",
@@ -745,10 +767,6 @@ def rapid_sample(
                     "rapid-sampling indexed penalty kernel is unavailable; "
                     "refusing the legacy gather/scatter path."
                 )
-            _record_rapid_penalty_index_stats(
-                rows=batch_size,
-                vocab_size=vocab_size,
-            )
             return _format_rapid_sample_result(
                 indexed_sampler(
                     logits,

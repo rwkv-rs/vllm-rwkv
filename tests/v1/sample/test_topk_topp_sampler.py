@@ -550,22 +550,38 @@ def test_rapid_sample_requires_indexed_penalty_kernel(
         )
 
 
-def test_rapid_sample_rejects_mixed_penalty_params(
+def test_rapid_sample_maps_per_request_frequency_penalty_to_rapid_repetition(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm.v1.sample.ops import topk_topp_sampler
 
+    captured_repetition_penalties = None
+
     class FakeRapidModule:
         @staticmethod
-        def batch_sampling_repetition_temperature_topk_topp(*args, **kwargs):
-            pytest.fail("mixed penalty params should not call rapid CUDA")
+        def batch_sampling_repetition_temperature_topk_topp_per_request_indexed(
+            logits,
+            penalties,
+            penalty_indices,
+            states,
+            presence_penalties,
+            repetition_penalties,
+            penalty_decays,
+            temperatures,
+            top_ks,
+            top_ps,
+            return_logprobs,
+        ):
+            nonlocal captured_repetition_penalties
+            captured_repetition_penalties = repetition_penalties
+            return [torch.tensor([2, 3], dtype=torch.int32)]
 
     fake_states = torch.empty(2, dtype=torch.uint8)
     logits = torch.randn(2, 8, dtype=torch.float32)
     penalties = torch.zeros(4, 8, dtype=torch.float32)
     penalty_indices = torch.tensor([3, 1], dtype=torch.int32)
     presence_penalties = torch.tensor([0.3, 0.4], dtype=torch.float32)
-    repetition_penalties = torch.tensor([0.1, 0.1], dtype=torch.float32)
+    frequency_penalties = torch.tensor([0.1, 0.1], dtype=torch.float32)
     penalty_decays = torch.tensor([0.95, 0.95], dtype=torch.float32)
 
     monkeypatch.setattr(
@@ -584,19 +600,60 @@ def test_rapid_sample_rejects_mixed_penalty_params(
         lambda module, logits: fake_states,
     )
 
-    with pytest.raises(
-        RuntimeError, match="with penalties only supports uniform scalar"
-    ):
-        topk_topp_sampler.rapid_sample(
-            logits,
-            None,
-            None,
-            penalties=penalties,
-            presence_penalties=presence_penalties,
-            repetition_penalties=repetition_penalties,
-            penalty_decays=penalty_decays,
-            penalty_indices=penalty_indices,
-        )
+    sampled = topk_topp_sampler.rapid_sample(
+        logits,
+        torch.tensor([4, 5], dtype=torch.int32),
+        torch.tensor([0.8, 0.9], dtype=torch.float32),
+        temperatures=torch.tensor([0.7, 1.1], dtype=torch.float32),
+        penalties=penalties,
+        presence_penalties=presence_penalties,
+        frequency_penalties=frequency_penalties,
+        penalty_decays=penalty_decays,
+        penalty_indices=penalty_indices,
+    )
+
+    assert sampled.tolist() == [2, 3]
+    assert torch.equal(captured_repetition_penalties, frequency_penalties)
+
+
+@pytest.mark.skipif(
+    not RAPID_SAMPLER_PLATFORM_SUPPORTED,
+    reason="Rapid sampler requires CUDA compute capability >= 7.",
+)
+def test_rapid_sample_applies_per_request_params_to_indexed_penalty_rows():
+    from vllm.v1.sample.ops import topk_topp_sampler
+
+    logits = torch.full((2, 8), -10.0, dtype=torch.float32, device=DEVICE_TYPE)
+    logits[0, 2] = 10.0
+    logits[1, 5] = 10.0
+    penalties = torch.zeros(4, 8, dtype=torch.float32, device=DEVICE_TYPE)
+    penalty_indices = torch.tensor([3, 1], dtype=torch.int32, device=DEVICE_TYPE)
+    kwargs = {
+        "k": torch.tensor([1, 4], dtype=torch.int32, device=DEVICE_TYPE),
+        "p": torch.tensor([0.0, 0.8], dtype=torch.float32, device=DEVICE_TYPE),
+        "temperatures": torch.tensor(
+            [0.7, 1.2], dtype=torch.float32, device=DEVICE_TYPE
+        ),
+        "presence_penalties": torch.tensor(
+            [0.1, 0.4], dtype=torch.float32, device=DEVICE_TYPE
+        ),
+        "frequency_penalties": torch.tensor(
+            [0.2, -0.1], dtype=torch.float32, device=DEVICE_TYPE
+        ),
+        "penalty_decays": torch.tensor(
+            [0.9, 0.5], dtype=torch.float32, device=DEVICE_TYPE
+        ),
+        "penalty_indices": penalty_indices,
+    }
+
+    first = topk_topp_sampler.rapid_sample(logits, penalties=penalties, **kwargs)
+    second = topk_topp_sampler.rapid_sample(logits, penalties=penalties, **kwargs)
+
+    assert first.tolist() == [2, 5]
+    assert second.tolist() == [2, 5]
+    assert penalties[3, 2].item() == pytest.approx(0.47)
+    assert penalties[1, 5].item() == pytest.approx(0.05)
+    assert torch.count_nonzero(penalties[[0, 2]]) == 0
 
 
 @pytest.mark.skipif(
@@ -622,7 +679,7 @@ def test_rapid_sample_indexed_penalty_identity_matches_contiguous():
 
     kwargs = {
         "presence_penalties": 0.5,
-        "repetition_penalties": 0.1,
+        "frequency_penalties": 0.1,
         "penalty_decays": 0.9,
     }
     contiguous = topk_topp_sampler.rapid_sample(
@@ -653,7 +710,6 @@ def test_rapid_sample_indexed_penalty_identity_matches_contiguous():
 def test_rapid_sample_updates_indexed_penalties():
     from vllm.v1.sample.ops import topk_topp_sampler
 
-    topk_topp_sampler.reset_rapid_penalty_index_stats()
     logits = torch.full((2, 8), -10.0, dtype=torch.float32, device=DEVICE_TYPE)
     logits[0, 2] = 10.0
     logits[1, 5] = 10.0
@@ -664,7 +720,7 @@ def test_rapid_sample_updates_indexed_penalties():
     penalty_indices = penalty_index_storage[::2]
     assert not penalty_indices.is_contiguous()
     presence_penalties = 0.5
-    repetition_penalties = 0.1
+    frequency_penalties = 0.1
     penalty_decays = 0.9
     top_p = 0.0
 
@@ -674,7 +730,7 @@ def test_rapid_sample_updates_indexed_penalties():
         top_p,
         penalties=penalties,
         presence_penalties=presence_penalties,
-        repetition_penalties=repetition_penalties,
+        frequency_penalties=frequency_penalties,
         penalty_decays=penalty_decays,
         penalty_indices=penalty_indices,
     )
@@ -684,7 +740,7 @@ def test_rapid_sample_updates_indexed_penalties():
         top_p,
         penalties=penalties,
         presence_penalties=presence_penalties,
-        repetition_penalties=repetition_penalties,
+        frequency_penalties=frequency_penalties,
         penalty_decays=penalty_decays,
         penalty_indices=penalty_indices,
     )
@@ -695,14 +751,67 @@ def test_rapid_sample_updates_indexed_penalties():
     assert torch.equal(
         second, torch.tensor([2, 5], dtype=torch.int32, device=DEVICE_TYPE)
     )
-    assert torch.allclose(penalties[3, 2], torch.tensor(0.55, device=DEVICE_TYPE))
-    assert torch.allclose(penalties[1, 5], torch.tensor(0.55, device=DEVICE_TYPE))
+    assert torch.allclose(penalties[3, 2], torch.tensor(0.64, device=DEVICE_TYPE))
+    assert torch.allclose(penalties[1, 5], torch.tensor(0.64, device=DEVICE_TYPE))
     assert torch.count_nonzero(penalties[[0, 2]]) == 0
-    assert topk_topp_sampler.get_rapid_penalty_index_stats() == {
-        "indexed_calls": 2,
-        "indexed_rows": 4,
-        "indexed_vocab_elements": 32,
-    }
+
+
+@pytest.mark.skipif(
+    not RAPID_SAMPLER_PLATFORM_SUPPORTED,
+    reason="Rapid sampler requires CUDA compute capability >= 7.",
+)
+def test_rapid_sample_applies_frequency_penalty_without_presence_penalty():
+    from vllm.v1.sample.ops import topk_topp_sampler
+
+    logits = torch.full((1, 8), -10.0, dtype=torch.float32, device=DEVICE_TYPE)
+    logits[0, 2] = 10.0
+    penalties = torch.zeros_like(logits)
+
+    for _ in range(2):
+        topk_topp_sampler.rapid_sample(
+            logits,
+            None,
+            0.0,
+            penalties=penalties,
+            presence_penalties=0.0,
+            frequency_penalties=0.1,
+            penalty_decays=0.9,
+        )
+
+    assert torch.allclose(penalties[0, 2], torch.tensor(0.19, device=DEVICE_TYPE))
+
+
+@pytest.mark.skipif(
+    not RAPID_SAMPLER_PLATFORM_SUPPORTED,
+    reason="Rapid sampler requires CUDA compute capability >= 7.",
+)
+def test_rapid_sample_does_not_reapply_presence_after_penalty_cancels():
+    from vllm.v1.sample.ops import topk_topp_sampler
+
+    logits = torch.full((1, 8), -10.0, dtype=torch.float32, device=DEVICE_TYPE)
+    logits[0, 2] = 10.0
+    penalties = torch.zeros_like(logits)
+
+    def sample():
+        topk_topp_sampler.rapid_sample(
+            logits,
+            None,
+            0.0,
+            penalties=penalties,
+            presence_penalties=-0.1,
+            frequency_penalties=0.1,
+            penalty_decays=1.0,
+        )
+
+    sample()
+    logits[0, 2] = -10.0
+    logits[0, 3] = 10.0
+    sample()
+    logits[0, 2] = 10.0
+    logits[0, 3] = -10.0
+    sample()
+
+    assert torch.allclose(penalties[0, 2], torch.tensor(0.1, device=DEVICE_TYPE))
 
 
 @pytest.mark.skipif(

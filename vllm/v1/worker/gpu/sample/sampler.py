@@ -58,10 +58,12 @@ class Sampler:
         self.use_flashinfer = not self.use_rapid and flashinfer_sampler_supported()
         self.require_rapid = False
         self.rapid_penalties: torch.Tensor | None = None
+        self.rapid_penalty_native_fallback = np.zeros(max_num_reqs, dtype=bool)
 
     def add_request(
         self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
     ) -> None:
+        self.rapid_penalty_native_fallback[req_idx] = False
         if (
             not self.use_rapid
             and sampling_params.penalty_decay != RAPID_PENALTY_DECAY_DEFAULT
@@ -71,7 +73,7 @@ class Sampler:
             )
         if (
             self.use_rapid
-            and sampling_params.frequency_penalty != 0.0
+            and sampling_params.repetition_penalty != 1.0
             and (
                 self.require_rapid
                 or (
@@ -81,18 +83,16 @@ class Sampler:
             )
         ):
             raise RuntimeError(
-                "rapid-sampling does not support frequency_penalty. "
-                "Set frequency_penalty=0.0."
+                "rapid-sampling does not support repetition_penalty. "
+                "Set repetition_penalty=1.0."
             )
         use_rapid_penalty = self.use_rapid and (
             sampling_params.presence_penalty != 0.0
-            or sampling_params.repetition_penalty != 1.0
+            or sampling_params.frequency_penalty != 0.0
             or sampling_params.penalty_decay != RAPID_PENALTY_DECAY_DEFAULT
         )
         if self.use_rapid and (self.rapid_penalties is not None or use_rapid_penalty):
             self._ensure_rapid_penalties()[req_idx].zero_()
-        if use_rapid_penalty:
-            self._seed_rapid_prompt_penalties(req_idx, prompt_len, sampling_params)
         self.sampling_states.add_request(req_idx, sampling_params)
         self.penalties_state.add_request(req_idx, sampling_params)
         self.logit_bias_state.add_request(req_idx, prompt_len, sampling_params)
@@ -111,32 +111,9 @@ class Sampler:
             )
         return self.rapid_penalties
 
-    def _seed_rapid_prompt_penalties(
-        self,
-        req_idx: int,
-        prompt_len: int,
-        sampling_params: SamplingParams,
-    ) -> None:
-        if sampling_params.repetition_penalty == 1.0 or prompt_len <= 0:
-            return
-        all_token_ids = self.req_states.all_token_ids.gpu
-        if all_token_ids is None:
-            return
-        penalties = self._ensure_rapid_penalties()
-        prompt_token_ids = all_token_ids[req_idx, :prompt_len].to(
-            device=penalties.device,
-            dtype=torch.long,
-            non_blocking=True,
-        )
-        valid_mask = (prompt_token_ids >= 0) & (prompt_token_ids < penalties.shape[1])
-        prompt_token_ids = prompt_token_ids[valid_mask]
-        if prompt_token_ids.numel() == 0:
-            return
-        penalties[req_idx].scatter_(
-            0,
-            prompt_token_ids,
-            float(sampling_params.repetition_penalty),
-        )
+    def _mark_rapid_penalty_native_fallback(self, idx_mapping_np: np.ndarray) -> None:
+        rapid_penalty_mask = self.penalties_state.rapid_penalty_mask(idx_mapping_np)
+        self.rapid_penalty_native_fallback[idx_mapping_np[rapid_penalty_mask]] = True
 
     def apply_staged_writes(self) -> None:
         self.sampling_states.apply_staged_writes()
@@ -331,10 +308,18 @@ class Sampler:
         return_logprobs: bool = False,
         sampled_only_logprobs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, bool]:
-        use_rapid = self.use_rapid
+        rapid_penalty_native_fallback = bool(
+            np.any(self.rapid_penalty_native_fallback[idx_mapping_np])
+        )
+        use_rapid = self.use_rapid and not rapid_penalty_native_fallback
         rapid_sampler_forced = self.require_rapid or (
             envs.is_set("VLLM_USE_RAPID_SAMPLER") and envs.VLLM_USE_RAPID_SAMPLER
         )
+        if rapid_penalty_native_fallback and rapid_sampler_forced:
+            raise RuntimeError(
+                "rapid-sampling cannot resume a request after it falls back to "
+                "native sampling with frequency or presence penalties."
+            )
         if self.require_rapid and not use_rapid:
             raise RuntimeError("RWKV7 requires rapid-sampling on CUDA.")
         needs_processed_logprobs = (
@@ -375,28 +360,34 @@ class Sampler:
             scalar_if_uniform=use_rapid,
         )
         rapid_penalty_active = False
+        rapid_per_request_params = False
+        rapid_penalty_params: (
+            tuple[torch.Tensor | float, torch.Tensor | float, torch.Tensor | float]
+            | None
+        ) = None
         temperatures = None
         if use_rapid:
-            rapid_penalty_active = self.penalties_state.use_rapid_penalty(
+            rapid_penalty_mask = self.penalties_state.rapid_penalty_mask(
                 idx_mapping_np
             )
+            rapid_penalty_active = bool(np.any(rapid_penalty_mask))
             temperatures = self.sampling_states.get_temperatures(
                 expanded_idx_mapping,
                 idx_mapping_np,
                 scalar_if_uniform=True,
             )
-            if not rapid_penalty_active and any(
-                isinstance(value, torch.Tensor)
-                for value in (temperatures, top_k, top_p)
-                if value is not None
-            ):
-                if rapid_sampler_forced:
-                    raise RuntimeError(
-                        "rapid-sampling requires uniform temperature, top_k, "
-                        "and top_p within each batch."
-                    )
-                use_rapid = False
-                processed_logits, top_k, top_p = use_native_sampling_params()
+            if rapid_penalty_active:
+                rapid_penalty_params = self.penalties_state.rapid_penalty_params(
+                    expanded_idx_mapping,
+                    idx_mapping_np,
+                    scalar_if_uniform=True,
+                )
+            rapid_sampler_params = (temperatures, top_k, top_p)
+            if rapid_penalty_params is not None:
+                rapid_sampler_params += rapid_penalty_params
+            rapid_per_request_params = any(
+                isinstance(value, torch.Tensor) for value in rapid_sampler_params
+            )
         use_flashinfer = self.use_flashinfer and not (
             # Don't use FI sampler if no requests use top_k/top_p, if there are
             # any greedy requests or per-request seeds, or if post-processed
@@ -438,10 +429,10 @@ class Sampler:
                     "in (0, 1048576] and divisible by 4. Set "
                     "VLLM_USE_RAPID_SAMPLER=0 to use another sampler."
                 )
-            elif self.penalties_state.any_frequency_penalty(idx_mapping_np):
+            elif self.penalties_state.any_repetition_penalty(idx_mapping_np):
                 rapid_incompatibility = (
-                    "rapid-sampling does not support frequency_penalty. "
-                    "Set frequency_penalty=0.0."
+                    "rapid-sampling does not support repetition_penalty. "
+                    "Set repetition_penalty=1.0."
                 )
             elif (
                 rapid_penalty_active
@@ -455,29 +446,36 @@ class Sampler:
             if rapid_incompatibility is not None:
                 if rapid_sampler_forced:
                     raise RuntimeError(rapid_incompatibility)
+                if rapid_penalty_active:
+                    # The rapid kernel owns an accumulated penalty buffer. Once
+                    # native sampling advances a request, that buffer cannot
+                    # reconstruct its decayed history, so keep the affected
+                    # requests on the native path for their remaining lifetime.
+                    self._mark_rapid_penalty_native_fallback(idx_mapping_np)
                 use_rapid = False
                 rapid_penalty_active = False
+                rapid_per_request_params = False
+                rapid_penalty_params = None
                 processed_logits, top_k, top_p = use_native_sampling_params()
 
         # Sample the next token.
         if use_rapid:
             assert temperatures is not None
-            if rapid_penalty_active:
+            if rapid_penalty_active or rapid_per_request_params:
                 if expanded_idx_mapping.shape[0] != idx_mapping_np.shape[0]:
                     raise RuntimeError(
                         "rapid-sampling penalties do not support speculative "
                         "expanded logits. Disable speculative decoding."
                     )
                 rapid_penalties = self._ensure_rapid_penalties()
-                (
-                    presence_penalties,
-                    repetition_penalties,
-                    penalty_decays,
-                ) = self.penalties_state.rapid_penalty_params(
-                    expanded_idx_mapping,
-                    idx_mapping_np,
-                    scalar_if_uniform=True,
-                )
+                if rapid_penalty_params is None:
+                    presence_penalties = 0.0
+                    frequency_penalties = 0.0
+                    penalty_decays = RAPID_PENALTY_DECAY_DEFAULT
+                else:
+                    presence_penalties, frequency_penalties, penalty_decays = (
+                        rapid_penalty_params
+                    )
                 rapid_result = rapid_sample(
                     processed_logits,
                     top_k,
@@ -485,7 +483,7 @@ class Sampler:
                     temperatures=temperatures,
                     penalties=rapid_penalties,
                     presence_penalties=presence_penalties,
-                    repetition_penalties=repetition_penalties,
+                    frequency_penalties=frequency_penalties,
                     penalty_decays=penalty_decays,
                     penalty_indices=expanded_idx_mapping,
                     return_logprobs=needs_processed_logprobs,

@@ -83,16 +83,14 @@ class PenaltiesState:
         self.presence_penalty.copy_to_uva()
         self.penalty_decay.copy_to_uva()
 
-    def any_frequency_penalty(self, idx_mapping_np: np.ndarray) -> bool:
-        return bool(np.any(self.frequency_penalty.np[idx_mapping_np] != 0.0))
+    def any_repetition_penalty(self, idx_mapping_np: np.ndarray) -> bool:
+        return bool(np.any(self.repetition_penalty.np[idx_mapping_np] != 1.0))
 
-    def use_rapid_penalty(self, idx_mapping_np: np.ndarray) -> bool:
-        return bool(
-            np.any(self.presence_penalty.np[idx_mapping_np] != 0.0)
-            or np.any(self.repetition_penalty.np[idx_mapping_np] != 1.0)
-            or np.any(
-                self.penalty_decay.np[idx_mapping_np] != RAPID_PENALTY_DECAY_DEFAULT
-            )
+    def rapid_penalty_mask(self, idx_mapping_np: np.ndarray) -> np.ndarray:
+        return (
+            (self.presence_penalty.np[idx_mapping_np] != 0.0)
+            | (self.frequency_penalty.np[idx_mapping_np] != 0.0)
+            | (self.penalty_decay.np[idx_mapping_np] != RAPID_PENALTY_DECAY_DEFAULT)
         )
 
     def rapid_penalty_params(
@@ -106,22 +104,22 @@ class PenaltiesState:
             if idx_mapping_np is None:
                 raise ValueError("idx_mapping_np is required for scalar_if_uniform")
             presence_values = self.presence_penalty.np[idx_mapping_np]
-            repetition_values = self.repetition_penalty.np[idx_mapping_np]
+            frequency_values = self.frequency_penalty.np[idx_mapping_np]
             decay_values = self.penalty_decay.np[idx_mapping_np]
             if (
                 presence_values.size > 0
                 and np.all(presence_values == presence_values[0])
-                and np.all(repetition_values == repetition_values[0])
+                and np.all(frequency_values == frequency_values[0])
                 and np.all(decay_values == decay_values[0])
             ):
                 return (
                     float(presence_values[0]),
-                    float(repetition_values[0]),
+                    float(frequency_values[0]),
                     float(decay_values[0]),
                 )
         return (
             self.presence_penalty.gpu[expanded_idx_mapping],
-            self.repetition_penalty.gpu[expanded_idx_mapping],
+            self.frequency_penalty.gpu[expanded_idx_mapping],
             self.penalty_decay.gpu[expanded_idx_mapping],
         )
 

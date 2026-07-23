@@ -29,18 +29,19 @@ MAX_NUM_PROMPT_TOKENS = 64
 def test_sampler_warmup_params_for_rapid_sampler() -> None:
     sampling_params = SamplingParams.for_sampler_warmup(use_rapid_sampler=True)
 
-    assert sampling_params.frequency_penalty == 0.0
+    assert sampling_params.frequency_penalty == 0.5
     assert sampling_params.min_p == 0.0
     assert sampling_params.logprobs is None
     assert sampling_params.prompt_logprobs is None
     assert sampling_params.presence_penalty == 0.5
-    assert sampling_params.repetition_penalty == 1.2
+    assert sampling_params.repetition_penalty == 1.0
 
 
 def test_sampler_warmup_params_for_native_sampler() -> None:
     sampling_params = SamplingParams.for_sampler_warmup(use_rapid_sampler=False)
 
     assert sampling_params.frequency_penalty == 0.5
+    assert sampling_params.repetition_penalty == 1.2
     assert sampling_params.min_p == 0.1
     assert sampling_params.logprobs == 5
     assert sampling_params.prompt_logprobs == 1

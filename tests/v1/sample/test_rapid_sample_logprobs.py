@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
 import torch
@@ -71,7 +72,7 @@ def test_rapid_penalty_kernels_return_same_distribution_logprob():
     kwargs = {
         "temperatures": 0.7,
         "presence_penalties": 0.0,
-        "repetition_penalties": 0.0,
+        "frequency_penalties": 0.0,
         "penalty_decays": 1.0,
         "return_logprobs": True,
     }
