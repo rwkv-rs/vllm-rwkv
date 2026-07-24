@@ -75,6 +75,7 @@ class RWKVTokenizer(TokenizerLike):
         }
 
         self.name_or_path = str(name_or_path or vocab_file)
+        self.bos_token = self.eos_token = self.pad_token = "<|endoftext|>"
         self._max_chars_per_token = max(len(token) for token in self.idx2token)
 
         self.root = _Trie()

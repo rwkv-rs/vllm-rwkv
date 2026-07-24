@@ -136,6 +136,7 @@ def resolve_rwkv_offline_sampling_params(
             return item
         return msgspec.structs.replace(
             item,
+            _all_stop_token_ids=set(item.all_stop_token_ids),
             stop=list(dict.fromkeys((*item.stop, *RWKV_DEFAULT_STOPS))),
             stop_token_ids=list(
                 dict.fromkeys((*item.stop_token_ids, *RWKV_DEFAULT_STOP_TOKEN_IDS))

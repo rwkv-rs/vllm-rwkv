@@ -24,7 +24,7 @@ def test_offline_rwkv_boundaries_merge_without_mutating_callers() -> None:
     resolved = captured["params"]
     assert (resolved.stop, resolved.stop_token_ids) == (
         list(RWKV_DEFAULT_STOPS), list(RWKV_DEFAULT_STOP_TOKEN_IDS))
-    assert resolved.all_stop_token_ids == set(RWKV_DEFAULT_STOP_TOKEN_IDS)
+    assert resolved.all_stop_token_ids == set(RWKV_DEFAULT_STOP_TOKEN_IDS) and caller.all_stop_token_ids == set() and resolved.all_stop_token_ids is not caller.all_stop_token_ids
     assert resolved.ignore_eos is False and (caller.stop, caller.stop_token_ids) == ([], [])
     task = SamplingParams(stop=["END"], stop_token_ids=[7])
     llm.generate("prompt", task, use_tqdm=False)
