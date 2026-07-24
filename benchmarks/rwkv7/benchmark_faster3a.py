@@ -13,7 +13,6 @@ import gc
 import json
 import math
 import os
-import socket
 import subprocess
 import sys
 import time
@@ -132,22 +131,22 @@ SOURCE_PROVENANCE = (
     SourceProvenanceEntry(
         source_path=f"{ALBATROSS_IMPL}/cuda/rwkv7_wkv_fp16_v2.cpp",
         target_path="csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp16_v2.cpp",
-        correspondence="cuda-source-port",
+        correspondence="packed-varlen-derived",
     ),
     SourceProvenanceEntry(
         source_path=f"{ALBATROSS_IMPL}/cuda/rwkv7_wkv_fp16_v2.cu",
         target_path="csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp16_v2.cu",
-        correspondence="cuda-source-port",
+        correspondence="packed-varlen-derived",
     ),
     SourceProvenanceEntry(
         source_path=f"{ALBATROSS_IMPL}/cuda/rwkv7_wkv_fp32_v2.cpp",
         target_path="csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp32_v2.cpp",
-        correspondence="cuda-source-port",
+        correspondence="packed-varlen-derived",
     ),
     SourceProvenanceEntry(
         source_path=f"{ALBATROSS_IMPL}/cuda/rwkv7_wkv_fp32_v2.cu",
         target_path="csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp32_v2.cu",
-        correspondence="cuda-source-port",
+        correspondence="packed-varlen-derived",
     ),
 )
 
@@ -409,8 +408,7 @@ def _duration_ms_summary(durations_s: list[float]) -> dict[str, float | None]:
     if not durations_s:
         return {f"p{p}_ms": None for p in (10, 50, 90)}
     return {
-        f"p{p}_ms": _percentile(durations_s, p / 100) * 1000.0
-        for p in (10, 50, 90)
+        f"p{p}_ms": _percentile(durations_s, p / 100) * 1000.0 for p in (10, 50, 90)
     }
 
 
@@ -426,14 +424,19 @@ def _phase_throughput_summary(
     unit_tokens: list[int],
 ) -> dict[str, Any]:
     total_duration_s = sum(iteration_durations_s)
-    iteration_tokens = total_tokens // len(iteration_durations_s) if iteration_durations_s else 0
+    iteration_tokens = (
+        total_tokens // len(iteration_durations_s) if iteration_durations_s else 0
+    )
     peak_iteration = (
         max(_tokens_per_second(iteration_tokens, d) for d in iteration_durations_s)
         if iteration_durations_s
         else None
     )
     peak_unit = (
-        max(_tokens_per_second(tokens, d) for tokens, d in zip(unit_tokens, unit_durations_s))
+        max(
+            _tokens_per_second(tokens, d)
+            for tokens, d in zip(unit_tokens, unit_durations_s)
+        )
         if unit_durations_s
         else None
     )
@@ -1578,17 +1581,13 @@ def _runner_throughput_contract_blocker(
     provenance = config.get("provenance") if isinstance(config, dict) else None
     raw_env = provenance.get("raw_env") if isinstance(provenance, dict) else None
     fixed_model_contract = (
-        provenance.get("fixed_model_contract")
-        if isinstance(provenance, dict)
-        else None
+        provenance.get("fixed_model_contract") if isinstance(provenance, dict) else None
     )
     if (
         not isinstance(raw_env, dict)
         or any(name not in raw_env for name in RUNNER_RUNTIME_ENV_REQUIREMENTS)
         or not isinstance(fixed_model_contract, dict)
-        or any(
-            name not in fixed_model_contract for name in RUNNER_FIXED_MODEL_CONTRACT
-        )
+        or any(name not in fixed_model_contract for name in RUNNER_FIXED_MODEL_CONTRACT)
     ):
         return _blocker(
             "missing_runner_throughput_provenance",
@@ -1882,9 +1881,8 @@ def _measurement_exit_code(measurement: dict[str, Any]) -> int:
         return 2
     return int(
         not math.isfinite(tokens_per_s)
-        or tokens_per_s < ACCEPTANCE_THRESHOLDS["runner_steady_decode"][
-            "min_runner_tokens_per_s"
-        ]
+        or tokens_per_s
+        < ACCEPTANCE_THRESHOLDS["runner_steady_decode"]["min_runner_tokens_per_s"]
     )
 
 

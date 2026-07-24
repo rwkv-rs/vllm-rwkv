@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Measure RWKV model and lm_head at the Albatross CUDA-graph boundary."""
 
 from __future__ import annotations
@@ -6,8 +9,9 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 if __package__:
     from .benchmark_faster3a import (
@@ -99,7 +103,7 @@ def _capture_graph(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         output = fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return graph, output
 
 
@@ -117,7 +121,7 @@ def _measure_replay(
 
     for _ in range(warmup):
         replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     durations_ms: list[float] = []
     if profile_range:
@@ -161,9 +165,7 @@ def _measurement_result(
         "output_shape": list(final_output.shape),
         "output_dtype": str(final_output.dtype),
     }
-    result["tokens_per_s_p50"] = (
-        result["tokens"] * 1000.0 / result["p50_ms"]
-    )
+    result["tokens_per_s_p50"] = result["tokens"] * 1000.0 / result["p50_ms"]
 
     return result
 
@@ -184,7 +186,7 @@ def _measure_replay_pair(
         order = variants if iteration % 2 == 0 else variants[::-1]
         for variant in order:
             replays[variant]()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     durations_ms = {variant: [] for variant in variants}
     for iteration in range(iters):
@@ -221,7 +223,7 @@ def _profile_graph_kernels(graph: Any, replays: int = 3) -> list[dict[str, Any]]
     ) as profiler:
         for _ in range(replays):
             graph.replay()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
     events = []
     for event in profiler.key_averages():
         self_device_us = float(
@@ -280,20 +282,44 @@ def _run_worker_direct_model_benchmark(
         ).view(batch_size, token_count)
         tokens = (tokens * 1103515245 + 12345) % model.vocab_size
         embedded = model.embed(tokens).contiguous()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         path = select_path(batch_size, token_count)
+        query_start_loc = torch.arange(
+            0,
+            (batch_size + 1) * token_count,
+            token_count,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        wkv_slot_indices = torch.arange(
+            batch_size,
+            dtype=torch.int32,
+            device="cuda",
+        )
 
         if joint_only:
             joint_state = model.zero_state(batch_size)
 
-            def joint_call_only() -> Any:
-                joint_hidden = model.forward_from_x(embedded, joint_state, path)
+            def joint_call_only(
+                embedded: Any = embedded,
+                joint_state: Any = joint_state,
+                path: Any = path,
+                query_start_loc: Any = query_start_loc,
+                wkv_slot_indices: Any = wkv_slot_indices,
+            ) -> Any:
+                joint_hidden = model.forward_from_x(
+                    embedded,
+                    joint_state,
+                    path,
+                    query_start_loc=query_start_loc,
+                    wkv_slot_indices=wkv_slot_indices,
+                )
                 return model.project_logits_fp32(joint_hidden)
 
             joint_graph, joint_output = _capture_graph(joint_call_only)
             joint_result = _measure_replay(
                 joint_graph.replay,
-                lambda: joint_output,
+                lambda joint_output=joint_output: joint_output,
                 batch_size,
                 token_count,
                 "model_plus_fp32_head_fullgraph",
@@ -314,18 +340,30 @@ def _run_worker_direct_model_benchmark(
             del joint_call_only, joint_output, joint_graph, joint_state
             gc.collect()
             del embedded, tokens
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
             continue
 
         hidden_state = model.zero_state(batch_size)
 
-        def hidden_call() -> Any:
-            return model.forward_from_x(embedded, hidden_state, path)
+        def hidden_call(
+            embedded: Any = embedded,
+            hidden_state: Any = hidden_state,
+            path: Any = path,
+            query_start_loc: Any = query_start_loc,
+            wkv_slot_indices: Any = wkv_slot_indices,
+        ) -> Any:
+            return model.forward_from_x(
+                embedded,
+                hidden_state,
+                path,
+                query_start_loc=query_start_loc,
+                wkv_slot_indices=wkv_slot_indices,
+            )
 
         hidden_graph, hidden = _capture_graph(hidden_call)
         hidden_result = _measure_replay(
             hidden_graph.replay,
-            lambda: hidden,
+            lambda hidden=hidden: hidden,
             batch_size,
             token_count,
             "model_hidden_fullgraph",
@@ -334,16 +372,19 @@ def _run_worker_direct_model_benchmark(
         )
         results.append(hidden_result)
 
-        external_output = hidden
+        external_output = [hidden]
 
-        def replay_with_external_head() -> None:
-            nonlocal external_output
+        def replay_with_external_head(
+            hidden_graph: Any = hidden_graph,
+            hidden: Any = hidden,
+            external_output: list[Any] = external_output,
+        ) -> None:
             hidden_graph.replay()
-            external_output = model.project_logits_fp32(hidden)
+            external_output[0] = model.project_logits_fp32(hidden)
 
         external_result = _measure_replay(
             replay_with_external_head,
-            lambda: external_output,
+            lambda external_output=external_output: external_output[0],
             batch_size,
             token_count,
             "model_graph_then_fp32_head",
@@ -355,18 +396,30 @@ def _run_worker_direct_model_benchmark(
         del replay_with_external_head, hidden_call
         del external_output, hidden, hidden_graph, hidden_state
         gc.collect()
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
 
         joint_state = model.zero_state(batch_size)
 
-        def joint_call() -> Any:
-            joint_hidden = model.forward_from_x(embedded, joint_state, path)
+        def joint_call(
+            embedded: Any = embedded,
+            joint_state: Any = joint_state,
+            path: Any = path,
+            query_start_loc: Any = query_start_loc,
+            wkv_slot_indices: Any = wkv_slot_indices,
+        ) -> Any:
+            joint_hidden = model.forward_from_x(
+                embedded,
+                joint_state,
+                path,
+                query_start_loc=query_start_loc,
+                wkv_slot_indices=wkv_slot_indices,
+            )
             return model.project_logits_fp32(joint_hidden)
 
         joint_graph, joint_output = _capture_graph(joint_call)
         joint_result = _measure_replay(
             joint_graph.replay,
-            lambda: joint_output,
+            lambda joint_output=joint_output: joint_output,
             batch_size,
             token_count,
             "model_plus_fp32_head_fullgraph",
@@ -404,7 +457,7 @@ def _run_worker_direct_model_benchmark(
         del joint_call, joint_output, joint_graph, joint_state
         gc.collect()
         del embedded, tokens
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
 
     return {
         "device": torch.cuda.get_device_name(),
@@ -526,8 +579,20 @@ def _run_worker_variant_comparison(
             ).view(batch_size, token_count)
             tokens = (tokens * 1103515245 + 12345) % model.vocab_size
             embedded = model.embed(tokens).contiguous()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             path = rwkv7.select_path(batch_size, token_count)
+            query_start_loc = torch.arange(
+                0,
+                (batch_size + 1) * token_count,
+                token_count,
+                dtype=torch.int32,
+                device="cuda",
+            )
+            wkv_slot_indices = torch.arange(
+                batch_size,
+                dtype=torch.int32,
+                device="cuda",
+            )
             captures: dict[str, tuple[Any, Any, Any, Any]] = {}
 
             for variant in variants:
@@ -537,8 +602,17 @@ def _run_worker_variant_comparison(
                 def joint_call(
                     state: Any = state,
                     path: Any = path,
+                    embedded: Any = embedded,
+                    query_start_loc: Any = query_start_loc,
+                    wkv_slot_indices: Any = wkv_slot_indices,
                 ) -> Any:
-                    hidden = model.forward_from_x(embedded, state, path)
+                    hidden = model.forward_from_x(
+                        embedded,
+                        state,
+                        path,
+                        query_start_loc=query_start_loc,
+                        wkv_slot_indices=wkv_slot_indices,
+                    )
                     return model.project_logits_fp32(hidden)
 
                 graph, output = _capture_graph(joint_call)
@@ -571,7 +645,7 @@ def _run_worker_variant_comparison(
                 baseline_output.float().flatten(),
                 dim=0,
             )
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             comparisons.append(
                 {
                     "batch_size": batch_size,
@@ -588,9 +662,7 @@ def _run_worker_variant_comparison(
                         / case_results["baseline"]["p50_ms"]
                         * 100.0
                     ),
-                    "max_abs_logit_difference": float(
-                        difference.abs().max().item()
-                    ),
+                    "max_abs_logit_difference": float(difference.abs().max().item()),
                     "relative_l2_logit_difference": float(
                         (difference.norm() / baseline_norm).item()
                     ),
@@ -605,7 +677,7 @@ def _run_worker_variant_comparison(
             )
             del captures, embedded, tokens
             gc.collect()
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
     finally:
         restore_production()
 
@@ -615,9 +687,7 @@ def _run_worker_variant_comparison(
         "iters": iters,
         "capture_order": capture_order,
         "comparison_kind": comparison_kind,
-        "tuning_family": (
-            tuning_family if comparison_kind == "fp16-lt" else None
-        ),
+        "tuning_family": (tuning_family if comparison_kind == "fp16-lt" else None),
         "measurement_order": "alternating-paired",
         "providers": [
             "baseline_model_plus_fp32_head_fullgraph",
@@ -627,18 +697,14 @@ def _run_worker_variant_comparison(
             "attention_c2c": att_tuned,
             "ffn_down": ffn_tuned,
             "lowrank_in": {
-                f"{rows}x{rank}": cfg
-                for (rows, rank), cfg in lowrank_in_tuned.items()
+                f"{rows}x{rank}": cfg for (rows, rank), cfg in lowrank_in_tuned.items()
             },
             "lowrank_out": {
-                f"{rows}x{rank}": cfg
-                for (rows, rank), cfg in lowrank_out_tuned.items()
+                f"{rows}x{rank}": cfg for (rows, rank), cfg in lowrank_out_tuned.items()
             },
             "m1_rkv_grouped_rows": sorted(m1_rkv_tuned),
             "m1_cmix_prezero_rows": sorted(m1_cmix_prezero_tuned),
-            "production_allow_fp16_accumulation": (
-                production_allow_fp16_accumulation
-            ),
+            "production_allow_fp16_accumulation": (production_allow_fp16_accumulation),
             "production_ln1_tmix_fuse": production_ln1_tmix_fuse,
             "tuned_allow_fp16_accumulation": (
                 False

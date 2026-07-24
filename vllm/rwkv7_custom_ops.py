@@ -118,9 +118,7 @@ def _rwkv7_linear_f16_m1_splitk_fp32_fake(
     )
 
 
-@_register_fake_if_exists(
-    "rwkv7_v3a_ops::linear_f16_m1_splitk_prepare_zero"
-)
+@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_m1_splitk_prepare_zero")
 def _rwkv7_linear_f16_m1_splitk_prepare_zero_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -527,30 +525,11 @@ def _rwkv7_advance_i32_fake(*args) -> None:
     return None
 
 
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq")
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_slot")
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_w0")
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_w0_slot")
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_grid2d")
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_slot_grid2d")
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_w0_grid2d")
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_w0_slot_grid2d")
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_forced")
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_slot_forced")
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_w0_forced")
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_w0_slot_forced")
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_grid2d_forced")
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_slot_grid2d_forced")
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_w0_grid2d_forced")
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_w0_slot_grid2d_forced")
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_varlen")
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_w0_varlen")
+@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv")
 def _rwkv7_wkv_fp16_fake(*args) -> None:
     return None
 
 
-@_register_fake_if_exists("rwkv7_wkv_fp32_v2::forward")
-@_register_fake_if_exists("rwkv7_wkv_fp32_v2::forward_slot")
-@_register_fake_if_exists("rwkv7_wkv_fp32_v2::forward_varlen")
+@_register_fake_if_exists("rwkv7_wkv_fp32_v2::wkv")
 def _rwkv7_wkv_fp32_fake(*args) -> None:
     return None

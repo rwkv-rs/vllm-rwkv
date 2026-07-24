@@ -128,18 +128,6 @@ def _rwkv7_import_or_skip() -> None:
     import vllm._custom_ops  # noqa: F401
 
 
-def _assert_repeatable(
-    run: Callable[[], tuple[torch.Tensor, torch.Tensor]], repeats: int = 200
-) -> None:
-    expected = run()
-    torch.cuda.synchronize()
-    for _ in range(repeats - 1):
-        actual = run()
-        torch.cuda.synchronize()
-        for got, want in zip(actual, expected, strict=True):
-            assert torch.equal(got, want)
-
-
 def _op(name: str):
     namespace, op_name = name.split("::", 1)
     return getattr(getattr(torch.ops, namespace), op_name)
@@ -578,7 +566,6 @@ def test_rwkv7_linear_f16_lt_cfg_matches_fp16_accumulation(
     weight = torch.randn((4096, 128), device="cuda", dtype=torch.float16)
     op = torch.ops.rwkv7_v3a_ops.linear_f16_lt_cfg
 
-    baseline = torch.ops.rwkv7_v3a_ops.linear_f16(x, weight, True)
     output = op(x, weight, workspace_mb, 0, True)
     repeated = op(x, weight, workspace_mb, 0, True)
     reference = torch.mm(x, weight, out_dtype=torch.float32)
@@ -693,9 +680,7 @@ def test_rwkv7_linear_fp32_lt_3d_graph_matches_fp32_reference() -> None:
     graph.replay()
     second_replay = graph_output.clone()
 
-    reference = (x.float().reshape(-1, x.shape[-1]) @ weight.float()).reshape(
-        2, 3, 512
-    )
+    reference = (x.float().reshape(-1, x.shape[-1]) @ weight.float()).reshape(2, 3, 512)
     torch.accelerator.synchronize()
 
     assert output.shape == (2, 3, 512)
@@ -741,7 +726,7 @@ def test_rwkv7_linear_fp32_lt_rejects_invalid_inputs() -> None:
 
 
 def test_rwkv7_linear_fp32_lt_rejects_cross_device() -> None:
-    if torch.cuda.device_count() < 2:
+    if torch.accelerator.device_count() < 2:
         pytest.skip("two CUDA devices are required")
     x = torch.empty((2, 8), device="cuda:0", dtype=torch.float16)
     weight = torch.empty((8, 5), device="cuda:1", dtype=torch.float16)
@@ -807,12 +792,10 @@ def test_rwkv7_tmix_lnx_warp_matches_two_warp_kernel() -> None:
     batch_size, token_count, hidden_size, num_heads = 64, 1, 4096, 64
     shape = (batch_size, token_count, hidden_size)
     x, r, k, v, g = [
-        0.1 * torch.randn(shape, device="cuda", dtype=torch.float16)
-        for _ in range(5)
+        0.1 * torch.randn(shape, device="cuda", dtype=torch.float16) for _ in range(5)
     ]
     r_k, weight, bias = [
-        0.1
-        * torch.randn((hidden_size,), device="cuda", dtype=torch.float16)
+        0.1 * torch.randn((hidden_size,), device="cuda", dtype=torch.float16)
         for _ in range(3)
     ]
     args = (
@@ -980,12 +963,10 @@ def test_rwkv7_rkv_m1_splitk_rejects_each_misaligned_contiguous_weight(
     weight_name: str,
 ) -> None:
     inputs = tuple(
-        torch.empty((1, 8), device="cuda", dtype=torch.float16)
-        for _ in range(3)
+        torch.empty((1, 8), device="cuda", dtype=torch.float16) for _ in range(3)
     )
     weights = [
-        torch.empty((8, 64), device="cuda", dtype=torch.float16)
-        for _ in range(3)
+        torch.empty((8, 64), device="cuda", dtype=torch.float16) for _ in range(3)
     ]
     weights[weight_index] = _misaligned_contiguous_half((8, 64))
 
@@ -1079,12 +1060,8 @@ def test_rwkv7_cmix_sparse_down_relu_one_out_matches_allocating_op(
 ) -> None:
     torch.manual_seed(20260731 + F)
     C = 256
-    preact = (
-        torch.randn((F,), device="cuda", dtype=torch.float16) * 0.25
-    )
-    value_fc = (
-        torch.randn((F, C), device="cuda", dtype=torch.float16) * 0.05
-    )
+    preact = torch.randn((F,), device="cuda", dtype=torch.float16) * 0.25
+    value_fc = torch.randn((F, C), device="cuda", dtype=torch.float16) * 0.05
     expected = torch.ops.rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one(
         C,
         F,
@@ -1126,9 +1103,7 @@ def test_rwkv7_cmix_m1_prepare_zero_full_graph_replays_consecutively() -> None:
     C, F = 256, 128
     x = torch.randn((1, 1, C), device="cuda", dtype=torch.float16)
     key_weight = torch.randn((C, F), device="cuda", dtype=torch.float16)
-    value_weight = (
-        torch.randn((F, C), device="cuda", dtype=torch.float16) * 0.05
-    )
+    value_weight = torch.randn((F, C), device="cuda", dtype=torch.float16) * 0.05
     prepare = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk_prepare_zero
     sparse_out = torch.ops.rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one_out
     baseline_preact = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(
@@ -1453,8 +1428,7 @@ def test_rwkv7_rkv_m1_splitk_empty_inputs_preserve_each_leading_shape() -> None:
         torch.empty((1, 1, 1, 0), device="cuda", dtype=torch.float16),
     )
     empty_weights = tuple(
-        torch.empty((0, 64), device="cuda", dtype=torch.float16)
-        for _ in range(3)
+        torch.empty((0, 64), device="cuda", dtype=torch.float16) for _ in range(3)
     )
 
     outputs = op(*empty_inputs, *empty_weights)
@@ -1476,8 +1450,7 @@ def test_rwkv7_rkv_m1_splitk_empty_inputs_preserve_each_leading_shape() -> None:
         torch.empty((1, 1, 1, 8), device="cuda", dtype=torch.float16),
     )
     empty_vocab_weights = tuple(
-        torch.empty((8, 0), device="cuda", dtype=torch.float16)
-        for _ in range(3)
+        torch.empty((8, 0), device="cuda", dtype=torch.float16) for _ in range(3)
     )
     empty_vocab_outputs = op(*empty_vocab_inputs, *empty_vocab_weights)
     assert tuple(output.shape for output in empty_vocab_outputs) == (
@@ -1494,18 +1467,20 @@ def test_rwkv7_rkv_m1_splitk_empty_inputs_preserve_each_leading_shape() -> None:
 def test_rwkv7_rkv_m1_splitk_invalid_inputs_fail_closed() -> None:
     op = torch.ops.rwkv7_v3a_ops.linear_rkv_f16_m1_splitk
     inputs = tuple(
-        torch.empty((1, 8), device="cuda", dtype=torch.float16)
-        for _ in range(3)
+        torch.empty((1, 8), device="cuda", dtype=torch.float16) for _ in range(3)
     )
     weights = tuple(
-        torch.empty((8, 64), device="cuda", dtype=torch.float16)
-        for _ in range(3)
+        torch.empty((8, 64), device="cuda", dtype=torch.float16) for _ in range(3)
     )
 
     with pytest.raises(RuntimeError, match="M=1"):
         op(inputs[0].expand(2, -1).contiguous(), *inputs[1:], *weights)
     with pytest.raises(RuntimeError, match="input/weight shape mismatch"):
-        op(*inputs, torch.empty((9, 64), device="cuda", dtype=torch.float16), *weights[1:])
+        op(
+            *inputs,
+            torch.empty((9, 64), device="cuda", dtype=torch.float16),
+            *weights[1:],
+        )
     with pytest.raises(RuntimeError, match="common K"):
         op(
             inputs[0],
@@ -1535,9 +1510,9 @@ def test_rwkv7_rkv_m1_splitk_invalid_inputs_fail_closed() -> None:
     with pytest.raises(RuntimeError, match="weight_v must be fp16"):
         op(*inputs, *weights[:2], weights[2].float())
     with pytest.raises(RuntimeError, match="x_v must be contiguous"):
-        noncontiguous_x = torch.empty(
-            (1, 16), device="cuda", dtype=torch.float16
-        )[:, ::2]
+        noncontiguous_x = torch.empty((1, 16), device="cuda", dtype=torch.float16)[
+            :, ::2
+        ]
         op(inputs[0], inputs[1], noncontiguous_x, *weights)
     with pytest.raises(RuntimeError, match="weight_k must be contiguous"):
         noncontiguous_weight = torch.empty(
@@ -1577,33 +1552,31 @@ def test_rwkv7_m1_splitk_rejects_chunk_grid_y_overflow() -> None:
 
 
 def test_rwkv7_rkv_m1_splitk_uses_input_device_stream() -> None:
-    if torch.cuda.device_count() < 2:
+    if torch.accelerator.device_count() < 2:
         pytest.skip("two CUDA devices are required")
     inputs = tuple(
-        torch.randn((1, 1024), device="cuda:1", dtype=torch.float16)
-        for _ in range(3)
+        torch.randn((1, 1024), device="cuda:1", dtype=torch.float16) for _ in range(3)
     )
     weights = tuple(
         torch.randn((1024, 4096), device="cuda:1", dtype=torch.float16)
         for _ in range(3)
     )
-    torch.cuda.synchronize(1)
+    torch.accelerator.synchronize(1)
     stream = torch.cuda.Stream(device=1)
     assert stream.cuda_stream != torch.cuda.default_stream(1).cuda_stream
 
-    with torch.cuda.device(0):
-        with torch.cuda.stream(stream):
-            assert torch.cuda.current_stream(1).cuda_stream == stream.cuda_stream
-            outputs = torch.ops.rwkv7_v3a_ops.linear_rkv_f16_m1_splitk(
-                *inputs,
-                *weights,
-            )
+    with torch.accelerator.device_index(0), torch.cuda.stream(stream):
+        assert torch.cuda.current_stream(1).cuda_stream == stream.cuda_stream
+        outputs = torch.ops.rwkv7_v3a_ops.linear_rkv_f16_m1_splitk(
+            *inputs,
+            *weights,
+        )
     stream.synchronize()
     references = tuple(
         torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(value, weight)
         for value, weight in zip(inputs, weights, strict=True)
     )
-    torch.cuda.synchronize(1)
+    torch.accelerator.synchronize(1)
 
     for output, reference in zip(outputs, references, strict=True):
         assert output.device == inputs[0].device
@@ -1618,27 +1591,24 @@ def test_rwkv7_rkv_m1_splitk_uses_input_device_stream() -> None:
 
 
 def test_rwkv7_m1_splitk_prepare_zero_uses_cuda1_non_default_stream() -> None:
-    if torch.cuda.device_count() < 2:
+    if torch.accelerator.device_count() < 2:
         pytest.skip("two CUDA devices are required")
     x = torch.randn((1, 1024), device="cuda:1", dtype=torch.float16)
     weight = torch.randn((1024, 4096), device="cuda:1", dtype=torch.float16)
-    torch.cuda.synchronize(1)
+    torch.accelerator.synchronize(1)
     stream = torch.cuda.Stream(device=1)
     assert stream.cuda_stream != torch.cuda.default_stream(1).cuda_stream
 
-    with torch.cuda.device(0):
-        with torch.cuda.stream(stream):
-            assert torch.cuda.current_stream(1).cuda_stream == stream.cuda_stream
-            preact, zero_output = (
-                torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk_prepare_zero(
-                    x,
-                    weight,
-                    4096,
-                )
-            )
+    with torch.accelerator.device_index(0), torch.cuda.stream(stream):
+        assert torch.cuda.current_stream(1).cuda_stream == stream.cuda_stream
+        preact, zero_output = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk_prepare_zero(
+            x,
+            weight,
+            4096,
+        )
     stream.synchronize()
     baseline = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(x, weight)
-    torch.cuda.synchronize(1)
+    torch.accelerator.synchronize(1)
 
     assert preact.device == x.device
     assert zero_output.device == x.device
@@ -1654,7 +1624,7 @@ def test_rwkv7_m1_splitk_prepare_zero_uses_cuda1_non_default_stream() -> None:
 
 
 def test_rwkv7_cmix_sparse_down_out_uses_cuda1_non_default_stream() -> None:
-    if torch.cuda.device_count() < 2:
+    if torch.accelerator.device_count() < 2:
         pytest.skip("two CUDA devices are required")
     C, F = 256, 128
     preact = torch.randn((F,), device="cuda:1", dtype=torch.float16)
@@ -1663,16 +1633,15 @@ def test_rwkv7_cmix_sparse_down_out_uses_cuda1_non_default_stream() -> None:
     stream = torch.cuda.Stream(device=1)
     assert stream.cuda_stream != torch.cuda.default_stream(1).cuda_stream
 
-    with torch.cuda.device(0):
-        with torch.cuda.stream(stream):
-            assert torch.cuda.current_stream(1).cuda_stream == stream.cuda_stream
-            torch.ops.rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one_out(
-                C,
-                F,
-                preact,
-                value_fc,
-                out,
-            )
+    with torch.accelerator.device_index(0), torch.cuda.stream(stream):
+        assert torch.cuda.current_stream(1).cuda_stream == stream.cuda_stream
+        torch.ops.rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one_out(
+            C,
+            F,
+            preact,
+            value_fc,
+            out,
+        )
     stream.synchronize()
     expected = torch.ops.rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one(
         C,
@@ -1680,7 +1649,7 @@ def test_rwkv7_cmix_sparse_down_out_uses_cuda1_non_default_stream() -> None:
         preact,
         value_fc,
     )
-    torch.cuda.synchronize(1)
+    torch.accelerator.synchronize(1)
 
     assert torch.equal(out, expected)
     with pytest.raises(RuntimeError, match="same CUDA device"):
@@ -1773,18 +1742,17 @@ def test_rwkv7_m1_splitk_uses_input_device_non_default_stream(
     op_name: str,
     output_dtype: torch.dtype,
 ) -> None:
-    if torch.cuda.device_count() < 2:
+    if torch.accelerator.device_count() < 2:
         pytest.skip("two CUDA devices are required")
     x = torch.randn((1, 1024), device="cuda:1", dtype=torch.float16)
     weight = torch.randn((1024, 4096), device="cuda:1", dtype=torch.float16)
-    torch.cuda.synchronize(1)
+    torch.accelerator.synchronize(1)
     stream = torch.cuda.Stream(device=1)
     assert stream.cuda_stream != torch.cuda.default_stream(1).cuda_stream
 
-    with torch.cuda.device(0):
-        with torch.cuda.stream(stream):
-            assert torch.cuda.current_stream(1).cuda_stream == stream.cuda_stream
-            output = getattr(torch.ops.rwkv7_v3a_ops, op_name)(x, weight)
+    with torch.accelerator.device_index(0), torch.cuda.stream(stream):
+        assert torch.cuda.current_stream(1).cuda_stream == stream.cuda_stream
+        output = getattr(torch.ops.rwkv7_v3a_ops, op_name)(x, weight)
     stream.synchronize()
     reference = x.float() @ weight.float()
 
@@ -1837,70 +1805,6 @@ def test_rwkv7_m1_splitk_fp32_empty_and_invalid_inputs() -> None:
             x,
             torch.empty((64, 8), device="cuda", dtype=torch.float16).t(),
         )
-
-
-@pytest.mark.parametrize("batch,time", [(2, 1), (3, 1), (2, 2), (1, 8)])
-def test_rwkv7_wkv_fp16_is_repeatable(batch: int, time: int) -> None:
-    torch.manual_seed(20260714 + batch * 10 + time)
-    C, H = 64, 1
-    state = 0.01 * torch.randn((batch, H, 64, 64), device="cuda", dtype=torch.float16)
-    payload = 0.01 * torch.randn((6, batch, time, C), device="cuda", dtype=torch.float16)
-    w0 = 0.01 * torch.randn((C,), device="cuda", dtype=torch.float16)
-    elapsed = torch.arange(batch, device="cuda", dtype=torch.int32)
-    op = torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_w0
-
-    def run() -> tuple[torch.Tensor, torch.Tensor]:
-        current_state = state.clone()
-        y = torch.empty((batch, time, C), device="cuda", dtype=torch.float16)
-        op(
-            batch,
-            time,
-            C,
-            H,
-            current_state,
-            *payload[:2],
-            w0,
-            *payload[2:],
-            y,
-            elapsed,
-        )
-        return y, current_state
-
-    _assert_repeatable(run)
-
-
-def test_rwkv7_wkv_fp16_varlen_is_repeatable() -> None:
-    torch.manual_seed(20260714)
-    B, total_tokens, max_t, C, H = 2, 5, 3, 64, 1
-    query_start_loc = torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32)
-    slot_indices = torch.tensor([3, 0], device="cuda", dtype=torch.int32)
-    state = torch.randn((5, H, 64, 64), device="cuda", dtype=torch.float16)
-    payload = torch.randn((6, total_tokens, C), device="cuda", dtype=torch.float16)
-    w0 = torch.randn((C,), device="cuda", dtype=torch.float16)
-    elapsed = torch.arange(5, device="cuda", dtype=torch.int32)
-    op = torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_w0_varlen
-
-    def run() -> tuple[torch.Tensor, torch.Tensor]:
-        current_state = state.clone()
-        y = torch.empty((total_tokens, C), device="cuda", dtype=torch.float16)
-        op(
-            B,
-            total_tokens,
-            max_t,
-            C,
-            H,
-            query_start_loc,
-            slot_indices,
-            current_state,
-            *payload[:2],
-            w0,
-            *payload[2:],
-            y,
-            elapsed,
-        )
-        return y, current_state
-
-    _assert_repeatable(run)
 
 
 @pytest.mark.parametrize("case", RETURNING_CASES, ids=lambda c: c.name)
@@ -1977,60 +1881,8 @@ def test_rwkv7_advance_i32_varlen_updates_only_mapped_slots() -> None:
     "op_name,args",
     [
         (
-            "rwkv7_wkv_fp16_v2::wkv_seq_slot",
+            "rwkv7_wkv_fp16_v2::wkv",
             lambda: (
-                2,
-                1,
-                64,
-                1,
-                _h("cuda", (5, 1, 64, 64)),
-                *[_h("cuda", (2, 1, 64)) for _ in range(6)],
-                _h("cuda", (2, 1, 64)),
-                torch.tensor([3, 0], device="cuda", dtype=torch.int32),
-                _i32("cuda", (5,)),
-            ),
-        ),
-        (
-            "rwkv7_wkv_fp16_v2::wkv_seq_w0_slot",
-            lambda: (
-                2,
-                1,
-                64,
-                1,
-                _h("cuda", (5, 1, 64, 64)),
-                _h("cuda", (2, 1, 64)),
-                _h("cuda", (2, 1, 64)),
-                _h("cuda", (64,)),
-                *[_h("cuda", (2, 1, 64)) for _ in range(4)],
-                _h("cuda", (2, 1, 64)),
-                torch.tensor([3, 0], device="cuda", dtype=torch.int32),
-                _i32("cuda", (5,)),
-            ),
-        ),
-        (
-            "rwkv7_wkv_fp16_v2::wkv_seq_varlen",
-            lambda: (
-                2,
-                5,
-                3,
-                64,
-                1,
-                torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32),
-                torch.tensor([3, 0], device="cuda", dtype=torch.int32),
-                _h("cuda", (5, 1, 64, 64)),
-                *[_h("cuda", (5, 64)) for _ in range(6)],
-                _h("cuda", (5, 64)),
-                _i32("cuda", (5,)),
-            ),
-        ),
-        (
-            "rwkv7_wkv_fp16_v2::wkv_seq_w0_varlen",
-            lambda: (
-                2,
-                5,
-                3,
-                64,
-                1,
                 torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32),
                 torch.tensor([3, 0], device="cuda", dtype=torch.int32),
                 _h("cuda", (5, 1, 64, 64)),
@@ -2043,26 +1895,8 @@ def test_rwkv7_advance_i32_varlen_updates_only_mapped_slots() -> None:
             ),
         ),
         (
-            "rwkv7_wkv_fp32_v2::forward_slot",
+            "rwkv7_wkv_fp32_v2::wkv",
             lambda: (
-                2,
-                1,
-                64,
-                1,
-                torch.empty((5, 1, 64, 64), device="cuda", dtype=torch.float32),
-                *[_h("cuda", (2, 1, 64)) for _ in range(6)],
-                _h("cuda", (2, 1, 64)),
-                torch.tensor([3, 0], device="cuda", dtype=torch.int32),
-            ),
-        ),
-        (
-            "rwkv7_wkv_fp32_v2::forward_varlen",
-            lambda: (
-                2,
-                5,
-                3,
-                64,
-                1,
                 torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32),
                 torch.tensor([3, 0], device="cuda", dtype=torch.int32),
                 torch.empty((5, 1, 64, 64), device="cuda", dtype=torch.float32),
@@ -2072,7 +1906,7 @@ def test_rwkv7_advance_i32_varlen_updates_only_mapped_slots() -> None:
         ),
     ],
 )
-def test_rwkv7_wkv_slot_schema_opcheck(op_name, args) -> None:
+def test_rwkv7_wkv_canonical_schema_opcheck(op_name, args) -> None:
     torch.library.opcheck(_op(op_name), args(), test_utils=("test_schema",))
 
 
@@ -2089,9 +1923,7 @@ def test_rwkv7_add_layer_norm_welford_matches_fp32_reference(
     device = "cuda"
     hidden = 4096
     eps = 1e-5
-    x = torch.randn(
-        (batch, tokens, hidden), device=device, dtype=torch.float16
-    )
+    x = torch.randn((batch, tokens, hidden), device=device, dtype=torch.float16)
     residual = torch.randn_like(x)
     weight = torch.randn((hidden,), device=device, dtype=torch.float16)
     bias = torch.randn((hidden,), device=device, dtype=torch.float16)
@@ -2155,8 +1987,7 @@ def test_rwkv7_add_layer_norm_cmix_mix_slot_matches_scattered_reference(
     torch.testing.assert_close(shift_state, expected_shift_state, atol=0, rtol=0)
 
 
-def test_rwkv7_add_layer_norm_cmix_mix_welford_cache_matches_fp32_reference(
-) -> None:
+def test_rwkv7_add_layer_norm_cmix_mix_welford_cache_matches_fp32_reference() -> None:
     torch.manual_seed(61)
     device = "cuda"
     batch, hidden = 320, 4096
@@ -2174,17 +2005,25 @@ def test_rwkv7_add_layer_norm_cmix_mix_welford_cache_matches_fp32_reference(
     )
 
     rounded_sum = (x.float() + residual.float()).half()
-    normalized = torch.nn.functional.layer_norm(
-        rounded_sum.float(),
-        (hidden,),
-        weight.float(),
-        bias.float(),
-        eps,
-    ).half().squeeze(1)
+    normalized = (
+        torch.nn.functional.layer_norm(
+            rounded_sum.float(),
+            (hidden,),
+            weight.float(),
+            bias.float(),
+            eps,
+        )
+        .half()
+        .squeeze(1)
+    )
     expected_mixed = (
-        normalized.float()
-        + (initial_shift_state.float() - normalized.float()) * x_k.float()
-    ).half().unsqueeze(1)
+        (
+            normalized.float()
+            + (initial_shift_state.float() - normalized.float()) * x_k.float()
+        )
+        .half()
+        .unsqueeze(1)
+    )
 
     torch.testing.assert_close(x_out, rounded_sum, atol=0, rtol=0)
     torch.testing.assert_close(shift_state, normalized, atol=2e-2, rtol=2e-2)
@@ -2199,8 +2038,7 @@ def test_rwkv7_add_layer_norm_cmix_mix_welford_cache_matches_fp32_reference(
     torch.testing.assert_close(repeated_state, shift_state, atol=0, rtol=0)
 
 
-def test_rwkv7_add_layer_norm_cmix_mix_welford_cache_slots_match_compact(
-) -> None:
+def test_rwkv7_add_layer_norm_cmix_mix_welford_cache_slots_match_compact() -> None:
     torch.manual_seed(62)
     device = "cuda"
     batch, slots, hidden = 320, 640, 4096
@@ -2267,8 +2105,7 @@ def test_rwkv7_add_layer_norm_tmix_mix6_slot_matches_scattered_reference(
     torch.testing.assert_close(shift_state, expected_shift_state, atol=0, rtol=0)
 
 
-def test_rwkv7_add_layer_norm_tmix_mix6_welford_cache_matches_fp32_reference(
-) -> None:
+def test_rwkv7_add_layer_norm_tmix_mix6_welford_cache_matches_fp32_reference() -> None:
     torch.manual_seed(71)
     device = "cuda"
     batch, hidden = 320, 4096
@@ -2294,18 +2131,24 @@ def test_rwkv7_add_layer_norm_tmix_mix6_welford_cache_matches_fp32_reference(
     )
 
     rounded_sum = (x.float() + residual.float()).half()
-    normalized = torch.nn.functional.layer_norm(
-        rounded_sum.float(),
-        (hidden,),
-        weight.float(),
-        bias.float(),
-        eps,
-    ).half().squeeze(1)
+    normalized = (
+        torch.nn.functional.layer_norm(
+            rounded_sum.float(),
+            (hidden,),
+            weight.float(),
+            bias.float(),
+            eps,
+        )
+        .half()
+        .squeeze(1)
+    )
     expected_mixed = [
         (
             normalized.float()
             + (initial_shift_state.float() - normalized.float()) * mix.float()
-        ).half().unsqueeze(1)
+        )
+        .half()
+        .unsqueeze(1)
         for mix in mix_weights
     ]
 
@@ -2329,8 +2172,7 @@ def test_rwkv7_add_layer_norm_tmix_mix6_welford_cache_matches_fp32_reference(
     torch.testing.assert_close(repeated_state, shift_state, atol=0, rtol=0)
 
 
-def test_rwkv7_add_layer_norm_tmix_mix6_welford_cache_slots_match_compact(
-) -> None:
+def test_rwkv7_add_layer_norm_tmix_mix6_welford_cache_slots_match_compact() -> None:
     torch.manual_seed(72)
     device = "cuda"
     batch, slots, hidden = 320, 640, 4096

@@ -85,6 +85,9 @@ class RWKV7ModelState(ModelState):
         self.execution_idx_mapping = torch.arange(
             self.max_num_reqs, dtype=torch.int32, device=device
         )
+        self.decode_query_start_loc = torch.arange(
+            self.max_num_reqs + 1, dtype=torch.int32, device=device
+        )
         self.decode_slot_indices = torch.empty(
             (self.max_num_reqs,), dtype=torch.int32, device=device
         )
@@ -163,6 +166,48 @@ class RWKV7ModelState(ModelState):
             ),
         }
 
+    def _packed_prefill_inputs(
+        self,
+        prefill_ranges: list[tuple[int, int, int]],
+        prefill_rows: list[int],
+    ) -> dict[str, torch.Tensor]:
+        if len(prefill_ranges) != len(prefill_rows):
+            raise RuntimeError("RWKV7 prefill range/row metadata mismatch")
+        query_offsets = [0]
+        token_positions: list[int] = []
+        req_id: list[int] = []
+        for local_req, (_batch_idx, start, end) in enumerate(prefill_ranges):
+            length = end - start
+            if length <= 0:
+                raise RuntimeError(
+                    "RWKV7 packed prefill requires positive request lengths"
+                )
+            token_positions.extend(range(start, end))
+            req_id.extend([local_req] * length)
+            query_offsets.append(query_offsets[-1] + length)
+        return {
+            "rwkv_prefill_query_start_loc": torch.tensor(
+                query_offsets,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "rwkv_prefill_slot_indices": torch.tensor(
+                prefill_rows,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "rwkv_prefill_token_positions": torch.tensor(
+                token_positions,
+                dtype=torch.long,
+                device=self.device,
+            ),
+            "rwkv_prefill_req_id": torch.tensor(
+                req_id,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+        }
+
     @staticmethod
     def _set_sampling_logits_fast_path(
         input_batch: InputBatch,
@@ -174,44 +219,6 @@ class RWKV7ModelState(ModelState):
             )
         except Exception:
             return
-
-    @staticmethod
-    def _build_prefill_groups(
-        prefill_ranges: list[tuple[int, int, int]],
-        prefill_rows: list[int],
-    ) -> list[tuple[int, int, int, int, int, int]]:
-        groups: list[tuple[int, int, int, int, int, int]] = []
-        group_start = 0
-        while group_start < len(prefill_ranges):
-            first_batch_idx, first_start, first_end = prefill_ranges[group_start]
-            query_len = first_end - first_start
-            row_start = prefill_rows[group_start]
-            group_end = group_start + 1
-            token_end = first_end
-            while group_end < len(prefill_ranges):
-                batch_idx, start, end = prefill_ranges[group_end]
-                row = prefill_rows[group_end]
-                if (
-                    batch_idx != first_batch_idx + (group_end - group_start)
-                    or start != token_end
-                    or end - start != query_len
-                    or row != row_start + (group_end - group_start)
-                ):
-                    break
-                token_end = end
-                group_end += 1
-            groups.append(
-                (
-                    first_batch_idx,
-                    first_batch_idx + (group_end - group_start),
-                    query_len,
-                    first_start,
-                    token_end,
-                    row_start,
-                )
-            )
-            group_start = group_end
-        return groups
 
     def get_supported_generation_tasks(self) -> tuple[GenerationTask, ...]:
         return ("generate",)
@@ -328,15 +335,40 @@ class RWKV7ModelState(ModelState):
         self._prefill_req_slots = []
         self._prefill_becomes_decode = []
         req_ids = getattr(input_batch, "req_ids", None)
-        is_dummy_batch = bool(req_ids) and all(
-            req_id not in self.req_id_to_index for req_id in req_ids
+        is_dummy_batch = (
+            req_ids is not None
+            and bool(req_ids)
+            and all(req_id not in self.req_id_to_index for req_id in req_ids)
         )
         if is_dummy_batch:
             if not self.req_id_to_index:
                 self._reset_mappings()
+            query_start_loc_np = getattr(
+                input_batch,
+                "query_start_loc_np",
+                None,
+            )
+            if query_start_loc_np is None:
+                query_start_loc = input_batch.query_start_loc
+                if (
+                    not isinstance(query_start_loc, torch.Tensor)
+                    or query_start_loc.device.type != "cpu"
+                ):
+                    raise RuntimeError("RWKV7 dummy prefill requires CPU query offsets")
+                query_offsets = [int(offset) for offset in query_start_loc.tolist()]
+            else:
+                query_offsets = [int(offset) for offset in query_start_loc_np]
+            prefill_ranges = [
+                (batch_idx, query_offsets[batch_idx], query_offsets[batch_idx + 1])
+                for batch_idx in range(input_batch.num_reqs)
+            ]
+            dummy_prefill_rows = list(range(input_batch.num_reqs))
             return {
                 "query_start_loc": input_batch.query_start_loc,
                 "idx_mapping": self.execution_idx_mapping[: input_batch.num_reqs],
+                "rwkv_prefill_token_ranges": prefill_ranges,
+                "rwkv_prefill_rows": dummy_prefill_rows,
+                **self._packed_prefill_inputs(prefill_ranges, dummy_prefill_rows),
                 **self._new_dummy_state_tensors(input_batch.num_reqs),
             }
 
@@ -464,6 +496,9 @@ class RWKV7ModelState(ModelState):
                 "rwkv_decode_batch_size": decode_context_size,
                 "rwkv_decode_rows": decode_rows,
                 "rwkv_decode_token_positions": decode_token_position_tensor,
+                "rwkv_decode_query_start_loc": self.decode_query_start_loc[
+                    : decode_context_size + 1
+                ],
                 "slot_indices": slot_indices,
             }
 
@@ -486,67 +521,20 @@ class RWKV7ModelState(ModelState):
             )
             for batch_idx, _req_slot, _row, _becomes_decode in prefill_entries
         ]
-        prefill_groups = self._build_prefill_groups(prefill_ranges, prefill_rows)
         prefill_lengths = [end - start for _batch_idx, start, end in prefill_ranges]
         has_positive_prefill_lengths = all(length > 0 for length in prefill_lengths)
-        grouped_ranges = sum(
-            batch_end - batch_start for batch_start, batch_end, *_ in prefill_groups
+        if not has_positive_prefill_lengths:
+            raise RuntimeError("RWKV7 fast prefill requires positive request lengths.")
+        prefill_varlen_inputs = self._packed_prefill_inputs(
+            prefill_ranges,
+            prefill_rows,
         )
-        can_use_grouped_prefill = (
-            has_positive_prefill_lengths
-            and len(prefill_groups) == 1
-            and grouped_ranges == len(prefill_ranges)
-        )
-        can_use_varlen_prefill = (
-            not can_use_grouped_prefill and has_positive_prefill_lengths
-        )
-        prefill_varlen_inputs: dict[str, Any] = {}
-        if can_use_varlen_prefill:
-            query_offsets = [0]
-            token_positions: list[int] = []
-            req_id: list[int] = []
-            for local_req, ((_batch_idx, start, end), length) in enumerate(
-                zip(prefill_ranges, prefill_lengths)
-            ):
-                token_positions.extend(range(start, end))
-                req_id.extend([local_req] * length)
-                query_offsets.append(query_offsets[-1] + length)
-            prefill_groups = []
-            prefill_varlen_inputs = {
-                "rwkv_prefill_query_start_loc": torch.tensor(
-                    query_offsets,
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-                "rwkv_prefill_slot_indices": torch.tensor(
-                    prefill_rows,
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-                "rwkv_prefill_token_positions": torch.tensor(
-                    token_positions,
-                    dtype=torch.long,
-                    device=self.device,
-                ),
-                "rwkv_prefill_req_id": torch.tensor(
-                    req_id,
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-                "rwkv_prefill_max_t": max(prefill_lengths),
-            }
-        elif not can_use_grouped_prefill:
-            raise RuntimeError(
-                "RWKV7 fast prefill requires one contiguous equal-length "
-                "group or positive-length varlen metadata."
-            )
         if len(prefill_entries) == input_batch.num_reqs:
             return {
                 "query_start_loc": input_batch.query_start_loc,
                 "idx_mapping": idx_mapping,
                 "rwkv_prefill_token_ranges": prefill_ranges,
                 "rwkv_prefill_rows": prefill_rows,
-                "rwkv_prefill_groups": prefill_groups,
                 **prefill_varlen_inputs,
                 "shift_state": self.shift_state,
                 "wkv_state": self.wkv_state,
@@ -559,10 +547,12 @@ class RWKV7ModelState(ModelState):
             "rwkv_decode_batch_size": decode_context_size,
             "rwkv_decode_rows": decode_rows,
             "rwkv_decode_token_positions": decode_token_position_tensor,
+            "rwkv_decode_query_start_loc": self.decode_query_start_loc[
+                : decode_context_size + 1
+            ],
             "slot_indices": slot_indices,
             "rwkv_prefill_token_ranges": prefill_ranges,
             "rwkv_prefill_rows": prefill_rows,
-            "rwkv_prefill_groups": prefill_groups,
             **prefill_varlen_inputs,
         }
         if decode_entries:
@@ -639,12 +629,27 @@ class RWKV7ModelState(ModelState):
                 "rwkv_decode_batch_size": num_reqs,
                 "rwkv_decode_rows": list(range(num_reqs)),
                 "rwkv_decode_token_positions": list(range(num_reqs)),
+                "rwkv_decode_query_start_loc": self.decode_query_start_loc[
+                    : num_reqs + 1
+                ],
                 "slot_indices": None,
             }
+        prefill_ranges = [
+            (
+                request,
+                int(query_start_loc[request]),
+                int(query_start_loc[request + 1]),
+            )
+            for request in range(num_reqs)
+        ]
+        prefill_rows = list(range(num_reqs))
         return {
             "query_start_loc": query_start_loc,
             "idx_mapping": idx_mapping,
             **state_tensors,
+            "rwkv_prefill_token_ranges": prefill_ranges,
+            "rwkv_prefill_rows": prefill_rows,
+            **self._packed_prefill_inputs(prefill_ranges, prefill_rows),
         }
 
     def prepare_attn(
