@@ -67,6 +67,73 @@ def _rwkv7_linear_f16_fake(
     return _rwkv7_linear_out(x, weight.shape[1])
 
 
+@_register_fake_if_exists("rwkv7_v3a_ops::linear_rkv_f16_m1_splitk")
+def _rwkv7_linear_rkv_f16_m1_splitk_fake(
+    x_r: torch.Tensor,
+    x_k: torch.Tensor,
+    x_v: torch.Tensor,
+    weight_r: torch.Tensor,
+    weight_k: torch.Tensor,
+    weight_v: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        _rwkv7_linear_out(x_r, weight_r.shape[1]),
+        _rwkv7_linear_out(x_k, weight_k.shape[1]),
+        _rwkv7_linear_out(x_v, weight_v.shape[1]),
+    )
+
+
+@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_lt_cfg")
+def _rwkv7_linear_f16_lt_cfg_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    workspace_mb: int,
+    heuristic_index: int,
+    strict_algo: bool = False,
+) -> torch.Tensor:
+    return _rwkv7_linear_out(x, weight.shape[1])
+
+
+@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_fp32_lt")
+def _rwkv7_linear_f16_fp32_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty(
+        (*x.shape[:-1], weight.shape[1]),
+        device=x.device,
+        dtype=torch.float32,
+    )
+
+
+@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_m1_splitk_fp32")
+def _rwkv7_linear_f16_m1_splitk_fp32_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty(
+        (*x.shape[:-1], weight.shape[1]),
+        device=x.device,
+        dtype=torch.float32,
+    )
+
+
+@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_m1_splitk_prepare_zero")
+def _rwkv7_linear_f16_m1_splitk_prepare_zero_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    zero_features: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        _rwkv7_linear_out(x, weight.shape[1]),
+        torch.empty(
+            (1, 1, zero_features),
+            device=x.device,
+            dtype=x.dtype,
+        ),
+    )
+
+
 @_register_fake_if_exists("rwkv7_v3a_ops::linear_t_f16")
 def _rwkv7_linear_t_f16_fake(
     x: torch.Tensor,
@@ -260,6 +327,7 @@ def _rwkv7_add_layer_norm_tmix_mix6_f16_slots_fake(
 
 
 @_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_mix6")
+@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_mix6_3d")
 def _rwkv7_tmix_mix6_fake(
     B: int,
     T: int,
@@ -315,6 +383,7 @@ def _rwkv7_tmix_mix6_varlen_fake(
 
 
 @_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_kk_a_gate")
+@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_kk_a_gate_2d")
 def _rwkv7_tmix_kk_a_gate_fake(
     B: int,
     T: int,
@@ -330,6 +399,7 @@ def _rwkv7_tmix_kk_a_gate_fake(
 
 
 @_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_lnx_rkvres_xg")
+@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_lnx_rkvres_xg_warp")
 def _rwkv7_tmix_lnx_rkvres_xg_fake(
     B: int,
     T: int,
@@ -367,7 +437,18 @@ def _rwkv7_cmix_sparse_down_relu_one_fake(
     preact: torch.Tensor,
     value_fc: torch.Tensor,
 ) -> torch.Tensor:
-    return torch.empty((C,), device=preact.device, dtype=preact.dtype)
+    return torch.empty((1, 1, C), device=preact.device, dtype=preact.dtype)
+
+
+@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_sparse_down_relu_one_out")
+def _rwkv7_cmix_sparse_down_relu_one_out_fake(
+    C: int,
+    F: int,
+    preact: torch.Tensor,
+    value_fc: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    return None
 
 
 @_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_sparse_down_relu_rows")
@@ -384,6 +465,7 @@ def _rwkv7_cmix_sparse_down_relu_rows_fake(
 
 
 @_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_mix")
+@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_mix_3d")
 def _rwkv7_cmix_mix_fake(
     B: int,
     T: int,
@@ -431,6 +513,7 @@ def _rwkv7_unary_fake(x: torch.Tensor) -> torch.Tensor:
 
 
 @_register_fake_if_exists("rwkv7_fast_ops_fp16::add_vec")
+@_register_fake_if_exists("rwkv7_fast_ops_fp16::add_vec_2d")
 def _rwkv7_add_vec_fake(C: int, x: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
     return _rwkv7_empty_like(x)
 
@@ -442,18 +525,11 @@ def _rwkv7_advance_i32_fake(*args) -> None:
     return None
 
 
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq")
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_slot")
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_w0")
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_w0_slot")
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_varlen")
-@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv_seq_w0_varlen")
+@_register_fake_if_exists("rwkv7_wkv_fp16_v2::wkv")
 def _rwkv7_wkv_fp16_fake(*args) -> None:
     return None
 
 
-@_register_fake_if_exists("rwkv7_wkv_fp32_v2::forward")
-@_register_fake_if_exists("rwkv7_wkv_fp32_v2::forward_slot")
-@_register_fake_if_exists("rwkv7_wkv_fp32_v2::forward_varlen")
+@_register_fake_if_exists("rwkv7_wkv_fp32_v2::wkv")
 def _rwkv7_wkv_fp32_fake(*args) -> None:
     return None

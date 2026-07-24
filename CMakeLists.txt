@@ -466,6 +466,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     USE_SABI 3
     WITH_SOABI)
   target_compile_definitions(rwkv7_ops PRIVATE USE_CUDA)
+  target_link_libraries(rwkv7_ops PRIVATE CUDA::cublas CUDA::cublasLt)
   if(VLLM_RWKV_ONLY_BUILD)
     target_compile_definitions(rwkv7_ops PRIVATE VLLM_RWKV_RUNTIME_OPS)
   endif()

@@ -42,13 +42,49 @@ LOWRANK_SUFFIXES = (
 LOWRANK_IN_ROWS_T = 7
 LOWRANK_OUT_ROWS_T = 4
 LOWRANK_FUSED_MIN_C = 1024
+# Exact FP16-accumulation cuBLASLt winners measured on the project benchmark
+# GPU (Blackwell sm_120, CUDA 13.0, PyTorch 2.11) against the current GemmEx
+# baseline. The second value is a runtime heuristic-list index, not a stable
+# algorithm ID, so production uses non-strict lookup and exact shape guards.
+ATT_C2C_FP16_LT_4096 = {64: (32, 2)}
+FFN_DOWN_FP16_LT_4096 = {64: (32, 3)}
+# Exact runtime-layout low-rank candidates. Keep these separate from the
+# dense tables: the rank is part of the dispatch contract and the aggregate
+# benefit comes from repeated W/A/G/V projections at the same row count.
+LOWRANK_IN_FP16_LT_4096 = {
+    (8, 128): (128, 0),
+    (8, 480): (128, 0),
+    (8, 96): (128, 0),
+    (16, 480): (32, 1),
+    (16, 96): (32, 0),
+}
+LOWRANK_OUT_FP16_LT_4096 = {
+    (8, 128): (0, 5),
+    (8, 480): (0, 3),
+    (8, 96): (0, 4),
+    (16, 128): (0, 1),
+    (16, 480): (32, 2),
+}
 CMIX_NOFC_ROW20_MAX_T = 5
 CMIX_NOFC_MAX_ROWS = 19
 CMIX_NOFC_T512_MIN_ROWS = 8
 LN1_TMIX_FUSE = True
+# The fused LN1/TMix owner is strongest for M=1 and for larger decode batches,
+# but paired full-model measurements favor the separate kernels at these exact
+# small T=1 shapes. Keep the exclusion table narrow: disabling the fusion also
+# regresses rows >= 64 and the canonical B320 decode path.
+LN1_TMIX_UNFUSED_BT = frozenset(((2, 1), (4, 1), (8, 1), (16, 1)))
 CMIX_B1T1_NOFC = "b1t1_nofc"
 CMIX_ROWS2_NOFC = "rows2_nofc"
 CMIX_DENSE = "dense"
+LNX_WARP_B1_T_4096 = frozenset((64, 96, 128, 160, 192, 240, 248, 264, 512))
+MIX_3D_B1_T_4096 = frozenset((2, 4, 16, 64, 512))
+# The direct-model harness clears this exact row set for paired A/B capture;
+# production keeps M=1 grouped without a user-visible mode or fallback knob.
+M1_RKV_GROUPED_ROWS = {1}
+# The M=1 no-fc path prepares the sparse-down accumulator while reducing the
+# FFN key split-K result, eliminating one zeroing launch per layer.
+M1_CMIX_PREZERO_ROWS = {1}
 
 
 @dataclass(frozen=True)
@@ -94,6 +130,42 @@ def select_path(B: int, T: int) -> PathConfig:
         CMIX_B1T1_NOFC if rows == 1 else (CMIX_ROWS2_NOFC if use_nofc else CMIX_DENSE)
     )
     return PathConfig(rows=rows, cmix_mode=cmix_mode)
+
+
+def use_tmix_kk_a_gate_2d(B: int, T: int, C: int, H: int) -> bool:
+    """Use the exact 2D head grid validated for the 7.2B model shape."""
+    return C == 4096 and H == 64 and 0 < B * T <= 65535
+
+
+def use_tmix_lnx_warp(B: int, T: int, C: int, H: int) -> bool:
+    """Use the one-warp LNX reduction only on validated batched shapes."""
+    return (
+        C == 4096
+        and H == 64
+        and B * T * H >= 4096
+        and (B >= 2 or T in LNX_WARP_B1_T_4096)
+    )
+
+
+def use_tmix_mix6_3d(B: int, T: int, C: int) -> bool:
+    """Use the validated B/T/channel launch grid for time mixing."""
+    return (
+        T != 1
+        and C == 4096
+        and 0 < B <= 65535
+        and 0 < T <= 65535
+        and (B >= 2 or T in MIX_3D_B1_T_4096)
+    )
+
+
+def use_cmix_mix_3d(B: int, T: int, C: int) -> bool:
+    """Use the validated B/T/channel launch grid for channel mixing."""
+    return use_tmix_mix6_3d(B, T, C)
+
+
+def use_ln1_tmix_fusion(B: int, T: int) -> bool:
+    """Choose the benchmark-backed LN1/TMix owner for a B/T shape."""
+    return LN1_TMIX_FUSE and T == 1 and (B, T) not in LN1_TMIX_UNFUSED_BT
 
 
 def is_lowrank_weight(key: str) -> bool:
@@ -771,14 +843,13 @@ class RWKV7ForCausalLM(nn.Module):
         rwkv_decode_batch_size: int = 0,
         rwkv_decode_rows: list[int] | None = None,
         rwkv_decode_token_positions: torch.Tensor | list[int] | None = None,
+        rwkv_decode_query_start_loc: torch.Tensor | None = None,
         rwkv_prefill_token_ranges: list[tuple[int, int, int]] | None = None,
         rwkv_prefill_rows: list[int] | None = None,
-        rwkv_prefill_groups: list[tuple[int, int, int, int, int, int]] | None = None,
         rwkv_prefill_query_start_loc: torch.Tensor | None = None,
         rwkv_prefill_slot_indices: torch.Tensor | None = None,
         rwkv_prefill_token_positions: torch.Tensor | None = None,
         rwkv_prefill_req_id: torch.Tensor | None = None,
-        rwkv_prefill_max_t: int = 0,
         slot_indices: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor | IntermediateTensors:
@@ -789,6 +860,7 @@ class RWKV7ForCausalLM(nn.Module):
             )
 
         assert query_start_loc is not None
+        assert idx_mapping is not None
         assert shift_state is not None
         assert wkv_state is not None
         assert elapsed is not None
@@ -808,14 +880,14 @@ class RWKV7ForCausalLM(nn.Module):
                 rwkv_decode_batch_size=rwkv_decode_batch_size,
                 rwkv_decode_rows=rwkv_decode_rows,
                 rwkv_decode_token_positions=rwkv_decode_token_positions,
+                rwkv_decode_query_start_loc=rwkv_decode_query_start_loc,
+                idx_mapping=idx_mapping,
                 rwkv_prefill_token_ranges=rwkv_prefill_token_ranges,
                 rwkv_prefill_rows=rwkv_prefill_rows,
-                rwkv_prefill_groups=rwkv_prefill_groups,
                 rwkv_prefill_query_start_loc=rwkv_prefill_query_start_loc,
                 rwkv_prefill_slot_indices=rwkv_prefill_slot_indices,
                 rwkv_prefill_token_positions=rwkv_prefill_token_positions,
                 rwkv_prefill_req_id=rwkv_prefill_req_id,
-                rwkv_prefill_max_t=rwkv_prefill_max_t,
                 slot_indices=slot_indices,
                 is_first_pp_rank=is_first_pp_rank,
                 is_last_pp_rank=is_last_pp_rank,
@@ -825,11 +897,7 @@ class RWKV7ForCausalLM(nn.Module):
         hidden_states = torch.empty(
             (input_ids.shape[0], self.hidden_size), dtype=DTYPE, device=CUDA_DEVICE
         )
-        if (
-            rwkv_decode_rows is not None
-            or rwkv_prefill_token_ranges is not None
-            or rwkv_prefill_groups is not None
-        ):
+        if rwkv_decode_rows is not None or rwkv_prefill_token_ranges is not None:
             decode_rows = rwkv_decode_rows or []
             decode_positions = rwkv_decode_token_positions
             assert len(decode_rows) == self._decode_token_positions_length(
@@ -838,6 +906,10 @@ class RWKV7ForCausalLM(nn.Module):
             if decode_rows:
                 decode_batch_size = rwkv_decode_batch_size
                 assert decode_batch_size > 0
+                assert rwkv_decode_query_start_loc is not None
+                decode_query_start_loc = rwkv_decode_query_start_loc[
+                    : decode_batch_size + 1
+                ]
                 if slot_indices is not None:
                     decode_position_tensor = self._decode_token_positions_tensor(
                         decode_positions,
@@ -854,6 +926,8 @@ class RWKV7ForCausalLM(nn.Module):
                         tokens,
                         state,
                         slot_indices=slot_indices[:decode_batch_size],
+                        query_start_loc=decode_query_start_loc,
+                        wkv_slot_indices=slot_indices[:decode_batch_size],
                     ).view(decode_batch_size, self.hidden_size)
                     hidden_states.index_copy_(0, hidden_position_tensor, out)
                 else:
@@ -869,9 +943,12 @@ class RWKV7ForCausalLM(nn.Module):
                         wkv_state[:, :decode_batch_size, :, :, :],
                         elapsed[:decode_batch_size],
                     ]
-                    out = self.forward_tokens(tokens, state).view(
-                        decode_batch_size, self.hidden_size
-                    )
+                    out = self.forward_tokens(
+                        tokens,
+                        state,
+                        query_start_loc=decode_query_start_loc,
+                        wkv_slot_indices=idx_mapping[:decode_batch_size],
+                    ).view(decode_batch_size, self.hidden_size)
                     hidden_states[start:end] = out.view(
                         decode_batch_size, self.hidden_size
                     )
@@ -891,7 +968,6 @@ class RWKV7ForCausalLM(nn.Module):
                 and rwkv_prefill_slot_indices is not None
                 and rwkv_prefill_token_positions is not None
                 and rwkv_prefill_req_id is not None
-                and rwkv_prefill_max_t > 0
             ):
                 input_position_tensor = rwkv_prefill_token_positions.to(
                     device=input_ids.device
@@ -907,47 +983,16 @@ class RWKV7ForCausalLM(nn.Module):
                     query_start_loc=rwkv_prefill_query_start_loc,
                     slot_indices=rwkv_prefill_slot_indices,
                     req_id=rwkv_prefill_req_id,
-                    max_t=rwkv_prefill_max_t,
                 )
                 hidden_states.index_copy_(0, hidden_position_tensor, out)
                 return hidden_states
-            prefill_groups = rwkv_prefill_groups or []
-            for (
-                _batch_start,
-                _batch_end,
-                query_len,
-                start,
-                end,
-                row_start,
-            ) in prefill_groups:
-                batch_size = (end - start) // query_len
-                row_end = row_start + batch_size
-                tokens = input_ids[start:end].view(batch_size, query_len)
-                state = [
-                    prefill_shift_state[:, :, row_start:row_end, :],
-                    prefill_wkv_state[:, row_start:row_end, :, :, :],
-                    prefill_elapsed[row_start:row_end],
-                ]
-                if query_len == 1:
-                    out = self.forward_tokens(tokens, state)
-                    hidden_states[start:end] = out.view(batch_size, self.hidden_size)
-                else:
-                    out = self.forward_all_hidden(tokens, state)
-                    hidden_states[start:end] = out.view(
-                        batch_size * query_len, self.hidden_size
-                    )
-            if prefill_groups:
-                return hidden_states
             if prefill_ranges:
                 raise RuntimeError(
-                    "RWKV7 prefill requires grouped or varlen fast-path metadata."
+                    "RWKV7 prefill requires canonical packed-varlen metadata."
                 )
             return hidden_states
 
-        raise RuntimeError(
-            "RWKV7 requires decode, grouped-prefill, or varlen-prefill "
-            "fast-path metadata."
-        )
+        raise RuntimeError("RWKV7 requires decode or packed-varlen prefill metadata.")
 
     def forward_vllm_pp_stage(
         self,
@@ -963,14 +1008,14 @@ class RWKV7ForCausalLM(nn.Module):
         rwkv_decode_batch_size: int,
         rwkv_decode_rows: list[int] | None,
         rwkv_decode_token_positions: torch.Tensor | list[int] | None,
+        rwkv_decode_query_start_loc: torch.Tensor | None,
+        idx_mapping: torch.Tensor,
         rwkv_prefill_token_ranges: list[tuple[int, int, int]] | None,
         rwkv_prefill_rows: list[int] | None,
-        rwkv_prefill_groups: list[tuple[int, int, int, int, int, int]] | None,
         rwkv_prefill_query_start_loc: torch.Tensor | None,
         rwkv_prefill_slot_indices: torch.Tensor | None,
         rwkv_prefill_token_positions: torch.Tensor | None,
         rwkv_prefill_req_id: torch.Tensor | None,
-        rwkv_prefill_max_t: int,
         slot_indices: torch.Tensor | None,
         is_first_pp_rank: bool,
         is_last_pp_rank: bool,
@@ -1001,11 +1046,7 @@ class RWKV7ForCausalLM(nn.Module):
                 device=CUDA_DEVICE,
             )
 
-        if (
-            rwkv_decode_rows is not None
-            or rwkv_prefill_token_ranges is not None
-            or rwkv_prefill_groups is not None
-        ):
+        if rwkv_decode_rows is not None or rwkv_prefill_token_ranges is not None:
             decode_rows = rwkv_decode_rows or []
             decode_positions = rwkv_decode_token_positions
             assert len(decode_rows) == self._decode_token_positions_length(
@@ -1014,6 +1055,10 @@ class RWKV7ForCausalLM(nn.Module):
             if decode_rows:
                 decode_batch_size = rwkv_decode_batch_size
                 assert decode_batch_size > 0
+                assert rwkv_decode_query_start_loc is not None
+                decode_query_start_loc = rwkv_decode_query_start_loc[
+                    : decode_batch_size + 1
+                ]
                 if slot_indices is not None:
                     decode_position_tensor = self._decode_token_positions_tensor(
                         decode_positions,
@@ -1044,6 +1089,7 @@ class RWKV7ForCausalLM(nn.Module):
                         )
                     state = [shift_state, wkv_state, elapsed]
                     decode_slot_indices = slot_indices[:decode_batch_size]
+                    decode_wkv_slot_indices = decode_slot_indices
                 else:
                     decode_position_list = self._decode_token_positions_list(
                         decode_positions
@@ -1073,6 +1119,7 @@ class RWKV7ForCausalLM(nn.Module):
                         elapsed[:decode_batch_size],
                     ]
                     decode_slot_indices = None
+                    decode_wkv_slot_indices = idx_mapping[:decode_batch_size]
                     decode_position_tensor = None
                 path = select_path(decode_batch_size, 1)
                 forward_kwargs = {}
@@ -1086,6 +1133,8 @@ class RWKV7ForCausalLM(nn.Module):
                     final=is_last_pp_rank,
                     all_logits=True,
                     last_indices=None,
+                    query_start_loc=decode_query_start_loc,
+                    wkv_slot_indices=decode_wkv_slot_indices,
                     **forward_kwargs,
                 )
                 out = out.view(decode_batch_size, self.hidden_size)
@@ -1126,7 +1175,6 @@ class RWKV7ForCausalLM(nn.Module):
                 and rwkv_prefill_slot_indices is not None
                 and rwkv_prefill_token_positions is not None
                 and rwkv_prefill_req_id is not None
-                and rwkv_prefill_max_t > 0
             ):
                 hidden_position_tensor = rwkv_prefill_token_positions.to(
                     device=hidden_states.device
@@ -1155,7 +1203,6 @@ class RWKV7ForCausalLM(nn.Module):
                     query_start_loc=rwkv_prefill_query_start_loc,
                     slot_indices=rwkv_prefill_slot_indices,
                     req_id=rwkv_prefill_req_id,
-                    max_t=rwkv_prefill_max_t,
                     v_first=group_v_first,
                     final=is_last_pp_rank,
                 )
@@ -1177,71 +1224,9 @@ class RWKV7ForCausalLM(nn.Module):
                         {"hidden_states": hidden_states, "v_first": v_first_states}
                     )
                 return hidden_states
-            prefill_groups = rwkv_prefill_groups or []
-            for (
-                _batch_start,
-                _batch_end,
-                query_len,
-                start,
-                end,
-                row_start,
-            ) in prefill_groups:
-                batch_size = (end - start) // query_len
-                row_end = row_start + batch_size
-                if is_first_pp_rank:
-                    assert input_ids is not None
-                    tokens = input_ids[start:end].view(batch_size, query_len)
-                    x = self.embed(tokens)
-                    group_v_first = None
-                else:
-                    assert incoming_hidden_states is not None
-                    assert incoming_v_first is not None
-                    x = incoming_hidden_states[start:end].view(
-                        batch_size, query_len, self.hidden_size
-                    )
-                    group_v_first = incoming_v_first[start:end].view(
-                        batch_size,
-                        query_len,
-                        getattr(self, "tp_hidden_size", self.hidden_size),
-                    )
-                state = [
-                    prefill_shift_state[:, :, row_start:row_end, :],
-                    prefill_wkv_state[:, row_start:row_end, :, :, :],
-                    prefill_elapsed[row_start:row_end],
-                ]
-                path = select_path(batch_size, query_len)
-                out, out_v_first = self.forward_layer_range(
-                    x,
-                    state,
-                    path,
-                    v_first=group_v_first,
-                    final=is_last_pp_rank,
-                    all_logits=True,
-                    last_indices=None,
-                )
-                hidden_states[start:end] = out.view(
-                    batch_size * query_len, self.hidden_size
-                )
-                if v_first_states is not None:
-                    if out_v_first is None:
-                        assert group_v_first is not None
-                        out_v_first = group_v_first
-                    if getattr(self, "tp_size", 1) > 1:
-                        out_v_first = tensor_model_parallel_all_gather(out_v_first)
-                    v_first_states[start:end] = out_v_first.view(
-                        batch_size * query_len, self.hidden_size
-                    )
-            if prefill_groups:
-                if not is_last_pp_rank:
-                    assert v_first_states is not None
-                    return IntermediateTensors(
-                        {"hidden_states": hidden_states, "v_first": v_first_states}
-                    )
-                return hidden_states
-
             if prefill_ranges:
                 raise RuntimeError(
-                    "RWKV7 prefill requires grouped or varlen fast-path metadata."
+                    "RWKV7 prefill requires canonical packed-varlen metadata."
                 )
 
             if not is_last_pp_rank:
@@ -1252,8 +1237,8 @@ class RWKV7ForCausalLM(nn.Module):
             return hidden_states
 
         raise RuntimeError(
-            "RWKV7 pipeline execution requires decode, grouped-prefill, or "
-            "varlen-prefill fast-path metadata."
+            "RWKV7 pipeline execution requires decode or packed-varlen "
+            "prefill metadata."
         )
 
     def forward_tokens(
@@ -1264,6 +1249,8 @@ class RWKV7ForCausalLM(nn.Module):
         all_logits: bool = False,
         last_indices: torch.Tensor | None = None,
         slot_indices: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
+        wkv_slot_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if tokens.dim() == 1:
             tokens = tokens.unsqueeze(0)
@@ -1271,7 +1258,14 @@ class RWKV7ForCausalLM(nn.Module):
         x = self.embed(tokens)
         path = select_path(batch_size, token_count)
         if not all_logits and last_indices is None:
-            return self.forward_from_x(x, state, path, slot_indices=slot_indices)
+            return self.forward_from_x(
+                x,
+                state,
+                path,
+                slot_indices=slot_indices,
+                query_start_loc=query_start_loc,
+                wkv_slot_indices=wkv_slot_indices,
+            )
         return self.forward_from_x(
             x,
             state,
@@ -1279,18 +1273,39 @@ class RWKV7ForCausalLM(nn.Module):
             all_logits=all_logits,
             last_indices=last_indices,
             slot_indices=slot_indices,
+            query_start_loc=query_start_loc,
+            wkv_slot_indices=wkv_slot_indices,
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed(input_ids)
 
+    def project_logits_fp32(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project the FP16 model output directly into FP32 logits."""
+        weight = self.z["head.weight"]
+        if (
+            hidden_states.dim() >= 2
+            and all(size == 1 for size in hidden_states.shape[:-1])
+            and weight.size(1) % 64 == 0
+        ):
+            return torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk_fp32(
+                hidden_states.contiguous(), weight
+            )
+
+        return torch.ops.rwkv7_v3a_ops.linear_f16_fp32_lt(
+            hidden_states.contiguous(),
+            weight,
+        )
+
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        logits = self.linear(hidden_states, self.z["head.weight"])
+        logits = self.project_logits_fp32(hidden_states)
         logits = self.logits_processor(None, logits)
         if logits is not None and getattr(self, "tp_size", 1) > 1:
             logits = tensor_model_parallel_all_gather(logits)
             if logits is not None:
                 logits = logits[..., : self.vocab_size]
+        if logits is not None and logits.dtype != torch.float32:
+            raise RuntimeError(f"RWKV7 logits must be FP32, but got {logits.dtype}.")
         return logits
 
     def compute_sampling_logits(
@@ -1453,6 +1468,8 @@ class RWKV7ForCausalLM(nn.Module):
         all_logits: bool = False,
         last_indices=None,
         slot_indices: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
+        wkv_slot_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run RWKV7 from embedded input."""
         out, _ = self.forward_layer_range(
@@ -1464,6 +1481,8 @@ class RWKV7ForCausalLM(nn.Module):
             all_logits=all_logits,
             last_indices=last_indices,
             slot_indices=slot_indices,
+            query_start_loc=query_start_loc,
+            wkv_slot_indices=wkv_slot_indices,
         )
         return out
 
@@ -1478,9 +1497,25 @@ class RWKV7ForCausalLM(nn.Module):
         all_logits: bool,
         last_indices=None,
         slot_indices: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
+        wkv_slot_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         z = self.z
         B, T, _ = x.shape
+        if query_start_loc is None:
+            query_start_loc = torch.arange(
+                0,
+                (B + 1) * T,
+                T,
+                dtype=torch.int32,
+                device=x.device,
+            )
+        if wkv_slot_indices is None:
+            wkv_slot_indices = (
+                slot_indices
+                if slot_indices is not None
+                else torch.arange(B, dtype=torch.int32, device=x.device)
+            )
         start_layer = getattr(self, "start_layer", 0)
         end_layer = getattr(self, "end_layer", self.total_num_layers)
 
@@ -1521,6 +1556,8 @@ class RWKV7ForCausalLM(nn.Module):
                 path,
                 pre_mix,
                 slot_indices=slot_indices,
+                query_start_loc=query_start_loc,
+                wkv_slot_indices=wkv_slot_indices,
             )
             pre_mix = None
             if T == 1:
@@ -1560,7 +1597,7 @@ class RWKV7ForCausalLM(nn.Module):
                 )
             if layer + 1 < end_layer:
                 p_next = f"blocks.{layer + 1}."
-                if LN1_TMIX_FUSE and T == 1:
+                if use_ln1_tmix_fusion(B, T):
                     if slot_indices is None:
                         outs = torch.ops.rwkv7_v3a_ops.add_layer_norm_tmix_mix6_f16(
                             x.contiguous(),
@@ -1641,7 +1678,6 @@ class RWKV7ForCausalLM(nn.Module):
         query_start_loc: torch.Tensor,
         slot_indices: torch.Tensor,
         req_id: torch.Tensor,
-        max_t: int,
     ) -> torch.Tensor:
         tokens = tokens.reshape(-1)
         x = self.embed(tokens).view(tokens.numel(), self.hidden_size)
@@ -1651,7 +1687,6 @@ class RWKV7ForCausalLM(nn.Module):
             query_start_loc=query_start_loc,
             slot_indices=slot_indices,
             req_id=req_id,
-            max_t=max_t,
             v_first=None,
             final=True,
         )
@@ -1665,7 +1700,6 @@ class RWKV7ForCausalLM(nn.Module):
         query_start_loc: torch.Tensor,
         slot_indices: torch.Tensor,
         req_id: torch.Tensor,
-        max_t: int,
         v_first: torch.Tensor | None,
         final: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -1710,7 +1744,6 @@ class RWKV7ForCausalLM(nn.Module):
                 query_start_loc=query_start_loc,
                 slot_indices=slot_indices,
                 req_id=req_id,
-                max_t=max_t,
             )
             x, xx = self.add_ln(x, xx, z[p + "ln2.weight"], z[p + "ln2.bias"])
             xx = self.cmix_varlen(
@@ -1776,9 +1809,7 @@ class RWKV7ForCausalLM(nn.Module):
         """Share the layout-independent time-mix projection pipeline."""
         z = self.z
         ops = torch.ops.rwkv7_fast_ops_fp16
-        r = self.linear(xr, z[p + "receptance.weight"])
-        k = self.linear(xk, z[p + "key.weight"])
-        v = self.linear(xv, z[p + "value.weight"])
+        r, k, v = self.project_att_rkv(xr, xk, xv, p, path.rows)
         local_c = r.shape[-1]
         local_h = local_c // self.head_size
         use_lowrank_in = can_use_lowrank_fused(self.hidden_size, path.rows)
@@ -1845,7 +1876,12 @@ class RWKV7ForCausalLM(nn.Module):
             )
 
         value_shape = (batch_size, time_steps, local_c)
-        k3, neg_kk3, kka3 = ops.tmix_kk_a_gate(
+        kk_a_gate = (
+            ops.tmix_kk_a_gate_2d
+            if use_tmix_kk_a_gate_2d(batch_size, time_steps, local_c, local_h)
+            else ops.tmix_kk_a_gate
+        )
+        k3, neg_kk3, kka3 = kk_a_gate(
             batch_size,
             time_steps,
             local_c,
@@ -1915,7 +1951,6 @@ class RWKV7ForCausalLM(nn.Module):
         query_start_loc: torch.Tensor,
         slot_indices: torch.Tensor,
         req_id: torch.Tensor,
-        max_t: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         z = self.z
         ops = torch.ops.rwkv7_fast_ops_fp16
@@ -1956,65 +1991,20 @@ class RWKV7ForCausalLM(nn.Module):
         local_h = local_c // self.head_size
 
         y = torch.empty_like(r)
-        if self.wkv_mode == "fp32io16":
-            w_raw = ops.add_vec(local_c, w.contiguous(), z[p + "w0"])
-            torch.ops.rwkv7_wkv_fp32_v2.forward_varlen(
-                B,
-                total_tokens,
-                max_t,
-                local_c,
-                local_h,
-                query_start_loc,
-                slot_indices,
-                wkv_state,
-                r.contiguous(),
-                w_raw.contiguous(),
-                k.contiguous(),
-                v.contiguous(),
-                neg_kk.contiguous(),
-                kka.contiguous(),
-                y,
-            )
-        elif max_t <= 16:
-            torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_w0_varlen(
-                B,
-                total_tokens,
-                max_t,
-                local_c,
-                local_h,
-                query_start_loc,
-                slot_indices,
-                wkv_state,
-                r.contiguous(),
-                w.contiguous(),
-                z[p + "w0"],
-                k.contiguous(),
-                v.contiguous(),
-                neg_kk.contiguous(),
-                kka.contiguous(),
-                y,
-                elapsed_t,
-            )
-        else:
-            w_raw = ops.add_vec(local_c, w.contiguous(), z[p + "w0"])
-            torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_varlen(
-                B,
-                total_tokens,
-                max_t,
-                local_c,
-                local_h,
-                query_start_loc,
-                slot_indices,
-                wkv_state,
-                r.contiguous(),
-                w_raw.contiguous(),
-                k.contiguous(),
-                v.contiguous(),
-                neg_kk.contiguous(),
-                kka.contiguous(),
-                y,
-                elapsed_t,
-            )
+        self._run_wkv(
+            query_start_loc,
+            slot_indices,
+            wkv_state,
+            r,
+            w,
+            z[p + "w0"],
+            k,
+            v,
+            neg_kk,
+            kka,
+            y,
+            elapsed_t,
+        )
         y = ops.tmix_lnx_rkvres_xg(
             total_tokens,
             1,
@@ -2029,7 +2019,7 @@ class RWKV7ForCausalLM(nn.Module):
             z[p + "ln_x.bias"],
             g.view(total_tokens, 1, local_c).contiguous(),
         ).view(total_tokens, local_c)
-        out = self.linear(y, z[p + "output.weight"])
+        out = self.linear_att_c2c(y, z[p + "output.weight"], path.rows)
         return self._tp_all_reduce(out), v_first
 
     def cmix_varlen(
@@ -2062,6 +2052,64 @@ class RWKV7ForCausalLM(nn.Module):
             mixed.view(total_tokens, 1, self.hidden_size), p, dense_path
         ).view(total_tokens, self.hidden_size)
 
+    def _run_wkv(
+        self,
+        query_start_loc: torch.Tensor,
+        slot_indices: torch.Tensor,
+        state: torch.Tensor,
+        r: torch.Tensor,
+        w: torch.Tensor,
+        w0: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        neg_kk: torch.Tensor,
+        kka: torch.Tensor,
+        y: torch.Tensor,
+        elapsed_t: torch.Tensor,
+    ) -> None:
+        """Run the canonical packed-varlen WKV operator for this precision."""
+        hidden_size = r.shape[-1]
+        r_rows = r.view(-1, hidden_size).contiguous()
+        w_rows = w.view(-1, hidden_size).contiguous()
+        k_rows = k.view(-1, hidden_size).contiguous()
+        v_rows = v.view(-1, hidden_size).contiguous()
+        neg_kk_rows = neg_kk.view(-1, hidden_size).contiguous()
+        kka_rows = kka.view(-1, hidden_size).contiguous()
+        y_rows = y.view(-1, hidden_size)
+        if self.wkv_mode == "fp32io16":
+            w_rows = torch.ops.rwkv7_fast_ops_fp16.add_vec(
+                hidden_size,
+                w_rows,
+                w0,
+            )
+            torch.ops.rwkv7_wkv_fp32_v2.wkv(
+                query_start_loc,
+                slot_indices,
+                state,
+                r_rows,
+                w_rows,
+                k_rows,
+                v_rows,
+                neg_kk_rows,
+                kka_rows,
+                y_rows,
+            )
+            return
+        torch.ops.rwkv7_wkv_fp16_v2.wkv(
+            query_start_loc,
+            slot_indices,
+            state,
+            r_rows,
+            w_rows,
+            w0,
+            k_rows,
+            v_rows,
+            neg_kk_rows,
+            kka_rows,
+            y_rows,
+            elapsed_t,
+        )
+
     def tmix(
         self,
         layer: int,
@@ -2074,6 +2122,8 @@ class RWKV7ForCausalLM(nn.Module):
         path: PathConfig,
         pre_mix=None,
         slot_indices: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
+        wkv_slot_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         z = self.z
         ops = torch.ops.rwkv7_fast_ops_fp16
@@ -2096,7 +2146,12 @@ class RWKV7ForCausalLM(nn.Module):
                 z[p + "x_g"],
             )
         else:
-            xr, xw, xk, xv, xa, xg = ops.tmix_mix6(
+            mix6 = (
+                ops.tmix_mix6_3d
+                if use_tmix_mix6_3d(B, T, self.hidden_size)
+                else ops.tmix_mix6
+            )
+            xr, xw, xk, xv, xa, xg = mix6(
                 B,
                 T,
                 self.hidden_size,
@@ -2127,111 +2182,28 @@ class RWKV7ForCausalLM(nn.Module):
         local_h = local_c // self.head_size
 
         y = torch.empty_like(r)
-        if self.wkv_mode == "fp32io16":
-            w_raw = ops.add_vec(local_c, w.contiguous(), z[p + "w0"])
-            if slot_indices is None:
-                torch.ops.rwkv7_wkv_fp32_v2.forward(
-                    B,
-                    T,
-                    local_c,
-                    local_h,
-                    wkv_state,
-                    r.contiguous(),
-                    w_raw.contiguous(),
-                    k.contiguous(),
-                    v.contiguous(),
-                    neg_kk.contiguous(),
-                    kka.contiguous(),
-                    y,
-                )
-            else:
-                torch.ops.rwkv7_wkv_fp32_v2.forward_slot(
-                    B,
-                    T,
-                    local_c,
-                    local_h,
-                    wkv_state,
-                    r.contiguous(),
-                    w_raw.contiguous(),
-                    k.contiguous(),
-                    v.contiguous(),
-                    neg_kk.contiguous(),
-                    kka.contiguous(),
-                    y,
-                    slot_indices,
-                )
-        elif T <= 16:
-            if slot_indices is None:
-                torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_w0(
-                    B,
-                    T,
-                    local_c,
-                    local_h,
-                    wkv_state,
-                    r.contiguous(),
-                    w.contiguous(),
-                    z[p + "w0"],
-                    k.contiguous(),
-                    v.contiguous(),
-                    neg_kk.contiguous(),
-                    kka.contiguous(),
-                    y,
-                    elapsed_t,
-                )
-            else:
-                torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_w0_slot(
-                    B,
-                    T,
-                    local_c,
-                    local_h,
-                    wkv_state,
-                    r.contiguous(),
-                    w.contiguous(),
-                    z[p + "w0"],
-                    k.contiguous(),
-                    v.contiguous(),
-                    neg_kk.contiguous(),
-                    kka.contiguous(),
-                    y,
-                    slot_indices,
-                    elapsed_t,
-                )
-        else:
-            w_raw = ops.add_vec(local_c, w.contiguous(), z[p + "w0"])
-            if slot_indices is None:
-                torch.ops.rwkv7_wkv_fp16_v2.wkv_seq(
-                    B,
-                    T,
-                    local_c,
-                    local_h,
-                    wkv_state,
-                    r.contiguous(),
-                    w_raw.contiguous(),
-                    k.contiguous(),
-                    v.contiguous(),
-                    neg_kk.contiguous(),
-                    kka.contiguous(),
-                    y,
-                    elapsed_t,
-                )
-            else:
-                torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_slot(
-                    B,
-                    T,
-                    local_c,
-                    local_h,
-                    wkv_state,
-                    r.contiguous(),
-                    w_raw.contiguous(),
-                    k.contiguous(),
-                    v.contiguous(),
-                    neg_kk.contiguous(),
-                    kka.contiguous(),
-                    y,
-                    slot_indices,
-                    elapsed_t,
-                )
-        y = ops.tmix_lnx_rkvres_xg(
+        if query_start_loc is None or wkv_slot_indices is None:
+            raise RuntimeError("RWKV7 WKV requires packed request metadata")
+        self._run_wkv(
+            query_start_loc,
+            wkv_slot_indices,
+            wkv_state,
+            r,
+            w,
+            z[p + "w0"],
+            k,
+            v,
+            neg_kk,
+            kka,
+            y,
+            elapsed_t,
+        )
+        lnx = (
+            ops.tmix_lnx_rkvres_xg_warp
+            if use_tmix_lnx_warp(B, T, local_c, local_h)
+            else ops.tmix_lnx_rkvres_xg
+        )
+        y = lnx(
             B,
             T,
             local_c,
@@ -2245,7 +2217,7 @@ class RWKV7ForCausalLM(nn.Module):
             z[p + "ln_x.bias"],
             g.contiguous(),
         )
-        out = self.linear(y, z[p + "output.weight"])
+        out = self.linear_att_c2c(y, z[p + "output.weight"], path.rows)
         return self._tp_all_reduce(out), v_first
 
     def cmix(
@@ -2273,7 +2245,10 @@ class RWKV7ForCausalLM(nn.Module):
             )
             return self.cmix_from_mixed(mixed, p, path)
 
-        mixed = ops.cmix_mix(
+        mix = (
+            ops.cmix_mix_3d if use_cmix_mix_3d(B, T, self.hidden_size) else ops.cmix_mix
+        )
+        mixed = mix(
             B, T, self.hidden_size, x.contiguous(), shift_state[1], z[p + "x_k"]
         )
         return self.cmix_from_mixed(mixed, p, path)
@@ -2284,16 +2259,42 @@ class RWKV7ForCausalLM(nn.Module):
         z = self.z
         ops = torch.ops.rwkv7_fast_ops_fp16
         B, T, _ = mixed.shape
-        hid = self.linear(mixed, z[p + "key.weight"])
         if path.cmix_mode == CMIX_B1T1_NOFC:
+            key_weight = z[p + "key.weight"]
+            value_weight = z[p + "value.weight"]
+            can_use_m1_splitk = (
+                mixed.numel() == mixed.size(-1) and key_weight.size(1) % 64 == 0
+            )
+            if path.rows in M1_CMIX_PREZERO_ROWS and can_use_m1_splitk:
+                hid, out = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk_prepare_zero(
+                    mixed.contiguous(),
+                    key_weight,
+                    self.hidden_size,
+                )
+                ops.cmix_sparse_down_relu_one_out(
+                    self.hidden_size,
+                    value_weight.size(0),
+                    hid.view(-1).contiguous(),
+                    value_weight,
+                    out,
+                )
+                return self._tp_all_reduce(out)
+            if can_use_m1_splitk:
+                hid = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(
+                    mixed.contiguous(),
+                    key_weight,
+                )
+            else:
+                hid = self.linear(mixed, key_weight)
             return self._tp_all_reduce(
                 ops.cmix_sparse_down_relu_one(
                     self.hidden_size,
-                    z[p + "value.weight"].size(0),
+                    value_weight.size(0),
                     hid.view(-1).contiguous(),
-                    z[p + "value.weight"],
+                    value_weight,
                 )
             )
+        hid = self.linear(mixed, z[p + "key.weight"])
         if path.cmix_mode == CMIX_ROWS2_NOFC:
             F = z[p + "value.weight"].size(0)
             if (
@@ -2323,7 +2324,9 @@ class RWKV7ForCausalLM(nn.Module):
             )
 
         k = ops.relu_square(hid.contiguous())
-        return self._tp_all_reduce(self.linear(k, z[p + "value.weight"]))
+        return self._tp_all_reduce(
+            self.linear_ffn_down(k, z[p + "value.weight"], path.rows)
+        )
 
     def linear(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         if x.numel() == x.size(-1) and weight.size(1) % 64 == 0:
@@ -2332,11 +2335,113 @@ class RWKV7ForCausalLM(nn.Module):
             x.contiguous(), weight, self.allow_fp16_accumulation
         )
 
+    def linear_att_c2c(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        rows: int,
+    ) -> torch.Tensor:
+        cfg = ATT_C2C_FP16_LT_4096.get(rows)
+        if (
+            self.allow_fp16_accumulation
+            and self.hidden_size == 4096
+            and tuple(weight.shape) == (4096, 4096)
+            and cfg is not None
+        ):
+            workspace_mb, heuristic_index = cfg
+            return torch.ops.rwkv7_v3a_ops.linear_f16_lt_cfg(
+                x.contiguous(),
+                weight,
+                workspace_mb,
+                heuristic_index,
+                False,
+            )
+        return self.linear(x, weight)
+
+    def project_att_rkv(
+        self,
+        xr: torch.Tensor,
+        xk: torch.Tensor,
+        xv: torch.Tensor,
+        p: str,
+        rows: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project exact-M1 R/K/V with shared launches and separate weights."""
+        weights = (
+            self.z[p + "receptance.weight"],
+            self.z[p + "key.weight"],
+            self.z[p + "value.weight"],
+        )
+        inputs = (xr, xk, xv)
+        weight_shape = tuple(weights[0].shape)
+        if (
+            rows in M1_RKV_GROUPED_ROWS
+            and all(value.numel() == value.size(-1) for value in inputs)
+            and all(tuple(weight.shape) == weight_shape for weight in weights)
+            and all(
+                value.size(-1) == weight.size(0)
+                for value, weight in zip(inputs, weights)
+            )
+            and weights[0].size(1) % 64 == 0
+        ):
+            return torch.ops.rwkv7_v3a_ops.linear_rkv_f16_m1_splitk(
+                *(value.contiguous() for value in inputs),
+                *weights,
+            )
+        if rows == 1:
+            # Keep the paired benchmark baseline pinned to the three independent
+            # split-K projections even if row-1 Lt tuning is added later.
+            return tuple(
+                self.linear(value, weight) for value, weight in zip(inputs, weights)
+            )
+        return tuple(
+            self.linear_att_c2c(value, weight, rows)
+            for value, weight in zip(inputs, weights)
+        )
+
+    def linear_ffn_down(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        rows: int,
+    ) -> torch.Tensor:
+        cfg = FFN_DOWN_FP16_LT_4096.get(rows)
+        if (
+            self.allow_fp16_accumulation
+            and self.hidden_size == 4096
+            and tuple(weight.shape) == (16384, 4096)
+            and cfg is not None
+        ):
+            workspace_mb, heuristic_index = cfg
+            return torch.ops.rwkv7_v3a_ops.linear_f16_lt_cfg(
+                x.contiguous(),
+                weight,
+                workspace_mb,
+                heuristic_index,
+                False,
+            )
+        return self.linear(x, weight)
+
     def linear_rank_in(
         self, x: torch.Tensor, weight: torch.Tensor, weight_t: torch.Tensor, rows: int
     ) -> torch.Tensor:
         if rows <= LOWRANK_IN_ROWS_T:
             return torch.ops.rwkv7_v3a_ops.linear_t_f16(x.contiguous(), weight_t)
+        cfg = LOWRANK_IN_FP16_LT_4096.get((rows, weight.size(1)))
+        if (
+            self.allow_fp16_accumulation
+            and self.hidden_size == 4096
+            and tuple(weight.shape) == (4096, weight.size(1))
+            and cfg is not None
+        ):
+            workspace_mb, heuristic_index = cfg
+            return torch.ops.rwkv7_v3a_ops.linear_f16_lt_cfg(
+                x.contiguous(),
+                weight,
+                workspace_mb,
+                heuristic_index,
+                False,
+            )
         return self.linear(x, weight)
 
     def linear_rank_out(
@@ -2344,6 +2449,21 @@ class RWKV7ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         if self.hidden_size >= LOWRANK_FUSED_MIN_C and rows <= LOWRANK_OUT_ROWS_T:
             return torch.ops.rwkv7_v3a_ops.linear_t_f16(x.contiguous(), weight_t)
+        cfg = LOWRANK_OUT_FP16_LT_4096.get((rows, weight.size(0)))
+        if (
+            self.allow_fp16_accumulation
+            and self.hidden_size == 4096
+            and tuple(weight.shape) == (weight.size(0), 4096)
+            and cfg is not None
+        ):
+            workspace_mb, heuristic_index = cfg
+            return torch.ops.rwkv7_v3a_ops.linear_f16_lt_cfg(
+                x.contiguous(),
+                weight,
+                workspace_mb,
+                heuristic_index,
+                False,
+            )
         return self.linear(x, weight)
 
     def linear_rank_out_act(
@@ -2364,7 +2484,7 @@ class RWKV7ForCausalLM(nn.Module):
             if act == 1
             else ops.act_sigmoid(x.contiguous())
         )
-        return self.linear(x, weight)
+        return self.linear_rank_out(x, weight, weight_t, rows)
 
     def add(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         return torch.ops.rwkv7_v3a_ops.add_f16(x.contiguous(), y.contiguous())

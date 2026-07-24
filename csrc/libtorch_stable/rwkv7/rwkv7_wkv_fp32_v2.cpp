@@ -1,27 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-// Adapted from BlinkDL/Albatross faster3a_2605/cuda at commit
-// 5e941fb1eeb7f735a562fb5bbb30fad19adc825b. Source:
-// https://github.com/BlinkDL/Albatross/tree/5e941fb1eeb7f735a562fb5bbb30fad19adc825b/faster3a_2605/cuda
-// Upstream license: Apache-2.0
-// (https://github.com/BlinkDL/Albatross/blob/5e941fb1eeb7f735a562fb5bbb30fad19adc825b/LICENSE).
 
 #include <torch/all.h>
 #include <torch/library.h>
 
-void wkv_fp32_v2_cuda(int B, int T, int C, int H, torch::Tensor state,
-                      torch::Tensor r, torch::Tensor w, torch::Tensor k,
-                      torch::Tensor v, torch::Tensor a, torch::Tensor b,
-                      torch::Tensor y, torch::Tensor slot_indices);
+#include <limits>
+#include <utility>
 
-void wkv_fp32_v2_cuda_varlen(int B, int max_t, int C, int H,
-                             torch::Tensor query_start_loc,
-                             torch::Tensor slot_indices, torch::Tensor state,
-                             torch::Tensor r, torch::Tensor w, torch::Tensor k,
-                             torch::Tensor v, torch::Tensor a, torch::Tensor b,
-                             torch::Tensor y);
+void wkv_fp32_cuda(int B, int C, int H, torch::Tensor query_start_loc,
+                   torch::Tensor slot_indices, torch::Tensor state,
+                   torch::Tensor r, torch::Tensor w, torch::Tensor k,
+                   torch::Tensor v, torch::Tensor a, torch::Tensor b,
+                   torch::Tensor y);
 
 namespace {
+
+constexpr int64_t HEAD_SIZE = 64;
 
 #ifdef _IO_FP16_
 constexpr auto IO_DTYPE = torch::kFloat16;
@@ -31,198 +25,86 @@ constexpr auto IO_DTYPE = torch::kFloat32;
 constexpr const char* IO_DTYPE_NAME = "fp32";
 #endif
 
-void check_float_cuda_contig(const torch::Tensor& x, const char* name) {
-  TORCH_CHECK(x.is_cuda(), name, " must be CUDA");
-  TORCH_CHECK(x.is_contiguous(), name, " must be contiguous");
-  TORCH_CHECK(x.scalar_type() == torch::kFloat32, name, " must be fp32");
+void check_cuda_contiguous(const torch::Tensor& tensor, torch::ScalarType dtype,
+                           const char* dtype_name, const char* name) {
+  TORCH_CHECK(tensor.is_cuda(), name, " must be CUDA");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+  TORCH_CHECK(tensor.scalar_type() == dtype, name, " must be ", dtype_name);
 }
 
-void check_io_cuda_contig(const torch::Tensor& x, const char* name) {
-  TORCH_CHECK(x.is_cuda(), name, " must be CUDA");
-  TORCH_CHECK(x.is_contiguous(), name, " must be contiguous");
-  TORCH_CHECK(x.scalar_type() == IO_DTYPE, name, " must be ", IO_DTYPE_NAME);
-}
-
-void check_i32_cuda_contig(const torch::Tensor& x, const char* name) {
-  TORCH_CHECK(x.is_cuda(), name, " must be CUDA");
-  TORCH_CHECK(x.is_contiguous(), name, " must be contiguous");
-  TORCH_CHECK(x.scalar_type() == torch::kInt32, name, " must be int32");
-}
-
-void check_inputs(int64_t B, int64_t T, int64_t C, int64_t H,
-                  torch::Tensor state, torch::Tensor r, torch::Tensor w,
-                  torch::Tensor k, torch::Tensor v, torch::Tensor a,
-                  torch::Tensor b, torch::Tensor y) {
-  TORCH_CHECK(C == H * 64, "only head size 64 is supported");
-  check_float_cuda_contig(state, "state");
-  check_io_cuda_contig(r, "r");
-  check_io_cuda_contig(w, "w");
-  check_io_cuda_contig(k, "k");
-  check_io_cuda_contig(v, "v");
-  check_io_cuda_contig(a, "a");
-  check_io_cuda_contig(b, "b");
-  check_io_cuda_contig(y, "y");
-  TORCH_CHECK(state.dim() == 4 && state.size(0) == B && state.size(1) == H &&
-                  state.size(2) == 64 && state.size(3) == 64,
-              "state must have shape [B,H,64,64]");
-  TORCH_CHECK(r.sizes() == w.sizes() && r.sizes() == k.sizes() &&
-                  r.sizes() == v.sizes() && r.sizes() == a.sizes() &&
-                  r.sizes() == b.sizes() && r.sizes() == y.sizes(),
-              "r,w,k,v,a,b,y shape mismatch");
-  TORCH_CHECK(
-      r.dim() == 3 && r.size(0) == B && r.size(1) == T && r.size(2) == C,
-      "r must have shape [B,T,C]");
-}
-
-void check_slot_indices(const torch::Tensor& x, int64_t B) {
-  check_i32_cuda_contig(x, "slot_indices");
-  TORCH_CHECK(x.dim() == 1 && x.size(0) == B,
-              "slot_indices must have shape [B]");
-}
-
-void check_query_start_loc(const torch::Tensor& x, int64_t B) {
-  check_i32_cuda_contig(x, "query_start_loc");
-  TORCH_CHECK(x.dim() == 1 && x.size(0) == B + 1,
-              "query_start_loc must have shape [B+1]");
-}
-
-void check_slot_inputs(int64_t B, int64_t T, int64_t C, int64_t H,
-                       torch::Tensor state, torch::Tensor r, torch::Tensor w,
-                       torch::Tensor k, torch::Tensor v, torch::Tensor a,
-                       torch::Tensor b, torch::Tensor y,
-                       torch::Tensor slot_indices) {
-  TORCH_CHECK(C == H * 64, "only head size 64 is supported");
-  check_float_cuda_contig(state, "state");
-  check_slot_indices(slot_indices, B);
-  check_io_cuda_contig(r, "r");
-  check_io_cuda_contig(w, "w");
-  check_io_cuda_contig(k, "k");
-  check_io_cuda_contig(v, "v");
-  check_io_cuda_contig(a, "a");
-  check_io_cuda_contig(b, "b");
-  check_io_cuda_contig(y, "y");
-  TORCH_CHECK(state.dim() == 4 && state.size(0) > 0 && state.size(1) == H &&
-                  state.size(2) == 64 && state.size(3) == 64,
-              "state must have shape [slots,H,64,64]");
-  TORCH_CHECK(r.sizes() == w.sizes() && r.sizes() == k.sizes() &&
-                  r.sizes() == v.sizes() && r.sizes() == a.sizes() &&
-                  r.sizes() == b.sizes() && r.sizes() == y.sizes(),
-              "r,w,k,v,a,b,y shape mismatch");
-  TORCH_CHECK(
-      r.dim() == 3 && r.size(0) == B && r.size(1) == T && r.size(2) == C,
-      "r must have shape [B,T,C]");
-}
-
-void check_varlen_inputs(int64_t B, int64_t total_tokens, int64_t max_t,
-                         int64_t C, int64_t H, torch::Tensor query_start_loc,
-                         torch::Tensor slot_indices, torch::Tensor state,
-                         torch::Tensor r, torch::Tensor w, torch::Tensor k,
-                         torch::Tensor v, torch::Tensor a, torch::Tensor b,
-                         torch::Tensor y) {
-  TORCH_CHECK(B > 0 && max_t > 0 && total_tokens > 0,
-              "B, max_t, and total_tokens must be positive");
-  TORCH_CHECK(C == H * 64, "only head size 64 is supported");
-  check_float_cuda_contig(state, "state");
-  check_query_start_loc(query_start_loc, B);
-  check_slot_indices(slot_indices, B);
-  check_io_cuda_contig(r, "r");
-  check_io_cuda_contig(w, "w");
-  check_io_cuda_contig(k, "k");
-  check_io_cuda_contig(v, "v");
-  check_io_cuda_contig(a, "a");
-  check_io_cuda_contig(b, "b");
-  check_io_cuda_contig(y, "y");
-  TORCH_CHECK(state.dim() == 4 && state.size(0) > 0 && state.size(1) == H &&
-                  state.size(2) == 64 && state.size(3) == 64,
-              "state must have shape [slots,H,64,64]");
-  TORCH_CHECK(r.sizes() == w.sizes() && r.sizes() == k.sizes() &&
-                  r.sizes() == v.sizes() && r.sizes() == a.sizes() &&
-                  r.sizes() == b.sizes() && r.sizes() == y.sizes(),
-              "r,w,k,v,a,b,y shape mismatch");
-  TORCH_CHECK(r.dim() == 2 && r.size(0) == total_tokens && r.size(1) == C,
-              "r must have shape [total_tokens,C]");
+void check_same_device(const torch::Tensor& reference,
+                       const torch::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device() == reference.device(), name,
+              " must be on the same device as state");
 }
 
 }  // namespace
 
-void forward_impl(int64_t B, int64_t T, int64_t C, int64_t H,
-                  torch::Tensor state, torch::Tensor r, torch::Tensor w,
-                  torch::Tensor k, torch::Tensor v, torch::Tensor a,
-                  torch::Tensor b, torch::Tensor y) {
-  check_inputs(B, T, C, H, state, r, w, k, v, a, b, y);
-  torch::Tensor slot_indices;
-  wkv_fp32_v2_cuda(static_cast<int>(B), static_cast<int>(T),
-                   static_cast<int>(C), static_cast<int>(H), state, r, w, k, v,
-                   a, b, y, slot_indices);
-}
+void wkv(torch::Tensor query_start_loc, torch::Tensor slot_indices,
+         torch::Tensor state, torch::Tensor r, torch::Tensor w, torch::Tensor k,
+         torch::Tensor v, torch::Tensor a, torch::Tensor b, torch::Tensor y) {
+  check_cuda_contiguous(query_start_loc, torch::kInt32, "int32",
+                        "query_start_loc");
+  check_cuda_contiguous(slot_indices, torch::kInt32, "int32", "slot_indices");
+  check_cuda_contiguous(state, torch::kFloat32, "fp32", "state");
+  check_cuda_contiguous(r, IO_DTYPE, IO_DTYPE_NAME, "r");
+  check_cuda_contiguous(w, IO_DTYPE, IO_DTYPE_NAME, "w");
+  check_cuda_contiguous(k, IO_DTYPE, IO_DTYPE_NAME, "k");
+  check_cuda_contiguous(v, IO_DTYPE, IO_DTYPE_NAME, "v");
+  check_cuda_contiguous(a, IO_DTYPE, IO_DTYPE_NAME, "a");
+  check_cuda_contiguous(b, IO_DTYPE, IO_DTYPE_NAME, "b");
+  check_cuda_contiguous(y, IO_DTYPE, IO_DTYPE_NAME, "y");
 
-void forward_slot_impl(int64_t B, int64_t T, int64_t C, int64_t H,
-                       torch::Tensor state, torch::Tensor r, torch::Tensor w,
-                       torch::Tensor k, torch::Tensor v, torch::Tensor a,
-                       torch::Tensor b, torch::Tensor y,
-                       torch::Tensor slot_indices) {
-  check_slot_inputs(B, T, C, H, state, r, w, k, v, a, b, y, slot_indices);
-  wkv_fp32_v2_cuda(static_cast<int>(B), static_cast<int>(T),
-                   static_cast<int>(C), static_cast<int>(H), state, r, w, k, v,
-                   a, b, y, slot_indices);
-}
+  const int64_t batch_size = slot_indices.numel();
+  TORCH_CHECK(batch_size > 0 && batch_size <= 65535,
+              "slot_indices must contain 1..65535 requests");
+  TORCH_CHECK(slot_indices.dim() == 1, "slot_indices must have shape [B]");
+  TORCH_CHECK(
+      query_start_loc.dim() == 1 && query_start_loc.size(0) == batch_size + 1,
+      "query_start_loc must have shape [B+1]");
+  TORCH_CHECK(state.dim() == 4 && state.size(0) > 0 &&
+                  state.size(2) == HEAD_SIZE && state.size(3) == HEAD_SIZE,
+              "state must have shape [slots,H,64,64]");
+  const int64_t head_count = state.size(1);
+  const int64_t hidden_size = head_count * HEAD_SIZE;
+  TORCH_CHECK(head_count > 0 && head_count <= std::numeric_limits<int>::max(),
+              "head count must be positive int32");
+  TORCH_CHECK(hidden_size <= std::numeric_limits<int>::max(),
+              "hidden size must fit in int32");
+  TORCH_CHECK(r.dim() == 2 && r.size(0) > 0 && r.size(1) == hidden_size,
+              "r must have shape [total_tokens,C]");
+  TORCH_CHECK(r.sizes() == w.sizes() && r.sizes() == k.sizes() &&
+                  r.sizes() == v.sizes() && r.sizes() == a.sizes() &&
+                  r.sizes() == b.sizes() && r.sizes() == y.sizes(),
+              "r,w,k,v,a,b,y shape mismatch");
+  TORCH_CHECK(r.size(0) <= std::numeric_limits<int>::max() / hidden_size,
+              "packed token indexing exceeds signed int32");
 
-void forward_varlen_impl(int64_t B, int64_t total_tokens, int64_t max_t,
-                         int64_t C, int64_t H,
-                         torch::Tensor query_start_loc,
-                         torch::Tensor slot_indices, torch::Tensor state,
-                         torch::Tensor r, torch::Tensor w, torch::Tensor k,
-                         torch::Tensor v, torch::Tensor a, torch::Tensor b,
-                         torch::Tensor y) {
-  check_varlen_inputs(B, total_tokens, max_t, C, H, query_start_loc,
-                      slot_indices, state, r, w, k, v, a, b, y);
-  wkv_fp32_v2_cuda_varlen(static_cast<int>(B), static_cast<int>(max_t),
-                          static_cast<int>(C), static_cast<int>(H),
-                          query_start_loc, slot_indices, state, r, w, k, v, a, b,
-                          y);
-}
+  for (const auto& item :
+       {std::pair<const torch::Tensor*, const char*>(&query_start_loc,
+                                                     "query_start_loc"),
+        std::pair<const torch::Tensor*, const char*>(&slot_indices,
+                                                     "slot_indices"),
+        std::pair<const torch::Tensor*, const char*>(&r, "r"),
+        std::pair<const torch::Tensor*, const char*>(&w, "w"),
+        std::pair<const torch::Tensor*, const char*>(&k, "k"),
+        std::pair<const torch::Tensor*, const char*>(&v, "v"),
+        std::pair<const torch::Tensor*, const char*>(&a, "a"),
+        std::pair<const torch::Tensor*, const char*>(&b, "b"),
+        std::pair<const torch::Tensor*, const char*>(&y, "y")}) {
+    check_same_device(state, *item.first, item.second);
+  }
 
-void forward(int64_t B, int64_t T, int64_t C, int64_t H, torch::Tensor state,
-             torch::Tensor r, torch::Tensor w, torch::Tensor k, torch::Tensor v,
-             torch::Tensor a, torch::Tensor b, torch::Tensor y) {
-  forward_impl(B, T, C, H, state, r, w, k, v, a, b, y);
-}
-
-void forward_slot(int64_t B, int64_t T, int64_t C, int64_t H,
-                  torch::Tensor state, torch::Tensor r, torch::Tensor w,
-                  torch::Tensor k, torch::Tensor v, torch::Tensor a,
-                  torch::Tensor b, torch::Tensor y,
-                  torch::Tensor slot_indices) {
-  forward_slot_impl(B, T, C, H, state, r, w, k, v, a, b, y, slot_indices);
-}
-
-void forward_varlen(int64_t B, int64_t total_tokens, int64_t max_t, int64_t C,
-                    int64_t H, torch::Tensor query_start_loc,
-                    torch::Tensor slot_indices, torch::Tensor state,
-                    torch::Tensor r, torch::Tensor w, torch::Tensor k,
-                    torch::Tensor v, torch::Tensor a, torch::Tensor b,
-                    torch::Tensor y) {
-  forward_varlen_impl(B, total_tokens, max_t, C, H, query_start_loc,
-                      slot_indices, state, r, w, k, v, a, b, y);
+  wkv_fp32_cuda(static_cast<int>(batch_size), static_cast<int>(hidden_size),
+                static_cast<int>(head_count), query_start_loc, slot_indices,
+                state, r, w, k, v, a, b, y);
 }
 
 TORCH_LIBRARY(rwkv7_wkv_fp32_v2, m) {
   m.def(
-      "forward(int B, int T, int C, int H, Tensor(a!) state, Tensor r, Tensor "
-      "w, Tensor k, Tensor v, Tensor a, Tensor b, Tensor(a!) y) -> ()");
-  m.def(
-      "forward_slot(int B, int T, int C, int H, Tensor(a!) state, Tensor r, "
-      "Tensor w, Tensor k, Tensor v, Tensor a, Tensor b, Tensor(a!) y, "
-      "Tensor slot_indices) -> ()");
-  m.def(
-      "forward_varlen(int B, int total_tokens, int max_t, int C, int H, "
-      "Tensor query_start_loc, Tensor slot_indices, Tensor(a!) state, Tensor "
-      "r, Tensor w, Tensor k, Tensor v, Tensor a, Tensor b, Tensor(a!) y) -> "
-      "()");
+      "wkv(Tensor query_start_loc, Tensor slot_indices, Tensor(a!) state, "
+      "Tensor r, Tensor w, Tensor k, Tensor v, Tensor a, Tensor b, "
+      "Tensor(b!) y) -> ()");
 }
 
-TORCH_LIBRARY_IMPL(rwkv7_wkv_fp32_v2, CUDA, m) {
-  m.impl("forward", &forward);
-  m.impl("forward_slot", &forward_slot);
-  m.impl("forward_varlen", &forward_varlen);
-}
+TORCH_LIBRARY_IMPL(rwkv7_wkv_fp32_v2, CUDA, m) { m.impl("wkv", &wkv); }

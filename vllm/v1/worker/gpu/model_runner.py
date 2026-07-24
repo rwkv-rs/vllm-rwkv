@@ -1335,8 +1335,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Update the EPLB meta.
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
+        # A recurrent model can reject a replay when runtime state rows do not
+        # match the static graph (for example, after a request leaves a hole).
+        use_full_cudagraph = batch_desc.cg_mode == CUDAGraphMode.FULL
+        can_replay_full_cudagraph = getattr(
+            self.model_state,
+            "can_replay_full_cudagraph",
+            None,
+        )
+        if use_full_cudagraph and callable(can_replay_full_cudagraph):
+            use_full_cudagraph = bool(can_replay_full_cudagraph(model_inputs))
+
         # Run model.
-        if batch_desc.cg_mode == CUDAGraphMode.FULL:
+        if use_full_cudagraph:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
@@ -1350,6 +1361,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
+            runtime_cg_mode = (
+                CUDAGraphMode.NONE
+                if batch_desc.cg_mode == CUDAGraphMode.FULL
+                else batch_desc.cg_mode
+            )
             batch_descriptor = BatchDescriptor(
                 num_tokens=input_batch.num_tokens_after_padding,
                 has_lora=self.lora_config is not None,
@@ -1360,7 +1376,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 attn_metadata,
                 self.vllm_config,
                 num_tokens=input_batch.num_tokens_after_padding,
-                cudagraph_runtime_mode=batch_desc.cg_mode,
+                cudagraph_runtime_mode=runtime_cg_mode,
                 num_tokens_across_dp=num_tokens_across_dp,
                 batch_descriptor=batch_descriptor,
                 slot_mapping=slot_mappings_by_layer,
@@ -1368,7 +1384,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 is_padding=input_batch.is_padding,
             ):
                 self.kv_connector.pre_forward(scheduler_output)
-                if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                if runtime_cg_mode == CUDAGraphMode.PIECEWISE:
                     # Run the PIECEWISE graph (compiled PW cudagraph or breakable
                     # cudagraph, chosen inside run_pw_graph). cg_mode is only
                     # PIECEWISE after the cudagraph manager exists.

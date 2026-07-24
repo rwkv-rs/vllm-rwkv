@@ -13,7 +13,6 @@ import gc
 import json
 import math
 import os
-import socket
 import subprocess
 import sys
 import time
@@ -30,22 +29,28 @@ if str(REPO_ROOT) not in sys.path:
 SCHEMA_VERSION = 1
 BENCHMARK_NAME = "rwkv7_faster3a"
 ALBATROSS_REPO = "https://github.com/BlinkDL/Albatross"
-ALBATROSS_COMMIT = "6af325aba3ee477bc1f59ef506375da550c2ef74"
+ALBATROSS_COMMIT = "ee3308f6922e59f2166c7fac3c5a192340a2b48e"
 ALBATROSS_RACE_FIX = "ff144b6b11e01ac984ed05ca7f7af4dfdca97180"
 ALBATROSS_2607_COMMIT = "63c53f4abf2cd891dd3a18c8f44f5b2cccc8c64b"
 ALBATROSS_IMPL = "faster3a_2607"
-RUNNER_FP16_THROUGHPUT_REQUIREMENTS = {
+RUNNER_RUNTIME_ENV_REQUIREMENTS = {
     "VLLM_RWKV7_WKV_MODE": "fp16",
-    "VLLM_RWKV7_ALLOW_FP16_ACCUMULATION": "1",
-    "VLLM_RWKV7_EMB_DEVICE": "gpu",
-    "VLLM_RWKV7_SLOT_MAPPED_STATE": "1",
-    "VLLM_RWKV7_RKV_MODE": "off",
-    "VLLM_RWKV7_CMIX_SPARSE": "no-fc",
-    "VLLM_RWKV7_LOW_RANK_WEIGHT": "both",
-    "VLLM_RWKV7_ORIG_LINEAR_GROUPS": "none",
     "VLLM_USE_RAPID_SAMPLER": "1",
     "VLLM_USE_V2_MODEL_RUNNER": "1",
     "VLLM_ALLOW_INSECURE_SERIALIZATION": "1",
+}
+# These are fixed implementation semantics, not user-selectable vLLM
+# environment variables. Keep them in benchmark provenance so the measured
+# model contract remains explicit after the legacy runtime branches are gone.
+RUNNER_FIXED_MODEL_CONTRACT = {
+    "allow_fp16_accumulation": True,
+    "embedding_device": "gpu",
+    "rkv_mode": "off",
+    "cmix_sparse": "no-fc",
+    "low_rank_weight": "both",
+    "orig_linear_groups": "none",
+    "slot_mapped_state": True,
+    "v2_kernel_warmup_policy": "skip_rwkv7",
 }
 RUNNER_BASELINE_TOKENS_PER_S = 9712.562
 RUNNER_MAX_REGRESSION_PCT = 1.0
@@ -62,17 +67,26 @@ VLLM_RUNNER_SAMPLING = {
     "ignore_eos": True,
     "detokenize": False,
 }
-BENCHMARK_ONLY_VLLM_ENV_VARS = ("VLLM_RWKV7_MODEL",)
-PROVENANCE_ENV_VARS = (
-    "VLLM_RWKV7_MODEL",
-    *RUNNER_FP16_THROUGHPUT_REQUIREMENTS,
+# The outer benchmark launcher can still provide these historical variables,
+# but vLLM deliberately rejects them because their model behavior is fixed.
+LEGACY_FIXED_MODEL_ENV_VARS = (
+    "VLLM_RWKV7_ALLOW_FP16_ACCUMULATION",
+    "VLLM_RWKV7_EMB_DEVICE",
+    "VLLM_RWKV7_RKV_MODE",
+    "VLLM_RWKV7_CMIX_SPARSE",
+    "VLLM_RWKV7_LOW_RANK_WEIGHT",
+    "VLLM_RWKV7_ORIG_LINEAR_GROUPS",
+    "VLLM_RWKV7_SLOT_MAPPED_STATE",
+    "VLLM_RWKV7_SKIP_V2_KERNEL_WARMUP",
 )
-PROVENANCE_ENV_DEFAULTS = {
-    "VLLM_RWKV7_WKV_MODE": "fp16",
-    "VLLM_USE_RAPID_SAMPLER": "1",
-    "VLLM_USE_V2_MODEL_RUNNER": "1",
-    "VLLM_ALLOW_INSECURE_SERIALIZATION": "1",
-}
+# The model path is a benchmark input rather than a vLLM runtime option. Strip
+# it together with the legacy fixed-model variables before importing vLLM.
+UNREGISTERED_BENCHMARK_ENV_VARS = (
+    "VLLM_RWKV7_MODEL",
+    *LEGACY_FIXED_MODEL_ENV_VARS,
+)
+PROVENANCE_ENV_VARS = tuple(RUNNER_RUNTIME_ENV_REQUIREMENTS)
+PROVENANCE_ENV_DEFAULTS = dict(RUNNER_RUNTIME_ENV_REQUIREMENTS)
 ACCEPTANCE_THRESHOLDS = {
     "runner_steady_decode": {
         "min_runner_tokens_per_s": RUNNER_MIN_TOKENS_PER_S,
@@ -117,22 +131,22 @@ SOURCE_PROVENANCE = (
     SourceProvenanceEntry(
         source_path=f"{ALBATROSS_IMPL}/cuda/rwkv7_wkv_fp16_v2.cpp",
         target_path="csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp16_v2.cpp",
-        correspondence="cuda-source-port",
+        correspondence="packed-varlen-derived",
     ),
     SourceProvenanceEntry(
         source_path=f"{ALBATROSS_IMPL}/cuda/rwkv7_wkv_fp16_v2.cu",
         target_path="csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp16_v2.cu",
-        correspondence="cuda-source-port",
+        correspondence="packed-varlen-derived",
     ),
     SourceProvenanceEntry(
         source_path=f"{ALBATROSS_IMPL}/cuda/rwkv7_wkv_fp32_v2.cpp",
         target_path="csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp32_v2.cpp",
-        correspondence="cuda-source-port",
+        correspondence="packed-varlen-derived",
     ),
     SourceProvenanceEntry(
         source_path=f"{ALBATROSS_IMPL}/cuda/rwkv7_wkv_fp32_v2.cu",
         target_path="csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp32_v2.cu",
-        correspondence="cuda-source-port",
+        correspondence="packed-varlen-derived",
     ),
 )
 
@@ -292,10 +306,10 @@ def _rwkv_environment_metadata() -> dict[str, str | None]:
 
 
 @contextmanager
-def _without_benchmark_only_vllm_env_vars():
+def _without_unregistered_benchmark_env_vars():
     saved = {
         name: os.environ.pop(name)
-        for name in BENCHMARK_ONLY_VLLM_ENV_VARS
+        for name in UNREGISTERED_BENCHMARK_ENV_VARS
         if name in os.environ
     }
     try:
@@ -310,6 +324,7 @@ def _benchmark_provenance(config: BenchmarkConfig) -> dict[str, Any]:
         "cuda": _cuda_device_metadata(),
         "env": _rwkv_environment_metadata(),
         "raw_env": _rwkv_environment_raw_metadata(),
+        "fixed_model_contract": dict(RUNNER_FIXED_MODEL_CONTRACT),
         "workload": {
             "batch_size": config.batch_size,
             "prompt_len": config.prompt_len,
@@ -393,8 +408,7 @@ def _duration_ms_summary(durations_s: list[float]) -> dict[str, float | None]:
     if not durations_s:
         return {f"p{p}_ms": None for p in (10, 50, 90)}
     return {
-        f"p{p}_ms": _percentile(durations_s, p / 100) * 1000.0
-        for p in (10, 50, 90)
+        f"p{p}_ms": _percentile(durations_s, p / 100) * 1000.0 for p in (10, 50, 90)
     }
 
 
@@ -410,14 +424,19 @@ def _phase_throughput_summary(
     unit_tokens: list[int],
 ) -> dict[str, Any]:
     total_duration_s = sum(iteration_durations_s)
-    iteration_tokens = total_tokens // len(iteration_durations_s) if iteration_durations_s else 0
+    iteration_tokens = (
+        total_tokens // len(iteration_durations_s) if iteration_durations_s else 0
+    )
     peak_iteration = (
         max(_tokens_per_second(iteration_tokens, d) for d in iteration_durations_s)
         if iteration_durations_s
         else None
     )
     peak_unit = (
-        max(_tokens_per_second(tokens, d) for tokens, d in zip(unit_tokens, unit_durations_s))
+        max(
+            _tokens_per_second(tokens, d)
+            for tokens, d in zip(unit_tokens, unit_durations_s)
+        )
         if unit_durations_s
         else None
     )
@@ -455,10 +474,6 @@ def _create_vllm_runner_llm(config: BenchmarkConfig) -> Any:
     os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "1")
 
-    import vllm.rwkv7_ops  # noqa: F401
-
-    from vllm import LLM
-
     max_model_len = max(1, config.prompt_len + config.decode_tokens)
     max_num_seqs = max(1, config.batch_size)
     prefill_chunk_tokens = _runner_prefill_chunk_tokens(config)
@@ -477,7 +492,11 @@ def _create_vllm_runner_llm(config: BenchmarkConfig) -> Any:
         llm_kwargs["compilation_config"] = {
             "cudagraph_capture_sizes": capture_sizes,
         }
-    with _without_benchmark_only_vllm_env_vars():
+    with _without_unregistered_benchmark_env_vars():
+        import vllm.rwkv7_ops  # noqa: F401
+
+        from vllm import LLM
+
         return LLM(
             model=_required_vllm_runner_model(config),
             skip_tokenizer_init=True,
@@ -1544,6 +1563,7 @@ def generate_vllm_runner_measurement(
     return {
         "schema_version": SCHEMA_VERSION,
         "benchmark": BENCHMARK_NAME,
+        "source": _source_metadata(runner_config),
         "runner_steady_decode": runner_metrics,
         "config": {
             "repo_root": str(config.repo_root),
@@ -1560,22 +1580,39 @@ def _runner_throughput_contract_blocker(
     config = measurements.get("config")
     provenance = config.get("provenance") if isinstance(config, dict) else None
     raw_env = provenance.get("raw_env") if isinstance(provenance, dict) else None
-    if not isinstance(raw_env, dict) or any(
-        name not in raw_env for name in RUNNER_FP16_THROUGHPUT_REQUIREMENTS
+    fixed_model_contract = (
+        provenance.get("fixed_model_contract") if isinstance(provenance, dict) else None
+    )
+    if (
+        not isinstance(raw_env, dict)
+        or any(name not in raw_env for name in RUNNER_RUNTIME_ENV_REQUIREMENTS)
+        or not isinstance(fixed_model_contract, dict)
+        or any(name not in fixed_model_contract for name in RUNNER_FIXED_MODEL_CONTRACT)
     ):
         return _blocker(
             "missing_runner_throughput_provenance",
-            "Runner performance acceptance requires retained precision provenance.",
+            "Runner performance acceptance requires runtime environment and "
+            "fixed model contract provenance.",
         )
 
     violations = {
-        name: {
+        f"runtime_env.{name}": {
             "required": required,
             "actual": raw_env[name],
         }
-        for name, required in RUNNER_FP16_THROUGHPUT_REQUIREMENTS.items()
+        for name, required in RUNNER_RUNTIME_ENV_REQUIREMENTS.items()
         if raw_env[name] != required
     }
+    violations.update(
+        {
+            f"fixed_model_contract.{name}": {
+                "required": required,
+                "actual": fixed_model_contract[name],
+            }
+            for name, required in RUNNER_FIXED_MODEL_CONTRACT.items()
+            if fixed_model_contract[name] != required
+        }
+    )
     if violations:
         return _blocker(
             "invalid_runner_throughput_contract",
@@ -1844,9 +1881,8 @@ def _measurement_exit_code(measurement: dict[str, Any]) -> int:
         return 2
     return int(
         not math.isfinite(tokens_per_s)
-        or tokens_per_s < ACCEPTANCE_THRESHOLDS["runner_steady_decode"][
-            "min_runner_tokens_per_s"
-        ]
+        or tokens_per_s
+        < ACCEPTANCE_THRESHOLDS["runner_steady_decode"]["min_runner_tokens_per_s"]
     )
 
 

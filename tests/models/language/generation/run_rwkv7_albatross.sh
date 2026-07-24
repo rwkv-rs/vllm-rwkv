@@ -21,7 +21,11 @@ fi
 
 export ALBATROSS_ROOT="${ALBATROSS_ROOT:-${HOME}/Projects/MachineLearning/albatross}"
 export ALBATROSS_IMPL="${ALBATROSS_IMPL:-faster3a_2607}"
+export ALBATROSS_REVISION="${ALBATROSS_REVISION:-ee3308f6922e59f2166c7fac3c5a192340a2b48e}"
 export VLLM_RWKV7_WKV_MODE="${VLLM_RWKV7_WKV_MODE:-fp32io16}"
+export VLLM_USE_V2_MODEL_RUNNER=1
+export VLLM_USE_RAPID_SAMPLER=1
+export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 export RWKV7_ALBATROSS_MAX_MODEL_LEN="${RWKV7_ALBATROSS_MAX_MODEL_LEN:-1024}"
 export RWKV7_ALBATROSS_GPU_MEMORY_UTILIZATION="${RWKV7_ALBATROSS_GPU_MEMORY_UTILIZATION:-0.70}"
 export RWKV7_ALBATROSS_ENABLE_FLASHINFER_AUTOTUNE="${RWKV7_ALBATROSS_ENABLE_FLASHINFER_AUTOTUNE:-0}"
@@ -42,7 +46,7 @@ if (( ${#missing[@]} > 0 )); then
   printf 'Missing required RWKV7 Albatross test environment variables:\n' >&2
   printf '  %s\n' "${missing[@]}" >&2
   printf '\nCreate .env or set RWKV7_ALBATROSS_ENV_FILE to a file with:\n' >&2
-  printf '  VLLM_RWKV7_MODEL=/path/to/rwkv7-g1g-1.5b-20260526-ctx8192.pth\n' >&2
+  printf '  VLLM_RWKV7_MODEL=/path/to/rwkv7-g1h-7.2b-20260710-ctx10240.pth\n' >&2
   printf '  # Optional: ALBATROSS_PTH=/path/to/same-rwkv7.pth\n' >&2
   printf '  # Optional: RWKV7_ALBATROSS_TENSOR_PARALLEL_SIZE=2\n' >&2
   printf '  # Optional: RWKV7_ALBATROSS_PIPELINE_PARALLEL_SIZE=2\n' >&2
