@@ -22,14 +22,6 @@ RWKV_GENERATION_PROMPT_MODES = (
 )
 
 _BLANK_LINES_RE = re.compile(r"\n{2,}")
-_DAPO_MATH_PROMPT_PREFIX_RE = re.compile(
-    r"\A\s*Solve the following math problem step by step\.\s*"
-    r"The last line of your response should be of the form Answer: \$Answer "
-    r"\(without quotes\) where \$Answer is the answer to the problem\.\s*\n",
-)
-_DAPO_MATH_PROMPT_SUFFIX_RE = re.compile(
-    r'\n\s*Remember to put your answer on its own line after "Answer:"\.?\s*\Z',
-)
 
 
 def normalize_rwkv_message_content(content: Any) -> str:
@@ -55,12 +47,6 @@ def normalize_rwkv_message_content(content: Any) -> str:
 
     text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     return _BLANK_LINES_RE.sub("\n", text)
-
-
-def simplify_rwkv_math_prompt(text: str) -> str:
-    text = _DAPO_MATH_PROMPT_PREFIX_RE.sub("", text)
-    text = _DAPO_MATH_PROMPT_SUFFIX_RE.sub("", text)
-    return text.strip()
 
 
 def render_rwkv_chat_template(
@@ -145,8 +131,6 @@ def _render_basic_chat(
     for message in messages:
         role = _field(message, "role", "")
         content = normalize_rwkv_message_content(_field(message, "content", ""))
-        if role == "user":
-            content = simplify_rwkv_math_prompt(content)
         if role == "system":
             label = "System"
         elif role == "user":
@@ -176,8 +160,6 @@ def _render_tool_chat(
     for message in messages:
         role = _field(message, "role", "")
         content = normalize_rwkv_message_content(_field(message, "content", ""))
-        if role == "user":
-            content = simplify_rwkv_math_prompt(content)
 
         if role == "system":
             pending_system.append(content)

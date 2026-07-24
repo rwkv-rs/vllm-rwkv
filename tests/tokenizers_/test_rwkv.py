@@ -136,26 +136,17 @@ def test_rwkv_chat_template_can_render_fake_think_generation_prompt():
     assert rendered == "User: Hi\n\nAssistant: <think></think"
 
 
-def test_rwkv_chat_template_strips_dapo_math_prompt_wrapper():
+def test_rwkv_chat_template_preserves_raw_user_content():
     tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
     problem = "已知 x+y=3, 求 x。"
-    wrapped_problem = (
-        "Solve the following math problem step by step. The last line of your "
-        "response should be of the form "
-        "Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n"
-        f"{problem}\n"
-        'Remember to put your answer on its own line after "Answer:".'
-    )
 
     rendered = tokenizer.apply_chat_template(
-        [{"role": "user", "content": wrapped_problem}],
+        [{"role": "user", "content": problem}],
         tokenize=False,
         add_generation_prompt=True,
     )
 
     assert rendered == f"User: {problem}\n\nAssistant: <think"
-    assert "Solve the following math problem" not in rendered
-    assert "Remember to put your answer" not in rendered
 
 
 def test_rwkv_chat_template_renders_tools_and_tool_outputs_from_training_template():
