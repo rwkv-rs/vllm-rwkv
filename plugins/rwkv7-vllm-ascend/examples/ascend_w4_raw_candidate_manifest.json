@@ -1,0 +1,103 @@
+{
+  "acceptance_scope": "raw-kernel-candidate-only",
+  "activation_dtype": "float16",
+  "admitted_rows": [
+    1,
+    8
+  ],
+  "backend": "vllm",
+  "bit": 4,
+  "ffn": {
+    "key_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31
+    ],
+    "value_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31
+    ]
+  },
+  "format": "rwkv7-ascend-ffn-weight-only-v1",
+  "group_size": 128,
+  "operator_schema_sha256": "f99a37dcc4e7d07f803bb83ce3d4c93ccbd15c41af1267d5a07dcc0d62e7dff0",
+  "production_accepted": false,
+  "source": "fp-checkpoint",
+  "tensors": {},
+  "verified_ffn_shapes": [
+    [
+      4096,
+      16384
+    ],
+    [
+      16384,
+      4096
+    ]
+  ],
+  "verified_stack": {
+    "cann_version": "8.5.0",
+    "device_name": "Ascend910B3",
+    "torch_npu_version": "2.9.0",
+    "torch_version": "2.9.0"
+  },
+  "version": 1
+}

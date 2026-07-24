@@ -1,0 +1,12 @@
+Model: /data/models/fla-hub-rwkv7-7.2B-g0a
+Validation: safetensors headers versus meta-constructed RWKV7ForCausalLM
+Parameters: 7,199,141,888
+Checkpoint keys: 1059
+Plugin parameter keys: 1059
+Missing keys: 0
+Unexpected keys: 0
+Shape mismatches: 0
+Recurrent per-layer cache:
+  wkv fp32 [64,64,64]
+  attention previous-x bf16 [4096]
+  FFN previous-x bf16 [4096]

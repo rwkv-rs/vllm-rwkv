@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rwkv7-vllm-ascend"
+version = "0.3.0"
+description = "Out-of-tree RWKV-7 model plugin for vLLM V1 on Ascend"
+requires-python = ">=3.10,<3.12"
+dependencies = []
+
+[project.entry-points."vllm.general_plugins"]
+rwkv7_ascend_model = "rwkv7_vllm_ascend.plugin:register"
+
+[tool.setuptools.packages.find]
+include = ["rwkv7_vllm_ascend*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests_vllm"]
+markers = ["integration: requires installed vLLM", "npu: requires Ascend NPU"]

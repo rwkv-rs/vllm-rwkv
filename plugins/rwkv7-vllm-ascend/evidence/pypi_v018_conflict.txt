@@ -1,0 +1,22 @@
+Host: Ascend 910B3, CANN 8.5.0, Python 3.11
+Observed: 2026-07-24
+
+Command:
+  pip install vllm==0.18.0 vllm-ascend==0.18.0
+
+Resolver result:
+  ERROR: Cannot install vllm-ascend==0.18.0 and vllm==0.18.0 because
+  these package versions have conflicting dependencies.
+
+  vllm 0.18.0 depends on torch==2.10.0
+  vllm-ascend 0.18.0 depends on torch==2.9.0
+
+Additional metadata mismatch:
+  vllm 0.18.0: opencv-python-headless>=4.13.0
+  vllm-ascend 0.18.0: opencv-python-headless<=4.11.0.86
+
+The vllm-ascend wheel metadata itself documents CANN 8.5.0,
+PyTorch 2.9.0 and torch-npu 2.9.0. The compatibility environment therefore
+installs the vLLM wheel without dependencies and resolves against the
+vendor-matched torch 2.9 stack. All imports/tests must still pass; this record
+does not claim the upstream packaging issue is fixed.

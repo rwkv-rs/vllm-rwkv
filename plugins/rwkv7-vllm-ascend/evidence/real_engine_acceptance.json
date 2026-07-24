@@ -1,0 +1,127 @@
+{
+  "chunk_gate": {
+    "long_input_tokens": 180,
+    "max_num_batched_tokens": 32,
+    "minimum_prefill_steps": 6
+  },
+  "config": {
+    "block_size": 128,
+    "disable_log_stats": true,
+    "dtype": "bfloat16",
+    "enable_chunked_prefill": true,
+    "enable_prefix_caching": false,
+    "enforce_eager": true,
+    "gpu_memory_utilization": 0.45,
+    "max_model_len": 256,
+    "max_num_batched_tokens": 32,
+    "max_num_seqs": 4,
+    "num_gpu_blocks_override": 4,
+    "trust_remote_code": true
+  },
+  "engine": "vllm-v1-ascend",
+  "evidence_sha256": {
+    "evidence/real_engine_acceptance_final.log": "2f0860c29c6d0cddca77fc80bada6d803970e26f5fbc30dea3dbaa752a932b9c",
+    "evidence/real_engine_scheduler_trace.jsonl": "2f5a8c408295cb034bec37b135f25e76f5a07c20fd5a31e47cd1b273d139c2d6",
+    "rwkv7_vllm_ascend/model.py": "02c7dc22857ee3ea6b4b83d4960a83a6b0b7dba0717fc3fa20e86b382c95482f",
+    "tests_vllm/run_real_engine_acceptance.py": "4fd03ddc8ac8ec05b3cb79359c05e877a9d69f84e924a294685bdee9dff2c667"
+  },
+  "first_batch": {
+    "long": {
+      "finish_reason": "length",
+      "finished": true,
+      "input_tokens": 180,
+      "output_token_ids": [
+        38828,
+        31601,
+        22590
+      ]
+    },
+    "medium": {
+      "finish_reason": "length",
+      "finished": true,
+      "input_tokens": 47,
+      "output_token_ids": [
+        21704,
+        38828,
+        31601
+      ]
+    },
+    "short": {
+      "finish_reason": "length",
+      "finished": true,
+      "input_tokens": 1,
+      "output_token_ids": [
+        45,
+        308,
+        459
+      ]
+    }
+  },
+  "hardware": "Ascend 910B3 64GB",
+  "model": "/data/models/fla-hub-rwkv7-7.2B-g0a",
+  "physical_slot_reuse_proven": true,
+  "reuse_outputs_identical": true,
+  "scheduler_trace": {
+    "actual_prefill_tokens": 455,
+    "continuation_prefill_segments": 14,
+    "first_batch_fresh_slots": [
+      2,
+      3
+    ],
+    "forward_steps": 21,
+    "fresh_prefill_segments": 5,
+    "fresh_zero_events": 6,
+    "max_prefill_tokens_in_step": 32,
+    "mixed_decode_prefill_steps": 6,
+    "multi_prefill_request_steps": 3,
+    "physically_reused_fresh_slots": [
+      2,
+      3
+    ],
+    "prefill_steps": 16,
+    "reused_slots_with_nonzero_state_before_clear": [
+      2,
+      3
+    ],
+    "second_batch_fresh_slots": [
+      1,
+      2,
+      3
+    ],
+    "trace_path": "evidence/real_engine_scheduler_trace.jsonl"
+  },
+  "script_commit": "55bd3601dc466db7a06fa03208cbe146097fbd7a",
+  "slot_reuse_reverse_batch": {
+    "long": {
+      "finish_reason": "length",
+      "finished": true,
+      "input_tokens": 180,
+      "output_token_ids": [
+        38828,
+        31601,
+        22590
+      ]
+    },
+    "medium": {
+      "finish_reason": "length",
+      "finished": true,
+      "input_tokens": 47,
+      "output_token_ids": [
+        21704,
+        38828,
+        31601
+      ]
+    },
+    "short": {
+      "finish_reason": "length",
+      "finished": true,
+      "input_tokens": 1,
+      "output_token_ids": [
+        45,
+        308,
+        459
+      ]
+    }
+  },
+  "status": "ACCEPTANCE_OK"
+}

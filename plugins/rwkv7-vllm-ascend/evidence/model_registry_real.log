@@ -1,0 +1,16 @@
+START
+INFO 07-23 17:42:50 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 07-23 17:42:50 [__init__.py:46] - ascend -> vllm_ascend:register
+INFO 07-23 17:42:50 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 07-23 17:42:50 [__init__.py:239] Platform plugin ascend is activated
+IMPORT
+ERROR 07-23 17:42:58 [config.py:29] Failed to import Triton kernels. Please make sure your triton version is compatible. Error: No module named 'triton.language.target_info'
+ERROR 07-23 17:42:58 [gpt_oss_triton_kernels_moe.py:61] Failed to import Triton kernels. Please make sure your triton version is compatible. Error: No module named 'triton.language.target_info'
+INFO 07-23 17:42:58 [__init__.py:110] Registered model loader `<class 'vllm_ascend.model_loader.netloader.netloader.ModelNetLoaderElastic'>` with load format `netloader`
+INFO 07-23 17:42:59 [__init__.py:110] Registered model loader `<class 'vllm_ascend.model_loader.rfork.rfork_loader.RForkModelLoader'>` with load format `rfork`
+PLUGINS
+INFO 07-23 17:43:19 [model.py:533] Resolved architecture: RWKV7ForCausalLM
+INFO 07-23 17:43:19 [model.py:1582] Using max model len 2048
+CONFIG ['RWKV7ForCausalLM']
+RESOLVED RWKV7ForCausalLM _ModelInfo(architecture='RWKV7ForCausalLM', is_text_generation_model=True, is_pooling_model=False, attn_type='decoder', default_seq_pooling_type='LAST', default_tok_pooling_type='ALL', score_type='bi-encoder', supports_multimodal=False, supports_multimodal_raw_input_only=False, requires_raw_input_tokens=False, supports_multimodal_encoder_tp_data=False, supports_pp=False, has_inner_state=True, is_attention_free=True, is_hybrid=False, has_noops=False, supports_mamba_prefix_caching=False, supports_transcription=False, supports_transcription_only=False)
+RC=0

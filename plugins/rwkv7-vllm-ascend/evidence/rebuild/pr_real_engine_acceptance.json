@@ -1,0 +1,128 @@
+{
+  "axis": "vllm_ascend_real_engine_acceptance",
+  "chunk_gate": {
+    "long_input_tokens": 180,
+    "max_num_batched_tokens": 32,
+    "minimum_prefill_steps": 6
+  },
+  "config": {
+    "block_size": 128,
+    "disable_log_stats": true,
+    "dtype": "bfloat16",
+    "enable_chunked_prefill": true,
+    "enable_prefix_caching": false,
+    "enforce_eager": true,
+    "gpu_memory_utilization": 0.45,
+    "max_model_len": 256,
+    "max_num_batched_tokens": 32,
+    "max_num_seqs": 4,
+    "num_gpu_blocks_override": 4,
+    "trust_remote_code": true
+  },
+  "engine": "vllm-v1-ascend",
+  "engine_load_s": 108.12832951545715,
+  "first_batch": {
+    "long": {
+      "finish_reason": "length",
+      "finished": true,
+      "input_tokens": 180,
+      "output_token_ids": [
+        38828,
+        31601,
+        22590
+      ]
+    },
+    "medium": {
+      "finish_reason": "length",
+      "finished": true,
+      "input_tokens": 47,
+      "output_token_ids": [
+        21704,
+        38828,
+        31601
+      ]
+    },
+    "short": {
+      "finish_reason": "length",
+      "finished": true,
+      "input_tokens": 1,
+      "output_token_ids": [
+        45,
+        308,
+        459
+      ]
+    }
+  },
+  "hardware": "Ascend910B3 64GB",
+  "hello_greedy_exact": true,
+  "model": "/data/models/fla-hub-rwkv7-7.2B-g0a",
+  "physical_slot_reuse_proven": true,
+  "reuse_outputs_identical": true,
+  "runtime": {
+    "plugin": "0.3.0",
+    "vllm": "0.18.0",
+    "vllm_ascend": "0.18.0"
+  },
+  "scheduler_trace": {
+    "actual_prefill_tokens": 455,
+    "continuation_prefill_segments": 14,
+    "first_batch_fresh_slots": [
+      2,
+      3
+    ],
+    "forward_steps": 21,
+    "fresh_prefill_segments": 5,
+    "fresh_zero_events": 6,
+    "max_prefill_tokens_in_step": 32,
+    "mixed_decode_prefill_steps": 6,
+    "multi_prefill_request_steps": 3,
+    "physically_reused_fresh_slots": [
+      2,
+      3
+    ],
+    "prefill_steps": 16,
+    "reused_slots_with_nonzero_state_before_clear": [
+      2,
+      3
+    ],
+    "second_batch_fresh_slots": [
+      1,
+      2,
+      3
+    ],
+    "trace_path": "pr_real_engine_scheduler_trace.jsonl"
+  },
+  "slot_reuse_reverse_batch": {
+    "long": {
+      "finish_reason": "length",
+      "finished": true,
+      "input_tokens": 180,
+      "output_token_ids": [
+        38828,
+        31601,
+        22590
+      ]
+    },
+    "medium": {
+      "finish_reason": "length",
+      "finished": true,
+      "input_tokens": 47,
+      "output_token_ids": [
+        21704,
+        38828,
+        31601
+      ]
+    },
+    "short": {
+      "finish_reason": "length",
+      "finished": true,
+      "input_tokens": 1,
+      "output_token_ids": [
+        45,
+        308,
+        459
+      ]
+    }
+  },
+  "status": "ACCEPTANCE_OK"
+}
