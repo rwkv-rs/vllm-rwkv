@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from vllm.transformers_utils.config import get_config, get_hf_image_processor_config
+from vllm.transformers_utils.configs.rwkv7 import try_parse_rwkv7_pth_source
 
 
 def test_rwkv7_pth_url_builds_config_from_blinkdl_filename():
@@ -28,10 +29,12 @@ def test_rwkv7_local_pth_builds_config_from_filename(tmp_path: Path):
     checkpoint = tmp_path / "rwkv7-g1g-2.9b-20260526-ctx8192.pth"
     checkpoint.touch()
 
-    config = get_config(checkpoint, trust_remote_code=False)
-
-    assert config.hidden_size == 2560
-    assert config.num_hidden_layers == 32
+    for model in (checkpoint, checkpoint.as_uri()):
+        config = get_config(model, trust_remote_code=False)
+        assert (config.hidden_size, config.num_hidden_layers) == (2560, 32)
+    assert try_parse_rwkv7_pth_source(checkpoint.as_uri()).local_path == checkpoint
+    assert try_parse_rwkv7_pth_source(f"file://remote{checkpoint}") is None
+    assert try_parse_rwkv7_pth_source("https://example.com/model.pth") is None
 
 
 def test_unknown_rwkv7_pth_filename_fails_closed(tmp_path: Path):

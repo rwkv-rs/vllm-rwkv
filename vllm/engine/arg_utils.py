@@ -773,7 +773,7 @@ class EngineArgs:
             # Skip cloud storage URIs (s3://, gs://, az://) — they are not
             # HF repo IDs and will be resolved later by
             # ModelConfig.maybe_pull_model_tokenizer_for_runai().
-            if not is_cloud_storage(self.model):
+            if not is_cloud_storage(self.model) and try_parse_rwkv7_pth_source(self.model) is None:  # noqa: E501
                 model_id = self.model
                 self.model = get_model_path(self.model, self.revision)
                 if model_id is not self.model:
@@ -783,7 +783,7 @@ class EngineArgs:
                         model_id,
                         self.model,
                     )
-            if self.tokenizer is not None and not is_cloud_storage(self.tokenizer):
+            if self.tokenizer is not None and not is_cloud_storage(self.tokenizer) and try_parse_rwkv7_pth_source(self.tokenizer) is None:  # noqa: E501
                 tokenizer_id = self.tokenizer
                 self.tokenizer = get_model_path(self.tokenizer, self.tokenizer_revision)
                 if tokenizer_id is not self.tokenizer:
@@ -1637,13 +1637,19 @@ class EngineArgs:
                 self.seed,
             )
 
+        rwkv7_source = try_parse_rwkv7_pth_source(self.model)
+        local_path = rwkv7_source.local_path if rwkv7_source else None
+        model = str(local_path) if local_path else self.model
+        hf_config_path = (
+            model if self.hf_config_path == self.model else self.hf_config_path
+        )
         return ModelConfig(
-            model=self.model,
+            model=model,
             model_weights=self.model_weights,
-            hf_config_path=self.hf_config_path,
+            hf_config_path=hf_config_path,
             runner=self.runner,
             convert=self.convert,
-            tokenizer=self.tokenizer,  # type: ignore[arg-type]
+            tokenizer=model if self.tokenizer == self.model else self.tokenizer,  # type: ignore[arg-type]
             tokenizer_mode=self.tokenizer_mode,
             trust_remote_code=self.trust_remote_code,
             allowed_local_media_path=self.allowed_local_media_path,

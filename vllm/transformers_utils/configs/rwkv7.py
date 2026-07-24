@@ -3,7 +3,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import regex as re
 from huggingface_hub import hf_hub_download
@@ -66,6 +66,13 @@ def try_parse_rwkv7_pth_source(model: str | Path) -> RWKV7PthSource | None:
         return RWKV7PthSource(filename=path.name, local_path=path)
 
     parsed = urlparse(model_str)
+    if parsed.scheme == "file":
+        if parsed.netloc not in {"", "localhost"} or parsed.query or parsed.fragment:
+            return None
+        path = Path(unquote(parsed.path))
+        if path.is_absolute() and path.is_file() and path.suffix == ".pth":
+            return RWKV7PthSource(filename=path.name, local_path=path)
+        return None
     if parsed.scheme not in {"http", "https"}:
         return None
     if parsed.netloc != "huggingface.co":
