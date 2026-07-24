@@ -593,6 +593,25 @@ class RWKV7ModelState(ModelState):
     def has_pending_postprocess_state(self) -> bool:
         return bool(self._prefill_req_slots)
 
+    @staticmethod
+    def can_replay_full_cudagraph(model_inputs: dict[str, Any]) -> bool:
+        """Return whether runtime decode matches the static contiguous graph."""
+        decode_batch_size = model_inputs.get("rwkv_decode_batch_size")
+        decode_rows = model_inputs.get("rwkv_decode_rows")
+        positions = model_inputs.get("positions")
+        if (
+            not isinstance(decode_batch_size, int)
+            or decode_batch_size <= 0
+            or not isinstance(decode_rows, list)
+            or not isinstance(positions, torch.Tensor)
+        ):
+            return False
+        return (
+            model_inputs.get("slot_indices") is None
+            and decode_batch_size == positions.shape[0]
+            and decode_rows == list(range(decode_batch_size))
+        )
+
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         lengths = torch.full(
             (num_reqs,),

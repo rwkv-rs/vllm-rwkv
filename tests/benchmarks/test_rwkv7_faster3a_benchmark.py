@@ -25,13 +25,72 @@ def _config(repo_root: Path, model: str | None = "https://example.test/model") -
     )
 
 
-def _measurement(tokens_per_s: float = 10000.0, *, wkv_mode: str = "fp16") -> dict[str, Any]:
-    env = dict(bench.RUNNER_FP16_THROUGHPUT_REQUIREMENTS)
+def _measurement(
+    tokens_per_s: float = 10000.0,
+    *,
+    wkv_mode: str = "fp16",
+    fixed_model_contract: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    env = dict(bench.RUNNER_RUNTIME_ENV_REQUIREMENTS)
     env["VLLM_RWKV7_WKV_MODE"] = wkv_mode
+    fixed_contract = (
+        dict(bench.RUNNER_FIXED_MODEL_CONTRACT)
+        if fixed_model_contract is None
+        else fixed_model_contract
+    )
     return {
         "runner_steady_decode": {"runner_tokens_per_s": tokens_per_s},
-        "config": {"provenance": {"env": env, "raw_env": env}},
+        "config": {
+            "provenance": {
+                "env": env,
+                "raw_env": env,
+                "fixed_model_contract": fixed_contract,
+            }
+        },
     }
+
+
+def test_source_metadata_pins_latest_albatross_2607_reference() -> None:
+    metadata = bench._source_metadata(_config(Path.cwd()))
+
+    assert metadata["albatross_commit"] == (
+        "ee3308f6922e59f2166c7fac3c5a192340a2b48e"
+    )
+    assert metadata["albatross_changes"]["faster3a_2607"] == (
+        "63c53f4abf2cd891dd3a18c8f44f5b2cccc8c64b"
+    )
+
+
+def test_runner_measurement_records_albatross_source(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(bench, "_create_vllm_runner_llm", lambda _config: object())
+    monkeypatch.setattr(bench, "_shutdown_vllm_runner_llm", lambda _llm: None)
+    monkeypatch.setattr(
+        bench,
+        "_time_vllm_runner_steady_decode",
+        lambda *_args, **_kwargs: {
+            "tokens_per_s": 10_000.0,
+            "p10_ms": 1.0,
+            "p50_ms": 1.1,
+            "p90_ms": 1.2,
+            "decode_steps": 4,
+            "worker_count": 1,
+        },
+    )
+
+    measurement = bench.generate_vllm_runner_measurement(
+        _config(tmp_path),
+        batch_size=2,
+        prompt_len=4,
+        decode_tokens=2,
+        warmup=1,
+        iters=1,
+    )
+
+    assert measurement["source"]["albatross_commit"] == bench.ALBATROSS_COMMIT
+    assert measurement["source"]["contracts"]
 
 
 def test_git_revision_reads_source_marker(tmp_path: Path) -> None:
@@ -68,9 +127,11 @@ def test_environment_metadata_resolves_defaults(monkeypatch) -> None:
 
     resolved = bench._rwkv_environment_metadata()
 
+    assert set(resolved) == set(bench.RUNNER_RUNTIME_ENV_REQUIREMENTS)
     assert resolved["VLLM_RWKV7_WKV_MODE"] == "fp16"
     assert resolved["VLLM_USE_RAPID_SAMPLER"] == "1"
-    assert resolved["VLLM_RWKV7_MODEL"] is None
+    assert resolved["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+    assert resolved["VLLM_ALLOW_INSECURE_SERIALIZATION"] == "1"
 
 
 def test_environment_metadata_preserves_explicit_values(monkeypatch) -> None:
@@ -80,7 +141,29 @@ def test_environment_metadata_preserves_explicit_values(monkeypatch) -> None:
     resolved = bench._rwkv_environment_metadata()
 
     assert resolved["VLLM_RWKV7_WKV_MODE"] == "fp32io16"
-    assert resolved["VLLM_RWKV7_MODEL"] == "/model.pth"
+    assert "VLLM_RWKV7_MODEL" not in resolved
+
+
+def test_provenance_excludes_unregistered_legacy_runtime_env(monkeypatch) -> None:
+    for name in bench.UNREGISTERED_BENCHMARK_ENV_VARS:
+        monkeypatch.setenv(name, "legacy-value")
+
+    assert set(bench.LEGACY_FIXED_MODEL_ENV_VARS).isdisjoint(
+        bench.RUNNER_RUNTIME_ENV_REQUIREMENTS
+    )
+    assert set(bench._rwkv_environment_raw_metadata()) == set(
+        bench.RUNNER_RUNTIME_ENV_REQUIREMENTS
+    )
+
+
+def test_provenance_records_fixed_model_contract(monkeypatch) -> None:
+    monkeypatch.setattr(bench, "_git_revision", lambda _repo_root: "abc123")
+    monkeypatch.setattr(bench, "_cuda_device_metadata", lambda: {"available": False})
+
+    provenance = bench._benchmark_provenance(_config(Path.cwd()))
+
+    assert provenance["fixed_model_contract"] == bench.RUNNER_FIXED_MODEL_CONTRACT
+    assert provenance["fixed_model_contract"] is not bench.RUNNER_FIXED_MODEL_CONTRACT
 
 
 def test_report_records_source_and_runner_check() -> None:
@@ -102,6 +185,16 @@ def test_report_records_source_and_runner_check() -> None:
     [
         (None, "blocked", "missing_measurement_json"),
         (_measurement(wkv_mode="fp32io16"), "blocked", "invalid_runner_throughput_contract"),
+        (
+            _measurement(
+                fixed_model_contract={
+                    **bench.RUNNER_FIXED_MODEL_CONTRACT,
+                    "embedding_device": "cpu",
+                }
+            ),
+            "blocked",
+            "invalid_runner_throughput_contract",
+        ),
         (_measurement(tokens_per_s=0.0), "failed", None),
     ],
 )
@@ -120,6 +213,41 @@ def test_report_rejects_missing_or_invalid_runner_measurement(
     assert report["overall_status"] == status
     if code is not None:
         assert check["blockers"][0]["code"] == code
+
+
+def test_report_identifies_fixed_model_contract_violation() -> None:
+    measurement = _measurement(
+        fixed_model_contract={
+            **bench.RUNNER_FIXED_MODEL_CONTRACT,
+            "embedding_device": "cpu",
+        }
+    )
+
+    report = bench.build_report(
+        _config(Path.cwd()),
+        measurements=measurement,
+        cuda_available=True,
+    )
+
+    blocker = report["checks"]["runner_steady_decode"]["blockers"][0]
+    assert blocker["violations"]["fixed_model_contract.embedding_device"] == {
+        "required": "gpu",
+        "actual": "cpu",
+    }
+
+
+def test_report_requires_fixed_model_contract_provenance() -> None:
+    measurement = _measurement()
+    del measurement["config"]["provenance"]["fixed_model_contract"]
+
+    report = bench.build_report(
+        _config(Path.cwd()),
+        measurements=measurement,
+        cuda_available=True,
+    )
+
+    blocker = report["checks"]["runner_steady_decode"]["blockers"][0]
+    assert blocker["code"] == "missing_runner_throughput_provenance"
 
 
 def test_report_blocks_missing_runtime_paths() -> None:
@@ -249,6 +377,10 @@ def test_create_runner_llm_preserves_env_and_capture_contract(
         def __init__(self, **kwargs: Any) -> None:
             captured.update(kwargs)
             captured["model_env"] = os.environ.get("VLLM_RWKV7_MODEL")
+            captured["legacy_env"] = {
+                name: os.environ.get(name)
+                for name in bench.UNREGISTERED_BENCHMARK_ENV_VARS
+            }
 
     fake_vllm = ModuleType("vllm")
     fake_vllm.__path__ = []
@@ -256,6 +388,7 @@ def test_create_runner_llm_preserves_env_and_capture_contract(
     monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
     monkeypatch.setitem(sys.modules, "vllm.rwkv7_ops", ModuleType("vllm.rwkv7_ops"))
     monkeypatch.setenv("VLLM_RWKV7_MODEL", str(model_path))
+    monkeypatch.setenv("VLLM_RWKV7_EMB_DEVICE", "gpu")
 
     config = replace(
         _config(tmp_path, model=str(model_path)),
@@ -271,7 +404,9 @@ def test_create_runner_llm_preserves_env_and_capture_contract(
     assert captured["max_num_batched_tokens"] == 1024
     assert captured["compilation_config"] == {"cudagraph_capture_sizes": [1024]}
     assert captured["model_env"] is None
+    assert all(value is None for value in captured["legacy_env"].values())
     assert os.environ["VLLM_RWKV7_MODEL"] == str(model_path)
+    assert os.environ["VLLM_RWKV7_EMB_DEVICE"] == "gpu"
 
 
 def test_create_runner_llm_omits_capture_for_eager_mode(

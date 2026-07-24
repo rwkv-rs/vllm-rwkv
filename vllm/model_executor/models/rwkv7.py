@@ -42,13 +42,52 @@ LOWRANK_SUFFIXES = (
 LOWRANK_IN_ROWS_T = 7
 LOWRANK_OUT_ROWS_T = 4
 LOWRANK_FUSED_MIN_C = 1024
+# Exact FP16-accumulation cuBLASLt winners measured on the project benchmark
+# GPU (Blackwell sm_120, CUDA 13.0, PyTorch 2.11) against the current GemmEx
+# baseline. The second value is a runtime heuristic-list index, not a stable
+# algorithm ID, so production uses non-strict lookup and exact shape guards.
+ATT_C2C_FP16_LT_4096 = {64: (32, 2)}
+FFN_DOWN_FP16_LT_4096 = {64: (32, 3)}
+# Exact runtime-layout low-rank candidates. Keep these separate from the
+# dense tables: the rank is part of the dispatch contract and the aggregate
+# benefit comes from repeated W/A/G/V projections at the same row count.
+LOWRANK_IN_FP16_LT_4096 = {
+    (8, 128): (128, 0),
+    (8, 480): (128, 0),
+    (8, 96): (128, 0),
+    (16, 480): (32, 1),
+    (16, 96): (32, 0),
+}
+LOWRANK_OUT_FP16_LT_4096 = {
+    (8, 128): (0, 5),
+    (8, 480): (0, 3),
+    (8, 96): (0, 4),
+    (16, 128): (0, 1),
+    (16, 480): (32, 2),
+}
 CMIX_NOFC_ROW20_MAX_T = 5
 CMIX_NOFC_MAX_ROWS = 19
 CMIX_NOFC_T512_MIN_ROWS = 8
 LN1_TMIX_FUSE = True
+# The fused LN1/TMix owner is strongest for M=1 and for larger decode batches,
+# but paired full-model measurements favor the separate kernels at these exact
+# small T=1 shapes. Keep the exclusion table narrow: disabling the fusion also
+# regresses rows >= 64 and the canonical B320 decode path.
+LN1_TMIX_UNFUSED_BT = frozenset(((2, 1), (4, 1), (8, 1), (16, 1)))
 CMIX_B1T1_NOFC = "b1t1_nofc"
 CMIX_ROWS2_NOFC = "rows2_nofc"
 CMIX_DENSE = "dense"
+LNX_WARP_B1_T_4096 = frozenset((64, 96, 128, 160, 192, 240, 248, 264, 512))
+MIX_3D_B1_T_4096 = frozenset((2, 4, 16, 64, 512))
+WKV_FP16_FUSED_EXACT_OVERRIDES = frozenset(
+    ((2, 32), (4, 16), (4, 64), (8, 8))
+)
+# The direct-model harness clears this exact row set for paired A/B capture;
+# production keeps M=1 grouped without a user-visible mode or fallback knob.
+M1_RKV_GROUPED_ROWS = {1}
+# The M=1 no-fc path prepares the sparse-down accumulator while reducing the
+# FFN key split-K result, eliminating one zeroing launch per layer.
+M1_CMIX_PREZERO_ROWS = {1}
 
 
 @dataclass(frozen=True)
@@ -94,6 +133,70 @@ def select_path(B: int, T: int) -> PathConfig:
         CMIX_B1T1_NOFC if rows == 1 else (CMIX_ROWS2_NOFC if use_nofc else CMIX_DENSE)
     )
     return PathConfig(rows=rows, cmix_mode=cmix_mode)
+
+
+def use_tmix_kk_a_gate_2d(B: int, T: int, C: int, H: int) -> bool:
+    """Use the exact 2D head grid validated for the 7.2B model shape."""
+    return C == 4096 and H == 64 and 0 < B * T <= 65535
+
+
+def use_tmix_lnx_warp(B: int, T: int, C: int, H: int) -> bool:
+    """Use the one-warp LNX reduction only on validated batched shapes."""
+    return (
+        C == 4096
+        and H == 64
+        and B * T * H >= 4096
+        and (B >= 2 or T in LNX_WARP_B1_T_4096)
+    )
+
+
+def use_tmix_mix6_3d(B: int, T: int, C: int) -> bool:
+    """Use the validated B/T/channel launch grid for time mixing."""
+    return (
+        T != 1
+        and C == 4096
+        and 0 < B <= 65535
+        and 0 < T <= 65535
+        and (B >= 2 or T in MIX_3D_B1_T_4096)
+    )
+
+
+def use_cmix_mix_3d(B: int, T: int, C: int) -> bool:
+    """Use the validated B/T/channel launch grid for channel mixing."""
+    return use_tmix_mix6_3d(B, T, C)
+
+
+def use_add_vec_2d(rows: int, channels: int) -> bool:
+    """Use the row/channel launch grid only where real-model timings won."""
+    return channels == 4096 and 17 <= rows <= 65535
+
+
+def use_ln1_tmix_fusion(B: int, T: int) -> bool:
+    """Choose the benchmark-backed LN1/TMix owner for a B/T shape."""
+    return LN1_TMIX_FUSE and T == 1 and (B, T) not in LN1_TMIX_UNFUSED_BT
+
+
+def use_wkv_bh_grid_2d(B: int, T: int, C: int, H: int) -> bool:
+    """Choose the validated batch/head grid for FP16 WKV."""
+    if (
+        C != 4096
+        or H != 64
+        or B <= 0
+        or T <= 0
+        or B > 65535
+        or B * T * C > 2**31 - 1
+        or B * C * HEAD_SIZE > 2**31 - 1
+    ):
+        return False
+    if T == 1:
+        return B <= 16
+    if (B, T) in WKV_FP16_FUSED_EXACT_OVERRIDES:
+        return True
+    return not (
+        (B == 1 and T >= 8)
+        or (B == 4 and T >= 4)
+        or (B == 8 and T >= 8)
+    )
 
 
 def is_lowrank_weight(key: str) -> bool:
@@ -1284,13 +1387,34 @@ class RWKV7ForCausalLM(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed(input_ids)
 
+    def project_logits_fp32(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project the FP16 model output directly into FP32 logits."""
+        weight = self.z["head.weight"]
+        if (
+            hidden_states.dim() >= 2
+            and all(size == 1 for size in hidden_states.shape[:-1])
+            and weight.size(1) % 64 == 0
+        ):
+            return torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk_fp32(
+                hidden_states.contiguous(), weight
+            )
+
+        return torch.ops.rwkv7_v3a_ops.linear_f16_fp32_lt(
+            hidden_states.contiguous(),
+            weight,
+        )
+
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        logits = self.linear(hidden_states, self.z["head.weight"])
+        logits = self.project_logits_fp32(hidden_states)
         logits = self.logits_processor(None, logits)
         if logits is not None and getattr(self, "tp_size", 1) > 1:
             logits = tensor_model_parallel_all_gather(logits)
             if logits is not None:
                 logits = logits[..., : self.vocab_size]
+        if logits is not None and logits.dtype != torch.float32:
+            raise RuntimeError(
+                f"RWKV7 logits must be FP32, but got {logits.dtype}."
+            )
         return logits
 
     def compute_sampling_logits(
@@ -1560,7 +1684,7 @@ class RWKV7ForCausalLM(nn.Module):
                 )
             if layer + 1 < end_layer:
                 p_next = f"blocks.{layer + 1}."
-                if LN1_TMIX_FUSE and T == 1:
+                if use_ln1_tmix_fusion(B, T):
                     if slot_indices is None:
                         outs = torch.ops.rwkv7_v3a_ops.add_layer_norm_tmix_mix6_f16(
                             x.contiguous(),
@@ -1776,9 +1900,7 @@ class RWKV7ForCausalLM(nn.Module):
         """Share the layout-independent time-mix projection pipeline."""
         z = self.z
         ops = torch.ops.rwkv7_fast_ops_fp16
-        r = self.linear(xr, z[p + "receptance.weight"])
-        k = self.linear(xk, z[p + "key.weight"])
-        v = self.linear(xv, z[p + "value.weight"])
+        r, k, v = self.project_att_rkv(xr, xk, xv, p, path.rows)
         local_c = r.shape[-1]
         local_h = local_c // self.head_size
         use_lowrank_in = can_use_lowrank_fused(self.hidden_size, path.rows)
@@ -1845,7 +1967,14 @@ class RWKV7ForCausalLM(nn.Module):
             )
 
         value_shape = (batch_size, time_steps, local_c)
-        k3, neg_kk3, kka3 = ops.tmix_kk_a_gate(
+        kk_a_gate = (
+            ops.tmix_kk_a_gate_2d
+            if use_tmix_kk_a_gate_2d(
+                batch_size, time_steps, local_c, local_h
+            )
+            else ops.tmix_kk_a_gate
+        )
+        k3, neg_kk3, kka3 = kk_a_gate(
             batch_size,
             time_steps,
             local_c,
@@ -2029,7 +2158,7 @@ class RWKV7ForCausalLM(nn.Module):
             z[p + "ln_x.bias"],
             g.view(total_tokens, 1, local_c).contiguous(),
         ).view(total_tokens, local_c)
-        out = self.linear(y, z[p + "output.weight"])
+        out = self.linear_att_c2c(y, z[p + "output.weight"], path.rows)
         return self._tp_all_reduce(out), v_first
 
     def cmix_varlen(
@@ -2061,6 +2190,173 @@ class RWKV7ForCausalLM(nn.Module):
         return self.cmix_from_mixed(
             mixed.view(total_tokens, 1, self.hidden_size), p, dense_path
         ).view(total_tokens, self.hidden_size)
+
+    def _run_wkv_fp16(
+        self,
+        B: int,
+        T: int,
+        C: int,
+        H: int,
+        state: torch.Tensor,
+        r: torch.Tensor,
+        w: torch.Tensor,
+        w0: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        neg_kk: torch.Tensor,
+        kka: torch.Tensor,
+        y: torch.Tensor,
+        elapsed_t: torch.Tensor,
+        slot_indices: torch.Tensor | None,
+    ) -> None:
+        """Run the fixed, benchmark-backed FP16 WKV launch policy."""
+        wkv_ops = torch.ops.rwkv7_wkv_fp16_v2
+        grid2d = use_wkv_bh_grid_2d(B, T, C, H)
+        has_slots = slot_indices is not None
+
+        if (B, T) in WKV_FP16_FUSED_EXACT_OVERRIDES and C == 4096 and H == 64:
+            if has_slots:
+                op = (
+                    wkv_ops.wkv_seq_w0_slot_grid2d_forced
+                    if grid2d
+                    else wkv_ops.wkv_seq_w0_slot_forced
+                )
+                op(
+                    B,
+                    T,
+                    C,
+                    H,
+                    0,
+                    state,
+                    r,
+                    w,
+                    w0,
+                    k,
+                    v,
+                    neg_kk,
+                    kka,
+                    y,
+                    slot_indices,
+                    elapsed_t,
+                )
+            else:
+                op = (
+                    wkv_ops.wkv_seq_w0_grid2d_forced
+                    if grid2d
+                    else wkv_ops.wkv_seq_w0_forced
+                )
+                op(
+                    B,
+                    T,
+                    C,
+                    H,
+                    0,
+                    state,
+                    r,
+                    w,
+                    w0,
+                    k,
+                    v,
+                    neg_kk,
+                    kka,
+                    y,
+                    elapsed_t,
+                )
+            return
+
+        if T <= 16:
+            if has_slots:
+                op = (
+                    wkv_ops.wkv_seq_w0_slot_grid2d
+                    if grid2d
+                    else wkv_ops.wkv_seq_w0_slot
+                )
+                op(
+                    B,
+                    T,
+                    C,
+                    H,
+                    state,
+                    r,
+                    w,
+                    w0,
+                    k,
+                    v,
+                    neg_kk,
+                    kka,
+                    y,
+                    slot_indices,
+                    elapsed_t,
+                )
+            else:
+                op = (
+                    wkv_ops.wkv_seq_w0_grid2d
+                    if grid2d
+                    else wkv_ops.wkv_seq_w0
+                )
+                op(
+                    B,
+                    T,
+                    C,
+                    H,
+                    state,
+                    r,
+                    w,
+                    w0,
+                    k,
+                    v,
+                    neg_kk,
+                    kka,
+                    y,
+                    elapsed_t,
+                )
+            return
+
+        add_vec = (
+            torch.ops.rwkv7_fast_ops_fp16.add_vec_2d
+            if use_add_vec_2d(B * T, C)
+            else torch.ops.rwkv7_fast_ops_fp16.add_vec
+        )
+        w_raw = add_vec(C, w, w0)
+        if has_slots:
+            op = (
+                wkv_ops.wkv_seq_slot_grid2d
+                if grid2d
+                else wkv_ops.wkv_seq_slot
+            )
+            op(
+                B,
+                T,
+                C,
+                H,
+                state,
+                r,
+                w_raw,
+                k,
+                v,
+                neg_kk,
+                kka,
+                y,
+                slot_indices,
+                elapsed_t,
+            )
+        else:
+            op = wkv_ops.wkv_seq_grid2d if grid2d else wkv_ops.wkv_seq
+            op(
+                B,
+                T,
+                C,
+                H,
+                state,
+                r,
+                w_raw,
+                k,
+                v,
+                neg_kk,
+                kka,
+                y,
+                elapsed_t,
+            )
 
     def tmix(
         self,
@@ -2096,7 +2392,12 @@ class RWKV7ForCausalLM(nn.Module):
                 z[p + "x_g"],
             )
         else:
-            xr, xw, xk, xv, xa, xg = ops.tmix_mix6(
+            mix6 = (
+                ops.tmix_mix6_3d
+                if use_tmix_mix6_3d(B, T, self.hidden_size)
+                else ops.tmix_mix6
+            )
+            xr, xw, xk, xv, xa, xg = mix6(
                 B,
                 T,
                 self.hidden_size,
@@ -2160,78 +2461,30 @@ class RWKV7ForCausalLM(nn.Module):
                     y,
                     slot_indices,
                 )
-        elif T <= 16:
-            if slot_indices is None:
-                torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_w0(
-                    B,
-                    T,
-                    local_c,
-                    local_h,
-                    wkv_state,
-                    r.contiguous(),
-                    w.contiguous(),
-                    z[p + "w0"],
-                    k.contiguous(),
-                    v.contiguous(),
-                    neg_kk.contiguous(),
-                    kka.contiguous(),
-                    y,
-                    elapsed_t,
-                )
-            else:
-                torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_w0_slot(
-                    B,
-                    T,
-                    local_c,
-                    local_h,
-                    wkv_state,
-                    r.contiguous(),
-                    w.contiguous(),
-                    z[p + "w0"],
-                    k.contiguous(),
-                    v.contiguous(),
-                    neg_kk.contiguous(),
-                    kka.contiguous(),
-                    y,
-                    slot_indices,
-                    elapsed_t,
-                )
         else:
-            w_raw = ops.add_vec(local_c, w.contiguous(), z[p + "w0"])
-            if slot_indices is None:
-                torch.ops.rwkv7_wkv_fp16_v2.wkv_seq(
-                    B,
-                    T,
-                    local_c,
-                    local_h,
-                    wkv_state,
-                    r.contiguous(),
-                    w_raw.contiguous(),
-                    k.contiguous(),
-                    v.contiguous(),
-                    neg_kk.contiguous(),
-                    kka.contiguous(),
-                    y,
-                    elapsed_t,
-                )
-            else:
-                torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_slot(
-                    B,
-                    T,
-                    local_c,
-                    local_h,
-                    wkv_state,
-                    r.contiguous(),
-                    w_raw.contiguous(),
-                    k.contiguous(),
-                    v.contiguous(),
-                    neg_kk.contiguous(),
-                    kka.contiguous(),
-                    y,
-                    slot_indices,
-                    elapsed_t,
-                )
-        y = ops.tmix_lnx_rkvres_xg(
+            self._run_wkv_fp16(
+                B,
+                T,
+                local_c,
+                local_h,
+                wkv_state,
+                r.contiguous(),
+                w.contiguous(),
+                z[p + "w0"],
+                k.contiguous(),
+                v.contiguous(),
+                neg_kk.contiguous(),
+                kka.contiguous(),
+                y,
+                elapsed_t,
+                slot_indices,
+            )
+        lnx = (
+            ops.tmix_lnx_rkvres_xg_warp
+            if use_tmix_lnx_warp(B, T, local_c, local_h)
+            else ops.tmix_lnx_rkvres_xg
+        )
+        y = lnx(
             B,
             T,
             local_c,
@@ -2245,7 +2498,7 @@ class RWKV7ForCausalLM(nn.Module):
             z[p + "ln_x.bias"],
             g.contiguous(),
         )
-        out = self.linear(y, z[p + "output.weight"])
+        out = self.linear_att_c2c(y, z[p + "output.weight"], path.rows)
         return self._tp_all_reduce(out), v_first
 
     def cmix(
@@ -2273,7 +2526,12 @@ class RWKV7ForCausalLM(nn.Module):
             )
             return self.cmix_from_mixed(mixed, p, path)
 
-        mixed = ops.cmix_mix(
+        mix = (
+            ops.cmix_mix_3d
+            if use_cmix_mix_3d(B, T, self.hidden_size)
+            else ops.cmix_mix
+        )
+        mixed = mix(
             B, T, self.hidden_size, x.contiguous(), shift_state[1], z[p + "x_k"]
         )
         return self.cmix_from_mixed(mixed, p, path)
@@ -2284,16 +2542,48 @@ class RWKV7ForCausalLM(nn.Module):
         z = self.z
         ops = torch.ops.rwkv7_fast_ops_fp16
         B, T, _ = mixed.shape
-        hid = self.linear(mixed, z[p + "key.weight"])
         if path.cmix_mode == CMIX_B1T1_NOFC:
+            key_weight = z[p + "key.weight"]
+            value_weight = z[p + "value.weight"]
+            can_use_m1_splitk = (
+                mixed.numel() == mixed.size(-1)
+                and key_weight.size(1) % 64 == 0
+            )
+            if (
+                path.rows in M1_CMIX_PREZERO_ROWS
+                and can_use_m1_splitk
+            ):
+                hid, out = (
+                    torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk_prepare_zero(
+                        mixed.contiguous(),
+                        key_weight,
+                        self.hidden_size,
+                    )
+                )
+                ops.cmix_sparse_down_relu_one_out(
+                    self.hidden_size,
+                    value_weight.size(0),
+                    hid.view(-1).contiguous(),
+                    value_weight,
+                    out,
+                )
+                return self._tp_all_reduce(out)
+            if can_use_m1_splitk:
+                hid = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(
+                    mixed.contiguous(),
+                    key_weight,
+                )
+            else:
+                hid = self.linear(mixed, key_weight)
             return self._tp_all_reduce(
                 ops.cmix_sparse_down_relu_one(
                     self.hidden_size,
-                    z[p + "value.weight"].size(0),
+                    value_weight.size(0),
                     hid.view(-1).contiguous(),
-                    z[p + "value.weight"],
+                    value_weight,
                 )
             )
+        hid = self.linear(mixed, z[p + "key.weight"])
         if path.cmix_mode == CMIX_ROWS2_NOFC:
             F = z[p + "value.weight"].size(0)
             if (
@@ -2323,20 +2613,127 @@ class RWKV7ForCausalLM(nn.Module):
             )
 
         k = ops.relu_square(hid.contiguous())
-        return self._tp_all_reduce(self.linear(k, z[p + "value.weight"]))
+        return self._tp_all_reduce(
+            self.linear_ffn_down(k, z[p + "value.weight"], path.rows)
+        )
 
     def linear(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         if x.numel() == x.size(-1) and weight.size(1) % 64 == 0:
-            return torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(x.contiguous(), weight)
+            return torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(
+                x.contiguous(), weight
+            )
         return torch.ops.rwkv7_v3a_ops.linear_f16(
             x.contiguous(), weight, self.allow_fp16_accumulation
         )
+
+    def linear_att_c2c(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        rows: int,
+    ) -> torch.Tensor:
+        cfg = ATT_C2C_FP16_LT_4096.get(rows)
+        if (
+            self.allow_fp16_accumulation
+            and self.hidden_size == 4096
+            and tuple(weight.shape) == (4096, 4096)
+            and cfg is not None
+        ):
+            workspace_mb, heuristic_index = cfg
+            return torch.ops.rwkv7_v3a_ops.linear_f16_lt_cfg(
+                x.contiguous(),
+                weight,
+                workspace_mb,
+                heuristic_index,
+                False,
+            )
+        return self.linear(x, weight)
+
+    def project_att_rkv(
+        self,
+        xr: torch.Tensor,
+        xk: torch.Tensor,
+        xv: torch.Tensor,
+        p: str,
+        rows: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project exact-M1 R/K/V with shared launches and separate weights."""
+        weights = (
+            self.z[p + "receptance.weight"],
+            self.z[p + "key.weight"],
+            self.z[p + "value.weight"],
+        )
+        inputs = (xr, xk, xv)
+        weight_shape = tuple(weights[0].shape)
+        if (
+            rows in M1_RKV_GROUPED_ROWS
+            and all(value.numel() == value.size(-1) for value in inputs)
+            and all(tuple(weight.shape) == weight_shape for weight in weights)
+            and all(
+                value.size(-1) == weight.size(0)
+                for value, weight in zip(inputs, weights)
+            )
+            and weights[0].size(1) % 64 == 0
+        ):
+            return torch.ops.rwkv7_v3a_ops.linear_rkv_f16_m1_splitk(
+                *(value.contiguous() for value in inputs),
+                *weights,
+            )
+        if rows == 1:
+            # Keep the paired benchmark baseline pinned to the three independent
+            # split-K projections even if row-1 Lt tuning is added later.
+            return tuple(
+                self.linear(value, weight)
+                for value, weight in zip(inputs, weights)
+            )
+        return tuple(
+            self.linear_att_c2c(value, weight, rows)
+            for value, weight in zip(inputs, weights)
+        )
+
+    def linear_ffn_down(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        rows: int,
+    ) -> torch.Tensor:
+        cfg = FFN_DOWN_FP16_LT_4096.get(rows)
+        if (
+            self.allow_fp16_accumulation
+            and self.hidden_size == 4096
+            and tuple(weight.shape) == (16384, 4096)
+            and cfg is not None
+        ):
+            workspace_mb, heuristic_index = cfg
+            return torch.ops.rwkv7_v3a_ops.linear_f16_lt_cfg(
+                x.contiguous(),
+                weight,
+                workspace_mb,
+                heuristic_index,
+                False,
+            )
+        return self.linear(x, weight)
 
     def linear_rank_in(
         self, x: torch.Tensor, weight: torch.Tensor, weight_t: torch.Tensor, rows: int
     ) -> torch.Tensor:
         if rows <= LOWRANK_IN_ROWS_T:
             return torch.ops.rwkv7_v3a_ops.linear_t_f16(x.contiguous(), weight_t)
+        cfg = LOWRANK_IN_FP16_LT_4096.get((rows, weight.size(1)))
+        if (
+            self.allow_fp16_accumulation
+            and self.hidden_size == 4096
+            and tuple(weight.shape) == (4096, weight.size(1))
+            and cfg is not None
+        ):
+            workspace_mb, heuristic_index = cfg
+            return torch.ops.rwkv7_v3a_ops.linear_f16_lt_cfg(
+                x.contiguous(),
+                weight,
+                workspace_mb,
+                heuristic_index,
+                False,
+            )
         return self.linear(x, weight)
 
     def linear_rank_out(
@@ -2344,6 +2741,21 @@ class RWKV7ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         if self.hidden_size >= LOWRANK_FUSED_MIN_C and rows <= LOWRANK_OUT_ROWS_T:
             return torch.ops.rwkv7_v3a_ops.linear_t_f16(x.contiguous(), weight_t)
+        cfg = LOWRANK_OUT_FP16_LT_4096.get((rows, weight.size(0)))
+        if (
+            self.allow_fp16_accumulation
+            and self.hidden_size == 4096
+            and tuple(weight.shape) == (weight.size(0), 4096)
+            and cfg is not None
+        ):
+            workspace_mb, heuristic_index = cfg
+            return torch.ops.rwkv7_v3a_ops.linear_f16_lt_cfg(
+                x.contiguous(),
+                weight,
+                workspace_mb,
+                heuristic_index,
+                False,
+            )
         return self.linear(x, weight)
 
     def linear_rank_out_act(
@@ -2364,7 +2776,7 @@ class RWKV7ForCausalLM(nn.Module):
             if act == 1
             else ops.act_sigmoid(x.contiguous())
         )
-        return self.linear(x, weight)
+        return self.linear_rank_out(x, weight, weight_t, rows)
 
     def add(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         return torch.ops.rwkv7_v3a_ops.add_f16(x.contiguous(), y.contiguous())

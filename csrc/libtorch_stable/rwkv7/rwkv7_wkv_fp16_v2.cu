@@ -3,6 +3,12 @@
 // Adapted from BlinkDL/Albatross faster3a_2605/cuda at commit
 // 5e941fb1eeb7f735a562fb5bbb30fad19adc825b. Source:
 // https://github.com/BlinkDL/Albatross/tree/5e941fb1eeb7f735a562fb5bbb30fad19adc825b/faster3a_2605/cuda
+// Flat/2D-grid launch selection and forced exact/seq routing are adapted from
+// BlinkDL/Albatross faster3a_2607/cuda at commit
+// 63c53f4abf2cd891dd3a18c8f44f5b2cccc8c64b. The slot-indexed state extension
+// remains vLLM-RWKV-specific and is supported by both launch layouts.
+// Source:
+// https://github.com/BlinkDL/Albatross/tree/63c53f4abf2cd891dd3a18c8f44f5b2cccc8c64b/faster3a_2607/cuda
 // Upstream license: Apache-2.0
 // (https://github.com/BlinkDL/Albatross/blob/5e941fb1eeb7f735a562fb5bbb30fad19adc825b/LICENSE).
 
@@ -82,7 +88,20 @@ __device__ __forceinline__ void clone_cp_commit() {
   asm volatile("cp.async.commit_group;\n" ::);
 }
 
-template <bool Tis1 = false, bool AddW0 = false>
+template <bool Grid2D>
+__device__ __forceinline__ void decode_batch_head(int H, int& batch,
+                                                   int& head) {
+  if constexpr (Grid2D) {
+    head = static_cast<int>(blockIdx.x);
+    batch = static_cast<int>(blockIdx.y);
+  } else {
+    const int bh = static_cast<int>(blockIdx.x);
+    batch = bh / H;
+    head = bh - batch * H;
+  }
+}
+
+template <bool Tis1 = false, bool AddW0 = false, bool Grid2D = false>
 __global__ void __launch_bounds__(CLONE_N, 2) wkv_fp16_v1_clone_kernel(
     const int B, const int T, const int C, const int H,
     F* __restrict__ state_ptr, const F* __restrict__ r_ptr,
@@ -94,8 +113,9 @@ __global__ void __launch_bounds__(CLONE_N, 2) wkv_fp16_v1_clone_kernel(
   if constexpr (Tis1) {
     __builtin_assume(T == 1);
   }
-  const int b = blockIdx.x / H;
-  const int h = blockIdx.x % H;
+  int b;
+  int h;
+  decode_batch_head<Grid2D>(H, b, h);
   const int i = threadIdx.x;
   const int lane = i % 32;
   const int state_b = slot_indices == nullptr ? b : slot_indices[b];
@@ -228,7 +248,7 @@ __device__ __forceinline__ void prefetch_token(
   cp_commit();
 }
 
-template <bool Tis1 = false, bool AddW0 = false>
+template <bool Tis1 = false, bool AddW0 = false, bool Grid2D = false>
 __global__ __launch_bounds__(N, 2) void wkv_fp16_v1_exact_kernel(
     const int B, const int T, const int C, const int H,
     half* __restrict__ state_ptr, const half* __restrict__ r_ptr,
@@ -240,11 +260,13 @@ __global__ __launch_bounds__(N, 2) void wkv_fp16_v1_exact_kernel(
   if constexpr (Tis1) {
     __builtin_assume(T == 1);
   }
-  const int b_id = blockIdx.x / H;
-  const int h = blockIdx.x % H;
+  int b_id;
+  int h;
+  decode_batch_head<Grid2D>(H, b_id, h);
   const int i = threadIdx.x;
   const int lane = i % 32;
-  const int state_b = slot_indices == nullptr ? b_id : slot_indices[b_id];
+  const int state_b =
+      slot_indices == nullptr ? b_id : slot_indices[b_id];
 
   __shared__ __align__(256) half2 state_smem[N][HALF2_N];
   state_ptr += static_cast<int64_t>(state_b) * C * N + h * N * N;
@@ -326,7 +348,7 @@ __global__ __launch_bounds__(N, 2) void wkv_fp16_v1_exact_kernel(
   }
 }
 
-template <bool AddW0 = false>
+template <bool AddW0 = false, bool Grid2D = false>
 __global__ __launch_bounds__(N, 2) void wkv_fp16_seq_v2_kernel(
     int T, int C, int H, half* __restrict__ state_ptr,
     const half* __restrict__ r_ptr, const half* __restrict__ w_ptr,
@@ -334,12 +356,13 @@ __global__ __launch_bounds__(N, 2) void wkv_fp16_seq_v2_kernel(
     const half* __restrict__ v_ptr, const half* __restrict__ a_ptr,
     const half* __restrict__ b_ptr, half* __restrict__ y_ptr,
     const int* __restrict__ elapsed_t, const int* __restrict__ slot_indices) {
-  const int bh = blockIdx.x;
-  const int b_id = bh / H;
-  const int h = bh - b_id * H;
+  int b_id;
+  int h;
+  decode_batch_head<Grid2D>(H, b_id, h);
   const int i = threadIdx.x;
   const int lane = i & 31;
-  const int state_b = slot_indices == nullptr ? b_id : slot_indices[b_id];
+  const int state_b =
+      slot_indices == nullptr ? b_id : slot_indices[b_id];
 
   __shared__ __align__(256) half2 state_smem[N][HALF2_N];
   state_ptr += static_cast<int64_t>(state_b) * C * N + h * N * N;
@@ -527,7 +550,7 @@ __global__ __launch_bounds__(N, 2) void wkv_fp16_seq_v2_varlen_kernel(
   }
 }
 
-template <bool AddW0 = false>
+template <bool AddW0 = false, bool Grid2D = false>
 __global__ __launch_bounds__(N, 1) void wkv_fp16_one_direct_kernel(
     int C, int H, half* __restrict__ state_ptr, const half* __restrict__ r_ptr,
     const half* __restrict__ w_ptr, const half* __restrict__ w0_ptr,
@@ -535,12 +558,13 @@ __global__ __launch_bounds__(N, 1) void wkv_fp16_one_direct_kernel(
     const half* __restrict__ a_ptr, const half* __restrict__ b_ptr,
     half* __restrict__ y_ptr, const int* __restrict__ elapsed_t,
     const int* __restrict__ slot_indices) {
-  const int bh = blockIdx.x;
-  const int b_id = bh / H;
-  const int h = bh - b_id * H;
+  int b_id;
+  int h;
+  decode_batch_head<Grid2D>(H, b_id, h);
   const int i = threadIdx.x;
   const int lane = i & 31;
-  const int state_b = slot_indices == nullptr ? b_id : slot_indices[b_id];
+  const int state_b =
+      slot_indices == nullptr ? b_id : slot_indices[b_id];
 
   __shared__ __align__(256) half2 state_smem[N][HALF2_N];
   half* state_base =
@@ -618,7 +642,7 @@ __global__ __launch_bounds__(N, 1) void wkv_fp16_one_direct_kernel(
   }
 }
 
-template <bool AddW0 = false>
+template <bool AddW0 = false, bool Grid2D = false>
 __global__ __launch_bounds__(N, 1) void wkv_fp16_one_cp_kernel(
     int C, int H, half* __restrict__ state_ptr, const half* __restrict__ r_ptr,
     const half* __restrict__ w_ptr, const half* __restrict__ w0_ptr,
@@ -626,12 +650,13 @@ __global__ __launch_bounds__(N, 1) void wkv_fp16_one_cp_kernel(
     const half* __restrict__ a_ptr, const half* __restrict__ b_ptr,
     half* __restrict__ y_ptr, const int* __restrict__ elapsed_t,
     const int* __restrict__ slot_indices) {
-  const int bh = blockIdx.x;
-  const int b_id = bh / H;
-  const int h = bh - b_id * H;
+  int b_id;
+  int h;
+  decode_batch_head<Grid2D>(H, b_id, h);
   const int i = threadIdx.x;
   const int lane = i & 31;
-  const int state_b = slot_indices == nullptr ? b_id : slot_indices[b_id];
+  const int state_b =
+      slot_indices == nullptr ? b_id : slot_indices[b_id];
 
   __shared__ __align__(256) half2 state_smem[N][HALF2_N];
   half* state_base =
@@ -722,26 +747,32 @@ void wkv_one_v2_cuda_impl(int B, int C, int H, at::Tensor state, at::Tensor r,
                           at::Tensor w, const half* w0_ptr, bool add_w0,
                           at::Tensor k, at::Tensor v, at::Tensor a,
                           at::Tensor b, at::Tensor y, at::Tensor elapsed_t,
-                          at::Tensor slot_indices);
+                          at::Tensor slot_indices, bool grid2d = false);
 
-void wkv_seq_v2_cuda_impl(int B, int T, int C, int H, at::Tensor state,
-                          at::Tensor r, at::Tensor w, const half* w0_ptr,
-                          bool add_w0, at::Tensor k, at::Tensor v, at::Tensor a,
-                          at::Tensor b, at::Tensor y, at::Tensor elapsed_t,
-                          at::Tensor slot_indices) {
+template <bool Grid2D>
+void launch_wkv_seq_v2_cuda_impl(
+    int B, int T, int C, int H, at::Tensor state, at::Tensor r,
+    at::Tensor w, const half* w0_ptr, bool add_w0, at::Tensor k,
+    at::Tensor v, at::Tensor a, at::Tensor b, at::Tensor y,
+    at::Tensor elapsed_t, at::Tensor slot_indices, int forced_mode) {
   assert(C == H * N);
   const int* slot_ptr = slot_indices.defined() && slot_indices.numel() > 0
                             ? slot_indices.data_ptr<int>()
                             : nullptr;
   if (T == 1) {
     wkv_one_v2_cuda_impl(B, C, H, state, r, w, w0_ptr, add_w0, k, v, a, b, y,
-                         elapsed_t, slot_indices);
+                         elapsed_t, slot_indices, Grid2D);
     return;
   }
   auto stream = at::cuda::getCurrentCUDAStream();
-  if (use_v2_seq(B, T)) {
+  const dim3 grid =
+      Grid2D ? dim3(H, B, 1) : dim3(static_cast<unsigned int>(B * H), 1, 1);
+  const bool use_seq_v2 =
+      forced_mode == 1 || (forced_mode < 0 && use_v2_seq(B, T));
+  if (use_seq_v2) {
     if (add_w0) {
-      wkv_fp16_seq_v2_kernel<true><<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_seq_v2_kernel<true, Grid2D>
+          <<<grid, dim3(N), 0, stream>>>(
           T, C, H, reinterpret_cast<half*>(state.data_ptr()),
           reinterpret_cast<const half*>(r.data_ptr()),
           reinterpret_cast<const half*>(w.data_ptr()), w0_ptr,
@@ -752,7 +783,8 @@ void wkv_seq_v2_cuda_impl(int B, int T, int C, int H, at::Tensor state,
           reinterpret_cast<half*>(y.data_ptr()), elapsed_t.data_ptr<int>(),
           slot_ptr);
     } else {
-      wkv_fp16_seq_v2_kernel<false><<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_seq_v2_kernel<false, Grid2D>
+          <<<grid, dim3(N), 0, stream>>>(
           T, C, H, reinterpret_cast<half*>(state.data_ptr()),
           reinterpret_cast<const half*>(r.data_ptr()),
           reinterpret_cast<const half*>(w.data_ptr()), nullptr,
@@ -765,8 +797,8 @@ void wkv_seq_v2_cuda_impl(int B, int T, int C, int H, at::Tensor state,
     }
   } else {
     if (add_w0) {
-      wkv_fp16_v1_exact_kernel<false, true>
-          <<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_v1_exact_kernel<false, true, Grid2D>
+          <<<grid, dim3(N), 0, stream>>>(
               B, T, C, H, reinterpret_cast<half*>(state.data_ptr()),
               reinterpret_cast<const half*>(r.data_ptr()),
               reinterpret_cast<const half*>(w.data_ptr()), w0_ptr,
@@ -777,8 +809,8 @@ void wkv_seq_v2_cuda_impl(int B, int T, int C, int H, at::Tensor state,
               reinterpret_cast<half*>(y.data_ptr()), elapsed_t.data_ptr<int>(),
               slot_ptr);
     } else {
-      wkv_fp16_v1_exact_kernel<false, false>
-          <<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_v1_exact_kernel<false, false, Grid2D>
+          <<<grid, dim3(N), 0, stream>>>(
               B, T, C, H, reinterpret_cast<half*>(state.data_ptr()),
               reinterpret_cast<const half*>(r.data_ptr()),
               reinterpret_cast<const half*>(w.data_ptr()), nullptr,
@@ -791,6 +823,23 @@ void wkv_seq_v2_cuda_impl(int B, int T, int C, int H, at::Tensor state,
     }
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void wkv_seq_v2_cuda_impl(int B, int T, int C, int H, at::Tensor state,
+                          at::Tensor r, at::Tensor w, const half* w0_ptr,
+                          bool add_w0, at::Tensor k, at::Tensor v, at::Tensor a,
+                          at::Tensor b, at::Tensor y, at::Tensor elapsed_t,
+                          at::Tensor slot_indices, int forced_mode = -1,
+                          bool grid2d = false) {
+  if (grid2d) {
+    launch_wkv_seq_v2_cuda_impl<true>(
+        B, T, C, H, state, r, w, w0_ptr, add_w0, k, v, a, b, y, elapsed_t,
+        slot_indices, forced_mode);
+  } else {
+    launch_wkv_seq_v2_cuda_impl<false>(
+        B, T, C, H, state, r, w, w0_ptr, add_w0, k, v, a, b, y, elapsed_t,
+        slot_indices, forced_mode);
+  }
 }
 
 void wkv_seq_varlen_v2_cuda_impl(int B, int max_t, int C, int H,
@@ -865,6 +914,18 @@ void wkv_seq_w0_slot_v2_cuda(int B, int T, int C, int H, at::Tensor state,
                        a, b, y, elapsed_t, slot_indices);
 }
 
+void wkv_seq_routed_v2_cuda(
+    int B, int T, int C, int H, int forced_mode, bool grid2d,
+    at::Tensor state, at::Tensor r, at::Tensor w, at::Tensor w0,
+    at::Tensor k, at::Tensor v, at::Tensor a, at::Tensor b, at::Tensor y,
+    at::Tensor slot_indices, at::Tensor elapsed_t) {
+  const bool add_w0 = w0.defined();
+  const half* w0_ptr =
+      add_w0 ? reinterpret_cast<const half*>(w0.data_ptr()) : nullptr;
+  wkv_seq_v2_cuda_impl(B, T, C, H, state, r, w, w0_ptr, add_w0, k, v, a, b,
+                       y, elapsed_t, slot_indices, forced_mode, grid2d);
+}
+
 void wkv_seq_varlen_v2_cuda(int B, int max_t, int C, int H,
                             at::Tensor query_start_loc, at::Tensor slot_indices,
                             at::Tensor state, at::Tensor r, at::Tensor w,
@@ -888,19 +949,23 @@ void wkv_seq_w0_varlen_v2_cuda(int B, int max_t, int C, int H,
                               true, k, v, a, b, y, elapsed_t);
 }
 
-void wkv_one_v2_cuda_impl(int B, int C, int H, at::Tensor state, at::Tensor r,
-                          at::Tensor w, const half* w0_ptr, bool add_w0,
-                          at::Tensor k, at::Tensor v, at::Tensor a,
-                          at::Tensor b, at::Tensor y, at::Tensor elapsed_t,
-                          at::Tensor slot_indices) {
+template <bool Grid2D>
+void launch_wkv_one_v2_cuda_impl(
+    int B, int C, int H, at::Tensor state, at::Tensor r, at::Tensor w,
+    const half* w0_ptr, bool add_w0, at::Tensor k, at::Tensor v,
+    at::Tensor a, at::Tensor b, at::Tensor y, at::Tensor elapsed_t,
+    at::Tensor slot_indices) {
   assert(C == H * N);
   auto stream = at::cuda::getCurrentCUDAStream();
+  const dim3 grid =
+      Grid2D ? dim3(H, B, 1) : dim3(static_cast<unsigned int>(B * H), 1, 1);
   const int* slot_ptr = slot_indices.defined() && slot_indices.numel() > 0
                             ? slot_indices.data_ptr<int>()
                             : nullptr;
   if (B <= 2) {
     if (add_w0) {
-      wkv_fp16_v1_clone_kernel<true, true><<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_v1_clone_kernel<true, true, Grid2D>
+          <<<grid, dim3(N), 0, stream>>>(
           B, 1, C, H, reinterpret_cast<half*>(state.data_ptr()),
           reinterpret_cast<const half*>(r.data_ptr()),
           reinterpret_cast<const half*>(w.data_ptr()), w0_ptr,
@@ -911,8 +976,8 @@ void wkv_one_v2_cuda_impl(int B, int C, int H, at::Tensor state, at::Tensor r,
           reinterpret_cast<half*>(y.data_ptr()), elapsed_t.data_ptr<int>(),
           slot_ptr);
     } else {
-      wkv_fp16_v1_clone_kernel<true, false>
-          <<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_v1_clone_kernel<true, false, Grid2D>
+          <<<grid, dim3(N), 0, stream>>>(
               B, 1, C, H, reinterpret_cast<half*>(state.data_ptr()),
               reinterpret_cast<const half*>(r.data_ptr()),
               reinterpret_cast<const half*>(w.data_ptr()), nullptr,
@@ -925,7 +990,8 @@ void wkv_one_v2_cuda_impl(int B, int C, int H, at::Tensor state, at::Tensor r,
     }
   } else if (B <= 64) {
     if (add_w0) {
-      wkv_fp16_one_cp_kernel<true><<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_one_cp_kernel<true, Grid2D>
+          <<<grid, dim3(N), 0, stream>>>(
           C, H, reinterpret_cast<half*>(state.data_ptr()),
           reinterpret_cast<const half*>(r.data_ptr()),
           reinterpret_cast<const half*>(w.data_ptr()), w0_ptr,
@@ -936,7 +1002,8 @@ void wkv_one_v2_cuda_impl(int B, int C, int H, at::Tensor state, at::Tensor r,
           reinterpret_cast<half*>(y.data_ptr()), elapsed_t.data_ptr<int>(),
           slot_ptr);
     } else {
-      wkv_fp16_one_cp_kernel<false><<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_one_cp_kernel<false, Grid2D>
+          <<<grid, dim3(N), 0, stream>>>(
           C, H, reinterpret_cast<half*>(state.data_ptr()),
           reinterpret_cast<const half*>(r.data_ptr()),
           reinterpret_cast<const half*>(w.data_ptr()), nullptr,
@@ -949,7 +1016,8 @@ void wkv_one_v2_cuda_impl(int B, int C, int H, at::Tensor state, at::Tensor r,
     }
   } else if (B <= 128) {
     if (add_w0) {
-      wkv_fp16_one_direct_kernel<true><<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_one_direct_kernel<true, Grid2D>
+          <<<grid, dim3(N), 0, stream>>>(
           C, H, reinterpret_cast<half*>(state.data_ptr()),
           reinterpret_cast<const half*>(r.data_ptr()),
           reinterpret_cast<const half*>(w.data_ptr()), w0_ptr,
@@ -960,7 +1028,8 @@ void wkv_one_v2_cuda_impl(int B, int C, int H, at::Tensor state, at::Tensor r,
           reinterpret_cast<half*>(y.data_ptr()), elapsed_t.data_ptr<int>(),
           slot_ptr);
     } else {
-      wkv_fp16_one_direct_kernel<false><<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_one_direct_kernel<false, Grid2D>
+          <<<grid, dim3(N), 0, stream>>>(
           C, H, reinterpret_cast<half*>(state.data_ptr()),
           reinterpret_cast<const half*>(r.data_ptr()),
           reinterpret_cast<const half*>(w.data_ptr()), nullptr,
@@ -973,7 +1042,8 @@ void wkv_one_v2_cuda_impl(int B, int C, int H, at::Tensor state, at::Tensor r,
     }
   } else {
     if (add_w0) {
-      wkv_fp16_v1_clone_kernel<true, true><<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_v1_clone_kernel<true, true, Grid2D>
+          <<<grid, dim3(N), 0, stream>>>(
           B, 1, C, H, reinterpret_cast<half*>(state.data_ptr()),
           reinterpret_cast<const half*>(r.data_ptr()),
           reinterpret_cast<const half*>(w.data_ptr()), w0_ptr,
@@ -984,8 +1054,8 @@ void wkv_one_v2_cuda_impl(int B, int C, int H, at::Tensor state, at::Tensor r,
           reinterpret_cast<half*>(y.data_ptr()), elapsed_t.data_ptr<int>(),
           slot_ptr);
     } else {
-      wkv_fp16_v1_clone_kernel<true, false>
-          <<<dim3(B * H), dim3(N), 0, stream>>>(
+      wkv_fp16_v1_clone_kernel<true, false, Grid2D>
+          <<<grid, dim3(N), 0, stream>>>(
               B, 1, C, H, reinterpret_cast<half*>(state.data_ptr()),
               reinterpret_cast<const half*>(r.data_ptr()),
               reinterpret_cast<const half*>(w.data_ptr()), nullptr,
@@ -998,4 +1068,20 @@ void wkv_one_v2_cuda_impl(int B, int C, int H, at::Tensor state, at::Tensor r,
     }
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void wkv_one_v2_cuda_impl(int B, int C, int H, at::Tensor state, at::Tensor r,
+                          at::Tensor w, const half* w0_ptr, bool add_w0,
+                          at::Tensor k, at::Tensor v, at::Tensor a,
+                          at::Tensor b, at::Tensor y, at::Tensor elapsed_t,
+                          at::Tensor slot_indices, bool grid2d) {
+  if (grid2d) {
+    launch_wkv_one_v2_cuda_impl<true>(
+        B, C, H, state, r, w, w0_ptr, add_w0, k, v, a, b, y, elapsed_t,
+        slot_indices);
+  } else {
+    launch_wkv_one_v2_cuda_impl<false>(
+        B, C, H, state, r, w, w0_ptr, add_w0, k, v, a, b, y, elapsed_t,
+        slot_indices);
+  }
 }

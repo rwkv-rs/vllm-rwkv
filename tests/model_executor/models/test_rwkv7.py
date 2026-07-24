@@ -160,6 +160,151 @@ def test_rwkv7_forward_tokens_keeps_slot_selected_cmix_path(monkeypatch):
     assert seen[0][0] != rwkv7.CMIX_DENSE
 
 
+@pytest.mark.parametrize(
+    ("batch", "tokens", "expected"),
+    [
+        (1, 2, True),
+        (1, 8, False),
+        (2, 2, True),
+        (4, 4, False),
+        (8, 8, True),
+        (16, 16, True),
+        (17, 1, False),
+    ],
+)
+def test_rwkv7_wkv_grid_2d_tuned_shapes(
+    batch: int,
+    tokens: int,
+    expected: bool,
+) -> None:
+    assert rwkv7.use_wkv_bh_grid_2d(batch, tokens, 4096, 64) is expected
+
+
+@pytest.mark.parametrize(
+    ("batch", "tokens", "expected"),
+    [(1, 2, True), (1, 8, False), (1, 16, True), (2, 2, True), (2, 1, False)],
+)
+def test_rwkv7_mix_3d_tuned_shapes(
+    batch: int,
+    tokens: int,
+    expected: bool,
+) -> None:
+    assert rwkv7.use_tmix_mix6_3d(batch, tokens, 4096) is expected
+    assert rwkv7.use_cmix_mix_3d(batch, tokens, 4096) is expected
+
+
+def test_rwkv7_auxiliary_tuned_shape_guards() -> None:
+    assert rwkv7.use_tmix_lnx_warp(1, 64, 4096, 64)
+    assert not rwkv7.use_tmix_lnx_warp(1, 32, 4096, 64)
+    assert rwkv7.use_tmix_lnx_warp(64, 1, 4096, 64)
+    assert rwkv7.use_add_vec_2d(17, 4096)
+    assert not rwkv7.use_add_vec_2d(16, 4096)
+    assert not rwkv7.use_add_vec_2d(17, 2048)
+    assert rwkv7.use_ln1_tmix_fusion(1, 1)
+    for batch in (2, 4, 8, 16):
+        assert not rwkv7.use_ln1_tmix_fusion(batch, 1)
+    assert rwkv7.use_ln1_tmix_fusion(32, 1)
+    assert rwkv7.use_ln1_tmix_fusion(320, 1)
+    assert not rwkv7.use_ln1_tmix_fusion(1, 2)
+
+
+@pytest.mark.parametrize(
+    (
+        "batch",
+        "tokens",
+        "with_slots",
+        "expected_add",
+        "expected_wkv",
+        "forced_mode",
+    ),
+    [
+        (1, 1, False, None, "wkv_seq_w0_grid2d", None),
+        (32, 1, False, None, "wkv_seq_w0", None),
+        (8, 8, False, None, "wkv_seq_w0_grid2d_forced", 0),
+        (4, 4, False, None, "wkv_seq_w0", None),
+        (1, 32, False, "add_vec_2d", "wkv_seq", None),
+        (2, 64, False, "add_vec_2d", "wkv_seq_grid2d", None),
+        (8, 1, True, None, "wkv_seq_w0_slot_grid2d", None),
+        (2, 32, True, None, "wkv_seq_w0_slot_grid2d_forced", 0),
+    ],
+)
+def test_rwkv7_run_wkv_fp16_uses_tuned_route(
+    monkeypatch,
+    batch: int,
+    tokens: int,
+    with_slots: bool,
+    expected_add: str | None,
+    expected_wkv: str,
+    forced_mode: int | None,
+) -> None:
+    calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    def record(name: str, result: torch.Tensor | None = None):
+        def op(*args):
+            calls.append((name, args))
+            return result
+
+        return op
+
+    wkv_names = (
+        "wkv_seq",
+        "wkv_seq_slot",
+        "wkv_seq_grid2d",
+        "wkv_seq_slot_grid2d",
+        "wkv_seq_w0",
+        "wkv_seq_w0_slot",
+        "wkv_seq_w0_grid2d",
+        "wkv_seq_w0_slot_grid2d",
+        "wkv_seq_w0_forced",
+        "wkv_seq_w0_slot_forced",
+        "wkv_seq_w0_grid2d_forced",
+        "wkv_seq_w0_slot_grid2d_forced",
+    )
+    for name in wkv_names:
+        monkeypatch.setattr(
+            torch.ops.rwkv7_wkv_fp16_v2,
+            name,
+            record(name),
+            raising=False,
+        )
+
+    tensors = [torch.empty(0) for _ in range(10)]
+    w_raw = torch.empty(0)
+    monkeypatch.setattr(
+        torch.ops.rwkv7_fast_ops_fp16,
+        "add_vec",
+        record("add_vec", w_raw),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.rwkv7_fast_ops_fp16,
+        "add_vec_2d",
+        record("add_vec_2d", w_raw),
+        raising=False,
+    )
+    slot_indices = torch.tensor([0], dtype=torch.int32) if with_slots else None
+    model = _new_rwkv7_forward_test_model()
+
+    RWKV7ForCausalLM._run_wkv_fp16(
+        model,
+        batch,
+        tokens,
+        4096,
+        64,
+        *tensors,
+        slot_indices,
+    )
+
+    assert [name for name, _ in calls] == (
+        [expected_add, expected_wkv] if expected_add is not None else [expected_wkv]
+    )
+    if forced_mode is not None:
+        wkv_args = calls[-1][1]
+        assert wkv_args[4] == forced_mode
+    if with_slots:
+        assert any(arg is slot_indices for arg in calls[-1][1])
+
+
 def test_rwkv7_forward_layer_range_uses_slot_fused_tmix_for_batched_decode(
     monkeypatch,
 ):
@@ -258,7 +403,9 @@ def test_rwkv7_forward_layer_range_uses_slot_fused_tmix_for_batched_decode(
     model.add_ln = add_ln
     model.tmix = tmix
     model.cmix_from_mixed = cmix_from_mixed
-    slot_indices = torch.tensor([3, 1], dtype=torch.int32)
+    # B=2/4/8/16 deliberately use separate LN1/TMix kernels; B=3 keeps the
+    # slot-aware fused owner and exercises that production branch.
+    slot_indices = torch.tensor([3, 1, 4], dtype=torch.int32)
     state = [
         torch.zeros((2, 2, 6, 4)),
         torch.empty((2,)),
@@ -267,9 +414,9 @@ def test_rwkv7_forward_layer_range_uses_slot_fused_tmix_for_batched_decode(
 
     RWKV7ForCausalLM.forward_layer_range(
         model,
-        torch.zeros((2, 1, 4)),
+        torch.zeros((3, 1, 4)),
         state,
-        rwkv7.PathConfig(2, rwkv7.CMIX_ROWS2_NOFC),
+        rwkv7.PathConfig(3, rwkv7.CMIX_ROWS2_NOFC),
         v_first=None,
         final=False,
         all_logits=False,
@@ -277,12 +424,12 @@ def test_rwkv7_forward_layer_range_uses_slot_fused_tmix_for_batched_decode(
     )
 
     assert calls == [
-        ("tmix", 0, False, [3, 1]),
-        ("fused_cmix", [3, 1]),
-        ("fused_tmix", 2, [3, 1]),
-        ("tmix", 1, True, [3, 1]),
-        ("fused_cmix", [3, 1]),
-        ("advance", [3, 1], 1),
+        ("tmix", 0, False, [3, 1, 4]),
+        ("fused_cmix", [3, 1, 4]),
+        ("fused_tmix", 3, [3, 1, 4]),
+        ("tmix", 1, True, [3, 1, 4]),
+        ("fused_cmix", [3, 1, 4]),
+        ("advance", [3, 1, 4], 1),
     ]
 
 
@@ -643,6 +790,606 @@ def test_rwkv7_passes_profile_accumulation_to_custom_op(monkeypatch, mode):
     assert calls == [("linear_f16", profile.allow_fp16_accumulation)]
 
 
+@pytest.mark.parametrize(
+    ("helper_name", "weight_shape", "rows", "expected_cfg"),
+    [
+        ("linear_att_c2c", (4096, 4096), 64, (32, 2)),
+        ("linear_ffn_down", (16384, 4096), 64, (32, 3)),
+    ],
+)
+def test_rwkv7_fp16_tuned_linear_helpers_use_exact_lt_configs(
+    monkeypatch,
+    helper_name,
+    weight_shape,
+    rows,
+    expected_cfg,
+):
+    calls = []
+    expected = torch.empty(
+        (rows, weight_shape[1]),
+        device="meta",
+        dtype=torch.float16,
+    )
+
+    def linear_f16_lt_cfg(
+        x,
+        weight,
+        workspace_mb,
+        heuristic_index,
+        strict_algo,
+    ):
+        calls.append(
+            (
+                x,
+                weight,
+                workspace_mb,
+                heuristic_index,
+                strict_algo,
+            )
+        )
+        return expected
+
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "linear_f16_lt_cfg",
+        linear_f16_lt_cfg,
+        raising=False,
+    )
+    model = _new_rwkv7_forward_test_model(
+        allow_fp16_accumulation=True,
+        hidden_size=4096,
+    )
+    model.linear = lambda *_args: pytest.fail("exact tuned shape must use Lt")
+    x = torch.empty((rows, weight_shape[0]), device="meta", dtype=torch.float16)
+    weight = torch.empty(weight_shape, device="meta", dtype=torch.float16)
+
+    output = getattr(model, helper_name)(x, weight, rows)
+
+    assert output is expected
+    assert calls == [(x, weight, *expected_cfg, False)]
+
+
+def test_rwkv7_project_att_rkv_groups_exact_m1_splitk(monkeypatch):
+    model = _new_rwkv7_forward_test_model(hidden_size=4096)
+    prefix = "blocks.0.att."
+    weights = tuple(
+        torch.empty((4096, 4096), device="meta", dtype=torch.float16)
+        for _ in range(3)
+    )
+    model.z = {
+        prefix + "receptance.weight": weights[0],
+        prefix + "key.weight": weights[1],
+        prefix + "value.weight": weights[2],
+    }
+    inputs = tuple(
+        torch.empty((1, 1, 4096), device="meta", dtype=torch.float16)
+        for _ in range(3)
+    )
+    expected = tuple(
+        torch.empty_like(inputs[0]) for _ in range(3)
+    )
+    calls = []
+
+    def grouped(*args):
+        calls.append(args)
+        return expected
+
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "linear_rkv_f16_m1_splitk",
+        grouped,
+        raising=False,
+    )
+    model.linear_att_c2c = lambda *_args: pytest.fail(
+        "exact M1 must use grouped split-K"
+    )
+    model.linear = lambda *_args: pytest.fail(
+        "exact M1 must use grouped split-K"
+    )
+
+    output = model.project_att_rkv(*inputs, prefix, 1)
+
+    assert output is expected
+    assert calls == [(*inputs, *weights)]
+
+
+@pytest.mark.parametrize(
+    ("rows", "weight_n"),
+    [
+        (2, 4096),
+        (1, 4000),
+    ],
+)
+def test_rwkv7_project_att_rkv_falls_back_outside_exact_contract(
+    monkeypatch,
+    rows,
+    weight_n,
+):
+    model = _new_rwkv7_forward_test_model(hidden_size=4096)
+    prefix = "blocks.0.att."
+    weights = tuple(
+        torch.empty((4096, weight_n), device="meta", dtype=torch.float16)
+        for _ in range(3)
+    )
+    model.z = {
+        prefix + "receptance.weight": weights[0],
+        prefix + "key.weight": weights[1],
+        prefix + "value.weight": weights[2],
+    }
+    inputs = tuple(
+        torch.empty((rows, 4096), device="meta", dtype=torch.float16)
+        for _ in range(3)
+    )
+    expected = tuple(
+        torch.empty((rows, weight_n), device="meta", dtype=torch.float16)
+        for _ in range(3)
+    )
+    calls = []
+
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "linear_rkv_f16_m1_splitk",
+        lambda *_args: pytest.fail("non-contract shape must not use grouped op"),
+        raising=False,
+    )
+
+    def project(value, weight, runtime_rows=None):
+        index = len(calls)
+        calls.append((value, weight, runtime_rows))
+        return expected[index]
+
+    if rows == 1:
+        model.linear = project
+        model.linear_att_c2c = lambda *_args: pytest.fail(
+            "M1 fallback must stay pinned to independent split-K"
+        )
+    else:
+        model.linear = lambda *_args: pytest.fail(
+            "multi-row fallback must retain attention Lt dispatch"
+        )
+        model.linear_att_c2c = project
+
+    output = model.project_att_rkv(*inputs, prefix, rows)
+
+    assert all(actual is reference for actual, reference in zip(output, expected))
+    assert calls == [
+        (
+            inputs[index],
+            weights[index],
+            None if rows == 1 else rows,
+        )
+        for index in range(3)
+    ]
+
+
+def test_rwkv7_project_att_rkv_can_disable_grouped_route_for_benchmark(
+    monkeypatch,
+):
+    model = _new_rwkv7_forward_test_model(hidden_size=4096)
+    prefix = "blocks.0.att."
+    weights = tuple(
+        torch.empty((4096, 4096), device="meta", dtype=torch.float16)
+        for _ in range(3)
+    )
+    model.z = {
+        prefix + "receptance.weight": weights[0],
+        prefix + "key.weight": weights[1],
+        prefix + "value.weight": weights[2],
+    }
+    inputs = tuple(
+        torch.empty((1, 4096), device="meta", dtype=torch.float16)
+        for _ in range(3)
+    )
+    expected = tuple(torch.empty_like(inputs[0]) for _ in range(3))
+    calls = []
+    monkeypatch.setattr(rwkv7, "M1_RKV_GROUPED_ROWS", set())
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "linear_rkv_f16_m1_splitk",
+        lambda *_args: pytest.fail("disabled grouped route must not run"),
+        raising=False,
+    )
+
+    def linear(value, weight):
+        index = len(calls)
+        calls.append((value, weight))
+        return expected[index]
+
+    model.linear = linear
+    model.linear_att_c2c = lambda *_args: pytest.fail(
+        "benchmark baseline must stay pinned to independent split-K"
+    )
+
+    output = model.project_att_rkv(*inputs, prefix, 1)
+
+    assert all(actual is reference for actual, reference in zip(output, expected))
+    assert calls == [
+        (inputs[index], weights[index]) for index in range(3)
+    ]
+
+
+def test_rwkv7_cmix_m1_prepares_sparse_accumulator_during_splitk(
+    monkeypatch,
+):
+    model = _new_rwkv7_forward_test_model(hidden_size=8)
+    prefix = "blocks.0.ffn."
+    key_weight = torch.empty((8, 64), device="meta", dtype=torch.float16)
+    value_weight = torch.empty((64, 8), device="meta", dtype=torch.float16)
+    mixed = torch.empty((1, 1, 8), device="meta", dtype=torch.float16)
+    hid = torch.empty((1, 1, 64), device="meta", dtype=torch.float16)
+    sparse_out = torch.empty((1, 1, 8), device="meta", dtype=torch.float16)
+    seen = {}
+    model.z = {
+        prefix + "key.weight": key_weight,
+        prefix + "value.weight": value_weight,
+    }
+    model._tp_all_reduce = lambda value: value
+    model.linear = lambda *_args: pytest.fail(
+        "exact M1 no-fc must use split-K prepare-zero"
+    )
+
+    def prepare_zero(value, weight, zero_features):
+        seen["prepare_zero"] = (value, weight, zero_features)
+        return hid, sparse_out
+
+    def sparse_down_out(C, F, preact, weight, out):
+        seen["sparse_down_out"] = (C, F, preact, weight, out)
+
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "linear_f16_m1_splitk_prepare_zero",
+        prepare_zero,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.rwkv7_fast_ops_fp16,
+        "cmix_sparse_down_relu_one_out",
+        sparse_down_out,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.rwkv7_fast_ops_fp16,
+        "cmix_sparse_down_relu_one",
+        lambda *_args: pytest.fail("prezero route must skip the zeroing op"),
+        raising=False,
+    )
+
+    output = model.cmix_from_mixed(
+        mixed,
+        prefix,
+        rwkv7.PathConfig(1, rwkv7.CMIX_B1T1_NOFC),
+    )
+
+    assert output is sparse_out
+    prepared_x, prepared_weight, zero_features = seen["prepare_zero"]
+    assert prepared_x is mixed
+    assert prepared_weight is key_weight
+    assert zero_features == 8
+    C, F, preact, sparse_weight, out = seen["sparse_down_out"]
+    assert (C, F) == (8, 64)
+    assert tuple(preact.shape) == (64,)
+    assert sparse_weight is value_weight
+    assert out is sparse_out
+
+
+@pytest.mark.parametrize("disable_tuning", [False, True])
+def test_rwkv7_cmix_m1_falls_back_to_independent_zero_path(
+    monkeypatch,
+    disable_tuning,
+):
+    model = _new_rwkv7_forward_test_model(hidden_size=8)
+    prefix = "blocks.0.ffn."
+    out_features = 64 if disable_tuning else 65
+    key_weight = torch.empty(
+        (8, out_features), device="meta", dtype=torch.float16
+    )
+    value_weight = torch.empty(
+        (out_features, 8), device="meta", dtype=torch.float16
+    )
+    mixed = torch.empty((1, 1, 8), device="meta", dtype=torch.float16)
+    hid = torch.empty(
+        (1, 1, out_features), device="meta", dtype=torch.float16
+    )
+    sparse_out = torch.empty((1, 1, 8), device="meta", dtype=torch.float16)
+    seen = {}
+    model.z = {
+        prefix + "key.weight": key_weight,
+        prefix + "value.weight": value_weight,
+    }
+    model._tp_all_reduce = lambda value: value
+    if disable_tuning:
+        monkeypatch.setattr(rwkv7, "M1_CMIX_PREZERO_ROWS", set())
+
+    def linear(value, weight):
+        seen["linear"] = (value, weight)
+        return hid
+
+    def splitk(value, weight):
+        seen["splitk"] = (value, weight)
+        return hid
+
+    def sparse_down(C, F, preact, weight):
+        seen["sparse_down"] = (C, F, preact, weight)
+        return sparse_out
+
+    model.linear = linear
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "linear_f16_m1_splitk_prepare_zero",
+        lambda *_args: pytest.fail("fallback must not prepare sparse output"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "linear_f16_m1_splitk",
+        splitk,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.rwkv7_fast_ops_fp16,
+        "cmix_sparse_down_relu_one_out",
+        lambda *_args: pytest.fail("fallback must use independent zero path"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.rwkv7_fast_ops_fp16,
+        "cmix_sparse_down_relu_one",
+        sparse_down,
+        raising=False,
+    )
+
+    output = model.cmix_from_mixed(
+        mixed,
+        prefix,
+        rwkv7.PathConfig(1, rwkv7.CMIX_B1T1_NOFC),
+    )
+
+    assert output is sparse_out
+    projection = "splitk" if disable_tuning else "linear"
+    projected_x, projected_weight = seen[projection]
+    assert projected_x is mixed
+    assert projected_weight is key_weight
+    assert ("linear" in seen) == (not disable_tuning)
+    assert ("splitk" in seen) == disable_tuning
+    C, F, preact, sparse_weight = seen["sparse_down"]
+    assert (C, F) == (8, out_features)
+    assert tuple(preact.shape) == (out_features,)
+    assert sparse_weight is value_weight
+
+
+@pytest.mark.parametrize(
+    ("helper_name", "rows", "rank", "expected_cfg"),
+    [
+        ("linear_rank_in", 8, 128, (128, 0)),
+        ("linear_rank_in", 8, 480, (128, 0)),
+        ("linear_rank_in", 8, 96, (128, 0)),
+        ("linear_rank_in", 16, 480, (32, 1)),
+        ("linear_rank_in", 16, 96, (32, 0)),
+        ("linear_rank_out", 8, 128, (0, 5)),
+        ("linear_rank_out", 8, 480, (0, 3)),
+        ("linear_rank_out", 8, 96, (0, 4)),
+        ("linear_rank_out", 16, 128, (0, 1)),
+        ("linear_rank_out", 16, 480, (32, 2)),
+    ],
+)
+def test_rwkv7_fp16_lowrank_helpers_use_exact_runtime_lt_configs(
+    monkeypatch,
+    helper_name,
+    rows,
+    rank,
+    expected_cfg,
+):
+    calls = []
+    is_rank_in = helper_name == "linear_rank_in"
+    weight_shape = (4096, rank) if is_rank_in else (rank, 4096)
+    weight_t_shape = (rank, 4096) if is_rank_in else (4096, rank)
+    expected = torch.empty(
+        (rows, weight_shape[1]),
+        device="meta",
+        dtype=torch.float16,
+    )
+
+    def linear_f16_lt_cfg(
+        x,
+        weight,
+        workspace_mb,
+        heuristic_index,
+        strict_algo,
+    ):
+        calls.append(
+            (
+                x,
+                weight,
+                workspace_mb,
+                heuristic_index,
+                strict_algo,
+            )
+        )
+        return expected
+
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "linear_f16_lt_cfg",
+        linear_f16_lt_cfg,
+        raising=False,
+    )
+    model = _new_rwkv7_forward_test_model(
+        allow_fp16_accumulation=True,
+        hidden_size=4096,
+    )
+    model.linear = lambda *_args: pytest.fail("exact low-rank shape must use Lt")
+    x = torch.empty((rows, weight_shape[0]), device="meta", dtype=torch.float16)
+    weight = torch.empty(weight_shape, device="meta", dtype=torch.float16)
+    weight_t = torch.empty(weight_t_shape, device="meta", dtype=torch.float16)
+
+    output = getattr(model, helper_name)(x, weight, weight_t, rows)
+
+    assert output is expected
+    assert calls == [(x, weight, *expected_cfg, False)]
+
+
+@pytest.mark.parametrize(
+    ("act", "op_name"),
+    [
+        (1, "act_tanh"),
+        (2, "act_sigmoid"),
+    ],
+)
+def test_rwkv7_lowrank_out_activation_delegates_to_tuned_helper(
+    monkeypatch,
+    act,
+    op_name,
+):
+    model = _new_rwkv7_forward_test_model(
+        allow_fp16_accumulation=True,
+        hidden_size=4096,
+    )
+    x = torch.empty((8, 480), device="meta", dtype=torch.float16)
+    activated = torch.empty_like(x)
+    weight = torch.empty((480, 4096), device="meta", dtype=torch.float16)
+    weight_t = torch.empty((4096, 480), device="meta", dtype=torch.float16)
+    expected = torch.empty((8, 4096), device="meta", dtype=torch.float16)
+    activation_calls = []
+    projection_calls = []
+
+    def activate(value):
+        activation_calls.append(value)
+        return activated
+
+    def linear_rank_out(value, runtime_weight, transposed_weight, rows):
+        projection_calls.append(
+            (value, runtime_weight, transposed_weight, rows)
+        )
+        return expected
+
+    monkeypatch.setattr(
+        torch.ops.rwkv7_fast_ops_fp16,
+        op_name,
+        activate,
+        raising=False,
+    )
+    model.linear_rank_out = linear_rank_out
+
+    output = model.linear_rank_out_act(x, weight, weight_t, 8, act)
+
+    assert output is expected
+    assert activation_calls == [x]
+    assert projection_calls == [(activated, weight, weight_t, 8)]
+
+
+@pytest.mark.parametrize(
+    ("helper_name", "weight_shape", "weight_t_shape"),
+    [
+        ("linear_rank_in", (4096, 128), (128, 4096)),
+        ("linear_rank_out", (128, 4096), (4096, 128)),
+    ],
+)
+def test_rwkv7_lowrank_lt_preserves_fp32_accumulation_path(
+    monkeypatch,
+    helper_name,
+    weight_shape,
+    weight_t_shape,
+):
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "linear_f16_lt_cfg",
+        lambda *_args: pytest.fail("fp32 accumulation must not use tuned FP16 Lt"),
+        raising=False,
+    )
+    model = _new_rwkv7_forward_test_model(
+        allow_fp16_accumulation=False,
+        hidden_size=4096,
+    )
+    expected = torch.empty(
+        (8, weight_shape[1]),
+        device="meta",
+        dtype=torch.float16,
+    )
+    model.linear = lambda *_args: expected
+    x = torch.empty((8, weight_shape[0]), device="meta", dtype=torch.float16)
+    weight = torch.empty(weight_shape, device="meta", dtype=torch.float16)
+    weight_t = torch.empty(weight_t_shape, device="meta", dtype=torch.float16)
+
+    assert getattr(model, helper_name)(x, weight, weight_t, 8) is expected
+
+
+@pytest.mark.parametrize(
+    ("helper_name", "weight_shape"),
+    [
+        ("linear_att_c2c", (4096, 4096)),
+        ("linear_ffn_down", (16384, 4096)),
+    ],
+)
+def test_rwkv7_tuned_linear_helpers_preserve_fp32_accumulation_path(
+    monkeypatch,
+    helper_name,
+    weight_shape,
+):
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "linear_f16_lt_cfg",
+        lambda *_args: pytest.fail("fp32 accumulation must not use tuned FP16 Lt"),
+        raising=False,
+    )
+    model = _new_rwkv7_forward_test_model(
+        allow_fp16_accumulation=False,
+        hidden_size=4096,
+    )
+    expected = torch.empty(
+        (64, weight_shape[1]),
+        device="meta",
+        dtype=torch.float16,
+    )
+    fallback_calls = []
+
+    def fallback(x, weight):
+        fallback_calls.append((x, weight))
+        return expected
+
+    model.linear = fallback
+    x = torch.empty((64, weight_shape[0]), device="meta", dtype=torch.float16)
+    weight = torch.empty(weight_shape, device="meta", dtype=torch.float16)
+
+    output = getattr(model, helper_name)(x, weight, 64)
+
+    assert output is expected
+    assert fallback_calls == [(x, weight)]
+
+
+@pytest.mark.parametrize(
+    ("helper_name", "weight_shape"),
+    [
+        ("linear_att_c2c", (4096, 4096)),
+        ("linear_ffn_down", (16384, 4096)),
+    ],
+)
+def test_rwkv7_tuned_linear_helpers_require_exact_rows(
+    monkeypatch,
+    helper_name,
+    weight_shape,
+):
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "linear_f16_lt_cfg",
+        lambda *_args: pytest.fail("untuned row count must not use Lt"),
+        raising=False,
+    )
+    model = _new_rwkv7_forward_test_model(
+        allow_fp16_accumulation=True,
+        hidden_size=4096,
+    )
+    expected = torch.empty(
+        (63, weight_shape[1]),
+        device="meta",
+        dtype=torch.float16,
+    )
+    model.linear = lambda *_args: expected
+    x = torch.empty((63, weight_shape[0]), device="meta", dtype=torch.float16)
+    weight = torch.empty(weight_shape, device="meta", dtype=torch.float16)
+
+    assert getattr(model, helper_name)(x, weight, 63) is expected
+
+
 def test_rwkv7_dummy_inputs_decode_capture_advertises_contiguous_rows():
     state = object.__new__(RWKV7ModelState)
     state.num_layers = 2
@@ -693,6 +1440,31 @@ def test_rwkv7_dummy_inputs_decode_capture_uses_persistent_state_buffers():
     assert inputs["rwkv_decode_rows"] == [0, 1, 2]
     assert inputs["rwkv_decode_token_positions"] == [0, 1, 2]
     assert inputs["slot_indices"] is None
+
+
+@pytest.mark.parametrize(
+    ("updates", "expected"),
+    [
+        ({}, True),
+        ({"rwkv_decode_batch_size": 2}, False),
+        ({"rwkv_decode_rows": [1, 2, 3]}, False),
+        ({"slot_indices": torch.tensor([1, 2, 3], dtype=torch.int32)}, False),
+        ({"rwkv_decode_rows": None}, False),
+    ],
+)
+def test_rwkv7_full_cudagraph_replay_requires_exact_contiguous_decode(
+    updates,
+    expected,
+):
+    model_inputs = {
+        "positions": torch.arange(3, dtype=torch.int64),
+        "rwkv_decode_batch_size": 3,
+        "rwkv_decode_rows": [0, 1, 2],
+        "slot_indices": None,
+    }
+    model_inputs.update(updates)
+
+    assert RWKV7ModelState.can_replay_full_cudagraph(model_inputs) is expected
 
 
 def test_rwkv7_load_weights_preprocesses_full_raw_weights(monkeypatch):
@@ -1548,16 +2320,158 @@ def test_rwkv7_tensor_parallel_shards_weights_for_rank():
     )
 
 
+def test_rwkv7_project_logits_fp32_uses_fp32_lt_op_for_batched_input(monkeypatch):
+    model = object.__new__(RWKV7ForCausalLM)
+    model.z = {"head.weight": torch.empty(4, 5, dtype=torch.float16)}
+    hidden_states = torch.empty(2, 3, 4, dtype=torch.float16)
+    expected = torch.ones(2, 3, 5, dtype=torch.float32)
+    calls = []
+
+    def fake_linear(x, weight):
+        calls.append((x, weight))
+        return expected
+
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "linear_f16_fp32_lt",
+        fake_linear,
+    )
+
+    logits = model.project_logits_fp32(hidden_states)
+
+    assert logits.shape == (2, 3, 5)
+    assert logits.dtype == torch.float32
+    assert len(calls) == 1
+    assert calls[0][0] is hidden_states
+    assert calls[0][1] is model.z["head.weight"]
+
+
+def test_rwkv7_project_logits_fp32_uses_m1_splitk(monkeypatch):
+    model = object.__new__(RWKV7ForCausalLM)
+    model.z = {"head.weight": torch.empty(4, 64, dtype=torch.float16)}
+    hidden_states = torch.empty(1, 4, dtype=torch.float16)
+    expected = torch.ones(1, 64, dtype=torch.float32)
+    calls = []
+
+    def fake_splitk(x, weight):
+        calls.append((x, weight))
+        return expected
+
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "linear_f16_m1_splitk_fp32",
+        fake_splitk,
+    )
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "linear_f16_fp32_lt",
+        lambda *_args, **_kwargs: pytest.fail("M=1 must use split-K"),
+    )
+
+    logits = model.project_logits_fp32(hidden_states)
+
+    assert logits is expected
+    assert len(calls) == 1
+    assert calls[0][0] is hidden_states
+    assert calls[0][1] is model.z["head.weight"]
+
+
+def test_rwkv7_project_logits_fp32_zero_k_multirow_uses_fp32_lt(monkeypatch):
+    model = object.__new__(RWKV7ForCausalLM)
+    model.z = {"head.weight": torch.empty(0, 64, dtype=torch.float16)}
+    hidden_states = torch.empty(2, 0, dtype=torch.float16)
+    expected = torch.zeros(2, 64, dtype=torch.float32)
+    calls = []
+
+    def fake_linear(x, weight):
+        calls.append((x, weight))
+        return expected
+
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "linear_f16_fp32_lt",
+        fake_linear,
+    )
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "linear_f16_m1_splitk_fp32",
+        lambda *_args: pytest.fail("multiple rows must not use split-K"),
+    )
+
+    logits = model.project_logits_fp32(hidden_states)
+
+    assert logits is expected
+    assert calls == [(hidden_states, model.z["head.weight"])]
+
+
+def test_rwkv7_project_logits_fp32_m1_non_aligned_vocab_uses_fp32_lt(
+    monkeypatch,
+):
+    model = object.__new__(RWKV7ForCausalLM)
+    model.z = {"head.weight": torch.empty(4, 65, dtype=torch.float16)}
+    hidden_states = torch.empty(1, 4, dtype=torch.float16)
+    expected = torch.ones(1, 65, dtype=torch.float32)
+    calls = []
+
+    def fake_linear(x, weight):
+        calls.append((x, weight))
+        return expected
+
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "linear_f16_fp32_lt",
+        fake_linear,
+    )
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "linear_f16_m1_splitk_fp32",
+        lambda *_args: pytest.fail("unaligned vocab must not use split-K"),
+    )
+
+    logits = model.project_logits_fp32(hidden_states)
+
+    assert logits is expected
+    assert calls == [(hidden_states, model.z["head.weight"])]
+
+
+def test_rwkv7_compute_logits_tp1_preserves_fp32_contract(monkeypatch):
+    model = object.__new__(RWKV7ForCausalLM)
+    model.tp_size = 1
+    expected = torch.arange(10, dtype=torch.float32).reshape(2, 5)
+    model.project_logits_fp32 = lambda hidden_states: expected
+    processor_calls = []
+
+    def logits_processor(lm_head, logits):
+        processor_calls.append((lm_head, logits))
+        return logits
+
+    model.logits_processor = logits_processor
+    monkeypatch.setattr(
+        rwkv7,
+        "tensor_model_parallel_all_gather",
+        lambda _logits: pytest.fail("TP=1 must not all-gather logits"),
+    )
+
+    logits = model.compute_logits(torch.empty(2, 4))
+
+    assert logits is expected
+    assert logits.dtype == torch.float32
+    assert processor_calls == [(None, expected)]
+
+
 def test_rwkv7_compute_logits_all_gathers_tensor_parallel_vocab(monkeypatch):
     model = object.__new__(RWKV7ForCausalLM)
     model.tp_size = 2
     model.vocab_size = 5
     model.z = {"head.weight": torch.empty(3, 4)}
-    model.linear = lambda hidden_states, weight: hidden_states.new_ones((2, 3))
+    model.project_logits_fp32 = lambda hidden_states: torch.ones(
+        (2, 3), dtype=torch.float32
+    )
     model.logits_processor = lambda lm_head, logits: logits
 
     def fake_all_gather(logits):
         assert logits.shape == (2, 3)
+        assert logits.dtype == torch.float32
         return torch.cat([logits, logits + 10], dim=-1)
 
     monkeypatch.setattr(rwkv7, "tensor_model_parallel_all_gather", fake_all_gather)
@@ -1565,6 +2479,7 @@ def test_rwkv7_compute_logits_all_gathers_tensor_parallel_vocab(monkeypatch):
     logits = model.compute_logits(torch.empty(2, 4))
 
     assert logits.shape == (2, 5)
+    assert logits.dtype == torch.float32
     assert logits.tolist() == [
         [1.0, 1.0, 1.0, 11.0, 11.0],
         [1.0, 1.0, 1.0, 11.0, 11.0],
