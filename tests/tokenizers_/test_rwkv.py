@@ -99,12 +99,12 @@ def test_rwkv_chat_template_tokenizes_rendered_prompt():
     tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
 
     rendered = tokenizer.apply_chat_template(
-        [{"role": "user", "content": "Hi"}],
+        [{"role": "user", "content": "Question: Hi\nAnswer:"}],
         tokenize=False,
         add_generation_prompt=True,
     )
     token_ids = tokenizer.apply_chat_template(
-        [{"role": "user", "content": "Hi"}],
+        [{"role": "user", "content": "Question: Hi\nAnswer:"}],
         tokenize=True,
         add_generation_prompt=True,
     )
@@ -121,6 +121,20 @@ def test_rwkv_chat_template_tokenizes_rendered_prompt():
         )[0]
         != tokenizer.bos_token_id
     )
+
+
+def test_rwkv_native_chat_unwraps_only_paired_user_shells(monkeypatch):
+    tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
+    paired = (("Question: 1+1?\nAnswer:", "1+1?"), ("Intro\nQuestion: Pick.\nA. One\nB. Two\nAnswer:", "Intro\nPick.\nA. One\nB. Two"), ("Question:\nState the result.\nAnswer:", "State the result."))  # noqa: E501
+    unchanged = ('Solve this. End with "ANSWER: $ANSWER".', "Write at least two words.", "plain\nAnswer:", "Question: missing answer", "Question:foo\nAnswer:", "Question: one\nQuestion: two\nAnswer:", "Question 1: numbered\nAnswer:", "Keep Question: inline\nAnswer:", "Question: wrong case\nANSWER:", "Question: nonempty\nAnswer: value")  # noqa: E501
+    render = lambda content: tokenizer.apply_chat_template([{"role": "user", "content": content}], tokenize=False, add_generation_prompt=True)  # noqa: E501
+    for content, expected in paired + tuple((text, text) for text in unchanged):
+        assert render(content) == f"User: {expected}\n\nAssistant: <think"
+    dialogue = tokenizer.apply_chat_template([{"role": "system", "content": "Question: system\nAnswer:"}, {"role": "user", "content": paired[0][0]}, {"role": "assistant", "content": "Question: gold\nAnswer:"}, {"role": "user", "content": paired[1][0]}], tokenize=False, add_generation_prompt=True)  # noqa: E501
+    assert dialogue == "System: Question: system\nAnswer:\n\nUser: 1+1?\n\nAssistant: Question: gold\nAnswer:\n\nUser: Intro\nPick.\nA. One\nB. Two\n\nAssistant: <think"  # noqa: E501
+    tool_chat = tokenizer.apply_chat_template([{"role": "user", "content": "Question: call?\nAnswer:"}, {"role": "tool", "content": "Question: tool\nAnswer:"}], tools=[{"function": {"name": "noop", "parameters": {}}}], tokenize=False, add_generation_prompt=True)  # noqa: E501
+    assert "### User\ncall?\n### Tool Output" in tool_chat and '"Question: tool\\nAnswer:"' in tool_chat  # noqa: E501
+    seen = {}; monkeypatch.setattr(tokenizer.apply_chat_template.__globals__["hf_chat_utils"], "render_jinja_template", lambda conversation, **_: seen.update(conversation=conversation) or (["sentinel"], [])); assert tokenizer.apply_chat_template([{"role": "user", "content": paired[0][0]}], chat_template="custom", tokenize=False) == "sentinel" and seen["conversation"][0]["content"] == paired[0][0]  # noqa: E501, E702
 
 
 def test_rwkv_chat_template_can_render_fake_think_generation_prompt():
