@@ -855,6 +855,10 @@ class ModelConfig:
         self._maybe_register_model_class_overrides()
         return me_models.ModelRegistry
 
+    @property
+    def max_seq_len_to_capture(self) -> int:
+        return self.max_model_len
+
     def _maybe_register_model_class_overrides(self) -> None:
         # Apply ``model_class_overrides`` here because this property is the
         # single chokepoint through which every model-class inspect/resolve

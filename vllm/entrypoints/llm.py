@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable, Sequence
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -49,6 +50,7 @@ from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike
+from vllm.tokenizers.rwkv_defaults import resolve_rwkv_offline_sampling_params
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.counter import Counter
 from vllm.v1.engine import PauseMode
@@ -221,8 +223,18 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
     ) -> None:
         """LLM constructor."""
 
-        if "disable_log_stats" not in kwargs:
-            kwargs["disable_log_stats"] = True
+        if "swap_space" in kwargs:
+            kwargs.pop("swap_space")
+            import warnings
+
+            warnings.warn(
+                "The 'swap_space' parameter is deprecated and ignored. "
+                "It will be removed in a future version.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        kwargs.setdefault("disable_log_stats", "VLLM_LOG_STATS_INTERVAL" not in os.environ)
 
         if "worker_cls" in kwargs:
             worker_cls = kwargs["worker_cls"]
@@ -410,9 +422,10 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
 
     def generate(
         self,
-        prompts: PromptType | Sequence[PromptType],
+        prompts: PromptType | Sequence[PromptType] | None = None,
         sampling_params: SamplingParams | Sequence[SamplingParams] | None = None,
         *,
+        prompt_token_ids: Sequence[list[int]] | None = None,
         use_tqdm: bool | Callable[..., tqdm] = True,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
         priority: list[int] | None = None,
@@ -451,6 +464,12 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             A list of `RequestOutput` objects containing the
             generated completions in the same order as the input prompts.
         """
+        if prompt_token_ids is not None:
+            if prompts is not None:
+                raise ValueError("prompts and prompt_token_ids are mutually exclusive")
+            prompts = [{"prompt_token_ids": list(ids)} for ids in prompt_token_ids]
+        if prompts is None:
+            raise ValueError("prompts or prompt_token_ids must be provided")
         runner_type = self.model_config.runner_type
         if runner_type != "generate":
             raise ValueError(
@@ -461,6 +480,9 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
 
         if sampling_params is None:
             sampling_params = self.get_default_sampling_params()
+        sampling_params = resolve_rwkv_offline_sampling_params(
+            sampling_params, self.model_config
+        )
 
         return self._run_completion(
             prompts=prompts,

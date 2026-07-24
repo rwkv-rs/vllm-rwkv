@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import msgspec
 import regex as re
 
 from vllm.transformers_utils.configs.rwkv7 import build_rwkv7_config_from_pth
@@ -119,6 +120,33 @@ def apply_rwkv_default_sampling_params(
         default_sampling_params["stop"] = list(RWKV_DEFAULT_STOPS)
     if "stop_token_ids" not in default_sampling_params:
         default_sampling_params["stop_token_ids"] = list(RWKV_DEFAULT_STOP_TOKEN_IDS)
+
+
+def resolve_rwkv_offline_sampling_params(
+    sampling_params: Any,
+    model_config: Any,
+) -> Any:
+    """Clone offline RWKV params and enforce the native turn/EOS boundaries."""
+
+    if not is_rwkv_model_config(model_config):
+        return sampling_params
+
+    def resolve(item: Any) -> Any:
+        if not item.detokenize:
+            return item
+        return msgspec.structs.replace(
+            item,
+            stop=list(dict.fromkeys((*item.stop, *RWKV_DEFAULT_STOPS))),
+            stop_token_ids=list(
+                dict.fromkeys((*item.stop_token_ids, *RWKV_DEFAULT_STOP_TOKEN_IDS))
+            ),
+        )
+
+    if isinstance(sampling_params, list):
+        return [resolve(item) for item in sampling_params]
+    if isinstance(sampling_params, tuple):
+        return tuple(resolve(item) for item in sampling_params)
+    return resolve(sampling_params)
 
 
 def _render_basic_chat(
