@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ruff: noqa: E501
 
 from types import MethodType, SimpleNamespace
 
 from vllm.entrypoints.llm import LLM
 from vllm.sampling_params import SamplingParams
-from vllm.tokenizers.rwkv_defaults import RWKV_DEFAULT_STOP_TOKEN_IDS, RWKV_DEFAULT_STOPS
+from vllm.tokenizers.rwkv_defaults import (
+    RWKV_DEFAULT_STOP_TOKEN_IDS,
+    RWKV_DEFAULT_STOPS,
+)
+
 
 def _offline_llm(*, rwkv: bool = True):
     llm = object.__new__(LLM)
