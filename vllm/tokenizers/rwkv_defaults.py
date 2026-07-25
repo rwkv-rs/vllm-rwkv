@@ -53,12 +53,18 @@ def normalize_rwkv_message_content(content: Any) -> str:
 def normalize_rwkv_user_content(content: Any) -> str:
     text = normalize_rwkv_message_content(content)
     lines = text.splitlines()
-    question_lines = [i for i, line in enumerate(lines) if line == "Question:" or line.startswith("Question: ")]  # noqa: E501
+    question_lines = [
+        i
+        for i, line in enumerate(lines)
+        if line == "Question:" or line.startswith("Question: ")
+    ]  # noqa: E501
     if len(question_lines) != 1 or lines[-1:] != ["Answer:"]:
         return text
     index = question_lines[0]
     question = lines[index].removeprefix("Question:").removeprefix(" ")
-    return "\n".join(lines[:index] + ([question] if question else []) + lines[index + 1 : -1])  # noqa: E501
+    return "\n".join(
+        lines[:index] + ([question] if question else []) + lines[index + 1 : -1]
+    )  # noqa: E501
 
 
 def render_rwkv_chat_template(
@@ -170,7 +176,11 @@ def _render_basic_chat(
     rendered: list[str] = []
     for message in messages:
         role = _field(message, "role", "")
-        normalize = normalize_rwkv_user_content if role == "user" else normalize_rwkv_message_content  # noqa: E501
+        normalize = (
+            normalize_rwkv_user_content
+            if role == "user"
+            else normalize_rwkv_message_content
+        )  # noqa: E501
         content = normalize(_field(message, "content", ""))
         if role == "system":
             label = "System"
@@ -200,7 +210,11 @@ def _render_tool_chat(
 
     for message in messages:
         role = _field(message, "role", "")
-        normalize = normalize_rwkv_user_content if role == "user" else normalize_rwkv_message_content  # noqa: E501
+        normalize = (
+            normalize_rwkv_user_content
+            if role == "user"
+            else normalize_rwkv_message_content
+        )  # noqa: E501
         content = normalize(_field(message, "content", ""))
 
         if role == "system":

@@ -234,7 +234,9 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
                 stacklevel=2,
             )
 
-        kwargs.setdefault("disable_log_stats", "VLLM_LOG_STATS_INTERVAL" not in os.environ)  # noqa: E501
+        kwargs.setdefault(
+            "disable_log_stats", "VLLM_LOG_STATS_INTERVAL" not in os.environ
+        )  # noqa: E501
 
         if "worker_cls" in kwargs:
             worker_cls = kwargs["worker_cls"]
