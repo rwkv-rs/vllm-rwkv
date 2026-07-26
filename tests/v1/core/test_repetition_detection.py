@@ -100,6 +100,12 @@ def _separated_occurrences(ngram: list[int], count: int) -> list[int]:
             False,
             id="high-count-threshold",
         ),
+        pytest.param(
+            _separated_occurrences([10, 20, 30, 40], 20),
+            {"max_pattern_size": 64, "min_pattern_size": 4, "min_count": 3},
+            False,
+            id="nonadjacent-math-expression",
+        ),
     ],
 )
 def test_consecutive_repetition_contract(
