@@ -30,7 +30,12 @@ from vllm.renderers.inputs.preprocess import (
     extract_prompt_len,
 )
 from vllm.renderers.online_renderer import OnlineRenderer
-from vllm.tokenizers.rwkv_defaults import apply_rwkv_default_sampling_params
+from vllm.tokenizers.rwkv_defaults import (
+    RWKV_NATIVE_CHAT_TEMPLATE,
+    is_rwkv_model_config,
+    resolve_rwkv_prompt_template,
+    resolve_rwkv_sampling_params,
+)
 from vllm.utils import random_uuid
 
 logger = init_logger(__name__)
@@ -56,7 +61,6 @@ class ServingRender(BaseServing):
             online_renderer.model_config.get_diff_sampling_param()
         )
         mc = online_renderer.model_config
-        apply_rwkv_default_sampling_params(self.default_sampling_params, mc)
         self.override_max_tokens = (
             self.default_sampling_params.get("max_tokens")
             if mc.generation_config not in ("auto", "vllm")
@@ -113,6 +117,27 @@ class ServingRender(BaseServing):
             truncate_prompt_tokens=request.truncate_prompt_tokens,
         )
         params = request.to_sampling_params(max_tokens, self.default_sampling_params)
+        chat_params = request.build_chat_params(
+            self.online_renderer.chat_template,
+            self.online_renderer.chat_template_content_format,
+        ).with_defaults(self.online_renderer.default_chat_template_kwargs)
+        prompt_template = None
+        if is_rwkv_model_config(self.model_config) and (
+            chat_params.chat_template is None
+            or chat_params.chat_template.strip() == RWKV_NATIVE_CHAT_TEMPLATE
+        ):
+            prompt_template = resolve_rwkv_prompt_template(
+                prompt_template=chat_params.chat_template_kwargs.get(
+                    "rwkv_prompt_template"
+                ),
+                messages=request.messages,
+                tools=request.tools or (),
+            )
+        params = resolve_rwkv_sampling_params(
+            params,
+            self.model_config,
+            prompt_template=prompt_template,
+        )
 
         assistant_tokens_mask: list[int] | None = engine_input.get(  # type: ignore[assignment]
             "assistant_tokens_mask"
@@ -190,6 +215,7 @@ class ServingRender(BaseServing):
             params = request.to_sampling_params(
                 max_tokens, self.default_sampling_params
             )
+            params = resolve_rwkv_sampling_params(params, self.model_config)
 
             request_id = f"cmpl-{random_uuid()}"
 

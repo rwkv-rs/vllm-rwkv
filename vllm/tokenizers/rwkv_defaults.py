@@ -2,18 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-import regex as re
+import msgspec
 
 from vllm.transformers_utils.configs.rwkv7 import build_rwkv7_config_from_pth
 
 RWKV_NATIVE_CHAT_TEMPLATE = "{# RWKV native chat template #}"
 RWKV_TOOL_CALL_PARSER = "rwkv"
-RWKV_DEFAULT_STOPS = ("\nUser:", "\n### User")
-RWKV_DEFAULT_STOP = RWKV_DEFAULT_STOPS[0]
-RWKV_DEFAULT_STOP_TOKEN_IDS = (0,)
+RWKV_BOS_EOS_TOKEN_ID = 0
+RWKV_PROMPT_TEMPLATE_BOT = "\nBot✿"
+RWKV_PROMPT_TEMPLATE_ASSISTANT = "\n\nAssistant: "
+RWKV_PROMPT_TEMPLATE_FUNCTION_CALLING = "\n### Assistant"
+RWKV_DEFAULT_PROMPT_TEMPLATE = RWKV_PROMPT_TEMPLATE_BOT
 RWKV_GENERATION_PROMPT_OPEN_THINK = "open_think"
 RWKV_GENERATION_PROMPT_FAKE_THINK = "fake_think"
 RWKV_GENERATION_PROMPT_MODES = (
@@ -21,23 +25,64 @@ RWKV_GENERATION_PROMPT_MODES = (
     RWKV_GENERATION_PROMPT_FAKE_THINK,
 )
 
-_BLANK_LINES_RE = re.compile(r"\n{2,}")
-_DAPO_MATH_PROMPT_PREFIX_RE = re.compile(
-    r"\A\s*Solve the following math problem step by step\.\s*"
-    r"The last line of your response should be of the form Answer: \$Answer "
-    r"\(without quotes\) where \$Answer is the answer to the problem\.\s*\n",
-)
-_DAPO_MATH_PROMPT_SUFFIX_RE = re.compile(
-    r'\n\s*Remember to put your answer on its own line after "Answer:"\.?\s*\Z',
-)
+
+@dataclass(frozen=True)
+class RWKVPromptTemplateSpec:
+    name: str
+    style: Literal["bot", "assistant", "function_calling"]
+    stop: str
 
 
-def normalize_rwkv_message_content(content: Any) -> str:
+RWKV_PROMPT_TEMPLATES = {
+    RWKV_PROMPT_TEMPLATE_BOT: RWKVPromptTemplateSpec(
+        name=RWKV_PROMPT_TEMPLATE_BOT,
+        style="bot",
+        stop="✿",
+    ),
+    RWKV_PROMPT_TEMPLATE_ASSISTANT: RWKVPromptTemplateSpec(
+        name=RWKV_PROMPT_TEMPLATE_ASSISTANT,
+        style="assistant",
+        stop="\nUser:",
+    ),
+    RWKV_PROMPT_TEMPLATE_FUNCTION_CALLING: RWKVPromptTemplateSpec(
+        name=RWKV_PROMPT_TEMPLATE_FUNCTION_CALLING,
+        style="function_calling",
+        stop="\n### User",
+    ),
+}
+
+
+def resolve_rwkv_prompt_template(
+    *,
+    prompt_template: str | None = None,
+    messages: Sequence[Any] = (),
+    tools: Sequence[dict[str, Any]] = (),
+) -> RWKVPromptTemplateSpec:
+    has_tool_history = any(
+        _field(message, "role", "") == "tool"
+        or bool(_field(message, "tool_calls", None))
+        for message in messages
+    )
+    name = (
+        RWKV_PROMPT_TEMPLATE_FUNCTION_CALLING
+        if tools or has_tool_history
+        else prompt_template or RWKV_DEFAULT_PROMPT_TEMPLATE
+    )
+    try:
+        return RWKV_PROMPT_TEMPLATES[name]
+    except KeyError as error:
+        raise ValueError(
+            f"Unsupported RWKV prompt template: {name!r}. "
+            f"Expected one of {tuple(RWKV_PROMPT_TEMPLATES)!r}."
+        ) from error
+
+
+def stringify_rwkv_message_content(content: Any) -> str:
     if content is None:
-        text = ""
-    elif isinstance(content, str):
-        text = content
-    elif isinstance(content, list):
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
         parts: list[str] = []
         for item in content:
             if isinstance(item, str):
@@ -49,18 +94,38 @@ def normalize_rwkv_message_content(content: Any) -> str:
                     parts.append(str(item["text"]))
             else:
                 parts.append(str(item))
-        text = "\n".join(part for part in parts if part)
-    else:
-        text = str(content)
-
-    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-    return _BLANK_LINES_RE.sub("\n", text)
+        return "\n".join(parts)
+    return str(content)
 
 
-def simplify_rwkv_math_prompt(text: str) -> str:
-    text = _DAPO_MATH_PROMPT_PREFIX_RE.sub("", text)
-    text = _DAPO_MATH_PROMPT_SUFFIX_RE.sub("", text)
-    return text.strip()
+def ensure_rwkv_prompt_bos_token(
+    token_ids: Sequence[int],
+    *,
+    max_length: int | None = None,
+    truncate_from_left: bool = False,
+) -> list[int]:
+    first_non_bos = 0
+    while (
+        first_non_bos < len(token_ids)
+        and token_ids[first_non_bos] == RWKV_BOS_EOS_TOKEN_ID
+    ):
+        first_non_bos += 1
+    normalized = [RWKV_BOS_EOS_TOKEN_ID, *token_ids[first_non_bos:]]
+    if max_length is None or len(normalized) <= max_length:
+        return normalized
+    if max_length < 1:
+        raise ValueError("RWKV prompts require at least one token for BOS/EOS token 0.")
+    if truncate_from_left:
+        tail_length = max_length - 1
+        return (
+            [RWKV_BOS_EOS_TOKEN_ID]
+            if tail_length == 0
+            else [RWKV_BOS_EOS_TOKEN_ID, *normalized[-tail_length:]]
+        )
+    raise ValueError(
+        f"RWKV prompt with required BOS/EOS has {len(normalized)} tokens, "
+        f"exceeding max_length={max_length}; prompt insertion never truncates."
+    )
 
 
 def render_rwkv_chat_template(
@@ -69,22 +134,24 @@ def render_rwkv_chat_template(
     *,
     add_generation_prompt: bool,
     rwkv_generation_prompt: str = RWKV_GENERATION_PROMPT_OPEN_THINK,
+    rwkv_prompt_template: str | None = None,
 ) -> str:
     _check_generation_prompt(rwkv_generation_prompt)
-    has_tool_history = any(
-        _field(message, "role", "") == "tool"
-        or bool(_field(message, "tool_calls", None))
-        for message in messages
+    prompt_template = resolve_rwkv_prompt_template(
+        prompt_template=rwkv_prompt_template,
+        messages=messages,
+        tools=tools or (),
     )
-    if tools or has_tool_history:
+    if prompt_template.style == "function_calling":
         return _render_tool_chat(
             messages,
             tools or [],
             add_generation_prompt=add_generation_prompt,
             rwkv_generation_prompt=rwkv_generation_prompt,
         )
-    return _render_basic_chat(
+    return _render_plain_chat(
         messages,
+        prompt_template,
         add_generation_prompt=add_generation_prompt,
         rwkv_generation_prompt=rwkv_generation_prompt,
     )
@@ -123,20 +190,102 @@ def resolve_rwkv_tool_parser(
     return tool_parser
 
 
-def apply_rwkv_default_sampling_params(
-    default_sampling_params: dict[str, Any],
+def apply_rwkv_sampling_stops(
+    sampling_params: dict[str, Any],
     model_config: Any,
+    *,
+    prompt_template: RWKVPromptTemplateSpec | None = None,
 ) -> None:
     if not is_rwkv_model_config(model_config):
         return
-    if "stop" not in default_sampling_params:
-        default_sampling_params["stop"] = list(RWKV_DEFAULT_STOPS)
-    if "stop_token_ids" not in default_sampling_params:
-        default_sampling_params["stop_token_ids"] = list(RWKV_DEFAULT_STOP_TOKEN_IDS)
+    stops, stop_token_ids = _resolve_rwkv_stops(
+        stop=sampling_params.get("stop"),
+        stop_token_ids=sampling_params.get("stop_token_ids"),
+        prompt_template=prompt_template,
+        detokenize=bool(sampling_params.get("detokenize", True)),
+    )
+    sampling_params["stop"] = stops
+    sampling_params["stop_token_ids"] = stop_token_ids
+    sampling_params["ignore_eos"] = False
 
 
-def _render_basic_chat(
+def resolve_rwkv_sampling_params(
+    sampling_params: Any,
+    model_config: Any,
+    *,
+    prompt_template: RWKVPromptTemplateSpec | None = None,
+) -> Any:
+    if not is_rwkv_model_config(model_config):
+        return sampling_params
+
+    def resolve(item: Any) -> Any:
+        if not hasattr(item, "stop_token_ids"):
+            if prompt_template is not None:
+                raise ValueError(
+                    "RWKV native chat templates require text stop strings, "
+                    "which beam search does not support."
+                )
+            return msgspec.structs.replace(item, ignore_eos=False)
+        stops, stop_token_ids = _resolve_rwkv_stops(
+            stop=item.stop,
+            stop_token_ids=item.stop_token_ids,
+            prompt_template=prompt_template,
+            detokenize=item.detokenize,
+        )
+        return msgspec.structs.replace(
+            item,
+            ignore_eos=False,
+            _all_stop_token_ids=set(item.all_stop_token_ids) | set(stop_token_ids),
+            stop=stops,
+            stop_token_ids=stop_token_ids,
+        )
+
+    if isinstance(sampling_params, list):
+        return [resolve(item) for item in sampling_params]
+    if isinstance(sampling_params, tuple):
+        return tuple(resolve(item) for item in sampling_params)
+    return resolve(sampling_params)
+
+
+def resolve_rwkv_chat_sampling_params(
+    sampling_params: Any,
+    model_config: Any,
+    *,
+    prompt_templates: Sequence[RWKVPromptTemplateSpec | None],
+) -> Any:
+    if not is_rwkv_model_config(model_config):
+        return sampling_params
+    if isinstance(sampling_params, (list, tuple)):
+        if len(sampling_params) != len(prompt_templates):
+            raise ValueError(
+                "The number of RWKV chat sampling params must match the number "
+                f"of conversations: {len(sampling_params)} != {len(prompt_templates)}."
+            )
+        resolved = [
+            resolve_rwkv_sampling_params(
+                item,
+                model_config,
+                prompt_template=prompt_template,
+            )
+            for item, prompt_template in zip(
+                sampling_params, prompt_templates, strict=True
+            )
+        ]
+        return tuple(resolved) if isinstance(sampling_params, tuple) else resolved
+    resolved = [
+        resolve_rwkv_sampling_params(
+            sampling_params,
+            model_config,
+            prompt_template=prompt_template,
+        )
+        for prompt_template in prompt_templates
+    ]
+    return resolved[0] if len(resolved) == 1 else resolved
+
+
+def _render_plain_chat(
     messages: list[Any],
+    prompt_template: RWKVPromptTemplateSpec,
     *,
     add_generation_prompt: bool,
     rwkv_generation_prompt: str,
@@ -144,23 +293,22 @@ def _render_basic_chat(
     rendered: list[str] = []
     for message in messages:
         role = _field(message, "role", "")
-        content = normalize_rwkv_message_content(_field(message, "content", ""))
-        if role == "user":
-            content = simplify_rwkv_math_prompt(content)
-        if role == "system":
-            label = "System"
-        elif role == "user":
-            label = "User"
-        elif role == "assistant":
-            label = "Assistant"
+        content = stringify_rwkv_message_content(_field(message, "content", ""))
+        label = _plain_role_label(role, prompt_template)
+        if prompt_template.style == "bot":
+            rendered.append(f"{label}✿{content}✿")
         else:
-            raise ValueError(f"Unsupported RWKV chat message role: {role!r}")
-        rendered.append(f"{label}: {content}" if content else f"{label}:")
+            rendered.append(f"{label}: {content}" if content else f"{label}:")
 
     if add_generation_prompt:
-        rendered.append(f"Assistant: {_generation_prompt_text(rwkv_generation_prompt)}")
+        generation_prompt = _generation_prompt_text(rwkv_generation_prompt)
+        if prompt_template.style == "bot":
+            rendered.append(f"Bot✿{generation_prompt}")
+        else:
+            rendered.append(f"Assistant: {generation_prompt}")
 
-    return "\n\n".join(rendered)
+    separator = "\n" if prompt_template.style == "bot" else "\n\n"
+    return separator.join(rendered)
 
 
 def _render_tool_chat(
@@ -175,9 +323,7 @@ def _render_tool_chat(
 
     for message in messages:
         role = _field(message, "role", "")
-        content = normalize_rwkv_message_content(_field(message, "content", ""))
-        if role == "user":
-            content = simplify_rwkv_math_prompt(content)
+        content = stringify_rwkv_message_content(_field(message, "content", ""))
 
         if role == "system":
             pending_system.append(content)
@@ -249,7 +395,7 @@ def _render_tool_definitions(tools: list[dict[str, Any]]) -> list[str]:
         rendered.append(f"### `{name}`")
         if description:
             rendered.append(
-                f"**Description:** {normalize_rwkv_message_content(description)}"
+                f"**Description:** {stringify_rwkv_message_content(description)}"
             )
         rendered.append("**Parameters:**")
         rendered.append("```json")
@@ -278,8 +424,44 @@ def _json_value(value: Any) -> Any:
         try:
             return json.loads(value)
         except json.JSONDecodeError:
-            return normalize_rwkv_message_content(value)
+            return value
     return value
+
+
+def _plain_role_label(
+    role: str,
+    prompt_template: RWKVPromptTemplateSpec,
+) -> str:
+    if role == "system":
+        return "System"
+    if role == "user":
+        return "User"
+    if role == "assistant":
+        return "Bot" if prompt_template.style == "bot" else "Assistant"
+    raise ValueError(f"Unsupported RWKV chat message role: {role!r}")
+
+
+def _resolve_rwkv_stops(
+    *,
+    stop: str | Sequence[str] | None,
+    stop_token_ids: Sequence[int] | None,
+    prompt_template: RWKVPromptTemplateSpec | None,
+    detokenize: bool,
+) -> tuple[list[str], list[int]]:
+    user_stops = [stop] if isinstance(stop, str) else list(stop or ())
+    required_stops = (
+        [prompt_template.stop] if prompt_template is not None and detokenize else []
+    )
+    stops = list(dict.fromkeys([*required_stops, *user_stops]))
+    token_ids = list(
+        dict.fromkeys(
+            [
+                RWKV_BOS_EOS_TOKEN_ID,
+                *(int(token_id) for token_id in stop_token_ids or ()),
+            ]
+        )
+    )
+    return stops, token_ids
 
 
 def _tool_function(tool: Any) -> Any:

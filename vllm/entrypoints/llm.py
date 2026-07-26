@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -49,6 +50,13 @@ from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike
+from vllm.tokenizers.rwkv_defaults import (
+    RWKV_NATIVE_CHAT_TEMPLATE,
+    is_rwkv_model_config,
+    resolve_rwkv_chat_sampling_params,
+    resolve_rwkv_prompt_template,
+    resolve_rwkv_sampling_params,
+)
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.counter import Counter
 from vllm.v1.engine import PauseMode
@@ -221,8 +229,20 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
     ) -> None:
         """LLM constructor."""
 
-        if "disable_log_stats" not in kwargs:
-            kwargs["disable_log_stats"] = True
+        if "swap_space" in kwargs:
+            kwargs.pop("swap_space")
+            import warnings
+
+            warnings.warn(
+                "The 'swap_space' parameter is deprecated and ignored. "
+                "It will be removed in a future version.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        kwargs.setdefault(
+            "disable_log_stats", "VLLM_LOG_STATS_INTERVAL" not in os.environ
+        )  # noqa: E501
 
         if "worker_cls" in kwargs:
             worker_cls = kwargs["worker_cls"]
@@ -410,9 +430,10 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
 
     def generate(
         self,
-        prompts: PromptType | Sequence[PromptType],
+        prompts: PromptType | Sequence[PromptType] | None = None,
         sampling_params: SamplingParams | Sequence[SamplingParams] | None = None,
         *,
+        prompt_token_ids: Sequence[list[int]] | None = None,
         use_tqdm: bool | Callable[..., tqdm] = True,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
         priority: list[int] | None = None,
@@ -451,6 +472,12 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             A list of `RequestOutput` objects containing the
             generated completions in the same order as the input prompts.
         """
+        if prompt_token_ids is not None:
+            if prompts is not None:
+                raise ValueError("prompts and prompt_token_ids are mutually exclusive")
+            prompts = [{"prompt_token_ids": list(ids)} for ids in prompt_token_ids]
+        if prompts is None:
+            raise ValueError("prompts or prompt_token_ids must be provided")
         runner_type = self.model_config.runner_type
         if runner_type != "generate":
             raise ValueError(
@@ -461,6 +488,10 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
 
         if sampling_params is None:
             sampling_params = self.get_default_sampling_params()
+        sampling_params = resolve_rwkv_sampling_params(
+            sampling_params,
+            self.model_config,
+        )
 
         return self._run_completion(
             prompts=prompts,
@@ -507,6 +538,10 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
 
         if sampling_params is None:
             sampling_params = self.get_default_sampling_params()
+        sampling_params = resolve_rwkv_sampling_params(
+            sampling_params,
+            self.model_config,
+        )
 
         return self._add_completion_requests(
             prompts=prompts,
@@ -679,6 +714,29 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
 
         if sampling_params is None:
             sampling_params = self.get_default_sampling_params()
+        prompt_templates = [None]
+        is_native_template = chat_template is None or (
+            chat_template.strip() == RWKV_NATIVE_CHAT_TEMPLATE
+        )
+        if is_rwkv_model_config(model_config) and is_native_template:
+            conversations = (
+                messages if messages and isinstance(messages[0], list) else [messages]
+            )
+            prompt_templates = [
+                resolve_rwkv_prompt_template(
+                    prompt_template=(chat_template_kwargs or {}).get(
+                        "rwkv_prompt_template"
+                    ),
+                    messages=conversation,
+                    tools=tools or (),
+                )
+                for conversation in conversations
+            ]
+        sampling_params = resolve_rwkv_chat_sampling_params(
+            sampling_params,
+            model_config,
+            prompt_templates=prompt_templates,
+        )
 
         return self._run_chat(
             messages=messages,
@@ -756,6 +814,29 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
 
         if sampling_params is None:
             sampling_params = self.get_default_sampling_params()
+        prompt_templates = [None]
+        is_native_template = chat_template is None or (
+            chat_template.strip() == RWKV_NATIVE_CHAT_TEMPLATE
+        )
+        if is_rwkv_model_config(model_config) and is_native_template:
+            conversations = (
+                messages if messages and isinstance(messages[0], list) else [messages]
+            )
+            prompt_templates = [
+                resolve_rwkv_prompt_template(
+                    prompt_template=(chat_template_kwargs or {}).get(
+                        "rwkv_prompt_template"
+                    ),
+                    messages=conversation,
+                    tools=tools or (),
+                )
+                for conversation in conversations
+            ]
+        sampling_params = resolve_rwkv_chat_sampling_params(
+            sampling_params,
+            model_config,
+            prompt_templates=prompt_templates,
+        )
 
         return self._add_chat_requests(
             messages=messages,

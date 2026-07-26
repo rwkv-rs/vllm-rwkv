@@ -2,16 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass, field
-from typing import Any
 
 import pytest
 
-from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
-from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers.rwkv_defaults import (
-    RWKV_DEFAULT_STOP_TOKEN_IDS,
-    RWKV_DEFAULT_STOPS,
-    apply_rwkv_default_sampling_params,
+    RWKV_BOS_EOS_TOKEN_ID,
+    RWKV_PROMPT_TEMPLATE_BOT,
+    resolve_rwkv_prompt_template,
+    resolve_rwkv_sampling_params,
 )
 
 
@@ -26,35 +25,42 @@ class _ModelConfig:
     hf_config: _HFConfig = field(default_factory=_HFConfig)
 
 
-def _chat_request(**kwargs: Any) -> ChatCompletionRequest:
-    return ChatCompletionRequest(
-        model="rwkv-test",
-        messages=[{"role": "user", "content": "hi"}],
-        **kwargs,
+def test_rwkv_template_and_user_stops_are_merged_in_contract_order() -> None:
+    prompt_template = resolve_rwkv_prompt_template(
+        prompt_template=RWKV_PROMPT_TEMPLATE_BOT
+    )
+    caller = SamplingParams(
+        stop=["END", "✿"],
+        stop_token_ids=[7, RWKV_BOS_EOS_TOKEN_ID],
+        ignore_eos=True,
     )
 
+    resolved = resolve_rwkv_sampling_params(
+        caller,
+        _ModelConfig(),
+        prompt_template=prompt_template,
+    )
 
-@pytest.mark.parametrize(
-    "api_request",
-    [_chat_request(), ResponsesRequest(model="rwkv-test", input="hi")],
-    ids=["chat", "responses"],
-)
-def test_rwkv_api_defaults_stop_string_and_token_id(
-    api_request: ChatCompletionRequest | ResponsesRequest,
-) -> None:
-    default_sampling_params: dict[str, Any] = {}
-    apply_rwkv_default_sampling_params(default_sampling_params, _ModelConfig())
-
-    sampling_params = api_request.to_sampling_params(128, default_sampling_params)
-
-    assert sampling_params.stop == list(RWKV_DEFAULT_STOPS)
-    assert sampling_params.stop_token_ids == list(RWKV_DEFAULT_STOP_TOKEN_IDS)
+    assert resolved.stop == ["✿", "END"]
+    assert resolved.stop_token_ids == [RWKV_BOS_EOS_TOKEN_ID, 7]
+    assert resolved.ignore_eos is False
+    assert caller.stop == ["END", "✿"]
+    assert caller.stop_token_ids == [7, RWKV_BOS_EOS_TOKEN_ID]
 
 
 def test_rwkv_defaults_do_not_apply_to_other_models() -> None:
-    default_sampling_params: dict[str, Any] = {}
     model_config = _ModelConfig(tokenizer_mode="auto", hf_config=_HFConfig("llama"))
+    sampling_params = SamplingParams(stop=["END"], stop_token_ids=[7])
 
-    apply_rwkv_default_sampling_params(default_sampling_params, model_config)
+    resolved = resolve_rwkv_sampling_params(sampling_params, model_config)
 
-    assert default_sampling_params == {}
+    assert resolved is sampling_params
+
+
+def test_rwkv_native_chat_rejects_beam_search_without_text_stops() -> None:
+    with pytest.raises(ValueError, match="beam search does not support"):
+        resolve_rwkv_sampling_params(
+            BeamSearchParams(beam_width=2, max_tokens=8),
+            _ModelConfig(),
+            prompt_template=resolve_rwkv_prompt_template(),
+        )

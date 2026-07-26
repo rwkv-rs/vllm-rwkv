@@ -46,6 +46,7 @@ from vllm.outputs import RequestOutput
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
+from vllm.tokenizers.rwkv_defaults import resolve_rwkv_sampling_params
 from vllm.utils.async_utils import merge_async_iterators
 from vllm.utils.collection_utils import as_list
 
@@ -179,6 +180,10 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+            sampling_params = resolve_rwkv_sampling_params(
+                sampling_params,
+                self.model_config,
+            )
 
             request_id_item = f"{request_id}-{i}"
 

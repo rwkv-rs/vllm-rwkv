@@ -19,6 +19,7 @@ from vllm.transformers_utils.repo_utils import (
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from .protocol import TokenizerLike
+from .rwkv_defaults import is_rwkv_model_arg
 
 if TYPE_CHECKING:
     from vllm.config.model import ModelConfig, RunnerType
@@ -140,6 +141,9 @@ def resolve_tokenizer_args(
 
         tokenizer_mode = "hf"
         kwargs["use_fast"] = False
+
+    if tokenizer_mode == "auto" and is_rwkv_model_arg(tokenizer_name):
+        tokenizer_mode = "rwkv"
 
     # Try to use official Mistral tokenizer if possible
     if (
