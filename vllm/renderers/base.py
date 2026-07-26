@@ -39,6 +39,10 @@ from vllm.multimodal.processing import BaseMultiModalProcessor
 from vllm.multimodal.processing import ProcessorInputs as MMProcessorInputs
 from vllm.multimodal.registry import MultiModalTimingRegistry
 from vllm.tokenizers import TokenizerLike
+from vllm.tokenizers.rwkv_defaults import (
+    ensure_rwkv_prompt_bos_token,
+    is_rwkv_model_config,
+)
 from vllm.utils.async_utils import make_async
 from vllm.utils.counter import AtomicCounter
 from vllm.utils.torch_utils import set_default_torch_num_threads
@@ -775,6 +779,12 @@ class BaseRenderer(ABC, Generic[_T]):
         to the shared thread pool in the async variant.
         """
         prompt_token_ids = prompt["prompt_token_ids"]
+        if is_rwkv_model_config(self.model_config):
+            prompt_token_ids = ensure_rwkv_prompt_bos_token(
+                prompt_token_ids,
+                max_length=max(1, len(prompt_token_ids)),
+                truncate_from_left=True,
+            )
 
         engine_input: TokensInput | MultiModalInput
         if multi_modal_data := prompt.get("multi_modal_data"):
@@ -838,6 +848,12 @@ class BaseRenderer(ABC, Generic[_T]):
         skip_mm_cache: bool = False,
     ) -> TokensInput | MultiModalInput:
         prompt_token_ids = prompt["prompt_token_ids"]
+        if is_rwkv_model_config(self.model_config):
+            prompt_token_ids = ensure_rwkv_prompt_bos_token(
+                prompt_token_ids,
+                max_length=max(1, len(prompt_token_ids)),
+                truncate_from_left=True,
+            )
 
         engine_input: TokensInput | MultiModalInput
         if multi_modal_data := prompt.get("multi_modal_data"):

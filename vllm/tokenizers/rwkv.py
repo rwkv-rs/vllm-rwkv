@@ -17,6 +17,7 @@ from .rwkv_defaults import (
     RWKV_NATIVE_CHAT_TEMPLATE as _RWKV_NATIVE_CHAT_TEMPLATE,
 )
 from .rwkv_defaults import (
+    ensure_rwkv_prompt_bos_token,
     render_rwkv_chat_template,
 )
 
@@ -302,7 +303,7 @@ class RWKVTokenizer(TokenizerLike):
         if conversation is None:
             raise ValueError("Either 'messages' or 'conversation' must be provided.")
 
-        add_special_tokens = bool(kwargs.pop("add_special_tokens", True))
+        kwargs.pop("add_special_tokens", None)
         template = self.get_chat_template(chat_template, tools=tools)
         if template is not None and template.strip() == _RWKV_NATIVE_CHAT_TEMPLATE:
             prompt = render_rwkv_chat_template(
@@ -313,6 +314,7 @@ class RWKVTokenizer(TokenizerLike):
                     "rwkv_generation_prompt",
                     "open_think",
                 ),
+                rwkv_prompt_template=kwargs.get("rwkv_prompt_template"),
             )
         else:
             rendered, _ = hf_chat_utils.render_jinja_template(
@@ -324,5 +326,7 @@ class RWKVTokenizer(TokenizerLike):
             prompt = rendered[0] if rendered else ""
 
         if tokenize:
-            return self.encode(prompt, add_special_tokens=add_special_tokens)
+            return ensure_rwkv_prompt_bos_token(
+                self.encode(prompt, add_special_tokens=False)
+            )
         return prompt

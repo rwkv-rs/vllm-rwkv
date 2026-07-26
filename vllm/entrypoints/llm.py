@@ -50,7 +50,13 @@ from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike
-from vllm.tokenizers.rwkv_defaults import resolve_rwkv_offline_sampling_params
+from vllm.tokenizers.rwkv_defaults import (
+    RWKV_NATIVE_CHAT_TEMPLATE,
+    is_rwkv_model_config,
+    resolve_rwkv_chat_sampling_params,
+    resolve_rwkv_prompt_template,
+    resolve_rwkv_sampling_params,
+)
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.counter import Counter
 from vllm.v1.engine import PauseMode
@@ -482,8 +488,9 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
 
         if sampling_params is None:
             sampling_params = self.get_default_sampling_params()
-        sampling_params = resolve_rwkv_offline_sampling_params(
-            sampling_params, self.model_config
+        sampling_params = resolve_rwkv_sampling_params(
+            sampling_params,
+            self.model_config,
         )
 
         return self._run_completion(
@@ -531,6 +538,10 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
 
         if sampling_params is None:
             sampling_params = self.get_default_sampling_params()
+        sampling_params = resolve_rwkv_sampling_params(
+            sampling_params,
+            self.model_config,
+        )
 
         return self._add_completion_requests(
             prompts=prompts,
@@ -703,6 +714,29 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
 
         if sampling_params is None:
             sampling_params = self.get_default_sampling_params()
+        prompt_templates = [None]
+        is_native_template = chat_template is None or (
+            chat_template.strip() == RWKV_NATIVE_CHAT_TEMPLATE
+        )
+        if is_rwkv_model_config(model_config) and is_native_template:
+            conversations = (
+                messages if messages and isinstance(messages[0], list) else [messages]
+            )
+            prompt_templates = [
+                resolve_rwkv_prompt_template(
+                    prompt_template=(chat_template_kwargs or {}).get(
+                        "rwkv_prompt_template"
+                    ),
+                    messages=conversation,
+                    tools=tools or (),
+                )
+                for conversation in conversations
+            ]
+        sampling_params = resolve_rwkv_chat_sampling_params(
+            sampling_params,
+            model_config,
+            prompt_templates=prompt_templates,
+        )
 
         return self._run_chat(
             messages=messages,
@@ -780,6 +814,29 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
 
         if sampling_params is None:
             sampling_params = self.get_default_sampling_params()
+        prompt_templates = [None]
+        is_native_template = chat_template is None or (
+            chat_template.strip() == RWKV_NATIVE_CHAT_TEMPLATE
+        )
+        if is_rwkv_model_config(model_config) and is_native_template:
+            conversations = (
+                messages if messages and isinstance(messages[0], list) else [messages]
+            )
+            prompt_templates = [
+                resolve_rwkv_prompt_template(
+                    prompt_template=(chat_template_kwargs or {}).get(
+                        "rwkv_prompt_template"
+                    ),
+                    messages=conversation,
+                    tools=tools or (),
+                )
+                for conversation in conversations
+            ]
+        sampling_params = resolve_rwkv_chat_sampling_params(
+            sampling_params,
+            model_config,
+            prompt_templates=prompt_templates,
+        )
 
         return self._add_chat_requests(
             messages=messages,

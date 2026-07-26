@@ -51,10 +51,6 @@ from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tokenizers import get_tokenizer
 from vllm.tokenizers.mistral import MistralTokenizer
 from vllm.tokenizers.registry import cached_tokenizer_from_config
-from vllm.tokenizers.rwkv_defaults import (
-    RWKV_DEFAULT_STOP_TOKEN_IDS,
-    RWKV_DEFAULT_STOPS,
-)
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.metrics.stats import RequestStateStats
 
@@ -797,10 +793,8 @@ def test_rwkv_serving_chat_defaults_tool_parser_when_auto_tools_enabled():
 
     assert serving_chat.parser_cls is not None
     assert serving_chat.parser_cls.tool_parser_cls.__name__ == "RWKVToolParser"
-    assert serving_chat.default_sampling_params["stop"] == list(RWKV_DEFAULT_STOPS)
-    assert serving_chat.default_sampling_params["stop_token_ids"] == list(
-        RWKV_DEFAULT_STOP_TOKEN_IDS
-    )
+    assert "stop" not in serving_chat.default_sampling_params
+    assert "stop_token_ids" not in serving_chat.default_sampling_params
 
 
 @dataclass

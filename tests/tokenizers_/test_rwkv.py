@@ -1,7 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
+
 from vllm.tokenizers.registry import TokenizerRegistry, get_tokenizer
+from vllm.tokenizers.rwkv_defaults import (
+    RWKV_PROMPT_TEMPLATE_ASSISTANT,
+    RWKV_PROMPT_TEMPLATE_BOT,
+    RWKV_PROMPT_TEMPLATE_FUNCTION_CALLING,
+    ensure_rwkv_prompt_bos_token,
+    resolve_rwkv_prompt_template,
+)
 
 
 def test_rwkv_tokenizer_matches_world_vocab_golden_ids():
@@ -77,134 +86,128 @@ def test_rwkv_chat_template_renders_basic_dialogue_from_training_template():
 
     rendered = tokenizer.apply_chat_template(
         [
-            {"role": "system", "content": "\r\n  You are concise.\r\n\r\nNo fluff.  "},
-            {"role": "user", "content": "  Hello\r\n\r\nworld  "},
-            {"role": "assistant", "content": "  Hi\r\n\r\nthere  "},
-            {"role": "user", "content": "  Continue\r\nplease  "},
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+            {"role": "user", "content": "Continue"},
         ],
         tokenize=False,
         add_generation_prompt=True,
     )
 
     assert rendered == (
-        "System: You are concise.\nNo fluff.\n\n"
-        "User: Hello\nworld\n\n"
-        "Assistant: Hi\nthere\n\n"
-        "User: Continue\nplease\n\n"
-        "Assistant: <think"
+        "System✿You are concise.✿\nUser✿Hello✿\nBot✿Hi✿\nUser✿Continue✿\nBot✿<think"
     )
 
 
-def test_rwkv_chat_template_tokenizes_rendered_prompt():
+@pytest.mark.parametrize(
+    ("prompt_template", "expected"),
+    [
+        (RWKV_PROMPT_TEMPLATE_BOT, "User✿Hi✿\nBot✿<think"),
+        (
+            RWKV_PROMPT_TEMPLATE_ASSISTANT,
+            "User: Hi\n\nAssistant: <think",
+        ),
+    ],
+)
+def test_rwkv_chat_template_and_stop_style_render_together(
+    prompt_template: str,
+    expected: str,
+):
+    tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
+
+    rendered = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "Hi"}],
+        tokenize=False,
+        add_generation_prompt=True,
+        rwkv_prompt_template=prompt_template,
+    )
+
+    assert rendered == expected
+
+
+@pytest.mark.parametrize(
+    ("prompt_template", "stop"),
+    [
+        (RWKV_PROMPT_TEMPLATE_BOT, "✿"),
+        (RWKV_PROMPT_TEMPLATE_ASSISTANT, "\nUser:"),
+        (RWKV_PROMPT_TEMPLATE_FUNCTION_CALLING, "\n### User"),
+    ],
+)
+def test_rwkv_prompt_templates_own_their_stop_string(
+    prompt_template: str,
+    stop: str,
+):
+    assert resolve_rwkv_prompt_template(prompt_template=prompt_template).stop == stop
+
+
+def test_rwkv_prompt_bos_normalization_preserves_a_truncated_length_budget():
+    assert ensure_rwkv_prompt_bos_token([0, 0, 11]) == [0, 11]
+    assert ensure_rwkv_prompt_bos_token(
+        [11, 12, 13],
+        max_length=3,
+        truncate_from_left=True,
+    ) == [0, 12, 13]
+
+
+@pytest.mark.parametrize(
+    "prompt_template",
+    [
+        RWKV_PROMPT_TEMPLATE_BOT,
+        RWKV_PROMPT_TEMPLATE_ASSISTANT,
+        RWKV_PROMPT_TEMPLATE_FUNCTION_CALLING,
+    ],
+)
+def test_rwkv_chat_template_tokenizes_with_exactly_one_leading_bos_eos(
+    prompt_template: str,
+):
     tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
 
     rendered = tokenizer.apply_chat_template(
         [{"role": "user", "content": "Question: Hi\nAnswer:"}],
         tokenize=False,
         add_generation_prompt=True,
+        rwkv_prompt_template=prompt_template,
     )
     token_ids = tokenizer.apply_chat_template(
         [{"role": "user", "content": "Question: Hi\nAnswer:"}],
         tokenize=True,
         add_generation_prompt=True,
+        rwkv_prompt_template=prompt_template,
     )
 
     assert isinstance(token_ids, list)
     assert token_ids[0] == tokenizer.bos_token_id
+    assert token_ids[1] != tokenizer.bos_token_id
     assert tokenizer.decode(token_ids) == rendered
-    assert (
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": "Hi"}],
-            tokenize=True,
-            add_generation_prompt=True,
-            add_special_tokens=False,
-        )[0]
-        != tokenizer.bos_token_id
+    without_special_tokens = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "Hi"}],
+        tokenize=True,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+        rwkv_prompt_template=prompt_template,
     )
+    assert without_special_tokens[0] == tokenizer.bos_token_id
+    assert without_special_tokens[1] != tokenizer.bos_token_id
 
 
-def test_rwkv_native_chat_unwraps_only_paired_user_shells(monkeypatch):
+def test_rwkv_native_chat_preserves_dataset_prompt_verbatim():
     tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
-    dapo_problem = "How many positive integers are less than 2024?"
     dapo_prompt = (
         "Solve the following math problem step by step. The last line of your "
         "response should be of the form Answer: $Answer (without quotes) where "
         "$Answer is the answer to the problem.\n"
-        f"{dapo_problem}\n"
+        "Question: How many positive integers are less than 2024?\n"
+        "Answer:\n"
         'Remember to put your answer on its own line after "Answer:".'
     )
-    paired = (
-        (dapo_prompt, dapo_problem),
-        ("Question: 1+1?\nAnswer:", "1+1?"),
-        (
-            "Intro\nQuestion: Pick.\nA. One\nB. Two\nAnswer:",
-            "Intro\nPick.\nA. One\nB. Two",
-        ),
-        ("Question:\nState the result.\nAnswer:", "State the result."),
-    )  # noqa: E501
-    unchanged = (
-        'Solve this. End with "ANSWER: $ANSWER".',
-        "Write at least two words.",
-        "plain\nAnswer:",
-        "Question: missing answer",
-        "Question:foo\nAnswer:",
-        "Question: one\nQuestion: two\nAnswer:",
-        "Question 1: numbered\nAnswer:",
-        "Keep Question: inline\nAnswer:",
-        "Question: wrong case\nANSWER:",
-        "Question: nonempty\nAnswer: value",
-    )  # noqa: E501
-    render = lambda content: tokenizer.apply_chat_template(
-        [{"role": "user", "content": content}],
+    rendered = tokenizer.apply_chat_template(
+        [{"role": "user", "content": dapo_prompt}],
         tokenize=False,
         add_generation_prompt=True,
-    )  # noqa: E501
-    for content, expected in paired + tuple((text, text) for text in unchanged):
-        assert render(content) == f"User: {expected}\n\nAssistant: <think"
-    dialogue = tokenizer.apply_chat_template(
-        [
-            {"role": "system", "content": "Question: system\nAnswer:"},
-            {"role": "user", "content": paired[1][0]},
-            {"role": "assistant", "content": "Question: gold\nAnswer:"},
-            {"role": "user", "content": paired[2][0]},
-        ],
-        tokenize=False,
-        add_generation_prompt=True,
-    )  # noqa: E501
-    assert (
-        dialogue
-        == "System: Question: system\nAnswer:\n\nUser: 1+1?\n\nAssistant: Question: gold\nAnswer:\n\nUser: Intro\nPick.\nA. One\nB. Two\n\nAssistant: <think"  # noqa: E501
-    )  # noqa: E501
-    tool_chat = tokenizer.apply_chat_template(
-        [
-            {"role": "user", "content": "Question: call?\nAnswer:"},
-            {"role": "tool", "content": "Question: tool\nAnswer:"},
-        ],
-        tools=[{"function": {"name": "noop", "parameters": {}}}],
-        tokenize=False,
-        add_generation_prompt=True,
-    )  # noqa: E501
-    assert (
-        "### User\ncall?\n### Tool Output" in tool_chat
-        and '"Question: tool\\nAnswer:"' in tool_chat
-    )  # noqa: E501
-    seen = {}
-    monkeypatch.setattr(
-        tokenizer.apply_chat_template.__globals__["hf_chat_utils"],
-        "render_jinja_template",
-        lambda conversation, **_: (
-            seen.update(conversation=conversation) or (["sentinel"], [])
-        ),
     )
-    assert (
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": paired[1][0]}],
-            chat_template="custom",
-            tokenize=False,
-        )
-        == "sentinel"
-        and seen["conversation"][0]["content"] == paired[1][0]
-    )  # noqa: E501, E702
+
+    assert rendered == f"User✿{dapo_prompt}✿\nBot✿<think"
 
 
 def test_rwkv_chat_template_can_render_fake_think_generation_prompt():
@@ -217,7 +220,7 @@ def test_rwkv_chat_template_can_render_fake_think_generation_prompt():
         rwkv_generation_prompt="fake_think",
     )
 
-    assert rendered == "User: Hi\n\nAssistant: <think></think"
+    assert rendered == "User✿Hi✿\nBot✿<think></think"
 
 
 def test_rwkv_chat_template_preserves_raw_user_content():
@@ -230,7 +233,7 @@ def test_rwkv_chat_template_preserves_raw_user_content():
         add_generation_prompt=True,
     )
 
-    assert rendered == f"User: {problem}\n\nAssistant: <think"
+    assert rendered == f"User✿{problem}✿\nBot✿<think"
 
 
 def test_rwkv_chat_template_renders_tools_and_tool_outputs_from_training_template():
@@ -254,8 +257,8 @@ def test_rwkv_chat_template_renders_tools_and_tool_outputs_from_training_templat
 
     rendered = tokenizer.apply_chat_template(
         [
-            {"role": "system", "content": "  Use tools carefully.\n\nExplain gaps. "},
-            {"role": "user", "content": " Weather in Paris?\r\n\r\nUse Celsius. "},
+            {"role": "system", "content": "Use tools carefully.\nExplain gaps."},
+            {"role": "user", "content": "Weather in Paris?\nUse Celsius."},
             {
                 "role": "assistant",
                 "content": "",

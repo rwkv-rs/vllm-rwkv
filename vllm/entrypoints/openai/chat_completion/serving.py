@@ -65,7 +65,10 @@ from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.rwkv_defaults import (
-    apply_rwkv_default_sampling_params,
+    RWKV_NATIVE_CHAT_TEMPLATE,
+    is_rwkv_model_config,
+    resolve_rwkv_prompt_template,
+    resolve_rwkv_sampling_params,
     resolve_rwkv_tool_parser,
 )
 from vllm.utils.collection_utils import as_list
@@ -181,9 +184,6 @@ class OpenAIServingChat(GenerateBaseServing):
         self.enable_force_include_usage = enable_force_include_usage
         self.enable_per_request_metrics = enable_per_request_metrics
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
-        apply_rwkv_default_sampling_params(
-            self.default_sampling_params, self.model_config
-        )
         mc = self.model_config
         self.override_max_tokens = (
             self.default_sampling_params.get("max_tokens")
@@ -337,6 +337,27 @@ class OpenAIServingChat(GenerateBaseServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+            chat_params = request.build_chat_params(
+                self.chat_template,
+                self.chat_template_content_format,
+            ).with_defaults(self.default_chat_template_kwargs)
+            prompt_template = None
+            if is_rwkv_model_config(self.model_config) and (
+                chat_params.chat_template is None
+                or chat_params.chat_template.strip() == RWKV_NATIVE_CHAT_TEMPLATE
+            ):
+                prompt_template = resolve_rwkv_prompt_template(
+                    prompt_template=chat_params.chat_template_kwargs.get(
+                        "rwkv_prompt_template"
+                    ),
+                    messages=request.messages,
+                    tools=request.tools or (),
+                )
+            sampling_params = resolve_rwkv_sampling_params(
+                sampling_params,
+                self.model_config,
+                prompt_template=prompt_template,
+            )
 
             self._log_inputs(
                 sub_request_id,

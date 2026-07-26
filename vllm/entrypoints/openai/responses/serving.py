@@ -103,7 +103,10 @@ from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.rwkv_defaults import (
-    apply_rwkv_default_sampling_params,
+    RWKV_NATIVE_CHAT_TEMPLATE,
+    is_rwkv_model_config,
+    resolve_rwkv_prompt_template,
+    resolve_rwkv_sampling_params,
     resolve_rwkv_tool_parser,
 )
 from vllm.utils import random_uuid
@@ -202,9 +205,6 @@ class OpenAIServingResponses(GenerateBaseServing):
         self.enable_force_include_usage = enable_force_include_usage
 
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
-        apply_rwkv_default_sampling_params(
-            self.default_sampling_params, self.model_config
-        )
         mc = self.model_config
         self.override_max_tokens = (
             self.default_sampling_params.get("max_tokens")
@@ -457,6 +457,22 @@ class OpenAIServingResponses(GenerateBaseServing):
             sampling_params = request.to_sampling_params(
                 default_max_tokens, self.default_sampling_params
             )
+            chat_template_kwargs = self._effective_chat_template_kwargs(request)
+            prompt_template = None
+            if is_rwkv_model_config(self.model_config) and (
+                self.chat_template is None
+                or self.chat_template.strip() == RWKV_NATIVE_CHAT_TEMPLATE
+            ):
+                prompt_template = resolve_rwkv_prompt_template(
+                    prompt_template=chat_template_kwargs.get("rwkv_prompt_template"),
+                    messages=messages,
+                    tools=request.tools,
+                )
+            sampling_params = resolve_rwkv_sampling_params(
+                sampling_params,
+                self.model_config,
+                prompt_template=prompt_template,
+            )
 
             trace_headers = (
                 None
@@ -464,7 +480,6 @@ class OpenAIServingResponses(GenerateBaseServing):
                 else await self._get_trace_headers(raw_request.headers)
             )
 
-            chat_template_kwargs = self._effective_chat_template_kwargs(request)
             response_parser = self._make_response_parser(
                 request, tokenizer, chat_template_kwargs
             )
