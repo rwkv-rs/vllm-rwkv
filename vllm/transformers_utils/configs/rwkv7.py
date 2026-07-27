@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -199,6 +200,42 @@ def build_rwkv7_config_from_pth(model: str | Path) -> RWKV7Config | None:
     source = try_parse_rwkv7_pth_source(model)
     if source is None:
         return None
+
+    if source.local_path is not None:
+        config_path = source.local_path.parent / "config.json"
+        if config_path.is_file():
+            try:
+                raw_config = json.loads(config_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise ValueError(f"Invalid RWKV7 checkpoint config: {config_path}") from error
+            if not isinstance(raw_config, dict):
+                raise ValueError(f"Invalid RWKV7 checkpoint config: {config_path}")
+            required_values = {
+                "vocab_size",
+                "hidden_size",
+                "head_size",
+                "num_hidden_layers",
+                "max_position_embeddings",
+            }
+            if (
+                raw_config.get("model_type") != "rwkv7"
+                or raw_config.get("architectures") != ["RWKV7ForCausalLM"]
+                or any(
+                    isinstance(raw_config.get(key), bool)
+                    or not isinstance(raw_config.get(key), int)
+                    or raw_config[key] <= 0
+                    for key in required_values
+                )
+                or raw_config["hidden_size"] % raw_config["head_size"] != 0
+            ):
+                raise ValueError(f"Invalid RWKV7 checkpoint config: {config_path}")
+            return RWKV7Config(
+                vocab_size=raw_config["vocab_size"],
+                hidden_size=raw_config["hidden_size"],
+                head_size=raw_config["head_size"],
+                num_hidden_layers=raw_config["num_hidden_layers"],
+                max_position_embeddings=raw_config["max_position_embeddings"],
+            )
 
     filename = Path(source.filename).name
     match = _RWKV7_G1_FILENAME_RE.match(filename)
