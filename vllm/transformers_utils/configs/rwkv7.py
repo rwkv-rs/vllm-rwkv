@@ -207,7 +207,9 @@ def build_rwkv7_config_from_pth(model: str | Path) -> RWKV7Config | None:
             try:
                 raw_config = json.loads(config_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as error:
-                raise ValueError(f"Invalid RWKV7 checkpoint config: {config_path}") from error
+                raise ValueError(
+                    f"Invalid RWKV7 checkpoint config: {config_path}"
+                ) from error
             if not isinstance(raw_config, dict):
                 raise ValueError(f"Invalid RWKV7 checkpoint config: {config_path}")
             required_values = {

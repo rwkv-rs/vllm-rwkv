@@ -319,6 +319,13 @@ class RWKV7ModelState(ModelState):
         self.shift_state.zero_()
         self.wkv_state.zero_()
         self.elapsed.zero_()
+        # Level-2 sleep discards allocator-backed tensors. Rebuild the static
+        # decode metadata that is not restored by checkpoint weight streaming.
+        torch.arange(self.max_num_reqs, out=self.execution_idx_mapping)
+        torch.arange(
+            self.max_num_reqs + 1,
+            out=self.decode_query_start_loc,
+        )
 
     def get_mm_embeddings(
         self,

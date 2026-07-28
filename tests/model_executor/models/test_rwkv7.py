@@ -2139,7 +2139,7 @@ def test_rwkv7_direct_parameter_update_is_not_supported():
         model.get_parameter("emb.weight")
 
 
-def test_rwkv7_model_state_reset_after_weight_update_preserves_mappings():
+def test_rwkv7_model_state_reset_after_weight_update_restores_runtime_metadata():
     hf_config = SimpleNamespace(
         num_hidden_layers=1,
         hidden_size=64,
@@ -2160,12 +2160,16 @@ def test_rwkv7_model_state_reset_after_weight_update_preserves_mappings():
     state.shift_state.fill_(1)
     state.wkv_state.fill_(2)
     state.elapsed.fill_(3)
+    state.execution_idx_mapping.fill_(-1)
+    state.decode_query_start_loc.fill_(-1)
 
     state.reset_after_weight_update()
 
     assert torch.count_nonzero(state.shift_state) == 0
     assert torch.count_nonzero(state.wkv_state) == 0
     assert torch.count_nonzero(state.elapsed) == 0
+    assert state.execution_idx_mapping.tolist() == [0, 1, 2]
+    assert state.decode_query_start_loc.tolist() == [0, 1, 2, 3]
     assert state.req_id_to_index == {"req-1": 1}
     assert state.req_slot_to_row[1] != -1
 
