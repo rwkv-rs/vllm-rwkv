@@ -8,6 +8,9 @@ forwarding chain. Endpoint-level coverage lives in
 ``tests/entrypoints/scale_out/render/test_render.py``.
 """
 
+import asyncio
+from types import SimpleNamespace
+
 import pytest
 
 from vllm.renderers.params import TokenizeParams
@@ -197,3 +200,28 @@ class TestProcessTokensForwardsOffsets:
         engine_input = renderer._process_tokens(tokens_prompt)
 
         assert "prompt_token_offsets" not in engine_input
+
+
+class TestRwkvProcessTokens:
+    @staticmethod
+    def _renderer():
+        renderer = _make_base_renderer_with(None)
+        renderer.model_config = SimpleNamespace(
+            tokenizer_mode="rwkv",
+            max_model_len=10240,
+        )
+        return renderer
+
+    def test_sync_bos_insertion_preserves_first_prompt_token(self):
+        engine_input = self._renderer()._process_tokens(
+            {"prompt_token_ids": [24281, 10060]}
+        )
+
+        assert engine_input["prompt_token_ids"] == [0, 24281, 10060]
+
+    def test_async_bos_insertion_preserves_first_prompt_token(self):
+        engine_input = asyncio.run(
+            self._renderer()._process_tokens_async({"prompt_token_ids": [24281, 10060]})
+        )
+
+        assert engine_input["prompt_token_ids"] == [0, 24281, 10060]

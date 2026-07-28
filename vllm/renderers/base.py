@@ -782,7 +782,7 @@ class BaseRenderer(ABC, Generic[_T]):
         if is_rwkv_model_config(self.model_config):
             prompt_token_ids = ensure_rwkv_prompt_bos_token(
                 prompt_token_ids,
-                max_length=max(1, len(prompt_token_ids)),
+                max_length=self.model_config.max_model_len,
                 truncate_from_left=True,
             )
 
@@ -851,7 +851,7 @@ class BaseRenderer(ABC, Generic[_T]):
         if is_rwkv_model_config(self.model_config):
             prompt_token_ids = ensure_rwkv_prompt_bos_token(
                 prompt_token_ids,
-                max_length=max(1, len(prompt_token_ids)),
+                max_length=self.model_config.max_model_len,
                 truncate_from_left=True,
             )
 
