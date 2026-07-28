@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from pathlib import Path
 
 import pytest
@@ -82,11 +83,40 @@ def test_rwkv7_local_pth_builds_config_from_filename(tmp_path: Path):
 
 
 def test_unknown_rwkv7_pth_filename_fails_closed(tmp_path: Path):
-    checkpoint = tmp_path / "rwkv7-g1g-custom-ctx8192.pth"
+    checkpoint = tmp_path / "rwkv_lm.pth"
     checkpoint.touch()
 
     with pytest.raises(ValueError, match="Unsupported RWKV7 raw .pth checkpoint"):
         get_config(checkpoint, trust_remote_code=False)
+
+
+def test_local_rwkv7_checkpoint_uses_sidecar_config(tmp_path: Path):
+    checkpoint = tmp_path / "rwkv_lm.pth"
+    checkpoint.touch()
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["RWKV7ForCausalLM"],
+                "model_type": "rwkv7",
+                "vocab_size": 65536,
+                "hidden_size": 2048,
+                "head_size": 64,
+                "num_hidden_layers": 24,
+                "max_position_embeddings": 10240,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = get_config(checkpoint, trust_remote_code=False)
+
+    assert config.architectures == ["RWKV7ForCausalLM"]
+    assert config.model_type == "rwkv7"
+    assert config.vocab_size == 65536
+    assert config.hidden_size == 2048
+    assert config.head_size == 64
+    assert config.num_hidden_layers == 24
+    assert config.max_position_embeddings == 10240
 
 
 def test_rwkv7_pth_url_has_no_image_processor_config():
