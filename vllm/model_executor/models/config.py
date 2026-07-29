@@ -632,6 +632,15 @@ class RWKV7ForCausalLMConfig(VerifyAndUpdateConfig):
                 )
 
         compilation_config = vllm_config.compilation_config
+        if (
+            scheduler_config is not None
+            and compilation_config.cudagraph_capture_sizes is None
+            and compilation_config.max_cudagraph_capture_size is None
+        ):
+            compilation_config.max_cudagraph_capture_size = (
+                scheduler_config.max_num_seqs
+            )
+
         if compilation_config.mode not in (None, CompilationMode.NONE):
             raise ValueError(
                 "RWKV7 does not support torch.compile. Use non-compiled "
