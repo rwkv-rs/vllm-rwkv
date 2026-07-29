@@ -701,6 +701,54 @@ def test_rwkv7_config_disables_prefix_caching():
     assert vllm_config.cache_config.enable_prefix_caching is False
 
 
+def test_rwkv7_config_captures_full_decode_capacity():
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(enforce_eager=False),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=960,
+            max_num_batched_tokens=8192,
+            max_num_scheduled_tokens=None,
+        ),
+        compilation_config=CompilationConfig(),
+    )
+
+    RWKV7ForCausalLMConfig.verify_and_update_config(vllm_config)
+
+    assert vllm_config.compilation_config.max_cudagraph_capture_size == 960
+
+
+@pytest.mark.parametrize(
+    "compilation_config",
+    [
+        CompilationConfig(max_cudagraph_capture_size=768),
+        CompilationConfig(cudagraph_capture_sizes=[64, 256, 512]),
+    ],
+)
+def test_rwkv7_config_preserves_explicit_cudagraph_sizes(compilation_config):
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(enforce_eager=False),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=960,
+            max_num_batched_tokens=8192,
+            max_num_scheduled_tokens=None,
+        ),
+        compilation_config=compilation_config,
+    )
+    expected_max_size = compilation_config.max_cudagraph_capture_size
+    expected_capture_sizes = compilation_config.cudagraph_capture_sizes
+
+    RWKV7ForCausalLMConfig.verify_and_update_config(vllm_config)
+
+    assert (
+        vllm_config.compilation_config.max_cudagraph_capture_size
+        == expected_max_size
+    )
+    assert (
+        vllm_config.compilation_config.cudagraph_capture_sizes
+        == expected_capture_sizes
+    )
+
+
 def test_rwkv7_allows_chunked_prefill_without_kv_cache():
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
