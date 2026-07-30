@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import vllm.model_executor.models.rwkv7 as rwkv7
+from vllm.config import ModelConfig
 from vllm.config.compilation import CompilationConfig, CompilationMode, CUDAGraphMode
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.models.config import RWKV7ForCausalLMConfig
@@ -17,7 +18,6 @@ from vllm.model_executor.models.rwkv7 import RWKV7ForCausalLM
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import NewRequestData
-from vllm.v1.engine.core import _supports_no_kv_cache_chunked_prefill
 from vllm.v1.worker.gpu.model_states.rwkv import RWKV7ModelState
 from vllm.v1.worker.gpu_input_batch import (
     CachedRequestState,
@@ -753,16 +753,14 @@ def test_rwkv7_config_preserves_explicit_cudagraph_sizes(compilation_config):
     )
 
 
-def test_rwkv7_allows_chunked_prefill_without_kv_cache():
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(
-            runner_type="generate",
-            architectures=["RWKV7ForCausalLM"],
-            hf_config=SimpleNamespace(architectures=[]),
-        )
+@pytest.mark.parametrize(("is_rwkv7", "expected"), [(True, True), (False, False)])
+def test_no_kv_cache_chunked_prefill_capability(is_rwkv7, expected):
+    supports_chunked_prefill = (
+        ModelConfig.supports_no_kv_cache_chunked_prefill.fget
     )
 
-    assert _supports_no_kv_cache_chunked_prefill(vllm_config)
+    assert supports_chunked_prefill is not None
+    assert supports_chunked_prefill(SimpleNamespace(is_rwkv7=is_rwkv7)) is expected
 
 
 def test_rwkv7_config_rejects_decode_budget_below_max_running_reqs():

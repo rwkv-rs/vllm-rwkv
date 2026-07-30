@@ -23,6 +23,8 @@ logger = init_logger(__name__)
 class RWKV7ModelState(ModelState):
     """Dense batched recurrent state for RWKV7."""
 
+    supports_v2_kernel_warmup = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,

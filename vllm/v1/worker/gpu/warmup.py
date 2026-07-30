@@ -27,7 +27,7 @@ logger = init_logger(__name__)
 
 def should_skip_v2_kernel_warmup(model_runner: object) -> bool:
     model_state = getattr(model_runner, "model_state", None)
-    return model_state.__class__.__name__ == "RWKV7ModelState"
+    return not getattr(model_state, "supports_v2_kernel_warmup", True)
 
 
 def run_mixed_prefill_decode_warmup(
