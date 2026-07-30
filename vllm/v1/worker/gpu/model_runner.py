@@ -1352,11 +1352,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
             assert self.cudagraph_manager is not None
-            prepare_cudagraph_inputs = getattr(
-                self.model, "prepare_cudagraph_inputs", None
-            )
-            if prepare_cudagraph_inputs is not None:
-                prepare_cudagraph_inputs(model_inputs)
             self.kv_connector.pre_forward(scheduler_output)
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
