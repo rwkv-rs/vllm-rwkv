@@ -498,33 +498,13 @@ def test_non_rwkv7_rejects_concurrent_partial_prefill():
         engine_args._check_feature_supported(model_config)
 
 
-@pytest.mark.parametrize(
-    ("layers", "hidden_size", "wkv_mode", "expected"),
-    [
-        (24, 2048, "fp16", 2560),
-        (32, 2560, "fp32io16", 1280),
-        (32, 4096, "fp16", 1280),
-        (61, 4096, "fp32io16", 160),
-    ],
-)
-def test_rwkv7_engine_defaults_active_batch_from_model_memory_and_mode(
-    monkeypatch, layers, hidden_size, wkv_mode, expected
-):
-    from vllm.platforms import current_platform
-
-    memory_gib = 48
-    monkeypatch.setattr(
-        current_platform,
-        "get_device_total_memory",
-        lambda *_: memory_gib * (1 << 30),
-    )
-    monkeypatch.setenv("VLLM_RWKV7_WKV_MODE", wkv_mode)
+def test_rwkv7_uses_framework_batch_defaults():
     engine_args = EngineArgs(max_model_len=10240)
     model_config = SimpleNamespace(
         architectures=["RWKV7ForCausalLM"],
         hf_config=RWKV7Config(
-            num_hidden_layers=layers,
-            hidden_size=hidden_size,
+            num_hidden_layers=24,
+            hidden_size=2048,
         ),
         max_model_len=10240,
         is_multimodal_model=False,
@@ -535,18 +515,38 @@ def test_rwkv7_engine_defaults_active_batch_from_model_memory_and_mode(
         model_config,
         SimpleNamespace(use_batched_dp_moe=False),
     )
-    assert engine_args.max_num_seqs == expected
-    assert engine_args.max_num_batched_tokens >= expected
-
-
-def test_rwkv7_explicit_batch_override_bypasses_default_matrix(monkeypatch):
-    from vllm.platforms import current_platform
-
-    monkeypatch.setattr(
-        current_platform,
-        "get_device_total_memory",
-        lambda *_: 80 * (1 << 30),
+    assert engine_args.max_num_seqs == SchedulerConfig.DEFAULT_MAX_NUM_SEQS
+    assert (
+        engine_args.max_num_batched_tokens
+        == model_config.max_model_len
     )
+
+
+def test_rwkv7_uses_framework_throughput_defaults():
+    engine_args = EngineArgs(
+        max_model_len=10240,
+        performance_mode="throughput",
+    )
+    model_config = SimpleNamespace(
+        architectures=["RWKV7ForCausalLM"],
+        hf_config=RWKV7Config(
+            num_hidden_layers=24,
+            hidden_size=2048,
+        ),
+        max_model_len=10240,
+        is_multimodal_model=False,
+        is_mm_prefix_lm=False,
+    )
+    engine_args._set_default_max_num_seqs_and_batched_tokens_args(
+        None,
+        model_config,
+        SimpleNamespace(use_batched_dp_moe=False),
+    )
+    assert engine_args.max_num_seqs == 2 * SchedulerConfig.DEFAULT_MAX_NUM_SEQS
+    assert engine_args.max_num_batched_tokens == model_config.max_model_len
+
+
+def test_rwkv7_preserves_explicit_batch_override():
     engine_args = EngineArgs(
         max_model_len=10240,
         max_num_seqs=37,
