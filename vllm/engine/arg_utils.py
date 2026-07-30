@@ -1731,6 +1731,15 @@ class EngineArgs:
         if self.quantization == "bitsandbytes":
             self.load_format = "bitsandbytes"
 
+        if try_parse_rwkv7_pth_source(self.model) is not None:
+            if self.load_format in {"auto", "hf", "pt"}:
+                self.load_format = "rwkv_pth"
+            elif self.load_format != "rwkv_pth":
+                raise ValueError(
+                    "RWKV7 raw .pth checkpoints require load_format='auto', "
+                    f"'hf', 'pt', or 'rwkv_pth', but got {self.load_format!r}."
+                )
+
         if self.load_format == "tensorizer":
             if hasattr(self.model_loader_extra_config, "to_serializable"):
                 self.model_loader_extra_config = (

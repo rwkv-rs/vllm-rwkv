@@ -108,8 +108,12 @@ def test_rwkv_manifest_fixture_matches_runtime_contract() -> None:
     assert load_build_profile_metadata(path) == RWKV_METADATA
 
 
-def test_rwkv_profile_accepts_declared_configuration() -> None:
-    validate_build_profile_capabilities(make_config(), RWKV_METADATA)
+@pytest.mark.parametrize("load_format", ["auto", "hf", "pt", "rwkv_pth"])
+def test_rwkv_profile_accepts_declared_configuration(load_format: str) -> None:
+    validate_build_profile_capabilities(
+        make_config(load_format=load_format),
+        RWKV_METADATA,
+    )
 
 
 def test_rwkv_profile_accepts_sleep_mode_and_cumem_allocator() -> None:

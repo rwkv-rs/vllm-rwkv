@@ -516,10 +516,7 @@ def test_rwkv7_uses_framework_batch_defaults():
         SimpleNamespace(use_batched_dp_moe=False),
     )
     assert engine_args.max_num_seqs == SchedulerConfig.DEFAULT_MAX_NUM_SEQS
-    assert (
-        engine_args.max_num_batched_tokens
-        == model_config.max_model_len
-    )
+    assert engine_args.max_num_batched_tokens == model_config.max_model_len
 
 
 def test_rwkv7_uses_framework_throughput_defaults():
@@ -566,6 +563,53 @@ def test_rwkv7_preserves_explicit_batch_override():
     )
     assert engine_args.max_num_seqs == 37
     assert engine_args.max_num_batched_tokens == 10240
+
+
+@pytest.mark.parametrize("load_format", ["auto", "hf", "pt", "rwkv_pth"])
+def test_rwkv7_raw_pth_selects_dedicated_loader(tmp_path, load_format):
+    checkpoint = tmp_path / "rwkv7-g1g-1.5b-20260526-ctx8192.pth"
+    checkpoint.touch()
+
+    load_config = EngineArgs(
+        model=str(checkpoint),
+        load_format=load_format,
+    ).create_load_config()
+
+    assert load_config.load_format == "rwkv_pth"
+
+
+def test_rwkv7_raw_pth_rejects_incompatible_loader(tmp_path):
+    checkpoint = tmp_path / "rwkv7-g1g-1.5b-20260526-ctx8192.pth"
+    checkpoint.touch()
+
+    with pytest.raises(ValueError, match="RWKV7 raw .pth checkpoints require"):
+        EngineArgs(
+            model=str(checkpoint),
+            load_format="safetensors",
+        ).create_load_config()
+
+
+def test_rwkv7_raw_pth_url_selects_dedicated_loader():
+    load_config = EngineArgs(
+        model=(
+            "https://huggingface.co/BlinkDL/rwkv7-g1/blob/main/"
+            "rwkv7-g1g-1.5b-20260526-ctx8192.pth"
+        ),
+    ).create_load_config()
+
+    assert load_config.load_format == "rwkv_pth"
+
+
+def test_ordinary_model_preserves_generic_load_format(tmp_path):
+    model_dir = tmp_path / "ordinary-model"
+    model_dir.mkdir()
+
+    load_config = EngineArgs(
+        model=str(model_dir),
+        load_format="auto",
+    ).create_load_config()
+
+    assert load_config.load_format == "auto"
 
 
 def test_prefix_cache_default():
