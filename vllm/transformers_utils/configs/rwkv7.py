@@ -14,21 +14,69 @@ from vllm.transformers_utils.config_parser_base import ConfigParserBase
 
 BLINKDL_RWKV7_G1_REPO = "BlinkDL/rwkv7-g1"
 
+
+@dataclass(frozen=True)
+class _RWKV7G1Spec:
+    num_hidden_layers: int
+    hidden_size: int
+    intermediate_size: int
+    decay_rank: int
+    in_context_learning_rank: int
+    value_residual_rank: int
+    gate_rank: int
+
+
 _RWKV7_G1_SPECS = {
-    "0.1b": (12, 768),
-    "0.4b": (24, 1024),
-    "1.5b": (24, 2048),
-    "2.9b": (32, 2560),
-    "7.2b": (32, 4096),
-    "13.3b": (61, 4096),
+    "rwkv7-g1d-0.1b-20260129-ctx8192.pth": _RWKV7G1Spec(12, 768, 3072, 64, 64, 32, 128),
+    "rwkv7-g1d-0.4b-20260210-ctx8192.pth": _RWKV7G1Spec(
+        24, 1024, 4096, 64, 64, 32, 128
+    ),
+    "rwkv7-g1f-1.5b-20260419-ctx8192.pth": _RWKV7G1Spec(
+        24, 2048, 8192, 96, 96, 64, 256
+    ),
+    "rwkv7-g1f-2.9b-20260420-ctx8192.pth": _RWKV7G1Spec(
+        32, 2560, 10240, 96, 96, 64, 320
+    ),
+    "rwkv7-g1f-7.2b-20260414-ctx8192.pth": _RWKV7G1Spec(
+        32, 4096, 16384, 128, 128, 96, 480
+    ),
+    "rwkv7-g1f-13.3b-20260415-ctx8192.pth": _RWKV7G1Spec(
+        61, 4096, 16384, 192, 192, 128, 384
+    ),
+    "rwkv7-g1g-1.5b-20260526-ctx8192.pth": _RWKV7G1Spec(
+        24, 2048, 8192, 96, 96, 64, 256
+    ),
+    "rwkv7-g1g-2.9b-20260526-ctx8192.pth": _RWKV7G1Spec(
+        32, 2560, 10240, 96, 96, 64, 320
+    ),
+    "rwkv7-g1g-7.2b-20260523-ctx8192.pth": _RWKV7G1Spec(
+        32, 4096, 16384, 128, 128, 96, 480
+    ),
+    "rwkv7-g1g-13.3b-20260523-ctx8192.pth": _RWKV7G1Spec(
+        61, 4096, 16384, 192, 192, 128, 384
+    ),
+    "rwkv7-g1h-1.5b-20260710-ctx10240.pth": _RWKV7G1Spec(
+        24, 2048, 8192, 96, 96, 64, 256
+    ),
+    "rwkv7-g1h-7.2b-20260710-ctx10240.pth": _RWKV7G1Spec(
+        32, 4096, 16384, 128, 128, 96, 480
+    ),
 }
 
-_RWKV7_G1_FILENAME_RE = re.compile(
-    r"^rwkv7-g1[a-z]-"
-    r"(?P<size>0\.1b|0\.4b|1\.5b|2\.9b|7\.2b|13\.3b)-"
-    r"(?P<date>\d{8})-ctx(?P<context>\d+)\.pth$",
-    re.IGNORECASE,
+_RWKV7_CONFIG_FIELDS = (
+    "vocab_size",
+    "hidden_size",
+    "intermediate_size",
+    "head_size",
+    "num_hidden_layers",
+    "max_position_embeddings",
+    "decay_rank",
+    "in_context_learning_rank",
+    "value_residual_rank",
+    "gate_rank",
 )
+
+_RWKV7_CONTEXT_RE = re.compile(r"-ctx(?P<context>\d+)\.pth$")
 
 
 @dataclass(frozen=True)
@@ -47,19 +95,51 @@ class RWKV7Config(PretrainedConfig):
         self,
         vocab_size: int = 65536,
         hidden_size: int = 2048,
+        intermediate_size: int = 8192,
         head_size: int = 64,
         num_hidden_layers: int = 24,
         max_position_embeddings: int = 8192,
+        decay_rank: int = 96,
+        in_context_learning_rank: int = 96,
+        value_residual_rank: int = 64,
+        gate_rank: int = 256,
         **kwargs,
     ):
+        values = {
+            "vocab_size": vocab_size,
+            "hidden_size": hidden_size,
+            "intermediate_size": intermediate_size,
+            "head_size": head_size,
+            "num_hidden_layers": num_hidden_layers,
+            "max_position_embeddings": max_position_embeddings,
+            "decay_rank": decay_rank,
+            "in_context_learning_rank": in_context_learning_rank,
+            "value_residual_rank": value_residual_rank,
+            "gate_rank": gate_rank,
+        }
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in values.values()
+        ):
+            raise ValueError("RWKV7 config values must be positive integers.")
+        if head_size != 64:
+            raise ValueError("RWKV7 currently requires head_size=64.")
+        if hidden_size % head_size != 0:
+            raise ValueError("RWKV7 hidden_size must be divisible by head_size.")
+
         kwargs.setdefault("architectures", self.architectures)
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
         self.head_size = head_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = hidden_size // head_size
         self.max_position_embeddings = max_position_embeddings
+        self.decay_rank = decay_rank
+        self.in_context_learning_rank = in_context_learning_rank
+        self.value_residual_rank = value_residual_rank
+        self.gate_rank = gate_rank
 
 
 class RWKV7PthConfigParser(ConfigParserBase):
@@ -120,7 +200,7 @@ def is_rwkv7_pth_source(model: str | Path) -> bool:
     source = try_parse_rwkv7_pth_source(model)
     if source is None:
         return False
-    if source.repo_id is not None or _RWKV7_G1_FILENAME_RE.match(source.filename):
+    if Path(source.filename).name in _RWKV7_G1_SPECS:
         return True
     if source.local_path is None:
         return False
@@ -138,6 +218,8 @@ def build_rwkv7_config_from_pth(model: str | Path) -> RWKV7Config | None:
     if source is None:
         return None
 
+    filename = Path(source.filename).name
+    spec = _RWKV7_G1_SPECS.get(filename)
     if source.local_path is not None:
         config_path = source.local_path.parent / "config.json"
         if config_path.is_file():
@@ -149,48 +231,61 @@ def build_rwkv7_config_from_pth(model: str | Path) -> RWKV7Config | None:
                 ) from error
             if not isinstance(raw_config, dict):
                 raise ValueError(f"Invalid RWKV7 checkpoint config: {config_path}")
-            required_values = {
-                "vocab_size",
-                "hidden_size",
-                "head_size",
-                "num_hidden_layers",
-                "max_position_embeddings",
-            }
-            if (
-                raw_config.get("model_type") != "rwkv7"
-                or raw_config.get("architectures") != ["RWKV7ForCausalLM"]
-                or any(
-                    isinstance(raw_config.get(key), bool)
-                    or not isinstance(raw_config.get(key), int)
-                    or raw_config[key] <= 0
-                    for key in required_values
-                )
-                or raw_config["hidden_size"] % raw_config["head_size"] != 0
-            ):
+            if raw_config.get("model_type") != "rwkv7" or raw_config.get(
+                "architectures"
+            ) != ["RWKV7ForCausalLM"]:
                 raise ValueError(f"Invalid RWKV7 checkpoint config: {config_path}")
-            return RWKV7Config(
-                vocab_size=raw_config["vocab_size"],
-                hidden_size=raw_config["hidden_size"],
-                head_size=raw_config["head_size"],
-                num_hidden_layers=raw_config["num_hidden_layers"],
-                max_position_embeddings=raw_config["max_position_embeddings"],
-            )
+            if spec is not None:
+                config = _build_rwkv7_config_from_spec(filename, spec)
+                mismatched = [
+                    key
+                    for key in _RWKV7_CONFIG_FIELDS
+                    if key in raw_config and raw_config[key] != getattr(config, key)
+                ]
+                if mismatched:
+                    raise ValueError(
+                        f"Invalid RWKV7 checkpoint config: {config_path}; "
+                        "official checkpoint fields do not match the catalog: "
+                        f"{', '.join(mismatched)}"
+                    )
+                return config
 
-    filename = Path(source.filename).name
-    match = _RWKV7_G1_FILENAME_RE.match(filename)
-    if match is None:
+            missing = [key for key in _RWKV7_CONFIG_FIELDS if key not in raw_config]
+            if missing:
+                raise ValueError(
+                    f"Invalid RWKV7 checkpoint config: {config_path}; "
+                    f"missing required fields: {', '.join(missing)}"
+                )
+            try:
+                return RWKV7Config(
+                    **{key: raw_config[key] for key in _RWKV7_CONFIG_FIELDS}
+                )
+            except ValueError as error:
+                raise ValueError(
+                    f"Invalid RWKV7 checkpoint config: {config_path}"
+                ) from error
+
+    if spec is None:
         raise ValueError(
             f"Unsupported RWKV7 raw .pth checkpoint: {filename}. "
-            "Expected a BlinkDL/rwkv7-g1 filename such as "
-            "rwkv7-g1g-1.5b-20260526-ctx8192.pth."
+            "Expected an audited BlinkDL/rwkv7-g1 checkpoint filename or a "
+            "local checkpoint with a complete config.json sidecar."
         )
+    return _build_rwkv7_config_from_spec(filename, spec)
 
-    size = match.group("size").lower()
-    num_layers, hidden_size = _RWKV7_G1_SPECS[size]
+
+def _build_rwkv7_config_from_spec(filename: str, spec: _RWKV7G1Spec) -> RWKV7Config:
+    match = _RWKV7_CONTEXT_RE.search(filename)
+    assert match is not None
     return RWKV7Config(
-        hidden_size=hidden_size,
-        num_hidden_layers=num_layers,
+        hidden_size=spec.hidden_size,
+        intermediate_size=spec.intermediate_size,
+        num_hidden_layers=spec.num_hidden_layers,
         max_position_embeddings=int(match.group("context")),
+        decay_rank=spec.decay_rank,
+        in_context_learning_rank=spec.in_context_learning_rank,
+        value_residual_rank=spec.value_residual_rank,
+        gate_rank=spec.gate_rank,
     )
 
 
