@@ -702,10 +702,11 @@ def test_rwkv7_config_disables_prefix_caching():
 
 
 def test_rwkv7_config_captures_full_decode_capacity():
+    configured_capacity = 768
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=False),
         scheduler_config=SimpleNamespace(
-            max_num_seqs=960,
+            max_num_seqs=configured_capacity,
             max_num_batched_tokens=8192,
             max_num_scheduled_tokens=None,
         ),
@@ -714,7 +715,10 @@ def test_rwkv7_config_captures_full_decode_capacity():
 
     RWKV7ForCausalLMConfig.verify_and_update_config(vllm_config)
 
-    assert vllm_config.compilation_config.max_cudagraph_capture_size == 960
+    assert (
+        vllm_config.compilation_config.max_cudagraph_capture_size
+        == configured_capacity
+    )
 
 
 @pytest.mark.parametrize(
@@ -728,7 +732,7 @@ def test_rwkv7_config_preserves_explicit_cudagraph_sizes(compilation_config):
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=False),
         scheduler_config=SimpleNamespace(
-            max_num_seqs=960,
+            max_num_seqs=768,
             max_num_batched_tokens=8192,
             max_num_scheduled_tokens=None,
         ),
