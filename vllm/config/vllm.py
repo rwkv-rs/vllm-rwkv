@@ -639,11 +639,7 @@ class VllmConfig:
 
     def _is_rwkv7_model(self) -> bool:
         model_config = self.model_config
-        if model_config is None:
-            return False
-        architectures = getattr(model_config, "architectures", [])
-        architecture = getattr(model_config, "architecture", None)
-        return architecture == "RWKV7ForCausalLM" or "RWKV7ForCausalLM" in architectures
+        return model_config is not None and model_config.is_rwkv7
 
     def _raise_rwkv7_unsupported_features(
         self, unsupported: list[str] | None = None

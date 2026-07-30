@@ -2423,9 +2423,7 @@ class EngineArgs:
     def _check_feature_supported(self, model_config: ModelConfig):
         """Raise an error if the feature is not supported."""
         # No Concurrent Partial Prefills so far.
-        architectures = getattr(model_config, "architectures", [])
-        is_rwkv7 = "RWKV7ForCausalLM" in architectures
-        if not is_rwkv7 and (
+        if (
             self.max_num_partial_prefills != SchedulerConfig.max_num_partial_prefills
             or self.max_long_partial_prefills
             != SchedulerConfig.max_long_partial_prefills
@@ -2661,7 +2659,7 @@ class EngineArgs:
 
         orig_max_num_batched_tokens = self.max_num_batched_tokens
         orig_max_num_seqs = self.max_num_seqs
-        is_rwkv7 = "RWKV7ForCausalLM" in (model_config.architectures or [])
+        is_rwkv7 = model_config.is_rwkv7
 
         if self.max_num_batched_tokens is None:
             if parallel_config.use_batched_dp_moe:

@@ -893,6 +893,15 @@ class ModelConfig:
         """The architecture vllm actually used."""
         return self._architecture
 
+    @property
+    def is_rwkv7(self) -> bool:
+        return self.architecture == "RWKV7ForCausalLM"
+
+    @property
+    def requires_uniform_decode_wave(self) -> bool:
+        """Whether ready decode requests must advance as one scheduler wave."""
+        return self.is_rwkv7
+
     def maybe_pull_model_tokenizer_for_runai(self, model: str, tokenizer: str) -> None:
         """Pull model/tokenizer from Object Storage to temporary
         directory when needed.

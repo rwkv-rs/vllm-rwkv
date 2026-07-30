@@ -54,7 +54,30 @@ jobs:
           fi
 
           echo "Replaying $rwkv_commit_count rwkv commits on top of upstream/main."
+          set +e
           git rebase refs/remotes/upstream/main
+          rebase_status="$?"
+          set -e
+          if [[ "$rebase_status" != "0" ]]; then
+            mkdir -p rebase-evidence
+            git diff --name-only --diff-filter=U > rebase-evidence/unmerged-paths.txt
+            git status --short > rebase-evidence/status.txt
+            git rev-parse REBASE_HEAD > rebase-evidence/rebase-head.txt
+            git show --no-patch --format=fuller REBASE_HEAD \
+              > rebase-evidence/rebase-commit.txt
+            cp .git/rebase-merge/git-rebase-todo rebase-evidence/rebase-todo.txt
+            {
+              echo "### Upstream rebase conflict"
+              echo
+              echo "- Rebase commit: \`$(git rev-parse REBASE_HEAD)\`"
+              echo "- Unmerged paths:"
+              sed 's/^/  - `/' rebase-evidence/unmerged-paths.txt | sed 's/$/`/'
+            } >> "$GITHUB_STEP_SUMMARY"
+            git rebase --abort
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "failed=false" >> "$GITHUB_OUTPUT"
 
           post_rebase_commit_count="$(git rev-list --count refs/remotes/upstream/main..HEAD)"
           if [[ "$post_rebase_commit_count" == "0" ]]; then
@@ -74,6 +97,21 @@ jobs:
             echo "upstream_head=$(git rev-parse refs/remotes/upstream/main)"
             echo "candidate_head=$(git rev-parse HEAD)"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Upload rebase conflict evidence
+        if: steps.rebase.outputs.failed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rwkv-rebase-conflict-${{ github.run_id }}
+          path: rebase-evidence
+          if-no-files-found: error
+
+      - name: Fail on rebase conflict
+        if: steps.rebase.outputs.failed == 'true'
+        shell: bash
+        run: |
+          echo "The upstream rebase conflicted; inspect the uploaded evidence artifact."
+          exit 1
 
       - name: Run lightweight RWKV interface guards
         if: steps.rebase.outputs.changed == 'true'
@@ -125,6 +163,34 @@ jobs:
           if failures:
               raise AssertionError("\n".join(failures))
           PY
+
+      - name: Guard prompt-sensitive paths
+        if: steps.rebase.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git diff --name-only \
+            "${{ steps.rebase.outputs.old_head }}"..HEAD > changed-paths.txt
+          sensitive_paths="$(
+            grep -E \
+              '(^|/)(chat_template|templates?|tokenizers?|tool_parser|reasoning_parser|stop_checker|serving_chat)(/|\.|$)|rwkv_defaults\.py$' \
+              changed-paths.txt || true
+          )"
+          if [[ -z "$sensitive_paths" ]]; then
+            exit 0
+          fi
+
+          {
+            echo "### Prompt-sensitive changes require owner approval"
+            echo
+            echo "The candidate branch was not pushed. Sensitive paths:"
+            while IFS= read -r path; do
+              echo "- \`$path\`"
+            done <<< "$sensitive_paths"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Refusing to push prompt-sensitive changes without explicit owner approval."
+          exit 1
 
       - name: Push rebase candidate and open PR
         if: steps.rebase.outputs.changed == 'true'
