@@ -37,6 +37,9 @@ class ModelSpecificAttnMetadata:
 
 
 class ModelState(ABC):
+    supports_v2_kernel_warmup: bool = True
+    """Whether the generic V2 kernel warmup is compatible with this state."""
+
     def __init__(
         self,
         vllm_config: VllmConfig,

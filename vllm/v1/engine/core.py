@@ -95,16 +95,6 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
-def _supports_no_kv_cache_chunked_prefill(vllm_config: VllmConfig) -> bool:
-    model_config = vllm_config.model_config
-    if model_config.runner_type != "generate":
-        return False
-    architectures = list(getattr(model_config, "architectures", []) or [])
-    hf_config = getattr(model_config, "hf_config", None)
-    architectures.extend(getattr(hf_config, "architectures", []) or [])
-    return "RWKV7ForCausalLM" in architectures
-
-
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -154,7 +144,10 @@ class EngineCore:
             # chunked prefill. Causal recurrent generation models such as
             # RWKV7 have no KV cache but still support scheduler chunking.
             if vllm_config.scheduler_config.enable_chunked_prefill:
-                if _supports_no_kv_cache_chunked_prefill(vllm_config):
+                if (
+                    vllm_config.model_config.runner_type == "generate"
+                    and vllm_config.model_config.supports_no_kv_cache_chunked_prefill
+                ):
                     logger.info(
                         "Keeping chunked prefill enabled for no-KVCache "
                         "causal recurrent model."

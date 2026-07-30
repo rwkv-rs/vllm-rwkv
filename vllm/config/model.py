@@ -855,10 +855,6 @@ class ModelConfig:
         self._maybe_register_model_class_overrides()
         return me_models.ModelRegistry
 
-    @property
-    def max_seq_len_to_capture(self) -> int:
-        return self.max_model_len
-
     def _maybe_register_model_class_overrides(self) -> None:
         # Apply ``model_class_overrides`` here because this property is the
         # single chokepoint through which every model-class inspect/resolve
@@ -900,6 +896,11 @@ class ModelConfig:
     @property
     def requires_uniform_decode_wave(self) -> bool:
         """Whether ready decode requests must advance as one scheduler wave."""
+        return self.is_rwkv7
+
+    @property
+    def supports_no_kv_cache_chunked_prefill(self) -> bool:
+        """Whether a causal model without KV cache supports chunked prefill."""
         return self.is_rwkv7
 
     def maybe_pull_model_tokenizer_for_runai(self, model: str, tokenizer: str) -> None:
