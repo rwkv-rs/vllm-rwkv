@@ -164,7 +164,8 @@ jobs:
               raise AssertionError("\n".join(failures))
           PY
 
-      - name: Guard prompt-sensitive paths
+      - name: Identify prompt-sensitive paths
+        id: sensitive
         if: steps.rebase.outputs.changed == 'true'
         shell: bash
         run: |
@@ -174,23 +175,23 @@ jobs:
             "${{ steps.rebase.outputs.old_head }}"..HEAD > changed-paths.txt
           sensitive_paths="$(
             grep -E \
-              '(^|/)(chat_template|templates?|tokenizers?|tool_parser|reasoning_parser|stop_checker|serving_chat)(/|\.|$)|rwkv_defaults\.py$' \
+              '(^|/)(chat_templates?|templates?|tokenizers?|tool_parsers?|reasoning_parsers?|stop_checker|serving_chat|repetition)(/|\.|$)|(^|/)sampling_params\.py$|rwkv_defaults\.py$' \
               changed-paths.txt || true
           )"
           if [[ -z "$sensitive_paths" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
 
           {
             echo "### Prompt-sensitive changes require owner approval"
             echo
-            echo "The candidate branch was not pushed. Sensitive paths:"
+            echo "The candidate will be opened as a PR for checks and manual owner approval. Sensitive paths:"
             while IFS= read -r path; do
               echo "- \`$path\`"
             done <<< "$sensitive_paths"
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "Refusing to push prompt-sensitive changes without explicit owner approval."
-          exit 1
 
       - name: Push rebase candidate and open PR
         if: steps.rebase.outputs.changed == 'true'
@@ -211,8 +212,10 @@ jobs:
           - Previous \`rwkv\` head: \`${{ steps.rebase.outputs.old_head }}\`
           - Upstream \`main\` head: \`${{ steps.rebase.outputs.upstream_head }}\`
           - Candidate head: \`${{ steps.rebase.outputs.candidate_head }}\`
+          - Prompt-sensitive paths: \`${{ steps.sensitive.outputs.changed || 'false' }}\`
 
           This workflow no longer updates \`rwkv\` directly. Merge this PR only after RWKV validation passes.
+          If prompt-sensitive paths are present, the repository owner must explicitly approve and manually merge this PR.
           EOF
 
           pr_number="$(gh pr list \
