@@ -26,6 +26,7 @@ from transformers.utils import CONFIG_NAME as HF_CONFIG_NAME
 
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.transformers_utils.configs.rwkv7 import RWKV7PthConfigParser
 from vllm.transformers_utils.repo_utils import is_mistral_model_repo
 from vllm.transformers_utils.utils import (
     parse_safetensors_file_metadata,
@@ -124,6 +125,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     step3p5="Step3p5Config",
     qianfan_ocr="QianfanOCRConfig",
     qwen3_asr="Qwen3ASRConfig",
+    rwkv7="RWKV7Config",
     qwen3_next="Qwen3NextConfig",
     qwen3_5="Qwen3_5Config",
     qwen3_5_text="Qwen3_5TextConfig",
@@ -399,12 +401,14 @@ class MistralConfigParser(ConfigParserBase):
 _CONFIG_FORMAT_TO_CONFIG_PARSER: dict[str, type[ConfigParserBase]] = {
     "hf": HFConfigParser,
     "mistral": MistralConfigParser,
+    "rwkv_pth": RWKV7PthConfigParser,
 }
 
 ConfigFormat = Literal[
     "auto",
     "hf",
     "mistral",
+    "rwkv_pth",
 ]
 
 
@@ -691,9 +695,13 @@ def get_config(
 ) -> PretrainedConfig:
     if config_format == "auto":
         try:
+            from vllm.transformers_utils.configs.rwkv7 import is_rwkv7_pth_source
+
             # First check for Mistral to avoid defaulting to
             # Transformers implementation.
-            if is_mistral_model_repo(
+            if is_rwkv7_pth_source(model):
+                config_format = "rwkv_pth"
+            elif is_mistral_model_repo(
                 model_name_or_path=str(model), revision=revision
             ) and file_or_path_exists(
                 model=model, config_name=MISTRAL_CONFIG_NAME, revision=revision
@@ -757,8 +765,10 @@ def get_config(
 
     # ModelOpt 0.29.0 and before saves the quantization config in a separate
     # "hf_quant_config.json" in the same directory as the model config file.
-    if quantization_config is None and file_or_path_exists(
-        model, "hf_quant_config.json", revision
+    if (
+        quantization_config is None
+        and config_parser.supports_hf_quant_config
+        and file_or_path_exists(model, "hf_quant_config.json", revision)
     ):
         quantization_config = get_hf_file_to_dict(
             "hf_quant_config.json", model, revision

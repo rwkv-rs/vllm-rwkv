@@ -8,6 +8,8 @@ from transformers import PretrainedConfig
 
 
 class ConfigParserBase(ABC):
+    supports_hf_quant_config = True
+
     @abstractmethod
     def parse(
         self,

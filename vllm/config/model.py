@@ -290,7 +290,8 @@ class ModelConfig:
     - "auto" will try to load the config in hf format if available after trying
       to load in mistral format.
     - "hf" will load the config in hf format.
-    - "mistral" will load the config in mistral format."""
+    - "mistral" will load the config in mistral format.
+    - "rwkv_pth" will derive an RWKV-7 config from a raw ``.pth`` checkpoint."""
     hf_token: bool | str | None = None
     """The token to use as HTTP bearer authorization for remote files . If
     `True`, will use the token generated when running `hf auth login`
