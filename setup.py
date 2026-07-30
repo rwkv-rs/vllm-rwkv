@@ -252,6 +252,7 @@ class cmake_build_ext(build_ext):
         cmake_args = [
             "-DCMAKE_BUILD_TYPE={}".format(cfg),
             "-DVLLM_TARGET_DEVICE={}".format(VLLM_TARGET_DEVICE),
+            "-DVLLM_BUILD_PROFILE={}".format(VLLM_BUILD_PROFILE),
         ]
 
         verbose = envs.VERBOSE
@@ -404,7 +405,7 @@ class cmake_build_ext(build_ext):
             os.makedirs(os.path.dirname(dst_file), exist_ok=True)
             self.copy_file(file, dst_file)
 
-        if _is_cuda() or _is_hip():
+        if (_is_cuda() or _is_hip()) and VLLM_BUILD_PROFILE != "rwkv":
             # copy vllm/third_party/triton_kernels/**/*.py from self.build_lib
             # to current directory so that they can be included in the editable
             # build
@@ -788,6 +789,7 @@ class precompiled_wheel_utils:
                             "vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so",
                             "vllm/vllm_flash_attn/_vllm_fa3_C.abi3.so",
                             "vllm/cumem_allocator.abi3.so",
+                            "vllm/rwkv7_ops.abi3.so",
                             "vllm/spinloop.abi3.so",
                             "vllm/fs_io_C.abi3.so",
                             # ROCm-specific libraries
@@ -1078,7 +1080,9 @@ def get_requirements() -> list[str]:
                 resolved_requirements.append(line)
         return resolved_requirements
 
-    if _no_device():
+    if VLLM_BUILD_PROFILE == "rwkv":
+        requirements = _read_requirements("rwkv.txt")
+    elif _no_device():
         requirements = _read_requirements("common.txt")
     elif _is_cuda():
         requirements = _read_requirements("cuda.txt")
@@ -1115,6 +1119,20 @@ def get_requirements() -> list[str]:
 
 
 ext_modules = []
+VLLM_BUILD_PROFILE = os.getenv("VLLM_BUILD_PROFILE", "")
+if VLLM_BUILD_PROFILE not in {"", "rwkv"}:
+    raise ValueError(
+        f"Unsupported VLLM_BUILD_PROFILE={VLLM_BUILD_PROFILE!r}; "
+        "expected empty or 'rwkv'"
+    )
+if VLLM_BUILD_PROFILE == "rwkv":
+    if not _is_cuda():
+        raise ValueError("VLLM_BUILD_PROFILE='rwkv' requires CUDA")
+    if USE_PRECOMPILED_EXTENSIONS:
+        raise ValueError(
+            "VLLM_BUILD_PROFILE='rwkv' builds its CUDA extension locally; "
+            "VLLM_USE_PRECOMPILED must be disabled"
+        )
 
 if _is_cuda() or _is_hip():
     ext_modules.append(CMakeExtension(name="vllm.cumem_allocator"))
@@ -1183,6 +1201,13 @@ if _build_custom_ops():
     if _is_cuda() or _is_hip():
         ext_modules.append(CMakeExtension(name="vllm._C_stable_libtorch"))
         ext_modules.append(CMakeExtension(name="vllm._moe_C_stable_libtorch"))
+    if _is_cuda():
+        ext_modules.append(CMakeExtension(name="vllm.rwkv7_ops"))
+
+if VLLM_BUILD_PROFILE == "rwkv":
+    ext_modules = [
+        extension for extension in ext_modules if extension.name == "vllm.rwkv7_ops"
+    ]
 
 package_data = {
     "vllm": [
@@ -1232,10 +1257,11 @@ if USE_PRECOMPILED_RUST_FRONTEND:
 
 # If the rust frontend binary is already present in the source tree (e.g.,
 # pre-built in a separate Docker build stage), ship it as-is.
-if PRECOMPILED_RUST_FRONTEND_PATH.exists():
+if PRECOMPILED_RUST_FRONTEND_PATH.exists() and VLLM_BUILD_PROFILE != "rwkv":
     add_vllm_package_data("vllm-rs")
-for rust_extension_path in get_precompiled_rust_extension_paths():
-    add_vllm_package_data(rust_extension_path.name)
+if VLLM_BUILD_PROFILE != "rwkv":
+    for rust_extension_path in get_precompiled_rust_extension_paths():
+        add_vllm_package_data(rust_extension_path.name)
 
 if _no_device():
     ext_modules = []
@@ -1248,7 +1274,7 @@ else:
         if USE_PRECOMPILED_EXTENSIONS
         else cmake_build_ext,
     }
-if (
+if VLLM_BUILD_PROFILE != "rwkv" and (
     USE_PRECOMPILED_RUST_FRONTEND
     or PRECOMPILED_RUST_FRONTEND_PATH.exists()
     or has_precompiled_rust_extensions()
@@ -1257,8 +1283,10 @@ if (
 
 # Rust artifacts, built via setuptools-rust and installed into the package
 # directory alongside the Python modules.
-rust_extensions = rust_build.rust_extensions(
-    optional=not should_require_rust_frontend()
+rust_extensions = (
+    []
+    if VLLM_BUILD_PROFILE == "rwkv"
+    else rust_build.rust_extensions(optional=not should_require_rust_frontend())
 )
 
 setup(

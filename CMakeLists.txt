@@ -31,8 +31,19 @@ endif()
 
 # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
 set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
+set(VLLM_BUILD_PROFILE "" CACHE STRING "Optional extension build profile")
+if(NOT VLLM_BUILD_PROFILE STREQUAL "" AND
+   NOT VLLM_BUILD_PROFILE STREQUAL "rwkv")
+  message(FATAL_ERROR
+    "Unsupported VLLM_BUILD_PROFILE=${VLLM_BUILD_PROFILE}; expected empty or rwkv")
+endif()
+if(VLLM_BUILD_PROFILE STREQUAL "rwkv" AND
+   NOT VLLM_TARGET_DEVICE STREQUAL "cuda")
+  message(FATAL_ERROR "VLLM_BUILD_PROFILE=rwkv requires VLLM_TARGET_DEVICE=cuda")
+endif()
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Target device: ${VLLM_TARGET_DEVICE}")
+message(STATUS "Build profile: ${VLLM_BUILD_PROFILE}")
 
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 
@@ -138,7 +149,8 @@ endif()
 # failure is handled gracefully on vLLM side for lower Python versions.
 # Skip the target entirely on Python < 3.11 so the build doesn't break.
 #
-if(Python_VERSION VERSION_GREATER_EQUAL "3.11")
+if(Python_VERSION VERSION_GREATER_EQUAL "3.11" AND
+   NOT VLLM_BUILD_PROFILE STREQUAL "rwkv")
   set(VLLM_SPINLOOP_EXT_SRC "csrc/spinloop.cpp")
   set(SPINLOOP_COMPILE_FLAGS "")
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
@@ -159,7 +171,8 @@ endif()
 # so CPU builds define the target before the early return).
 # GIL-releasing filesystem helpers for FileSystemTierManager.
 #
-if(Python_VERSION VERSION_GREATER_EQUAL "3.11")
+if(Python_VERSION VERSION_GREATER_EQUAL "3.11" AND
+   NOT VLLM_BUILD_PROFILE STREQUAL "rwkv")
   define_extension_target(
     fs_io_C
     DESTINATION vllm
@@ -331,7 +344,8 @@ set_gencode_flags_for_srcs(
   SRCS "${VLLM_CUMEM_EXT_SRC}"
   CUDA_ARCHS "${CUDA_ARCHS}")
 
-if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
+if((VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP") AND
+   NOT VLLM_BUILD_PROFILE STREQUAL "rwkv")
   message(STATUS "Enabling cumem allocator extension.")
   if(VLLM_GPU_LANG STREQUAL "CUDA")
     # link against cuda driver library
@@ -360,6 +374,62 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     LIBRARIES ${CUMEM_LIBS}
     USE_SABI 3.8
     WITH_SOABI)
+endif()
+
+#
+# RWKV7 extension
+#
+
+if(VLLM_GPU_LANG STREQUAL "CUDA")
+  set(RWKV7_CUDA_SRCS
+    "csrc/rwkv7/rwkv7_fast_ops_fp16.cu"
+    "csrc/rwkv7/rwkv7_v3a_ops.cu"
+    "csrc/rwkv7/rwkv7_wkv_fp16_v2.cu"
+    "csrc/rwkv7/rwkv7_wkv_fp32_v2.cu")
+
+  set(RWKV7_EXT_SRC
+    "csrc/rwkv7/rwkv7_fast_ops_fp16.cpp"
+    ${RWKV7_CUDA_SRCS}
+    "csrc/rwkv7/rwkv7_registration.cpp"
+    "csrc/rwkv7/rwkv7_v3a_ops.cpp"
+    "csrc/rwkv7/rwkv7_wkv_fp16_v2.cpp"
+    "csrc/rwkv7/rwkv7_wkv_fp32_v2.cpp")
+
+  set_source_files_properties(${RWKV7_CUDA_SRCS}
+    PROPERTIES COMPILE_FLAGS
+    "--extra-device-vectorization -Xptxas -O3")
+  set_source_files_properties(
+    "csrc/rwkv7/rwkv7_fast_ops_fp16.cu"
+    "csrc/rwkv7/rwkv7_v3a_ops.cu"
+    "csrc/rwkv7/rwkv7_wkv_fp32_v2.cu"
+    PROPERTIES COMPILE_FLAGS
+    "--use_fast_math --extra-device-vectorization -Xptxas -O3")
+  set_source_files_properties(
+    "csrc/rwkv7/rwkv7_wkv_fp32_v2.cpp"
+    "csrc/rwkv7/rwkv7_wkv_fp32_v2.cu"
+    PROPERTIES COMPILE_DEFINITIONS "_IO_FP16_")
+  set_gencode_flags_for_srcs(
+    SRCS "${RWKV7_CUDA_SRCS}"
+    CUDA_ARCHS "${CUDA_ARCHS}")
+
+  define_extension_target(
+    rwkv7_ops
+    DESTINATION vllm
+    LANGUAGE ${VLLM_GPU_LANG}
+    SOURCES ${RWKV7_EXT_SRC}
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES ${VLLM_GPU_ARCHES}
+    USE_SABI 3
+    WITH_SOABI)
+  target_compile_definitions(rwkv7_ops PRIVATE USE_CUDA)
+  if(VLLM_BUILD_PROFILE STREQUAL "rwkv")
+    target_compile_definitions(rwkv7_ops PRIVATE VLLM_RWKV_ONLY_BUILD)
+  endif()
+  target_link_libraries(rwkv7_ops PRIVATE CUDA::cublas CUDA::cublasLt)
+endif()
+
+if(VLLM_BUILD_PROFILE STREQUAL "rwkv")
+  return()
 endif()
 
 #

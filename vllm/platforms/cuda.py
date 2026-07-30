@@ -19,12 +19,8 @@ from torch.distributed import PrefixStore, ProcessGroup
 from torch.distributed.distributed_c10d import is_nccl_available
 from typing_extensions import ParamSpec
 
-# import custom ops, trigger op registration
-import vllm._C_stable_libtorch  # noqa
-
-with contextlib.suppress(ImportError):
-    import vllm._qutlass_C  # noqa
 import vllm.envs as envs
+import vllm.platforms.cuda_kernel_loader  # noqa: F401
 from vllm.logger import init_logger
 from vllm.utils.import_utils import import_pynvml
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -220,10 +216,8 @@ class CudaPlatformBase(Platform):
     @classmethod
     def import_kernels(cls) -> None:
         """Import CUDA kernel extensions (_C_stable_libtorch, optional _qutlass_C)."""
-        try:
-            import vllm._C_stable_libtorch  # noqa: F401
-        except ImportError as e:
-            logger.warning_once("Failed to import from vllm._C_stable_libtorch: %r", e)
+        import vllm._C_stable_libtorch  # noqa: F401
+
         with contextlib.suppress(ImportError):
             import vllm._moe_C_stable_libtorch  # noqa: F401
         with contextlib.suppress(ImportError):
