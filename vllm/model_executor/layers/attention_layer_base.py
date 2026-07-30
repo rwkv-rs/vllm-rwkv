@@ -11,7 +11,11 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionImpl
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
 
-class AttentionLayerBase(ABC):
+class AttentionPostLoadModule:
+    """Marker for attention modules finalized with the model activation dtype."""
+
+
+class AttentionLayerBase(AttentionPostLoadModule, ABC):
     """
     Base class for attention-like layers (Attention, Mamba, etc.)
     that support the v1 engine.

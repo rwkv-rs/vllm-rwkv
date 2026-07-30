@@ -13,6 +13,7 @@ from vllm.kernels.triton.qkv_padded_fp8_quant import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp, maybe_get_oot_by_class
+from vllm.model_executor.layers.attention_layer_base import AttentionPostLoadModule
 from vllm.model_executor.layers.quantization.input_quant_fp8 import (
     QuantFP8,
 )
@@ -216,7 +217,7 @@ def bucket_flashinfer_max_seqlen(
 
 # --8<-- [start:mm_encoder_attn]
 @CustomOp.register("mm_encoder_attn")
-class MMEncoderAttention(CustomOp):
+class MMEncoderAttention(CustomOp, AttentionPostLoadModule):
     """Multi-headed attention without any cache, used for multimodal encoder."""
 
     # --8<-- [end:mm_encoder_attn]

@@ -1,9 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from vllm.model_executor.layers.attention_layer_base import AttentionPostLoadModule
+from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     _merge_multimodal_embeddings,
@@ -11,6 +18,83 @@ from vllm.model_executor.models.utils import (
 from vllm.platforms import current_platform
 
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_auto_weights_loader_does_not_eagerly_import_optional_loaders():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "from vllm.model_executor.models.utils import AutoWeightsLoader; "
+                "assert 'vllm.model_executor.model_loader.default_loader' "
+                "not in sys.modules; "
+                "assert 'vllm.model_executor.model_loader.reload.layerwise' "
+                "not in sys.modules"
+            ),
+        ],
+        cwd=Path(__file__).parents[2],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_model_loader_public_exports_remain_compatible():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "import vllm.model_executor.model_loader as model_loader; "
+                "assert 'DefaultModelLoader' in dir(model_loader); "
+                "from vllm.model_executor.model_loader import DefaultModelLoader; "
+                "from vllm.model_executor.model_loader.default_loader "
+                "import DefaultModelLoader as DirectDefaultModelLoader; "
+                "assert DefaultModelLoader is DirectDefaultModelLoader; "
+                "assert 'vllm.model_executor.model_loader.reload.layerwise' "
+                "not in sys.modules"
+            ),
+        ],
+        cwd=Path(__file__).parents[2],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_attention_post_load_marker_controls_dtype_finalization():
+    class AttentionModule(torch.nn.Module, AttentionPostLoadModule):
+        def __init__(self):
+            super().__init__()
+            self.processed_dtype = None
+
+        def process_weights_after_loading(self, dtype):
+            self.processed_dtype = dtype
+
+    class NonAttentionModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.called = False
+
+        def process_weights_after_loading(self, dtype):
+            self.called = True
+
+    model = torch.nn.Module()
+    model.attention = AttentionModule()
+    model.non_attention = NonAttentionModule()
+    model_config = SimpleNamespace(dtype=torch.float16, quantization=None)
+
+    process_weights_after_loading(model, model_config, torch.device("cpu"))
+
+    assert model.attention.processed_dtype is torch.float16
+    assert model.non_attention.called is False
 
 
 class ModuleWithBatchNorm(torch.nn.Module):

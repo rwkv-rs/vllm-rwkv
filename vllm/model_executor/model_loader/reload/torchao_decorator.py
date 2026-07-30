@@ -10,11 +10,6 @@ import torch
 
 from vllm.config import ModelConfig
 
-from .layerwise import (
-    finalize_layerwise_reload,
-    initialize_layerwise_reload,
-)
-
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -48,6 +43,11 @@ def support_quantized_model_reload_from_hp_weights(original_load_weights: Functi
 
         if not getattr(model, "_do_torchao_reload", False):
             return original_load_weights(self, weights, *args, **kwargs)
+
+        from .layerwise import (
+            finalize_layerwise_reload,
+            initialize_layerwise_reload,
+        )
 
         initialize_layerwise_reload(model)
         loaded_weights = original_load_weights(self, weights, *args, **kwargs)

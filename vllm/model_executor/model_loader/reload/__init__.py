@@ -17,6 +17,15 @@ Limitations:
    reloading to fail
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
+
+    from vllm.config import ModelConfig
+
 __all__ = [
     "record_metadata_for_reloading",
     "initialize_layerwise_reload",
@@ -26,13 +35,37 @@ __all__ = [
     "support_quantized_model_reload_from_hp_weights",
 ]
 
-from .layerwise import (
-    finalize_layerwise_processing,
-    finalize_layerwise_reload,
-    initialize_layerwise_reload,
-    record_metadata_for_reloading,
-)
 from .torchao_decorator import (
     set_torchao_reload_attrs,
     support_quantized_model_reload_from_hp_weights,
 )
+
+
+def record_metadata_for_reloading(model: torch.nn.Module) -> None:
+    from .layerwise import record_metadata_for_reloading as impl
+
+    return impl(model)
+
+
+def initialize_layerwise_reload(model: torch.nn.Module) -> None:
+    from .layerwise import initialize_layerwise_reload as impl
+
+    return impl(model)
+
+
+def finalize_layerwise_processing(
+    model: torch.nn.Module,
+    model_config: ModelConfig,
+) -> None:
+    from .layerwise import finalize_layerwise_processing as impl
+
+    return impl(model, model_config)
+
+
+def finalize_layerwise_reload(
+    model: torch.nn.Module,
+    model_config: ModelConfig,
+) -> None:
+    from .layerwise import finalize_layerwise_reload as impl
+
+    return impl(model, model_config)

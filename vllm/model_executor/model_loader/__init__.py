@@ -1,30 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Literal
+from __future__ import annotations
 
-from torch import nn
+from importlib import import_module
+from typing import TYPE_CHECKING, Literal
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader.base_loader import BaseModelLoader
-from vllm.model_executor.model_loader.bitsandbytes_loader import BitsAndBytesModelLoader
-from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
-from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
-from vllm.model_executor.model_loader.modelexpress_loader import (
-    ModelExpressModelLoader,
-)
-from vllm.model_executor.model_loader.runai_streamer_loader import (
-    RunaiModelStreamerLoader,
-)
-from vllm.model_executor.model_loader.sharded_state_loader import ShardedStateLoader
-from vllm.model_executor.model_loader.tensorizer_loader import TensorizerLoader
-from vllm.model_executor.model_loader.utils import (
-    get_architecture_class_name,
-    get_model_architecture,
-    get_model_cls,
-)
+
+if TYPE_CHECKING:
+    from torch import nn
+
+    from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 
 logger = init_logger(__name__)
 
@@ -47,23 +36,55 @@ LoadFormats = Literal[
     "sharded_state",
     "tensorizer",
 ]
-_LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
-    "auto": DefaultModelLoader,
-    "hf": DefaultModelLoader,
-    "bitsandbytes": BitsAndBytesModelLoader,
-    "dummy": DummyModelLoader,
-    "fastsafetensors": DefaultModelLoader,
-    "instanttensor": DefaultModelLoader,
-    "mistral": DefaultModelLoader,
-    "modelexpress": ModelExpressModelLoader,
-    "npcache": DefaultModelLoader,
-    "pt": DefaultModelLoader,
-    "runai_streamer": RunaiModelStreamerLoader,
-    "runai_streamer_sharded": ShardedStateLoader,
-    "safetensors": DefaultModelLoader,
-    "sharded_state": ShardedStateLoader,
-    "tensorizer": TensorizerLoader,
+_BUILTIN_LOADERS = {
+    "auto": ("default_loader", "DefaultModelLoader"),
+    "hf": ("default_loader", "DefaultModelLoader"),
+    "bitsandbytes": ("bitsandbytes_loader", "BitsAndBytesModelLoader"),
+    "dummy": ("dummy_loader", "DummyModelLoader"),
+    "fastsafetensors": ("default_loader", "DefaultModelLoader"),
+    "instanttensor": ("default_loader", "DefaultModelLoader"),
+    "mistral": ("default_loader", "DefaultModelLoader"),
+    "modelexpress": ("modelexpress_loader", "ModelExpressModelLoader"),
+    "npcache": ("default_loader", "DefaultModelLoader"),
+    "pt": ("default_loader", "DefaultModelLoader"),
+    "runai_streamer": ("runai_streamer_loader", "RunaiModelStreamerLoader"),
+    "runai_streamer_sharded": ("sharded_state_loader", "ShardedStateLoader"),
+    "safetensors": ("default_loader", "DefaultModelLoader"),
+    "sharded_state": ("sharded_state_loader", "ShardedStateLoader"),
+    "tensorizer": ("tensorizer_loader", "TensorizerLoader"),
 }
+_LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {}
+
+_PUBLIC_EXPORTS = {
+    "BaseModelLoader": ("base_loader", "BaseModelLoader"),
+    "BitsAndBytesModelLoader": ("bitsandbytes_loader", "BitsAndBytesModelLoader"),
+    "DefaultModelLoader": ("default_loader", "DefaultModelLoader"),
+    "DummyModelLoader": ("dummy_loader", "DummyModelLoader"),
+    "ModelExpressModelLoader": ("modelexpress_loader", "ModelExpressModelLoader"),
+    "RunaiModelStreamerLoader": (
+        "runai_streamer_loader",
+        "RunaiModelStreamerLoader",
+    ),
+    "ShardedStateLoader": ("sharded_state_loader", "ShardedStateLoader"),
+    "TensorizerLoader": ("tensorizer_loader", "TensorizerLoader"),
+    "get_architecture_class_name": ("utils", "get_architecture_class_name"),
+    "get_model_architecture": ("utils", "get_model_architecture"),
+    "get_model_cls": ("utils", "get_model_cls"),
+}
+
+
+def __getattr__(name: str):
+    target = _PUBLIC_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attribute_name = target
+    value = getattr(import_module(f"{__name__}.{module_name}"), attribute_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | _PUBLIC_EXPORTS.keys())
 
 
 def register_model_loader(load_format: str):
@@ -97,13 +118,18 @@ def register_model_loader(load_format: str):
     """  # noqa: E501
 
     def _wrapper(model_loader_cls):
-        if load_format in _LOAD_FORMAT_TO_MODEL_LOADER:
+        if (
+            load_format in _BUILTIN_LOADERS
+            or load_format in _LOAD_FORMAT_TO_MODEL_LOADER
+        ):
             logger.warning(
                 "Load format `%s` is already registered, and will be "
                 "overwritten by the new loader class `%s`.",
                 load_format,
                 model_loader_cls,
             )
+        from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+
         if not issubclass(model_loader_cls, BaseModelLoader):
             raise ValueError(
                 "The model loader must be a subclass of `BaseModelLoader`."
@@ -122,9 +148,17 @@ def register_model_loader(load_format: str):
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     """Get a model loader based on the load format."""
     load_format = load_config.load_format
-    if load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
+    loader_cls = _LOAD_FORMAT_TO_MODEL_LOADER.get(load_format)
+    if loader_cls is None and load_format in _BUILTIN_LOADERS:
+        module_name, class_name = _BUILTIN_LOADERS[load_format]
+        loader_cls = getattr(
+            import_module(f"{__name__}.{module_name}"),
+            class_name,
+        )
+        _LOAD_FORMAT_TO_MODEL_LOADER[load_format] = loader_cls
+    if loader_cls is None:
         raise ValueError(f"Load format `{load_format}` is not supported")
-    return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config)
+    return loader_cls(load_config)
 
 
 def get_model(
