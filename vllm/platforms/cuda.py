@@ -6,7 +6,6 @@ pynvml. However, it should not initialize cuda context.
 
 from __future__ import annotations
 
-import contextlib
 import os
 import platform
 from collections.abc import Callable
@@ -20,8 +19,10 @@ from torch.distributed.distributed_c10d import is_nccl_available
 from typing_extensions import ParamSpec
 
 import vllm.envs as envs
-import vllm.platforms.cuda_kernel_loader  # noqa: F401
 from vllm.logger import init_logger
+from vllm.platforms.cuda_kernel_loader import (
+    import_kernels as import_cuda_kernels,
+)
 from vllm.utils.import_utils import import_pynvml
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -215,13 +216,8 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def import_kernels(cls) -> None:
-        """Import CUDA kernel extensions (_C_stable_libtorch, optional _qutlass_C)."""
-        import vllm._C_stable_libtorch  # noqa: F401
-
-        with contextlib.suppress(ImportError):
-            import vllm._moe_C_stable_libtorch  # noqa: F401
-        with contextlib.suppress(ImportError):
-            import vllm._qutlass_C  # noqa: F401
+        """Import the CUDA extensions provided by the installed artifact."""
+        import_cuda_kernels()
 
     @property
     def supported_dtypes(self) -> list[torch.dtype]:

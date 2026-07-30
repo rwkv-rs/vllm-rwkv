@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import os
 import runpy
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -15,6 +17,17 @@ ROOT = Path(__file__).parents[2]
 def test_generic_custom_ops_remain_independent_from_rwkv7() -> None:
     source = (ROOT / "vllm/_custom_ops.py").read_text()
     assert "rwkv7" not in source
+
+
+def test_rwkv_only_artifact_can_import_generic_wrappers() -> None:
+    try:
+        rwkv7_ops = importlib.import_module("vllm.rwkv7_ops")
+    except ImportError:
+        pytest.skip("RWKV CUDA extension is not built")
+    if not getattr(rwkv7_ops, "_rwkv_only_build", False):
+        pytest.skip("test requires an RWKV-only artifact")
+
+    importlib.import_module("vllm._custom_ops")
 
 
 def test_rwkv7_loader_reports_missing_extension(
@@ -77,14 +90,36 @@ def test_rwkv7_profile_only_selects_build_targets() -> None:
     assert runtime_occurrences == []
 
 
+def test_rwkv7_profile_rejects_precompiled_rust_frontend() -> None:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "VLLM_BUILD_PROFILE": "rwkv",
+            "VLLM_TARGET_DEVICE": "cuda",
+            "VLLM_USE_PRECOMPILED": "0",
+            "VLLM_USE_PRECOMPILED_RUST": "1",
+        }
+    )
+    result = subprocess.run(
+        [sys.executable, "setup.py", "--name"],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "VLLM_USE_PRECOMPILED_RUST must be disabled" in result.stderr
+
+
 def test_cuda_platform_loads_generic_kernels_on_demand() -> None:
     cuda_platform = (ROOT / "vllm/platforms/cuda.py").read_text()
     kernel_loader = (ROOT / "vllm/platforms/cuda_kernel_loader.py").read_text()
     import_kernels = cuda_platform.index("def import_kernels")
 
-    assert "import vllm.platforms.cuda_kernel_loader" in cuda_platform[:import_kernels]
+    assert "import_kernels as import_cuda_kernels" in cuda_platform[:import_kernels]
     assert 'getattr(rwkv7_ops, "_rwkv_only_build", False)' in kernel_loader
-    assert "import vllm._C_stable_libtorch" in cuda_platform[import_kernels:]
+    assert "import_cuda_kernels()" in cuda_platform[import_kernels:]
     assert "Failed to import from vllm._C_stable_libtorch" not in cuda_platform
 
 
@@ -111,11 +146,12 @@ def test_cuda_kernel_loader_distinguishes_rwkv_only_artifact(
 
     monkeypatch.setattr(importlib, "import_module", import_module)
 
+    namespace = runpy.run_path(str(loader))
     if raises:
         with pytest.raises(ImportError):
-            runpy.run_path(str(loader))
+            namespace["import_kernels"]()
     else:
-        runpy.run_path(str(loader))
+        namespace["import_kernels"]()
 
 
 def test_cuda_kernel_loader_preserves_full_build_eager_imports(
@@ -129,6 +165,11 @@ def test_cuda_kernel_loader_preserves_full_build_eager_imports(
         return types.ModuleType(name)
 
     monkeypatch.setattr(importlib, "import_module", import_module)
-    runpy.run_path(str(loader))
+    namespace = runpy.run_path(str(loader))
+    namespace["import_kernels"]()
 
-    assert imported == ["vllm._C_stable_libtorch", "vllm._qutlass_C"]
+    assert imported == [
+        "vllm._C_stable_libtorch",
+        "vllm._moe_C_stable_libtorch",
+        "vllm._qutlass_C",
+    ]

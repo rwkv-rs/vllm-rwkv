@@ -1133,6 +1133,11 @@ if VLLM_BUILD_PROFILE == "rwkv":
             "VLLM_BUILD_PROFILE='rwkv' builds its CUDA extension locally; "
             "VLLM_USE_PRECOMPILED must be disabled"
         )
+    if USE_PRECOMPILED_RUST_FRONTEND:
+        raise ValueError(
+            "VLLM_BUILD_PROFILE='rwkv' does not package the Rust frontend; "
+            "VLLM_USE_PRECOMPILED_RUST must be disabled"
+        )
 
 if _is_cuda() or _is_hip():
     ext_modules.append(CMakeExtension(name="vllm.cumem_allocator"))
