@@ -1,0 +1,202 @@
+name: Rebase RWKV on upstream vLLM
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub Actions cron is UTC: 10:00 is 04:00 CST / 05:00 CDT.
+    - cron: "0 10 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: rebase-rwkv
+  cancel-in-progress: false
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out rwkv
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: rwkv
+          fetch-depth: 0
+
+      - name: Rebase rwkv on upstream/main
+        id: rebase
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream https://github.com/vllm-project/vllm.git
+          else
+            git remote add upstream https://github.com/vllm-project/vllm.git
+          fi
+
+          git fetch origin rwkv
+          git fetch upstream main
+
+          old_head="$(git rev-parse refs/remotes/origin/rwkv)"
+          git switch --force-create rwkv refs/remotes/origin/rwkv
+
+          rwkv_commit_count="$(git rev-list --count refs/remotes/upstream/main..HEAD)"
+          if [[ "$rwkv_commit_count" == "0" ]]; then
+            echo "rwkv has no commits ahead of upstream/main; refusing to overwrite it with plain upstream."
+            exit 1
+          fi
+
+          echo "Replaying $rwkv_commit_count rwkv commits on top of upstream/main."
+          set +e
+          git rebase refs/remotes/upstream/main
+          rebase_status="$?"
+          set -e
+          if [[ "$rebase_status" != "0" ]]; then
+            mkdir -p rebase-evidence
+            git diff --name-only --diff-filter=U > rebase-evidence/unmerged-paths.txt
+            git status --short > rebase-evidence/status.txt
+            git rev-parse REBASE_HEAD > rebase-evidence/rebase-head.txt
+            git show --no-patch --format=fuller REBASE_HEAD \
+              > rebase-evidence/rebase-commit.txt
+            cp .git/rebase-merge/git-rebase-todo rebase-evidence/rebase-todo.txt
+            {
+              echo "### Upstream rebase conflict"
+              echo
+              echo "- Rebase commit: \`$(git rev-parse REBASE_HEAD)\`"
+              echo "- Unmerged paths:"
+              sed 's/^/  - `/' rebase-evidence/unmerged-paths.txt | sed 's/$/`/'
+            } >> "$GITHUB_STEP_SUMMARY"
+            git rebase --abort
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+
+          post_rebase_commit_count="$(git rev-list --count refs/remotes/upstream/main..HEAD)"
+          if [[ "$post_rebase_commit_count" == "0" ]]; then
+            echo "Rebase removed every rwkv commit; refusing to push."
+            exit 1
+          fi
+
+          if [[ "$(git rev-parse HEAD)" == "$old_head" ]]; then
+            echo "rwkv is already based on the latest upstream/main."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          {
+            echo "changed=true"
+            echo "old_head=$old_head"
+            echo "upstream_head=$(git rev-parse refs/remotes/upstream/main)"
+            echo "candidate_head=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload rebase conflict evidence
+        if: steps.rebase.outputs.failed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rwkv-rebase-conflict-${{ github.run_id }}
+          path: rebase-evidence
+          if-no-files-found: error
+
+      - name: Fail on rebase conflict
+        if: steps.rebase.outputs.failed == 'true'
+        shell: bash
+        run: |
+          echo "The upstream rebase conflicted; inspect the uploaded evidence artifact."
+          exit 1
+
+      - name: Validate rebased RWKV tree
+        if: steps.rebase.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor refs/remotes/upstream/main HEAD
+          git diff --check "${{ steps.rebase.outputs.old_head }}"..HEAD
+          python3 -m compileall -q \
+            vllm/model_executor/layers/mamba/rwkv7.py \
+            vllm/model_executor/models/rwkv7.py \
+            vllm/renderers/rwkv.py \
+            vllm/tokenizers/rwkv.py \
+            vllm/tokenizers/rwkv_chat.py \
+            vllm/tool_parsers/rwkv_tool_parser.py
+
+      - name: Identify prompt-sensitive paths
+        id: sensitive
+        if: steps.rebase.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git diff --name-only \
+            "${{ steps.rebase.outputs.old_head }}"..HEAD > changed-paths.txt
+          sensitive_paths="$(
+            grep -E \
+              '(^|/)(chat_templates?|templates?|tokenizers?|tool_parsers?|reasoning_parsers?|stop_checker|serving_chat|repetition)(/|\.|$)|(^|/)sampling_params\.py$|rwkv_defaults\.py$' \
+              changed-paths.txt || true
+          )"
+          if [[ -z "$sensitive_paths" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Prompt-sensitive changes require owner approval"
+            echo
+            echo "The candidate will be opened as a PR for checks and manual owner approval. Sensitive paths:"
+            while IFS= read -r path; do
+              echo "- \`$path\`"
+            done <<< "$sensitive_paths"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push rebase candidate and open PR
+        if: steps.rebase.outputs.changed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          candidate_branch="automation/rebase-rwkv"
+          git fetch origin "$candidate_branch" || true
+          git push --force-with-lease origin HEAD:"$candidate_branch"
+
+          body_file="$(mktemp)"
+          cat >"$body_file" <<EOF
+          Automated upstream sync candidate for \`rwkv\`.
+
+          - Previous \`rwkv\` head: \`${{ steps.rebase.outputs.old_head }}\`
+          - Upstream \`main\` head: \`${{ steps.rebase.outputs.upstream_head }}\`
+          - Candidate head: \`${{ steps.rebase.outputs.candidate_head }}\`
+          - Prompt-sensitive paths: \`${{ steps.sensitive.outputs.changed || 'false' }}\`
+
+          This workflow no longer updates \`rwkv\` directly. Merge this PR only after RWKV validation passes.
+          If prompt-sensitive paths are present, the repository owner must explicitly approve and manually merge this PR.
+          EOF
+
+          pr_number="$(gh pr list \
+            --head "$candidate_branch" \
+            --base rwkv \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')"
+
+          if [[ -z "$pr_number" ]]; then
+            gh pr create \
+              --base rwkv \
+              --head "$candidate_branch" \
+              --title "ci(rwkv): rebase on upstream main" \
+              --body-file "$body_file"
+          else
+            gh pr edit "$pr_number" \
+              --title "ci(rwkv): rebase on upstream main" \
+              --body-file "$body_file"
+          fi

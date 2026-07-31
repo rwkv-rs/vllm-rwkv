@@ -44,6 +44,31 @@ jobs:
             core.setFailed(`PR must have the 'verified', 'ready', or 'ready-run-all-tests' label to run pre-commit, or the author must have at least 4 merged PRs (found ${mergedCount}).`);
           }
 
+  rwkv-prompt-cpu:
+    if: github.event_name == 'pull_request' && github.base_ref == 'rwkv'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      VLLM_TARGET_DEVICE: empty
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+    - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+      with:
+        python-version: "3.12"
+    - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+    - name: Install CPU-only test dependencies
+      run: >-
+        uv pip install --system --torch-backend cpu
+        -r requirements/common.txt
+        torch==2.13.0 pytest pytest-asyncio
+    - name: Run RWKV prompt contract tests
+      run: >-
+        pytest --noconftest -q
+        tests/renderers/test_rwkv.py
+        tests/tokenizers_/test_rwkv.py
+        tests/tool_parsers/test_rwkv_tool_parser.py
+
   pre-commit:
     needs: pre-run-check
     if: always() && (needs.pre-run-check.result == 'success' || needs.pre-run-check.result == 'skipped')
