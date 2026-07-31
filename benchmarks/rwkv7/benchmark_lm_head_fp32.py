@@ -36,10 +36,10 @@ def _measure(
 ) -> tuple[float, int]:
     for _ in range(warmup_iters):
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
-    torch.cuda.reset_peak_memory_stats()
-    baseline = torch.cuda.memory_allocated()
+    torch.accelerator.reset_peak_memory_stats()
+    baseline = torch.accelerator.memory_allocated()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -48,7 +48,7 @@ def _measure(
         del output
     end.record()
     end.synchronize()
-    peak_delta = max(0, torch.cuda.max_memory_allocated() - baseline)
+    peak_delta = max(0, torch.accelerator.max_memory_allocated() - baseline)
     return start.elapsed_time(end) / benchmark_iters, peak_delta
 
 
@@ -79,25 +79,25 @@ def run(config: BenchmarkConfig) -> dict[str, object]:
             generator=generator,
         )
         if batch_size == 1:
-            legacy_project = (
-                lambda: torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(
-                    hidden_states, weight
-                )
+            legacy_project = lambda hidden_states=hidden_states: (
+                torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(hidden_states, weight)
             )
-            direct_project = (
-                lambda: torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk_fp32(
-                    hidden_states, weight
-                )
+            direct_project = lambda hidden_states=hidden_states: (
+                torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk_fp32(hidden_states, weight)
             )
         else:
-            legacy_project = lambda: torch.ops.rwkv7_v3a_ops.linear_f16(
-                hidden_states,
-                weight,
-                True,
+            legacy_project = lambda hidden_states=hidden_states: (
+                torch.ops.rwkv7_v3a_ops.linear_f16(
+                    hidden_states,
+                    weight,
+                    True,
+                )
             )
-            direct_project = lambda: torch.ops.rwkv7_v3a_ops.linear_f16_fp32_lt(
-                hidden_states,
-                weight,
+            direct_project = lambda hidden_states=hidden_states: (
+                torch.ops.rwkv7_v3a_ops.linear_f16_fp32_lt(
+                    hidden_states,
+                    weight,
+                )
             )
 
         providers = {
@@ -107,7 +107,7 @@ def run(config: BenchmarkConfig) -> dict[str, object]:
             ),
             "direct_fp32": Provider(project=direct_project),
             "torch_mm_fp32": Provider(
-                project=lambda: torch.mm(
+                project=lambda hidden_states=hidden_states: torch.mm(
                     hidden_states,
                     weight,
                     out_dtype=torch.float32,
@@ -128,12 +128,12 @@ def run(config: BenchmarkConfig) -> dict[str, object]:
                 conversion_peak_memory_bytes = 0
             else:
                 conversion_latency_ms, conversion_peak_memory_bytes = _measure(
-                    lambda: convert(projected),
+                    lambda convert=convert, projected=projected: convert(projected),
                     warmup_iters=config.warmup_iters,
                     benchmark_iters=config.benchmark_iters,
                 )
             total_latency_ms, peak_memory_bytes = _measure(
-                lambda: convert(provider.project()),
+                lambda convert=convert, provider=provider: convert(provider.project()),
                 warmup_iters=config.warmup_iters,
                 benchmark_iters=config.benchmark_iters,
             )

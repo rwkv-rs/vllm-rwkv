@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from vllm.transformers_utils.config import get_config, get_hf_image_processor_config
+from vllm.transformers_utils.configs import rwkv7
 from vllm.transformers_utils.configs.rwkv7 import (
     try_parse_rwkv7_pth_source,
 )
@@ -35,7 +36,9 @@ def test_rwkv7_local_pth_builds_config_from_filename(tmp_path: Path):
     for model in (checkpoint, checkpoint.as_uri()):
         config = get_config(model, trust_remote_code=False)
         assert (config.hidden_size, config.num_hidden_layers) == (2560, 32)
-    assert try_parse_rwkv7_pth_source(checkpoint.as_uri()).local_path == checkpoint
+    source = try_parse_rwkv7_pth_source(checkpoint.as_uri())
+    assert source is not None
+    assert source.local_path == checkpoint
     assert try_parse_rwkv7_pth_source(f"file://remote{checkpoint}") is None
     assert try_parse_rwkv7_pth_source("https://example.com/model.pth") is None
 
@@ -84,3 +87,39 @@ def test_rwkv7_pth_url_has_no_image_processor_config():
     )
 
     assert config == {}
+
+
+def test_rwkv7_pth_download_uses_shared_hf_api(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "model.pth"
+    calls: list[dict[str, object]] = []
+
+    class FakeHfApi:
+        def hf_hub_download(self, **kwargs: object) -> str:
+            calls.append(kwargs)
+            return str(checkpoint)
+
+    monkeypatch.setattr(rwkv7, "hf_api", lambda: FakeHfApi())
+    source = rwkv7.RWKV7PthSource(
+        filename="weights/model.pth",
+        repo_id="BlinkDL/rwkv7-g1",
+        revision="main",
+    )
+
+    resolved = rwkv7.download_rwkv7_pth_source(
+        source,
+        cache_dir="/cache",
+        revision="release",
+    )
+
+    assert resolved == checkpoint
+    assert calls == [
+        {
+            "repo_id": "BlinkDL/rwkv7-g1",
+            "filename": "weights/model.pth",
+            "revision": "release",
+            "cache_dir": "/cache",
+        }
+    ]

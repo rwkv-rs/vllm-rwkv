@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import socket
 import subprocess
 import sys
@@ -30,6 +29,7 @@ from typing import Any, cast
 from urllib.parse import urlparse
 
 import pytest
+import regex as re
 import requests
 import torch
 
@@ -413,6 +413,7 @@ def rwkv7_albatross_settings() -> AlbatrossSettings:
     reference = _albatross_reference(root, impl_dir)
     if reference is None:
         pytest.fail(f"Albatross reference provenance is unavailable: {impl_dir}")
+    assert reference is not None
     expected_revision = os.environ.get(
         "ALBATROSS_REVISION",
         ALBATROSS_REFERENCE_REVISION,
@@ -793,9 +794,12 @@ def vllm_direct_logits(
     rwkv7_albatross_settings: AlbatrossSettings,
     albatross_oracle: dict[str, Any],
 ) -> dict[str, Any]:
-    if PARALLEL_SETTINGS != ParallelSettings(
-        tensor_parallel_size=1,
-        pipeline_parallel_size=1,
+    if (
+        ParallelSettings(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+        )
+        != PARALLEL_SETTINGS
     ):
         pytest.skip("direct Albatross logits alignment requires TP=1 and PP=1")
 
@@ -857,8 +861,7 @@ def _assert_next_token_logprobs_close(
     vllm_logprobs: Mapping[int, Any],
 ) -> None:
     albatross_top = [
-        (int(token_id), float(value))
-        for token_id, value in case["next_top_logprobs"]
+        (int(token_id), float(value)) for token_id, value in case["next_top_logprobs"]
     ]
     vllm_top = _sorted_logprobs(vllm_logprobs)
 
@@ -908,7 +911,9 @@ def test_rwkv7_direct_fp32_logits_match_albatross(
         max_abs = float(difference.abs().max())
         relative_l2 = float(
             torch.linalg.vector_norm(difference)
-            / torch.linalg.vector_norm(expected).clamp_min(torch.finfo(torch.float32).tiny)
+            / torch.linalg.vector_norm(expected).clamp_min(
+                torch.finfo(torch.float32).tiny
+            )
         )
         cosine = float(
             torch.nn.functional.cosine_similarity(

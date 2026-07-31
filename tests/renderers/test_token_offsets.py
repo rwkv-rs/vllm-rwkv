@@ -9,10 +9,11 @@ forwarding chain. Endpoint-level coverage lives in
 """
 
 import asyncio
-import re
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
+import regex as re
 
 from vllm.renderers.params import TokenizeParams
 
@@ -28,7 +29,7 @@ def fast_tokenizer():
 
         def __call__(self, text: str, *, return_offsets_mapping: bool = False, **_):
             spans = [match.span() for match in re.finditer(r"\S+", text)]
-            encoding = {"input_ids": list(range(1, len(spans) + 1))}
+            encoding: dict[str, Any] = {"input_ids": list(range(1, len(spans) + 1))}
             if return_offsets_mapping:
                 encoding["offset_mapping"] = spans
             return encoding

@@ -4,7 +4,7 @@
 import os
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import cloudpickle
 import torch.nn as nn
@@ -42,7 +42,7 @@ from vllm.entrypoints.chat_utils import (
 from vllm.entrypoints.generate.beam_search.offline import BeamSearchOfflineMixin
 from vllm.entrypoints.pooling.offline import PoolingOfflineMixin
 from vllm.entrypoints.serve.utils.api_utils import log_non_default_args
-from vllm.inputs import PromptType
+from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -52,6 +52,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.rwkv_defaults import (
     RWKV_NATIVE_CHAT_TEMPLATE,
+    RWKVPromptTemplateSpec,
     is_rwkv_model_config,
     resolve_rwkv_chat_sampling_params,
     resolve_rwkv_prompt_template,
@@ -478,7 +479,9 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         if prompt_token_ids is not None:
             if prompts is not None:
                 raise ValueError("prompts and prompt_token_ids are mutually exclusive")
-            prompts = [{"prompt_token_ids": list(ids)} for ids in prompt_token_ids]
+            prompts = [
+                TokensPrompt(prompt_token_ids=list(ids)) for ids in prompt_token_ids
+            ]
         if prompts is None:
             raise ValueError("prompts or prompt_token_ids must be provided")
         runner_type = self.model_config.runner_type
@@ -717,7 +720,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
 
         if sampling_params is None:
             sampling_params = self.get_default_sampling_params()
-        prompt_templates = [None]
+        prompt_templates: list[RWKVPromptTemplateSpec | None] = [None]
         is_native_template = chat_template is None or (
             chat_template.strip() == RWKV_NATIVE_CHAT_TEMPLATE
         )
@@ -730,7 +733,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
                     prompt_template=(chat_template_kwargs or {}).get(
                         "rwkv_prompt_template"
                     ),
-                    messages=conversation,
+                    messages=cast(Sequence[Any], conversation),
                     tools=tools or (),
                 )
                 for conversation in conversations
@@ -817,7 +820,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
 
         if sampling_params is None:
             sampling_params = self.get_default_sampling_params()
-        prompt_templates = [None]
+        prompt_templates: list[RWKVPromptTemplateSpec | None] = [None]
         is_native_template = chat_template is None or (
             chat_template.strip() == RWKV_NATIVE_CHAT_TEMPLATE
         )
@@ -830,7 +833,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
                     prompt_template=(chat_template_kwargs or {}).get(
                         "rwkv_prompt_template"
                     ),
-                    messages=conversation,
+                    messages=cast(Sequence[Any], conversation),
                     tools=tools or (),
                 )
                 for conversation in conversations

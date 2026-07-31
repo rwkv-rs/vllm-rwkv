@@ -11,15 +11,14 @@ exact recorded GPU/CUDA/PyTorch environment only.
 from __future__ import annotations
 
 import argparse
+import json
+import statistics
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
-import json
 from pathlib import Path
-import statistics
 from typing import Any
 
 import torch
-
 
 LOWRANK_KN = (
     (4096, 128),
@@ -70,7 +69,7 @@ def _measure(
 ) -> Metrics:
     for _ in range(warmup_iters):
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(benchmark_iters)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(benchmark_iters)]
@@ -91,12 +90,12 @@ def _measure(
 
 
 def _measure_peak_bytes(fn: Callable[[], torch.Tensor]) -> int:
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    baseline = torch.cuda.memory_allocated()
+    torch.accelerator.synchronize()
+    torch.accelerator.reset_peak_memory_stats()
+    baseline = torch.accelerator.memory_allocated()
     output = fn()
-    torch.cuda.synchronize()
-    peak = max(0, torch.cuda.max_memory_allocated() - baseline)
+    torch.accelerator.synchronize()
+    peak = max(0, torch.accelerator.max_memory_allocated() - baseline)
     del output
     return peak
 
@@ -109,16 +108,16 @@ def _measure_graph(
 ) -> tuple[Metrics, int]:
     # Warm both the allocator and the shape-specific Lt plan before capture.
     fn()
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    baseline = torch.cuda.memory_allocated()
+    torch.accelerator.synchronize()
+    torch.accelerator.reset_peak_memory_stats()
+    baseline = torch.accelerator.memory_allocated()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         graph_output = fn()
-    torch.cuda.synchronize()
-    capture_peak = max(0, torch.cuda.max_memory_allocated() - baseline)
+    torch.accelerator.synchronize()
+    capture_peak = max(0, torch.accelerator.max_memory_allocated() - baseline)
     metrics = _measure(
-        lambda: graph.replay(),
+        graph.replay,
         warmup_iters=warmup_iters,
         benchmark_iters=benchmark_iters,
     )
@@ -150,30 +149,20 @@ def _accuracy(
 def _candidate_shapes(profile: str) -> tuple[Shape, ...]:
     if profile == "lagging":
         shapes = [
-            Shape(m, k, n)
-            for m in LAGGING_ROWS
-            for k, n in (*LOWRANK_KN, *DENSE_KN)
+            Shape(m, k, n) for m in LAGGING_ROWS for k, n in (*LOWRANK_KN, *DENSE_KN)
         ]
         shapes.append(Shape(64, 16384, 4096))
         return tuple(shapes)
     if profile == "full":
-        lowrank = [
-            Shape(m, k, n)
-            for m in FULL_LOWRANK_ROWS
-            for k, n in LOWRANK_KN
-        ]
-        dense = [
-            Shape(m, k, n)
-            for m in FULL_LOWRANK_ROWS
-            for k, n in DENSE_KN
-        ]
+        lowrank = [Shape(m, k, n) for m in FULL_LOWRANK_ROWS for k, n in LOWRANK_KN]
+        dense = [Shape(m, k, n) for m in FULL_LOWRANK_ROWS for k, n in DENSE_KN]
         ffn = [Shape(m, 16384, 4096) for m in FULL_FFN_ROWS]
         return tuple((*lowrank, *dense, *ffn))
     raise ValueError(f"unknown profile: {profile}")
 
 
 def _environment() -> dict[str, Any]:
-    device = torch.cuda.current_device()
+    device = torch.accelerator.current_device_index()
     return {
         "device_index": device,
         "device_name": torch.cuda.get_device_name(device),
@@ -224,7 +213,7 @@ def _run_shape(
     baseline_output = baseline_fn()
     repeated_baseline = baseline_fn()
     reference = torch.mm(x, weight, out_dtype=torch.float32)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     baseline_accuracy = _accuracy(baseline_output, reference)
     baseline = {
         "provider": baseline_provider,
@@ -251,21 +240,19 @@ def _run_shape(
     candidates: list[dict[str, Any]] = []
     for workspace_mb in workspace_limits_mb:
         for heuristic_index in heuristic_indices:
-            fn = (
-                lambda workspace_mb=workspace_mb, heuristic_index=heuristic_index: (
-                    torch.ops.rwkv7_v3a_ops.linear_f16_lt_cfg(
-                        x,
-                        weight,
-                        workspace_mb,
-                        heuristic_index,
-                        True,
-                    )
+            fn = lambda workspace_mb=workspace_mb, heuristic_index=heuristic_index: (
+                torch.ops.rwkv7_v3a_ops.linear_f16_lt_cfg(
+                    x,
+                    weight,
+                    workspace_mb,
+                    heuristic_index,
+                    True,
                 )
             )
             try:
                 output = fn()
                 repeated = fn()
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
             except RuntimeError as exc:
                 candidates.append(
                     {
@@ -280,8 +267,7 @@ def _run_shape(
             accuracy = _accuracy(output, reference)
             error_limit = float(baseline_accuracy["error_l2"]) * 1.02 + 1e-6
             accuracy_ok = (
-                bool(accuracy["finite"])
-                and float(accuracy["error_l2"]) <= error_limit
+                bool(accuracy["finite"]) and float(accuracy["error_l2"]) <= error_limit
             )
             metrics = _measure(
                 fn,
@@ -320,12 +306,14 @@ def _run_shape(
     for finalist in finalists:
         workspace_mb = int(finalist["workspace_limit_mb"])
         heuristic_index = int(finalist["heuristic_index"])
-        fn = lambda: torch.ops.rwkv7_v3a_ops.linear_f16_lt_cfg(
-            x,
-            weight,
-            workspace_mb,
-            heuristic_index,
-            True,
+        fn = lambda workspace_mb=workspace_mb, heuristic_index=heuristic_index: (
+            torch.ops.rwkv7_v3a_ops.linear_f16_lt_cfg(
+                x,
+                weight,
+                workspace_mb,
+                heuristic_index,
+                True,
+            )
         )
         graph_metrics, graph_peak = _measure_graph(
             fn,

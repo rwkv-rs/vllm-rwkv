@@ -378,9 +378,7 @@ class Sampler:
         ) = None
         temperatures = None
         if use_rapid:
-            rapid_penalty_mask = self.penalties_state.rapid_penalty_mask(
-                idx_mapping_np
-            )
+            rapid_penalty_mask = self.penalties_state.rapid_penalty_mask(idx_mapping_np)
             rapid_penalty_active = bool(np.any(rapid_penalty_mask))
             temperatures = self.sampling_states.get_temperatures(
                 expanded_idx_mapping,
@@ -393,7 +391,7 @@ class Sampler:
                     idx_mapping_np,
                     scalar_if_uniform=True,
                 )
-            rapid_sampler_params = (temperatures, top_k, top_p)
+            rapid_sampler_params: tuple[object, ...] = (temperatures, top_k, top_p)
             if rapid_penalty_params is not None:
                 rapid_sampler_params += rapid_penalty_params
             rapid_per_request_params = any(
