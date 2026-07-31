@@ -768,6 +768,7 @@ class CompilationConfig:
         "vllm::mamba_mixer",
         "vllm::short_conv",
         "vllm::linear_attention",
+        "vllm::rwkv7_block",
         "vllm::qwen_gdn_attention_core",
         "vllm::gdn_attention_core_xpu",
         "vllm::olmo_hybrid_gdn_full_forward",

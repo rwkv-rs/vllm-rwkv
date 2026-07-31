@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     VLLM_TARGET_DEVICE: str = "cuda"
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
+    VLLM_RWKV7_WKV_MODE: Literal["fp16", "fp32io16"] = "fp16"
     VLLM_BATCH_INVARIANT: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     # Deprecated alias of VLLM_TRITON_USE_TD (removed in v0.25).
@@ -600,6 +601,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_FLOAT32_MATMUL_PRECISION",
         "highest",
         ["highest", "high", "medium"],
+        case_sensitive=False,
+    ),
+    "VLLM_RWKV7_WKV_MODE": env_with_choices(
+        "VLLM_RWKV7_WKV_MODE",
+        "fp16",
+        ["fp16", "fp32io16"],
         case_sensitive=False,
     ),
     # Enable batch-invariant mode: deterministic results regardless of

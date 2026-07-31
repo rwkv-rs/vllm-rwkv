@@ -92,7 +92,8 @@ __device__ __forceinline__ void prefetch_token(
 }
 
 __global__ __launch_bounds__(HEAD_SIZE, 2) void wkv_fp16_kernel(
-    int C, const int* __restrict__ query_start_loc,
+    int C, int64_t state_slot_stride, int64_t elapsed_slot_stride,
+    const int* __restrict__ query_start_loc,
     const int* __restrict__ slot_indices, half* __restrict__ state_ptr,
     const half* __restrict__ r_ptr, const half* __restrict__ w_ptr,
     const half* __restrict__ w0_ptr, const half* __restrict__ k_ptr,
@@ -123,7 +124,7 @@ __global__ __launch_bounds__(HEAD_SIZE, 2) void wkv_fp16_kernel(
   }
 
   __shared__ __align__(256) half2 state_smem[HEAD_SIZE][HALF2_HEAD_SIZE];
-  state_ptr += static_cast<int64_t>(state_slot) * C * HEAD_SIZE +
+  state_ptr += static_cast<int64_t>(state_slot) * state_slot_stride +
                h * HEAD_SIZE * HEAD_SIZE;
 
 #pragma unroll
@@ -152,7 +153,9 @@ __global__ __launch_bounds__(HEAD_SIZE, 2) void wkv_fp16_kernel(
 
   const int channel = h * HEAD_SIZE + thread;
   const half w0 = w0_ptr[channel];
-  const int phase0 = elapsed_t[state_slot] + channel;
+  const int phase0 = elapsed_t[static_cast<int64_t>(state_slot) *
+                               elapsed_slot_stride] +
+                     channel;
   int token = token_start * C + h * HEAD_SIZE;
   prefetch_token(thread, lane, token, r[0], w[0], k[0], a[0], bvec[0],
                  bvec_dummy, r_ptr, w_ptr, k_ptr, a_ptr, b_ptr);
@@ -225,14 +228,16 @@ __global__ __launch_bounds__(HEAD_SIZE, 2) void wkv_fp16_kernel(
 
 }  // namespace
 
-void wkv_fp16_cuda(int B, int C, int H, at::Tensor query_start_loc,
+void wkv_fp16_cuda(int B, int C, int H, int64_t state_slot_stride,
+                   int64_t elapsed_slot_stride, at::Tensor query_start_loc,
                    at::Tensor slot_indices, at::Tensor state, at::Tensor r,
                    at::Tensor w, at::Tensor w0, at::Tensor k, at::Tensor v,
                    at::Tensor a, at::Tensor b, at::Tensor y,
                    at::Tensor elapsed_t) {
   const auto stream = at::cuda::getCurrentCUDAStream();
   wkv_fp16_kernel<<<dim3(H, B), dim3(HEAD_SIZE), 0, stream>>>(
-      C, query_start_loc.data_ptr<int>(), slot_indices.data_ptr<int>(),
+      C, state_slot_stride, elapsed_slot_stride,
+      query_start_loc.data_ptr<int>(), slot_indices.data_ptr<int>(),
       reinterpret_cast<half*>(state.data_ptr()),
       reinterpret_cast<const half*>(r.data_ptr()),
       reinterpret_cast<const half*>(w.data_ptr()),

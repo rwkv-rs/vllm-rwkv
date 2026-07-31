@@ -666,6 +666,25 @@ class MambaModelConfig(VerifyAndUpdateConfig):
                 cache_config.mamba_block_size = model_config.max_model_len
 
 
+class RWKV7ModelConfig(VerifyAndUpdateConfig):
+    """Configure only the recurrent-cache features RWKV7 currently supports."""
+
+    @classmethod
+    def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        cache_config = vllm_config.cache_config
+        if cache_config.enable_prefix_caching:
+            cache_config.enable_prefix_caching = False
+            logger.warning(
+                "Disabling prefix caching because RWKV7 does not support it yet."
+            )
+        if vllm_config.speculative_config is not None:
+            raise ValueError("RWKV7 does not support speculative decoding yet")
+        if cache_config.mamba_cache_mode != "none":
+            raise ValueError("RWKV7 requires mamba_cache_mode='none'")
+        if cache_config.mamba_block_size is None:
+            cache_config.mamba_block_size = vllm_config.model_config.max_model_len
+
+
 class NemotronHForCausalLMConfig(VerifyAndUpdateConfig):
     DEFAULT_MAMBA_SSM_CACHE_DTYPE = "float32"
     """Only `float32` is known to have no accuracy issues by default."""
@@ -957,6 +976,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "LlamaNemotronVLModel": LlamaNemotronVLConfig,
     "Mamba2ForCausalLM": MambaModelConfig,
     "MambaForCausalLM": MambaModelConfig,
+    "RWKV7ForCausalLM": RWKV7ModelConfig,
     "NemotronHForCausalLM": NemotronHForCausalLMConfig,
     "NemotronHPuzzleForCausalLM": NemotronHForCausalLMConfig,
     "NemotronH_Nano_VL_V2": NemotronHNanoVLV2Config,

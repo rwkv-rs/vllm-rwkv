@@ -6,6 +6,8 @@
 import pytest
 import torch
 
+from vllm.utils.math_utils import round_up
+
 HEAD_SIZE = 64
 TWO_NEG_41 = 4.547473508864641e-13
 NEXP_HALF_LOG2_E = -0.8750387749145276
@@ -303,6 +305,168 @@ def test_wkv_fp32_matches_float_reference() -> None:
 
     torch.testing.assert_close(output, expected_output, atol=2e-3, rtol=2e-3)
     torch.testing.assert_close(state, expected_state, atol=2e-5, rtol=2e-5)
+
+
+def test_wkv_fp16_supports_block_strided_recurrent_cache() -> None:
+    query_start_loc, slot_indices, state, r, w, k, v, a, b, w0, elapsed = _case(
+        (2, 3), state_dtype=torch.float16, seed=41
+    )
+    shift_nbytes = 2 * HEAD_SIZE * torch.float16.itemsize
+    state_nbytes = state[0].numel() * state.element_size()
+    elapsed_nbytes = torch.int32.itemsize
+    page_size = round_up(shift_nbytes + state_nbytes + elapsed_nbytes, 16)
+    state_pages = torch.empty(
+        (state.size(0), page_size),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    packed_state = (
+        state_pages[:, shift_nbytes : shift_nbytes + state_nbytes]
+        .view(torch.float16)
+        .view_as(state)
+    )
+    packed_state.copy_(state)
+    elapsed_offset = shift_nbytes + state_nbytes
+    packed_elapsed = (
+        state_pages[:, elapsed_offset : elapsed_offset + elapsed_nbytes]
+        .view(torch.int32)
+        .view(-1, 1)
+    )
+    packed_elapsed.copy_(elapsed[:, None])
+    expected_state = state.clone()
+    expected_output = torch.empty_like(r)
+    output = torch.empty_like(r)
+
+    torch.ops.rwkv7_wkv_fp16_v2.wkv(
+        query_start_loc,
+        slot_indices,
+        expected_state,
+        r,
+        w,
+        w0,
+        k,
+        v,
+        a,
+        b,
+        expected_output,
+        elapsed,
+    )
+    torch.ops.rwkv7_wkv_fp16_v2.wkv(
+        query_start_loc,
+        slot_indices,
+        packed_state,
+        r,
+        w,
+        w0,
+        k,
+        v,
+        a,
+        b,
+        output,
+        packed_elapsed,
+    )
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(output, expected_output)
+    torch.testing.assert_close(packed_state, expected_state)
+
+
+def test_wkv_fp16_rejects_misaligned_recurrent_cache() -> None:
+    query_start_loc, slot_indices, state, r, w, k, v, a, b, w0, elapsed = _case(
+        (2, 3), state_dtype=torch.float16, seed=43
+    )
+    output = torch.empty_like(r)
+    slot_elements = state[0].numel()
+    misaligned_stride_pages = torch.empty(
+        (state.size(0), slot_elements + 1),
+        device="cuda",
+        dtype=state.dtype,
+    )
+    misaligned_stride_state = misaligned_stride_pages[:, :slot_elements].view_as(state)
+
+    with pytest.raises(RuntimeError, match="slot stride must be 16-byte aligned"):
+        torch.ops.rwkv7_wkv_fp16_v2.wkv(
+            query_start_loc,
+            slot_indices,
+            misaligned_stride_state,
+            r,
+            w,
+            w0,
+            k,
+            v,
+            a,
+            b,
+            output,
+            elapsed,
+        )
+
+    misaligned_base = torch.empty(
+        state.numel() + 1,
+        device="cuda",
+        dtype=state.dtype,
+    )[1:].view_as(state)
+    with pytest.raises(RuntimeError, match="data pointer must be 16-byte aligned"):
+        torch.ops.rwkv7_wkv_fp16_v2.wkv(
+            query_start_loc,
+            slot_indices,
+            misaligned_base,
+            r,
+            w,
+            w0,
+            k,
+            v,
+            a,
+            b,
+            output,
+            elapsed,
+        )
+
+
+def test_wkv_fp32_supports_block_strided_recurrent_cache() -> None:
+    query_start_loc, slot_indices, state, r, w, k, v, a, b, w0, _elapsed = _case(
+        (2, 3), state_dtype=torch.float32, seed=42
+    )
+    slot_elements = state[0].numel()
+    state_pages = torch.empty(
+        (state.size(0), slot_elements + 17),
+        device="cuda",
+        dtype=state.dtype,
+    )
+    packed_state = state_pages[:, :slot_elements].view_as(state)
+    packed_state.copy_(state)
+    expected_state = state.clone()
+    expected_output = torch.empty_like(r)
+    output = torch.empty_like(r)
+    w_with_bias = (w + w0).contiguous()
+
+    torch.ops.rwkv7_wkv_fp32_v2.wkv(
+        query_start_loc,
+        slot_indices,
+        expected_state,
+        r,
+        w_with_bias,
+        k,
+        v,
+        a,
+        b,
+        expected_output,
+    )
+    torch.ops.rwkv7_wkv_fp32_v2.wkv(
+        query_start_loc,
+        slot_indices,
+        packed_state,
+        r,
+        w_with_bias,
+        k,
+        v,
+        a,
+        b,
+        output,
+    )
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(output, expected_output)
+    torch.testing.assert_close(packed_state, expected_state)
 
 
 def test_wkv_canonical_rejects_invalid_inputs() -> None:

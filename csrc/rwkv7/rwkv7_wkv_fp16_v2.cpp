@@ -7,18 +7,22 @@
 #include <torch/all.h>
 #include <torch/library.h>
 
+#include <cstdint>
 #include <limits>
 #include <utility>
 
-void wkv_fp16_cuda(int B, int C, int H, torch::Tensor query_start_loc,
-                   torch::Tensor slot_indices, torch::Tensor state,
-                   torch::Tensor r, torch::Tensor w, torch::Tensor w0,
-                   torch::Tensor k, torch::Tensor v, torch::Tensor a,
-                   torch::Tensor b, torch::Tensor y, torch::Tensor elapsed_t);
+void wkv_fp16_cuda(int B, int C, int H, int64_t state_slot_stride,
+                   int64_t elapsed_slot_stride,
+                   torch::Tensor query_start_loc, torch::Tensor slot_indices,
+                   torch::Tensor state, torch::Tensor r, torch::Tensor w,
+                   torch::Tensor w0, torch::Tensor k, torch::Tensor v,
+                   torch::Tensor a, torch::Tensor b, torch::Tensor y,
+                   torch::Tensor elapsed_t);
 
 namespace {
 
 constexpr int64_t HEAD_SIZE = 64;
+constexpr int64_t STATE_ALIGNMENT_BYTES = 16;
 
 void check_half_cuda_contiguous(const torch::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.is_cuda(), name, " must be CUDA");
@@ -29,6 +33,16 @@ void check_half_cuda_contiguous(const torch::Tensor& tensor, const char* name) {
 void check_i32_cuda_contiguous(const torch::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.is_cuda(), name, " must be CUDA");
   TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+  TORCH_CHECK(tensor.scalar_type() == torch::kInt32, name, " must be int32");
+}
+
+void check_half_cuda(const torch::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.is_cuda(), name, " must be CUDA");
+  TORCH_CHECK(tensor.scalar_type() == torch::kFloat16, name, " must be fp16");
+}
+
+void check_i32_cuda(const torch::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.is_cuda(), name, " must be CUDA");
   TORCH_CHECK(tensor.scalar_type() == torch::kInt32, name, " must be int32");
 }
 
@@ -46,8 +60,8 @@ void wkv(torch::Tensor query_start_loc, torch::Tensor slot_indices,
          torch::Tensor b, torch::Tensor y, torch::Tensor elapsed_t) {
   check_i32_cuda_contiguous(query_start_loc, "query_start_loc");
   check_i32_cuda_contiguous(slot_indices, "slot_indices");
-  check_i32_cuda_contiguous(elapsed_t, "elapsed_t");
-  check_half_cuda_contiguous(state, "state");
+  check_i32_cuda(elapsed_t, "elapsed_t");
+  check_half_cuda(state, "state");
   check_half_cuda_contiguous(r, "r");
   check_half_cuda_contiguous(w, "w");
   check_half_cuda_contiguous(w0, "w0");
@@ -69,12 +83,31 @@ void wkv(torch::Tensor query_start_loc, torch::Tensor slot_indices,
               "state must have shape [slots,H,64,64]");
   const int64_t head_count = state.size(1);
   const int64_t hidden_size = head_count * HEAD_SIZE;
+  TORCH_CHECK(state.stride(3) == 1 && state.stride(2) == HEAD_SIZE &&
+                  state.stride(1) == HEAD_SIZE * HEAD_SIZE &&
+                  state.stride(0) >= head_count * HEAD_SIZE * HEAD_SIZE,
+              "state must be contiguous within each slot");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(state.data_ptr()) %
+                      STATE_ALIGNMENT_BYTES ==
+                  0,
+              "state data pointer must be 16-byte aligned");
+  TORCH_CHECK(state.stride(0) * state.element_size() %
+                      STATE_ALIGNMENT_BYTES ==
+                  0,
+              "state slot stride must be 16-byte aligned");
   TORCH_CHECK(head_count > 0 && head_count <= std::numeric_limits<int>::max(),
               "head count must be positive int32");
   TORCH_CHECK(hidden_size <= std::numeric_limits<int>::max(),
               "hidden size must fit in int32");
-  TORCH_CHECK(elapsed_t.dim() == 1 && elapsed_t.size(0) == state.size(0),
-              "elapsed_t must have shape [slots]");
+  const bool elapsed_is_vector =
+      elapsed_t.dim() == 1 && elapsed_t.size(0) == state.size(0);
+  const bool elapsed_is_column =
+      elapsed_t.dim() == 2 && elapsed_t.size(0) == state.size(0) &&
+      elapsed_t.size(1) == 1 && elapsed_t.stride(1) == 1;
+  TORCH_CHECK(elapsed_is_vector || elapsed_is_column,
+              "elapsed_t must have shape [slots] or [slots,1]");
+  TORCH_CHECK(elapsed_t.stride(0) > 0,
+              "elapsed_t slot stride must be positive");
   TORCH_CHECK(w0.dim() == 1 && w0.size(0) == hidden_size,
               "w0 must have shape [C]");
 
@@ -104,9 +137,11 @@ void wkv(torch::Tensor query_start_loc, torch::Tensor slot_indices,
     check_same_device(state, *item.first, item.second);
   }
 
-  wkv_fp16_cuda(static_cast<int>(batch_size), static_cast<int>(hidden_size),
-                static_cast<int>(head_count), query_start_loc, slot_indices,
-                state, r, w, w0, k, v, a, b, y, elapsed_t);
+  wkv_fp16_cuda(
+      static_cast<int>(batch_size), static_cast<int>(hidden_size),
+      static_cast<int>(head_count), state.stride(0), elapsed_t.stride(0),
+      query_start_loc, slot_indices, state, r, w, w0, k, v, a, b, y,
+      elapsed_t);
 }
 
 TORCH_LIBRARY(rwkv7_wkv_fp16_v2, m) {

@@ -7,11 +7,11 @@
 #include <limits>
 #include <utility>
 
-void wkv_fp32_cuda(int B, int C, int H, torch::Tensor query_start_loc,
-                   torch::Tensor slot_indices, torch::Tensor state,
-                   torch::Tensor r, torch::Tensor w, torch::Tensor k,
-                   torch::Tensor v, torch::Tensor a, torch::Tensor b,
-                   torch::Tensor y);
+void wkv_fp32_cuda(int B, int C, int H, int64_t state_slot_stride,
+                   torch::Tensor query_start_loc, torch::Tensor slot_indices,
+                   torch::Tensor state, torch::Tensor r, torch::Tensor w,
+                   torch::Tensor k, torch::Tensor v, torch::Tensor a,
+                   torch::Tensor b, torch::Tensor y);
 
 namespace {
 
@@ -32,6 +32,12 @@ void check_cuda_contiguous(const torch::Tensor& tensor, torch::ScalarType dtype,
   TORCH_CHECK(tensor.scalar_type() == dtype, name, " must be ", dtype_name);
 }
 
+void check_cuda(const torch::Tensor& tensor, torch::ScalarType dtype,
+                const char* dtype_name, const char* name) {
+  TORCH_CHECK(tensor.is_cuda(), name, " must be CUDA");
+  TORCH_CHECK(tensor.scalar_type() == dtype, name, " must be ", dtype_name);
+}
+
 void check_same_device(const torch::Tensor& reference,
                        const torch::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.device() == reference.device(), name,
@@ -46,7 +52,7 @@ void wkv(torch::Tensor query_start_loc, torch::Tensor slot_indices,
   check_cuda_contiguous(query_start_loc, torch::kInt32, "int32",
                         "query_start_loc");
   check_cuda_contiguous(slot_indices, torch::kInt32, "int32", "slot_indices");
-  check_cuda_contiguous(state, torch::kFloat32, "fp32", "state");
+  check_cuda(state, torch::kFloat32, "fp32", "state");
   check_cuda_contiguous(r, IO_DTYPE, IO_DTYPE_NAME, "r");
   check_cuda_contiguous(w, IO_DTYPE, IO_DTYPE_NAME, "w");
   check_cuda_contiguous(k, IO_DTYPE, IO_DTYPE_NAME, "k");
@@ -67,6 +73,10 @@ void wkv(torch::Tensor query_start_loc, torch::Tensor slot_indices,
               "state must have shape [slots,H,64,64]");
   const int64_t head_count = state.size(1);
   const int64_t hidden_size = head_count * HEAD_SIZE;
+  TORCH_CHECK(state.stride(3) == 1 && state.stride(2) == HEAD_SIZE &&
+                  state.stride(1) == HEAD_SIZE * HEAD_SIZE &&
+                  state.stride(0) >= head_count * HEAD_SIZE * HEAD_SIZE,
+              "state must be contiguous within each slot");
   TORCH_CHECK(head_count > 0 && head_count <= std::numeric_limits<int>::max(),
               "head count must be positive int32");
   TORCH_CHECK(hidden_size <= std::numeric_limits<int>::max(),
@@ -96,8 +106,8 @@ void wkv(torch::Tensor query_start_loc, torch::Tensor slot_indices,
   }
 
   wkv_fp32_cuda(static_cast<int>(batch_size), static_cast<int>(hidden_size),
-                static_cast<int>(head_count), query_start_loc, slot_indices,
-                state, r, w, k, v, a, b, y);
+                static_cast<int>(head_count), state.stride(0), query_start_loc,
+                slot_indices, state, r, w, k, v, a, b, y);
 }
 
 TORCH_LIBRARY(rwkv7_wkv_fp32_v2, m) {

@@ -37,7 +37,8 @@ __device__ __forceinline__ float w_eff(float w) {
 }
 
 __global__ __launch_bounds__(HEAD_SIZE, 2) void wkv_fp32_kernel(
-    int C, int H, const int* __restrict__ query_start_loc,
+    int C, int H, int64_t state_slot_stride,
+    const int* __restrict__ query_start_loc,
     const int* __restrict__ slot_indices, float* __restrict__ state_ptr,
     const io_t* __restrict__ r_ptr, const io_t* __restrict__ w_ptr,
     const io_t* __restrict__ k_ptr, const io_t* __restrict__ v_ptr,
@@ -64,8 +65,8 @@ __global__ __launch_bounds__(HEAD_SIZE, 2) void wkv_fp32_kernel(
     return;
   }
 
-  float* state_base = state_ptr + (static_cast<int64_t>(state_slot) * H *
-                                       HEAD_SIZE * HEAD_SIZE +
+  float* state_base = state_ptr + (static_cast<int64_t>(state_slot) *
+                                       state_slot_stride +
                                    h * HEAD_SIZE * HEAD_SIZE + row * HEAD_SIZE);
   float state[HEAD_SIZE];
 #pragma unroll
@@ -118,13 +119,14 @@ __global__ __launch_bounds__(HEAD_SIZE, 2) void wkv_fp32_kernel(
 
 }  // namespace
 
-void wkv_fp32_cuda(int B, int C, int H, at::Tensor query_start_loc,
-                   at::Tensor slot_indices, at::Tensor state, at::Tensor r,
-                   at::Tensor w, at::Tensor k, at::Tensor v, at::Tensor a,
-                   at::Tensor b, at::Tensor y) {
+void wkv_fp32_cuda(int B, int C, int H, int64_t state_slot_stride,
+                   at::Tensor query_start_loc, at::Tensor slot_indices,
+                   at::Tensor state, at::Tensor r, at::Tensor w, at::Tensor k,
+                   at::Tensor v, at::Tensor a, at::Tensor b, at::Tensor y) {
   const auto stream = at::cuda::getCurrentCUDAStream();
   wkv_fp32_kernel<<<dim3(H, B), dim3(HEAD_SIZE), 0, stream>>>(
-      C, H, query_start_loc.data_ptr<int>(), slot_indices.data_ptr<int>(),
+      C, H, state_slot_stride, query_start_loc.data_ptr<int>(),
+      slot_indices.data_ptr<int>(),
       state.data_ptr<float>(), reinterpret_cast<const io_t*>(r.data_ptr()),
       reinterpret_cast<const io_t*>(w.data_ptr()),
       reinterpret_cast<const io_t*>(k.data_ptr()),

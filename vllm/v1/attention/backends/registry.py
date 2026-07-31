@@ -177,6 +177,7 @@ class MambaAttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     MAMBA2 = "vllm.v1.attention.backends.mamba2_attn.Mamba2AttentionBackend"
     SHORT_CONV = "vllm.v1.attention.backends.short_conv_attn.ShortConvAttentionBackend"
     LINEAR = "vllm.v1.attention.backends.linear_attn.LinearAttentionBackend"
+    RWKV7 = "vllm.v1.attention.backends.rwkv7_attn.RWKV7AttentionBackend"
     GDN_ATTN = "vllm.v1.attention.backends.gdn_attn.GDNAttentionBackend"
     # Placeholder for third-party/custom backends - must be registered before use
     # set to None to avoid alias with other backend, whose value is an empty string

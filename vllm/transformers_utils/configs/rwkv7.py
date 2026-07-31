@@ -128,6 +128,7 @@ class RWKV7Config(PretrainedConfig):
             raise ValueError("RWKV7 hidden_size must be divisible by head_size.")
 
         kwargs.setdefault("architectures", self.architectures)
+        kwargs.setdefault("tie_word_embeddings", False)
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
