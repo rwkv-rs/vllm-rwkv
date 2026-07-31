@@ -406,7 +406,7 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
         "https://huggingface.co/BlinkDL/rwkv7-g1/blob/main/"
         "rwkv7-g1h-1.5b-20260710-ctx10240.pth",
         tokenizer_mode="rwkv",
-        is_available_online=False,
+        dtype="float16",
     ),
     "FalconMambaForCausalLM": _HfExamplesInfo("tiiuae/falcon-mamba-7b-instruct"),
     "MiniCPMForCausalLM": _HfExamplesInfo(
