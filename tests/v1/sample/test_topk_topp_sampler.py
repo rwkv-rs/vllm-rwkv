@@ -10,6 +10,7 @@ from vllm.platforms import current_platform
 from vllm.sampling_params import RAPID_PENALTY_DECAY_DEFAULT, SamplingParams
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.sample.ops import rapid_sampling
 from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p_pytorch,
     random_sample,
@@ -54,6 +55,41 @@ def _rapid_sampler_platform_supported() -> bool:
 
 
 RAPID_SAMPLER_PLATFORM_SUPPORTED = _rapid_sampler_platform_supported()
+
+
+def test_rapid_sampler_public_api_is_reexported_from_owned_module():
+    from vllm.v1.sample.ops import topk_topp_sampler
+
+    assert topk_topp_sampler.rapid_sample is rapid_sampling.rapid_sample
+    assert (
+        topk_topp_sampler.rapid_sample_input_supported
+        is rapid_sampling.rapid_sample_input_supported
+    )
+    assert (
+        topk_topp_sampler.rapid_sampler_supported
+        is rapid_sampling.rapid_sampler_supported
+    )
+
+
+def test_rapid_sampler_extension_import_failure_is_cached(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = 0
+
+    def missing_extension(name: str):
+        nonlocal calls
+        calls += 1
+        assert name == "vllm._rapid_sampling"
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr(rapid_sampling, "_RAPID_SAMPLER_MODULE", None)
+    monkeypatch.setattr(rapid_sampling.importlib, "import_module", missing_extension)
+
+    for _ in range(2):
+        with pytest.raises(ImportError, match="is not installed"):
+            rapid_sampling._load_rapid_sampler_module()
+
+    assert calls == 1
 
 
 def _seed_default_generator(seed: int) -> None:
@@ -232,10 +268,8 @@ def test_rapid_sampler_backend_enabled_by_default(monkeypatch: pytest.MonkeyPatc
     from vllm.v1.sample.ops import topk_topp_sampler
 
     monkeypatch.delenv("VLLM_USE_RAPID_SAMPLER", raising=False)
-    monkeypatch.setattr(topk_topp_sampler, "_RAPID_SAMPLER_MODULE", None)
-    monkeypatch.setattr(
-        topk_topp_sampler, "_load_rapid_sampler_module", lambda: object()
-    )
+    monkeypatch.setattr(rapid_sampling, "_RAPID_SAMPLER_MODULE", None)
+    monkeypatch.setattr(rapid_sampling, "_load_rapid_sampler_module", lambda: object())
 
     assert topk_topp_sampler.rapid_sampler_supported()
 
@@ -266,7 +300,7 @@ def test_rapid_sampler_handles_unsupported_cuda_capability(
         monkeypatch.setenv("VLLM_USE_RAPID_SAMPLER", "1")
     else:
         monkeypatch.delenv("VLLM_USE_RAPID_SAMPLER", raising=False)
-    monkeypatch.setattr(topk_topp_sampler, "current_platform", MockPlatform())
+    monkeypatch.setattr(rapid_sampling, "current_platform", MockPlatform())
 
     if explicit_opt_in:
         with pytest.raises(RuntimeError, match="unsupported compute capability 6.0"):
@@ -451,12 +485,12 @@ def test_rapid_sample_rejects_vector_tensor_params_without_penalties(
     temperatures = torch.tensor([1.0, 1.0], dtype=torch.float32)
 
     monkeypatch.setattr(
-        topk_topp_sampler,
+        rapid_sampling,
         "rapid_sample_input_supported",
         lambda logits: True,
     )
     monkeypatch.setattr(
-        topk_topp_sampler,
+        rapid_sampling,
         "_load_rapid_sampler_module",
         lambda: FakeRapidModule(),
     )
@@ -526,17 +560,17 @@ def test_rapid_sample_requires_indexed_penalty_kernel(
     penalty_indices = torch.tensor([3, 1], dtype=torch.int32)
 
     monkeypatch.setattr(
-        topk_topp_sampler,
+        rapid_sampling,
         "rapid_sample_input_supported",
         lambda logits: True,
     )
     monkeypatch.setattr(
-        topk_topp_sampler,
+        rapid_sampling,
         "_load_rapid_sampler_module",
         lambda: FakeRapidModule(),
     )
     monkeypatch.setattr(
-        topk_topp_sampler,
+        rapid_sampling,
         "_rapid_states",
         lambda module, logits: torch.empty(2, dtype=torch.uint8),
     )
@@ -586,17 +620,17 @@ def test_rapid_sample_maps_per_request_frequency_penalty_to_rapid_repetition(
     penalty_decays = torch.tensor([0.95, 0.95], dtype=torch.float32)
 
     monkeypatch.setattr(
-        topk_topp_sampler,
+        rapid_sampling,
         "rapid_sample_input_supported",
         lambda logits: True,
     )
     monkeypatch.setattr(
-        topk_topp_sampler,
+        rapid_sampling,
         "_load_rapid_sampler_module",
         lambda: FakeRapidModule(),
     )
     monkeypatch.setattr(
-        topk_topp_sampler,
+        rapid_sampling,
         "_rapid_states",
         lambda module, logits: fake_states,
     )
