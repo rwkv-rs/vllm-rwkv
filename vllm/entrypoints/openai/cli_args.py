@@ -111,8 +111,9 @@ class BaseFrontendArgs:
     tool_call_parser: str | None = None
     """Select the tool call parser depending on the model that you're using.
     This is used to parse the model-generated tool call into OpenAI API format.
-    Required for `--enable-auto-tool-choice`. You can choose any option from
-    the built-in parsers or register a plugin via `--tool-parser-plugin`."""
+    Required for `--enable-auto-tool-choice` unless the selected renderer
+    provides a model-specific default. You can choose any built-in parser or
+    register a plugin via `--tool-parser-plugin`."""
     tool_parser_plugin: str = ""
     """Special the tool parser plugin write to parse the model-generated tool
     into OpenAI API format, the name register in this plugin can be used in
@@ -391,9 +392,8 @@ def validate_parsed_serve_args(args: argparse.Namespace):
     # Ensure that the chat template is valid; raises if it likely isn't
     validate_chat_template(args.chat_template)
 
-    # Enable auto tool needs a tool call parser to be valid
-    if args.enable_auto_tool_choice and not args.tool_call_parser:
-        raise TypeError("Error: --enable-auto-tool-choice requires --tool-call-parser")
+    # A renderer may supply a model-specific default tool parser. The final
+    # validation therefore happens after the renderer is loaded.
     if args.enable_log_outputs and not args.enable_log_requests:
         raise TypeError("Error: --enable-log-outputs requires --enable-log-requests")
 

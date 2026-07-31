@@ -35,7 +35,7 @@ class BeamSearchOnlineMixin(ABC):
     ) -> AsyncGenerator[RequestOutput, None]:
         beam_width = params.beam_width
         max_tokens = params.max_tokens
-        ignore_eos = params.ignore_eos
+        ignore_eos = self.renderer.resolve_ignore_eos(params.ignore_eos)
         temperature = params.temperature
         length_penalty = params.length_penalty
         include_stop_str_in_output = params.include_stop_str_in_output

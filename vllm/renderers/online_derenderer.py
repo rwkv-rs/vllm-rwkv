@@ -63,6 +63,13 @@ class OnlineDerenderer:
         self.enable_auto_tools = enable_auto_tools
         self.exclude_tools_when_tool_choice_none = exclude_tools_when_tool_choice_none
         self.use_harmony = model_config.hf_config.model_type == "gpt_oss"
+        tool_parser = tool_parser or (
+            renderer.default_tool_parser if enable_auto_tools else None
+        )
+        if enable_auto_tools and tool_parser is None:
+            raise TypeError(
+                "Error: --enable-auto-tool-choice requires --tool-call-parser"
+            )
         self.parser: type[Parser] | None = ParserManager.get_parser(
             tool_parser_name=tool_parser,
             reasoning_parser_name=reasoning_parser,

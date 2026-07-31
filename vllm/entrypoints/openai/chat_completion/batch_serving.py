@@ -11,6 +11,7 @@ from fastapi import Request
 from vllm.entrypoints.chat_utils import ConversationMessage
 from vllm.entrypoints.openai.chat_completion.protocol import (
     BatchChatCompletionRequest,
+    ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
     ChatMessage,
@@ -43,6 +44,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
     async def render_batch_chat_request(
         self,
         request: BatchChatCompletionRequest,
+        single_requests: list[ChatCompletionRequest] | None = None,
     ) -> tuple[list[list[ConversationMessage]], list[EngineInput]] | ErrorResponse:
         """Validate the model and preprocess a batched chat completion request.
 
@@ -80,8 +82,14 @@ class OpenAIServingChatBatch(OpenAIServingChat):
         all_conversations: list[list[ConversationMessage]] = []
         all_engine_prompts: list[EngineInput] = []
 
-        for messages in request.messages:
-            single_request = request.to_chat_completion_request(messages)
+        if single_requests is None:
+            single_requests = [
+                request.to_chat_completion_request(messages)
+                for messages in request.messages
+            ]
+        for messages, single_request in zip(
+            request.messages, single_requests, strict=True
+        ):
             if renderer.use_harmony:
                 conversation, engine_prompts = renderer._make_request_with_harmony(
                     single_request, should_include_tools=tool_dicts is not None
@@ -130,7 +138,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                 chat_template_kwargs=chat_template_kwargs,
             )
 
-        render_result = await self.render_batch_chat_request(request)
+        render_result = await self.render_batch_chat_request(request, single_requests)
         if isinstance(render_result, ErrorResponse):
             return render_result
         all_conversations, engine_prompts = render_result

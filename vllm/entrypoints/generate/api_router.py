@@ -52,6 +52,7 @@ async def init_generate_state(
     args: "Namespace",
     request_logger: RequestLogger | None,
     supported_tasks: tuple["SupportedTask", ...],
+    tool_parser: str | None,
 ):
     from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
     from vllm.entrypoints.chat_utils import load_chat_template
@@ -100,7 +101,7 @@ async def init_generate_state(
             chat_template_content_format=args.chat_template_content_format,
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_auto_tools=args.enable_auto_tool_choice,
-            tool_parser=args.tool_call_parser,
+            tool_parser=tool_parser,
             tool_server=tool_server,
             reasoning_parser=args.structured_outputs_config.reasoning_parser,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
@@ -124,7 +125,7 @@ async def init_generate_state(
         return_tokens_as_token_ids=args.return_tokens_as_token_ids,
         enable_auto_tools=args.enable_auto_tool_choice,
         exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
-        tool_parser=args.tool_call_parser,
+        tool_parser=tool_parser,
         reasoning_parser=args.structured_outputs_config.reasoning_parser,
         enable_prompt_tokens_details=args.enable_prompt_tokens_details,
         enable_force_include_usage=args.enable_force_include_usage,
@@ -167,7 +168,7 @@ async def init_generate_state(
             chat_template_content_format=args.chat_template_content_format,
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_auto_tools=args.enable_auto_tool_choice,
-            tool_parser=args.tool_call_parser,
+            tool_parser=tool_parser,
             reasoning_parser=args.structured_outputs_config.reasoning_parser,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,

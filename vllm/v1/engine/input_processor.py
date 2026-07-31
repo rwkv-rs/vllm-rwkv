@@ -321,6 +321,9 @@ class InputProcessor:
                 )
                 sampling_params.max_tokens = self.model_config.max_model_len - seq_len
 
+            sampling_params.ignore_eos = self.renderer.resolve_ignore_eos(
+                sampling_params.ignore_eos
+            )
             sampling_params.update_from_generation_config(
                 self.generation_config_fields,
                 self.renderer.get_eos_token_id(),

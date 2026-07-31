@@ -84,6 +84,14 @@ class OnlineRenderer:
         self.enable_auto_tools = enable_auto_tools
         self.exclude_tools_when_tool_choice_none = exclude_tools_when_tool_choice_none
         self.use_harmony = model_config.hf_config.model_type == "gpt_oss"
+        tool_parser = tool_parser or (
+            renderer.default_tool_parser if enable_auto_tools else None
+        )
+        if enable_auto_tools and tool_parser is None:
+            raise TypeError(
+                "Error: --enable-auto-tool-choice requires --tool-call-parser"
+            )
+        self.tool_parser_name = tool_parser
         self.parser: type[Parser] | None = ParserManager.get_parser(
             tool_parser_name=tool_parser,
             reasoning_parser_name=reasoning_parser,
@@ -393,6 +401,19 @@ class OnlineRenderer:
             default_media_io_kwargs=(mm_config.media_io_kwargs if mm_config else None),
             default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
         )
+        if chat_stop := renderer.get_chat_stop(messages, chat_params):
+            if getattr(request, "use_beam_search", False):
+                raise ValueError(
+                    "The selected chat template requires a text stop string, "
+                    "which beam search does not support."
+                )
+            request_stop = getattr(request, "stop", None)
+            request_stops = (
+                [request_stop]
+                if isinstance(request_stop, str)
+                else list(request_stop or ())
+            )
+            request.stop = list(dict.fromkeys([chat_stop, *request_stops]))
 
         reuse_ids = _reused_prompt_token_ids(request)
         if reuse_ids:

@@ -779,6 +779,14 @@ class DelegatingParser(Parser):
                     delta_message = DeltaMessage()
                 delta_message.content = (delta_message.content or "") + promoted
 
+        fallback_fn = getattr(self._tool_parser, "get_streaming_fallback_content", None)
+        if fallback_fn is not None:
+            promoted = fallback_fn(state.previous_text, request)
+            if promoted:
+                if delta_message is None:
+                    delta_message = DeltaMessage()
+                delta_message.content = (delta_message.content or "") + promoted
+
         self._append_unstreamed_tool_args(delta_message)
         return delta_message
 

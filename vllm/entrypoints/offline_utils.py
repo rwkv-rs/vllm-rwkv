@@ -4,6 +4,7 @@
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
+import msgspec
 from tqdm import tqdm
 from typing_extensions import TypeVar
 
@@ -28,7 +29,7 @@ from vllm.renderers.inputs.preprocess import (
     parse_model_prompt,
     prompt_to_seq,
 )
-from vllm.sampling_params import RequestOutputKind
+from vllm.sampling_params import BeamSearchParams, RequestOutputKind
 from vllm.utils.counter import Counter
 from vllm.utils.mistral import is_mistral_tokenizer
 from vllm.utils.tqdm_utils import maybe_tqdm
@@ -405,9 +406,43 @@ class OfflineInferenceMixin:
         mm_processor_kwargs: dict[str, Any] | None = None,
     ) -> list[str]:
         seq_convs = conversation_to_seq(messages)
-        seq_params = self._params_to_seq(params, len(seq_convs))
+        seq_params = list(self._params_to_seq(params, len(seq_convs)))
         seq_lora_requests = self._lora_request_to_seq(lora_request, len(seq_convs))
         seq_priority = self._priority_to_seq(priority, len(seq_convs))
+
+        chat_params = ChatParams(
+            chat_template=chat_template,
+            chat_template_content_format=chat_template_content_format,
+            chat_template_kwargs=merge_kwargs(
+                chat_template_kwargs,
+                dict(
+                    add_generation_prompt=add_generation_prompt,
+                    continue_final_message=continue_final_message,
+                    tools=tools,
+                ),
+            ),
+        )
+        for index, (conversation, request_params) in enumerate(
+            zip(seq_convs, seq_params, strict=True)
+        ):
+            chat_stop = self.renderer.get_chat_stop(conversation, chat_params)
+            if chat_stop is None:
+                continue
+            if isinstance(request_params, BeamSearchParams):
+                raise ValueError(
+                    "The selected chat template requires a text stop string, "
+                    "which beam search does not support."
+                )
+            if isinstance(request_params, SamplingParams) and request_params.detokenize:
+                user_stops = (
+                    [request_params.stop]
+                    if isinstance(request_params.stop, str)
+                    else list(request_params.stop or ())
+                )
+                seq_params[index] = msgspec.structs.replace(
+                    request_params,
+                    stop=list(dict.fromkeys([chat_stop, *user_stops])),
+                )
 
         # When thinking is enabled or tools are provided, and the model
         # uses special tokens for structured output (e.g. Gemma4's

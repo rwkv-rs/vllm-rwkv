@@ -10,8 +10,15 @@ from pathlib import Path
 from typing import Any, overload
 
 from transformers import BatchEncoding
+from transformers.utils import chat_template_utils as hf_chat_utils
 
 from .protocol import TokenizerLike
+from .rwkv_chat import (
+    RWKV_GENERATION_PROMPT_OPEN_THINK,
+    RWKV_NATIVE_CHAT_TEMPLATE,
+    ensure_rwkv_prompt_bos,
+    render_rwkv_chat,
+)
 
 _VOCAB_FILE = Path(__file__).parent / "assets" / "rwkv_vocab_v20230424.txt"
 _RWKV7_VOCAB_SIZE = 65536
@@ -149,7 +156,7 @@ class RWKVTokenizer(TokenizerLike):
         return self._truncation_side
 
     def num_special_tokens_to_add(self) -> int:
-        return 0
+        return 1
 
     def encode_bytes(self, source: bytes) -> list[int]:
         tokens: list[int] = []
@@ -189,15 +196,28 @@ class RWKVTokenizer(TokenizerLike):
         max_length: int | None = None,
         add_special_tokens: bool = True,
     ) -> list[int]:
-        del add_special_tokens
         tokens = self.encode_bytes(text.encode("utf-8"))
+        if add_special_tokens:
+            tokens = ensure_rwkv_prompt_bos(tokens)
         if truncation and max_length is not None:
             if max_length < 0:
                 raise ValueError(f"max_length must be non-negative, got {max_length}")
             if max_length == 0:
+                if add_special_tokens:
+                    raise ValueError(
+                        "RWKV prompts require one token for BOS/EOS token 0."
+                    )
                 return []
             if self.truncation_side == "left":
-                tokens = tokens[-max_length:]
+                tokens = (
+                    ensure_rwkv_prompt_bos(
+                        tokens,
+                        max_length=max_length,
+                        truncate_from_left=True,
+                    )
+                    if add_special_tokens
+                    else tokens[-max_length:]
+                )
             else:
                 tokens = tokens[:max_length]
         return tokens
@@ -297,14 +317,59 @@ class RWKVTokenizer(TokenizerLike):
                 chunks.append(token.encode("utf-8"))
         return b"".join(chunks).decode("utf-8", errors="replace")
 
+    def get_chat_template(
+        self,
+        chat_template: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> str:
+        del tools
+        return chat_template or RWKV_NATIVE_CHAT_TEMPLATE
+
     def apply_chat_template(
         self,
-        messages: list[Any],
+        messages: list[Any] | None = None,
         tools: list[dict[str, Any]] | None = None,
+        chat_template: str | None = None,
+        tokenize: bool = False,
+        add_generation_prompt: bool = False,
+        continue_final_message: bool = False,
+        rwkv_generation_prompt: str = RWKV_GENERATION_PROMPT_OPEN_THINK,
+        rwkv_prompt_template: str | None = None,
+        return_dict: bool = False,
         **kwargs,
     ) -> str | list[int]:
-        del messages, tools, kwargs
-        raise NotImplementedError("RWKVTokenizer does not define a chat template.")
+        del return_dict
+        conversation = (
+            messages if messages is not None else kwargs.pop("conversation", None)
+        )
+        if conversation is None:
+            raise ValueError("Either 'messages' or 'conversation' must be provided.")
+
+        kwargs.pop("add_special_tokens", None)
+        template = self.get_chat_template(chat_template, tools)
+        if template.strip() == RWKV_NATIVE_CHAT_TEMPLATE:
+            prompt = render_rwkv_chat(
+                list(conversation),
+                tools,
+                add_generation_prompt=add_generation_prompt,
+                continue_final_message=continue_final_message,
+                generation_prompt=rwkv_generation_prompt,
+                prompt_template=rwkv_prompt_template,
+            )
+        else:
+            rendered, _ = hf_chat_utils.render_jinja_template(
+                [list(conversation)],
+                chat_template=template,
+                tools=tools,
+                add_generation_prompt=add_generation_prompt,
+                continue_final_message=continue_final_message,
+                **kwargs,
+            )
+            prompt = rendered[0] if rendered else ""
+
+        if tokenize:
+            return self.encode(prompt, add_special_tokens=True)
+        return prompt
 
     @staticmethod
     def _token_to_vocab_key(token: bytes) -> str:

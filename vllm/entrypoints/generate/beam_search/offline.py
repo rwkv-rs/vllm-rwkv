@@ -80,7 +80,7 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
         beam_width = params.beam_width
         max_tokens = params.max_tokens
         temperature = params.temperature
-        ignore_eos = params.ignore_eos
+        ignore_eos = self.renderer.resolve_ignore_eos(params.ignore_eos)
         length_penalty = params.length_penalty
 
         tokenizer = self.renderer.get_tokenizer()

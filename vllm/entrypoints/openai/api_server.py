@@ -360,13 +360,6 @@ async def init_app_state(
 ) -> None:
     vllm_config = engine_client.vllm_config
 
-    if args.tool_call_parser is not None:
-        from vllm.parser.metrics import init_parser_metrics
-
-        init_parser_metrics(
-            model_name=cast(str, vllm_config.model_config.served_model_name)
-        )
-
     if supported_tasks is None:
         warnings.warn(
             "The 'supported_tasks' parameter was not provided to "
@@ -426,6 +419,13 @@ async def init_app_state(
         default_chat_template_kwargs=args.default_chat_template_kwargs,
         log_error_stack=args.log_error_stack,
     )
+    effective_tool_parser = state.online_renderer.tool_parser_name
+    if effective_tool_parser is not None:
+        from vllm.parser.metrics import init_parser_metrics
+
+        init_parser_metrics(
+            model_name=cast(str, vllm_config.model_config.served_model_name)
+        )
 
     state.online_derenderer = OnlineDerenderer(
         model_config=engine_client.model_config,
@@ -436,7 +436,7 @@ async def init_app_state(
         trust_request_chat_template=args.trust_request_chat_template,
         enable_auto_tools=args.enable_auto_tool_choice,
         exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
-        tool_parser=args.tool_call_parser,
+        tool_parser=effective_tool_parser,
         reasoning_parser=args.structured_outputs_config.reasoning_parser,
         default_chat_template_kwargs=args.default_chat_template_kwargs,
         log_error_stack=args.log_error_stack,
@@ -456,7 +456,12 @@ async def init_app_state(
         from vllm.entrypoints.generate.api_router import init_generate_state
 
         await init_generate_state(
-            engine_client, state, args, request_logger, supported_tasks
+            engine_client,
+            state,
+            args,
+            request_logger,
+            supported_tasks,
+            effective_tool_parser,
         )
 
         from vllm.entrypoints.scale_out.factories import init_scale_out_state
@@ -539,7 +544,7 @@ async def init_render_app_state(
         trust_request_chat_template=args.trust_request_chat_template,
         enable_auto_tools=args.enable_auto_tool_choice,
         exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
-        tool_parser=args.tool_call_parser,
+        tool_parser=state.online_renderer.tool_parser_name,
         reasoning_parser=args.reasoning_parser,
         default_chat_template_kwargs=args.default_chat_template_kwargs,
         log_error_stack=args.log_error_stack,
@@ -599,7 +604,11 @@ def create_server_unix_socket(path: str) -> socket.socket:
 
 def validate_api_server_args(args):
     valid_tool_parses = ToolParserManager.list_registered()
-    if args.enable_auto_tool_choice and args.tool_call_parser not in valid_tool_parses:
+    if (
+        args.enable_auto_tool_choice
+        and args.tool_call_parser is not None
+        and args.tool_call_parser not in valid_tool_parses
+    ):
         raise KeyError(
             f"invalid tool call parser: {args.tool_call_parser} "
             f"(chose from {{ {','.join(valid_tool_parses)} }})"

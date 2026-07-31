@@ -147,11 +147,9 @@ def test_multiple_valid_inputs(serve_parser):
 
 ### Tests for serve argument validation that run prior to loading
 def test_enable_auto_choice_passes_without_tool_call_parser(serve_parser):
-    """Ensure validation fails if tool choice is enabled with no call parser"""
-    # If we enable-auto-tool-choice, explode with no tool-call-parser
+    """Defer validation so model renderers can provide their default parser."""
     args = serve_parser.parse_args(args=["--enable-auto-tool-choice"])
-    with pytest.raises(TypeError):
-        validate_parsed_serve_args(args)
+    validate_parsed_serve_args(args)
 
 
 def test_enable_auto_choice_passes_with_tool_call_parser(serve_parser):
@@ -167,7 +165,7 @@ def test_enable_auto_choice_passes_with_tool_call_parser(serve_parser):
 
 
 def test_enable_auto_choice_fails_with_enable_reasoning(serve_parser):
-    """Ensure validation fails if reasoning is enabled with auto tool choice"""
+    """Reasoning parsing does not block deferred tool parser resolution."""
     args = serve_parser.parse_args(
         args=[
             "--enable-auto-tool-choice",
@@ -175,8 +173,7 @@ def test_enable_auto_choice_fails_with_enable_reasoning(serve_parser):
             "deepseek_r1",
         ]
     )
-    with pytest.raises(TypeError):
-        validate_parsed_serve_args(args)
+    validate_parsed_serve_args(args)
 
 
 def test_passes_with_reasoning_parser(serve_parser):

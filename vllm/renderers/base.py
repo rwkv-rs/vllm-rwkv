@@ -70,6 +70,8 @@ _T = TypeVar("_T", bound=TokenizerLike, default=TokenizerLike)
 
 
 class BaseRenderer(ABC, Generic[_T]):
+    default_tool_parser: str | None = None
+
     def __init__(self, config: "VllmConfig", tokenizer: _T | None) -> None:
         super().__init__()
 
@@ -316,6 +318,27 @@ class BaseRenderer(ABC, Generic[_T]):
 
         return self.tokenizer.eos_token_id
 
+    def resolve_ignore_eos(self, ignore_eos: bool) -> bool:
+        """Apply a model-specific EOS policy without changing other models."""
+        return ignore_eos
+
+    def get_chat_stop(
+        self,
+        messages: Sequence["ChatCompletionMessageParam"],
+        params: ChatParams,
+    ) -> str | None:
+        """Return a renderer-owned text stop for the selected chat template."""
+        return None
+
+    def normalize_prompt_token_ids(
+        self,
+        token_ids: Sequence[int],
+        *,
+        max_length: int | None = None,
+    ) -> list[int]:
+        """Apply model-specific invariants to token inputs."""
+        return list(token_ids)
+
     def get_dec_start_token_id(self) -> int:
         """
         Obtain the decoder start token id employed by an encoder/decoder model,
@@ -531,7 +554,16 @@ class BaseRenderer(ABC, Generic[_T]):
 
             prompt = self._detokenize_prompt(prompt)  # type: ignore[arg-type]
 
-        return params.apply_post_tokenization(self.tokenizer, prompt)  # type: ignore[arg-type]
+        prompt = params.apply_post_tokenization(self.tokenizer, prompt)  # type: ignore[arg-type]
+        if "prompt_token_ids" in prompt:
+            max_length = params.truncate_prompt_tokens
+            if max_length is None or max_length < 0:
+                max_length = params.max_input_tokens
+            prompt["prompt_token_ids"] = self.normalize_prompt_token_ids(
+                prompt["prompt_token_ids"],
+                max_length=max_length,
+            )
+        return prompt
 
     @overload
     async def _tokenize_singleton_prompt_async(
@@ -567,7 +599,16 @@ class BaseRenderer(ABC, Generic[_T]):
 
             prompt = await self._detokenize_prompt_async(prompt)  # type: ignore[arg-type]
 
-        return params.apply_post_tokenization(self.tokenizer, prompt)  # type: ignore[arg-type]
+        prompt = params.apply_post_tokenization(self.tokenizer, prompt)  # type: ignore[arg-type]
+        if "prompt_token_ids" in prompt:
+            max_length = params.truncate_prompt_tokens
+            if max_length is None or max_length < 0:
+                max_length = params.max_input_tokens
+            prompt["prompt_token_ids"] = self.normalize_prompt_token_ids(
+                prompt["prompt_token_ids"],
+                max_length=max_length,
+            )
+        return prompt
 
     def _tokenize_enc_dec_prompt(
         self,
@@ -773,7 +814,10 @@ class BaseRenderer(ABC, Generic[_T]):
         """Process token inputs, with multimodal preprocessing offloaded
         to the shared thread pool in the async variant.
         """
-        prompt_token_ids = prompt["prompt_token_ids"]
+        prompt_token_ids = self.normalize_prompt_token_ids(
+            prompt["prompt_token_ids"],
+            max_length=self.model_config.max_model_len,
+        )
 
         engine_input: TokensInput | MultiModalInput
         if multi_modal_data := prompt.get("multi_modal_data"):
@@ -836,7 +880,10 @@ class BaseRenderer(ABC, Generic[_T]):
         *,
         skip_mm_cache: bool = False,
     ) -> TokensInput | MultiModalInput:
-        prompt_token_ids = prompt["prompt_token_ids"]
+        prompt_token_ids = self.normalize_prompt_token_ids(
+            prompt["prompt_token_ids"],
+            max_length=self.model_config.max_model_len,
+        )
 
         engine_input: TokensInput | MultiModalInput
         if multi_modal_data := prompt.get("multi_modal_data"):

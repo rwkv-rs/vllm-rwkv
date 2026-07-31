@@ -22,6 +22,10 @@ Example:
 
 
 _TOOL_PARSERS_TO_REGISTER = {
+    "rwkv": (
+        "rwkv_tool_parser",
+        "RWKVToolParser",
+    ),
     "deepseek_v3": (  # name
         "deepseekv3_tool_parser",  # filename
         "DeepSeekV3ToolParser",  # class_name
