@@ -813,6 +813,32 @@ def is_attention_free(
 
 
 @runtime_checkable
+class RequiresUniformDecodeWave(Protocol):
+    """The interface for models that must schedule ready decode requests
+    together as a uniform one-token wave."""
+
+    requires_uniform_decode_wave: ClassVar[Literal[True]] = True
+
+
+@overload
+def requires_uniform_decode_wave(
+    model: object,
+) -> TypeIs[RequiresUniformDecodeWave]: ...
+
+
+@overload
+def requires_uniform_decode_wave(
+    model: type[object],
+) -> TypeIs[type[RequiresUniformDecodeWave]]: ...
+
+
+def requires_uniform_decode_wave(
+    model: type[object] | object,
+) -> TypeIs[type[RequiresUniformDecodeWave]] | TypeIs[RequiresUniformDecodeWave]:
+    return getattr(model, "requires_uniform_decode_wave", False)
+
+
+@runtime_checkable
 class IsHybrid(Protocol):
     """The interface required for all models like Jamba that have both
     attention and mamba blocks, indicates that

@@ -1764,6 +1764,10 @@ class ModelConfig:
         return self._model_info.is_attention_free
 
     @property
+    def requires_uniform_decode_wave(self) -> bool:
+        return self._model_info.requires_uniform_decode_wave
+
+    @property
     def is_hybrid(self) -> bool:
         if not self._model_info.is_hybrid:
             return False

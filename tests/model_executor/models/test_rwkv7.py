@@ -13,6 +13,7 @@ import vllm.model_executor.models.rwkv7 as rwkv7
 from vllm.config.compilation import CompilationConfig, CompilationMode, CUDAGraphMode
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.models.config import RWKV7ForCausalLMConfig
+from vllm.model_executor.models.interfaces import requires_uniform_decode_wave
 from vllm.model_executor.models.rwkv7 import RWKV7ForCausalLM
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
@@ -25,6 +26,10 @@ from vllm.v1.worker.gpu_input_batch import (
 from vllm.v1.worker.gpu_input_batch import (
     InputBatch as LegacyInputBatch,
 )
+
+
+def test_rwkv7_declares_uniform_decode_wave_capability():
+    assert requires_uniform_decode_wave(RWKV7ForCausalLM)
 
 
 def test_rwkv7_cuda_ops_match_torch_reference():
@@ -716,8 +721,7 @@ def test_rwkv7_config_captures_full_decode_capacity():
     RWKV7ForCausalLMConfig.verify_and_update_config(vllm_config)
 
     assert (
-        vllm_config.compilation_config.max_cudagraph_capture_size
-        == configured_capacity
+        vllm_config.compilation_config.max_cudagraph_capture_size == configured_capacity
     )
 
 
@@ -744,12 +748,10 @@ def test_rwkv7_config_preserves_explicit_cudagraph_sizes(compilation_config):
     RWKV7ForCausalLMConfig.verify_and_update_config(vllm_config)
 
     assert (
-        vllm_config.compilation_config.max_cudagraph_capture_size
-        == expected_max_size
+        vllm_config.compilation_config.max_cudagraph_capture_size == expected_max_size
     )
     assert (
-        vllm_config.compilation_config.cudagraph_capture_sizes
-        == expected_capture_sizes
+        vllm_config.compilation_config.cudagraph_capture_sizes == expected_capture_sizes
     )
 
 
@@ -3713,6 +3715,7 @@ def test_rwkv7_model_state_requires_rapid_sampler():
     state = object.__new__(RWKV7ModelState)
     sampler = SimpleNamespace(use_rapid=True, require_rapid=False)
 
+    assert "uniform recurrent decode waves" in state.get_v2_kernel_warmup_skip_reason()
     assert state.custom_sampler(sampler) == (sampler, None)
     assert sampler.require_rapid is True
 

@@ -51,7 +51,10 @@ from vllm.v1.worker.gpu.lora_utils import LoraState
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner as PackedGPUModelRunner
-from vllm.v1.worker.gpu.warmup import warmup_kernels
+from vllm.v1.worker.gpu.warmup import (
+    get_v2_kernel_warmup_skip_reason,
+    warmup_kernels,
+)
 from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import select_common_block_size
@@ -59,6 +62,17 @@ from vllm.v1.worker.utils import select_common_block_size
 BLOCK_SIZE = 16
 NUM_BLOCKS = 10
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_v2_kernel_warmup_skip_reason_uses_model_state_hook():
+    model_runner = SimpleNamespace(
+        model_state=SimpleNamespace(
+            get_v2_kernel_warmup_skip_reason=lambda: "backend constraint"
+        )
+    )
+
+    assert get_v2_kernel_warmup_skip_reason(model_runner) == "backend constraint"
+    assert get_v2_kernel_warmup_skip_reason(SimpleNamespace()) is None
 
 
 def test_warmup_kernels_handles_no_kv_cache_groups(monkeypatch):
@@ -77,8 +91,11 @@ def test_warmup_kernels_handles_no_kv_cache_groups(monkeypatch):
             max_num_batched_tokens=16,
         ),
         is_pooling_model=False,
+        is_encoder_decoder=False,
         is_last_pp_rank=True,
         model_config=SimpleNamespace(get_vocab_size=lambda: 64),
+        model_state=SimpleNamespace(max_encoder_len=0),
+        kv_block_zeroer=None,
         kv_connector=kv_connector,
     )
     executed: list[Any] = []
@@ -90,16 +107,24 @@ def test_warmup_kernels_handles_no_kv_cache_groups(monkeypatch):
         True,
         False,
     ]
-    assert len(executed) == 3
-    assert len(sampled) == 2
+    assert len(executed) == 5
+    assert len(sampled) == 4
 
-    prefill_output, decode_output, cleanup_output = executed
+    prefill_output = executed[0]
+    decode_outputs = executed[1:-1]
+    cleanup_output = executed[-1]
     assert len(prefill_output.scheduled_new_reqs) == 4
     assert all(req.block_ids == () for req in prefill_output.scheduled_new_reqs)
     assert prefill_output.num_common_prefix_blocks == []
 
-    assert decode_output.scheduled_cached_reqs.new_block_ids == [None] * 4
-    assert decode_output.num_common_prefix_blocks == []
+    assert all(
+        all(
+            block_ids is None
+            for block_ids in output.scheduled_cached_reqs.new_block_ids
+        )
+        for output in decode_outputs
+    )
+    assert all(output.num_common_prefix_blocks == [] for output in decode_outputs)
     assert cleanup_output.finished_req_ids == {f"_warmup_{i}_" for i in range(4)}
 
 

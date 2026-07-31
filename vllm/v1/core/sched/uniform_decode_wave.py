@@ -4,17 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 
-_RWKV7_ARCHITECTURE = "RWKV7ForCausalLM"
-
-
 @dataclass
-class RWKVDecodeWavePlan:
+class UniformDecodeWavePlan:
     pending_decode_request_ids: set[str] = field(default_factory=set)
     block_decode: bool = False
 
@@ -48,15 +45,7 @@ class RWKVDecodeWavePlan:
         return request_or_request_id.request_id
 
 
-class RWKVNativeDecodeWavePolicy:
-    @staticmethod
-    def enabled_for_model(model_config: Any) -> bool:
-        architecture = getattr(model_config, "architecture", None)
-        architectures = getattr(model_config, "architectures", None) or []
-        return (
-            architecture == _RWKV7_ARCHITECTURE or _RWKV7_ARCHITECTURE in architectures
-        )
-
+class UniformDecodeWavePolicy:
     @staticmethod
     def make_plan(
         *,
@@ -65,7 +54,7 @@ class RWKVNativeDecodeWavePolicy:
         current_step: int,
         max_model_len: int,
         num_sampled_tokens_per_step: int,
-    ) -> RWKVDecodeWavePlan:
+    ) -> UniformDecodeWavePlan:
         decode_wave: list[Request] = []
         has_lower_running_prefill = False
 
@@ -75,15 +64,15 @@ class RWKVNativeDecodeWavePolicy:
                     has_lower_running_prefill = True
                 continue
             if has_lower_running_prefill:
-                return RWKVDecodeWavePlan(block_decode=True)
+                return UniformDecodeWavePlan(block_decode=True)
             if current_step < request.next_decode_eligible_step:
-                return RWKVDecodeWavePlan(block_decode=True)
+                return UniformDecodeWavePlan(block_decode=True)
             if (
                 request.num_output_placeholders > 0
                 and request.num_computed_tokens + 2 - request.num_output_placeholders
                 >= request.num_prompt_tokens + request.max_tokens
             ):
-                return RWKVDecodeWavePlan(block_decode=True)
+                return UniformDecodeWavePlan(block_decode=True)
 
             num_new_tokens = (
                 request.num_tokens_with_spec
@@ -99,24 +88,24 @@ class RWKVNativeDecodeWavePolicy:
             if num_new_tokens == 1:
                 decode_wave.append(request)
             elif num_new_tokens == 0:
-                return RWKVDecodeWavePlan(block_decode=True)
+                return UniformDecodeWavePlan(block_decode=True)
             elif num_new_tokens > 1:
                 raise ValueError(
-                    "RWKV7 native decode wave only supports one-token decode "
-                    f"requests; request {request.request_id!r} has "
+                    "Uniform decode wave only supports one-token decode requests; "
+                    f"request {request.request_id!r} has "
                     f"{num_new_tokens} schedulable tokens."
                 )
 
         if len(decode_wave) > token_budget:
             raise ValueError(
-                "RWKV7 native decode wave requires scheduling all ready decode "
-                "requests in one step. Increase max_num_scheduled_tokens or "
+                "Uniform decode wave requires scheduling all ready decode requests "
+                "in one step. Increase max_num_scheduled_tokens or "
                 "max_num_batched_tokens."
             )
 
-        return RWKVDecodeWavePlan(
+        return UniformDecodeWavePlan(
             pending_decode_request_ids={request.request_id for request in decode_wave},
         )
 
 
-__all__ = ["RWKVDecodeWavePlan", "RWKVNativeDecodeWavePolicy"]
+__all__ = ["UniformDecodeWavePlan", "UniformDecodeWavePolicy"]

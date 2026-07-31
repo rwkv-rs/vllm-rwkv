@@ -51,7 +51,7 @@ from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
 )
-from vllm.v1.core.sched.rwkv_decode_wave import RWKVNativeDecodeWavePolicy
+from vllm.v1.core.sched.uniform_decode_wave import UniformDecodeWavePolicy
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -96,9 +96,7 @@ class Scheduler(SchedulerInterface):
         self.structured_output_manager = structured_output_manager
         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
         model_config = vllm_config.model_config
-        self.use_rwkv_native_decode_wave = RWKVNativeDecodeWavePolicy.enabled_for_model(
-            model_config
-        )
+        self.requires_uniform_decode_wave = model_config.requires_uniform_decode_wave
 
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
@@ -484,9 +482,9 @@ class Scheduler(SchedulerInterface):
         defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
-        rwkv_decode_wave_plan = None
-        if self.use_rwkv_native_decode_wave and token_budget > 0 and self.running:
-            rwkv_decode_wave_plan = RWKVNativeDecodeWavePolicy.make_plan(
+        uniform_decode_wave_plan = None
+        if self.requires_uniform_decode_wave and token_budget > 0 and self.running:
+            uniform_decode_wave_plan = UniformDecodeWavePolicy.make_plan(
                 running_requests=self.running,
                 token_budget=token_budget,
                 current_step=self.current_step,
@@ -499,8 +497,8 @@ class Scheduler(SchedulerInterface):
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
             if (
-                rwkv_decode_wave_plan is not None
-                and not rwkv_decode_wave_plan.allows_running_request(request)
+                uniform_decode_wave_plan is not None
+                and not uniform_decode_wave_plan.allows_running_request(request)
             ):
                 req_index += 1
                 continue
@@ -657,8 +655,8 @@ class Scheduler(SchedulerInterface):
             token_budget -= num_new_tokens
             req_index += 1
             if (
-                rwkv_decode_wave_plan is not None
-                and rwkv_decode_wave_plan.on_running_request_scheduled(request)
+                uniform_decode_wave_plan is not None
+                and uniform_decode_wave_plan.on_running_request_scheduled(request)
             ):
                 req_index = 0
 

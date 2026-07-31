@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm import PoolingParams, SamplingParams
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
@@ -25,9 +26,10 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 logger = init_logger(__name__)
 
 
-def should_skip_v2_kernel_warmup(model_runner: object) -> bool:
+def get_v2_kernel_warmup_skip_reason(model_runner: object) -> str | None:
     model_state = getattr(model_runner, "model_state", None)
-    return model_state.__class__.__name__ == "RWKV7ModelState"
+    get_reason = getattr(model_state, "get_v2_kernel_warmup_skip_reason", None)
+    return get_reason() if callable(get_reason) else None
 
 
 def run_mixed_prefill_decode_warmup(

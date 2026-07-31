@@ -105,6 +105,10 @@ class ModelState(ABC):
         """
         return AttentionCGSupport.ALWAYS, None
 
+    def get_v2_kernel_warmup_skip_reason(self) -> str | None:
+        """Return why generic V2 mixed prefill/decode warmup is unsupported."""
+        return None
+
     def preprocess_state(
         self,
         input_batch: InputBatch,

@@ -50,6 +50,7 @@ from .interfaces import (
     is_attention_free,
     is_hybrid,
     requires_raw_input_tokens,
+    requires_uniform_decode_wave,
     supports_mamba_prefix_caching,
     supports_multimodal,
     supports_multimodal_encoder_tp_data,
@@ -806,6 +807,7 @@ class _ModelInfo:
     supports_pp: bool
     has_inner_state: bool
     is_attention_free: bool
+    requires_uniform_decode_wave: bool
     is_hybrid: bool
     has_noops: bool
     supports_mamba_prefix_caching: bool
@@ -835,6 +837,7 @@ class _ModelInfo:
             supports_pp=supports_pp(model),
             has_inner_state=has_inner_state(model),
             is_attention_free=is_attention_free(model),
+            requires_uniform_decode_wave=requires_uniform_decode_wave(model),
             is_hybrid=is_hybrid(model),
             supports_mamba_prefix_caching=supports_mamba_prefix_caching(model),
             supports_replayssm=supports_replayssm(model),

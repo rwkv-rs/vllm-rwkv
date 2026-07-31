@@ -82,13 +82,13 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from ...model_executor.model_loader import TensorizerLoader
-from .gpu.warmup import should_skip_v2_kernel_warmup, warmup_kernels
+from .gpu.warmup import get_v2_kernel_warmup_skip_reason, warmup_kernels
 from .utils import request_memory
 
-if get_build_profile_metadata().profile == "rwkv":
+if not get_build_profile_metadata().unrestricted:
 
     def kernel_warmup(worker: "Worker") -> None:
-        """Skip attention/MoE kernel warmups omitted by the RWKV artifact."""
+        """Skip kernel warmups for operators omitted by a reduced artifact."""
 
 else:
     from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
@@ -800,8 +800,11 @@ class Worker(WorkerBase):
 
         if self.use_v2_model_runner:
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
-            if should_skip_v2_kernel_warmup(self.model_runner):
-                logger.info("Skipping the incompatible V2 kernel warmup for RWKV7.")
+            skip_reason = get_v2_kernel_warmup_skip_reason(self.model_runner)
+            if skip_reason is not None:
+                logger.info(
+                    "Skipping the incompatible V2 kernel warmup: %s.", skip_reason
+                )
             else:
                 warmup_kernels(
                     self.model_runner, self.execute_model, self.sample_tokens

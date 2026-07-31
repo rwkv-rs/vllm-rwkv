@@ -32,8 +32,8 @@ from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
-from vllm.v1.core.sched.rwkv_decode_wave import RWKVNativeDecodeWavePolicy
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.uniform_decode_wave import UniformDecodeWavePolicy
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
@@ -510,7 +510,7 @@ class _FakeEncoderCacheManager:
 
 def _new_fake_scheduler(
     *,
-    use_rwkv_native_decode_wave: bool,
+    requires_uniform_decode_wave: bool,
     max_num_scheduled_tokens: int = 16,
     max_num_running_reqs: int = 16,
 ) -> Scheduler:
@@ -529,7 +529,7 @@ def _new_fake_scheduler(
     scheduler.num_sampled_tokens_per_step = 1
     scheduler.num_lookahead_tokens = 0
     scheduler.max_num_encoder_input_tokens = 0
-    scheduler.use_rwkv_native_decode_wave = use_rwkv_native_decode_wave
+    scheduler.requires_uniform_decode_wave = requires_uniform_decode_wave
     scheduler.prefill_capacity_bound = False
     scheduler._pause_state = PauseState.UNPAUSED
     scheduler.policy = SchedulingPolicy.FCFS
@@ -587,34 +587,8 @@ def _new_running_prefill_chunk_request(req_id: str) -> Request:
     return request
 
 
-@pytest.mark.parametrize(
-    ("model_config", "enabled"),
-    [
-        pytest.param(
-            SimpleNamespace(architecture="RWKV7ForCausalLM", architectures=[]),
-            True,
-            id="resolved-architecture",
-        ),
-        pytest.param(
-            SimpleNamespace(architecture=None, architectures=["RWKV7ForCausalLM"]),
-            True,
-            id="declared-architectures",
-        ),
-        pytest.param(
-            SimpleNamespace(architecture="LlamaForCausalLM", architectures=[]),
-            False,
-            id="other-model",
-        ),
-    ],
-)
-def test_rwkv_decode_wave_policy_matches_model_architecture(
-    model_config: SimpleNamespace, enabled: bool
-) -> None:
-    assert RWKVNativeDecodeWavePolicy.enabled_for_model(model_config) is enabled
-
-
-def test_rwkv_decode_wave_policy_rejects_multi_token_decode_request():
-    policy = RWKVNativeDecodeWavePolicy()
+def test_uniform_decode_wave_policy_rejects_multi_token_decode_request():
+    policy = UniformDecodeWavePolicy()
     request = _new_ready_decode_request("r0")
     request.append_output_token_ids(1)
 
@@ -628,8 +602,8 @@ def test_rwkv_decode_wave_policy_rejects_multi_token_decode_request():
         )
 
 
-def test_rwkv_decode_wave_policy_restarts_after_complete_decode_wave():
-    policy = RWKVNativeDecodeWavePolicy()
+def test_uniform_decode_wave_policy_restarts_after_complete_decode_wave():
+    policy = UniformDecodeWavePolicy()
     decode0 = _new_ready_decode_request("r0")
     decode1 = _new_ready_decode_request("r1")
     prefill = _new_running_prefill_chunk_request("p0")
@@ -652,7 +626,7 @@ def test_rwkv_decode_wave_policy_restarts_after_complete_decode_wave():
 
 
 def test_rwkv_scheduler_waits_when_live_decode_row_is_not_ready():
-    scheduler = _new_fake_scheduler(use_rwkv_native_decode_wave=True)
+    scheduler = _new_fake_scheduler(requires_uniform_decode_wave=True)
     req0 = _new_ready_decode_request("r0")
     req1 = _new_ready_decode_request("r1")
     scheduler.running = [req0, req1]
@@ -667,7 +641,7 @@ def test_rwkv_scheduler_waits_when_live_decode_row_is_not_ready():
 
 
 def test_rwkv_scheduler_allows_running_prefill_chunk_when_decode_wave_unready():
-    scheduler = _new_fake_scheduler(use_rwkv_native_decode_wave=True)
+    scheduler = _new_fake_scheduler(requires_uniform_decode_wave=True)
     ready = _new_ready_decode_request("r0")
     unready = _new_ready_decode_request("r1")
     unready.next_decode_eligible_step = scheduler.current_step + 2
@@ -684,7 +658,7 @@ def test_rwkv_scheduler_allows_running_prefill_chunk_when_decode_wave_unready():
 
 
 def test_rwkv_scheduler_holds_decode_behind_lower_running_prefill_chunk():
-    scheduler = _new_fake_scheduler(use_rwkv_native_decode_wave=True)
+    scheduler = _new_fake_scheduler(requires_uniform_decode_wave=True)
     prefill = _new_running_prefill_chunk_request("p0")
     decode = _new_ready_decode_request("r0")
     scheduler.running = [prefill, decode]
@@ -698,7 +672,7 @@ def test_rwkv_scheduler_holds_decode_behind_lower_running_prefill_chunk():
 
 
 def test_rwkv_scheduler_waits_when_live_decode_row_reaches_max_tokens():
-    scheduler = _new_fake_scheduler(use_rwkv_native_decode_wave=True)
+    scheduler = _new_fake_scheduler(requires_uniform_decode_wave=True)
     req0 = _new_ready_decode_request("r0")
     req1 = _new_ready_decode_request("r1")
     scheduler.running = [req0, req1]
@@ -715,7 +689,7 @@ def test_rwkv_scheduler_waits_when_live_decode_row_reaches_max_tokens():
 
 def test_rwkv_scheduler_requires_complete_ready_decode_wave_budget():
     scheduler = _new_fake_scheduler(
-        use_rwkv_native_decode_wave=True,
+        requires_uniform_decode_wave=True,
         max_num_scheduled_tokens=1,
     )
     scheduler.running = [
@@ -723,13 +697,13 @@ def test_rwkv_scheduler_requires_complete_ready_decode_wave_budget():
         _new_ready_decode_request("r1"),
     ]
 
-    with pytest.raises(ValueError, match="RWKV7 native decode wave"):
+    with pytest.raises(ValueError, match="Uniform decode wave"):
         scheduler.schedule()
 
 
 def test_rwkv_scheduler_keeps_live_decode_running_while_refilling_rows():
     scheduler = _new_fake_scheduler(
-        use_rwkv_native_decode_wave=True,
+        requires_uniform_decode_wave=True,
         max_num_scheduled_tokens=8,
         max_num_running_reqs=3,
     )
@@ -748,7 +722,7 @@ def test_rwkv_scheduler_keeps_live_decode_running_while_refilling_rows():
 
 
 def test_rwkv_scheduler_waits_when_live_decode_row_has_no_token_ready():
-    scheduler = _new_fake_scheduler(use_rwkv_native_decode_wave=True)
+    scheduler = _new_fake_scheduler(requires_uniform_decode_wave=True)
     (req0,) = create_requests(num_requests=1, num_tokens=4, req_ids=["r0"])
     req0.status = RequestStatus.RUNNING
     req0.num_computed_tokens = req0.num_prompt_tokens
@@ -764,7 +738,7 @@ def test_rwkv_scheduler_waits_when_live_decode_row_has_no_token_ready():
 
 def test_rwkv_scheduler_does_not_mix_waiting_prefill_after_decode_wave():
     scheduler = _new_fake_scheduler(
-        use_rwkv_native_decode_wave=True,
+        requires_uniform_decode_wave=True,
         max_num_scheduled_tokens=8,
         max_num_running_reqs=2,
     )
@@ -781,7 +755,7 @@ def test_rwkv_scheduler_does_not_mix_waiting_prefill_after_decode_wave():
 
 
 def test_default_scheduler_still_allows_running_decode_subset():
-    scheduler = _new_fake_scheduler(use_rwkv_native_decode_wave=False)
+    scheduler = _new_fake_scheduler(requires_uniform_decode_wave=False)
     req0 = _new_ready_decode_request("r0")
     req1 = _new_ready_decode_request("r1")
     scheduler.running = [req0, req1]
