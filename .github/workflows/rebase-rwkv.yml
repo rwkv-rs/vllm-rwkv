@@ -26,8 +26,8 @@ jobs:
           ref: rwkv
           fetch-depth: 0
 
-      - name: Rebase rwkv on upstream/main
-        id: rebase
+      - name: Prepare review candidate
+        id: sync
         shell: bash
         run: |
           set -euo pipefail
@@ -45,81 +45,113 @@ jobs:
           git fetch upstream main
 
           old_head="$(git rev-parse refs/remotes/origin/rwkv)"
-          git switch --force-create rwkv refs/remotes/origin/rwkv
+          upstream_head="$(git rev-parse refs/remotes/upstream/main)"
+          git switch --force-create rwkv "$old_head"
 
-          rwkv_commit_count="$(git rev-list --count refs/remotes/upstream/main..HEAD)"
+          rwkv_commit_count="$(git rev-list --count "$upstream_head"..HEAD)"
           if [[ "$rwkv_commit_count" == "0" ]]; then
-            echo "rwkv has no commits ahead of upstream/main; refusing to overwrite it with plain upstream."
+            echo "rwkv has no commits ahead of upstream/main; refusing a plain-upstream candidate."
             exit 1
           fi
 
-          echo "Replaying $rwkv_commit_count rwkv commits on top of upstream/main."
+          echo "Replaying $rwkv_commit_count rwkv commits on top of $upstream_head."
           set +e
-          git rebase refs/remotes/upstream/main
-          rebase_status="$?"
+          git rebase "$upstream_head"
+          rebase_status=$?
           set -e
+
           if [[ "$rebase_status" != "0" ]]; then
-            mkdir -p rebase-evidence
-            git diff --name-only --diff-filter=U > rebase-evidence/unmerged-paths.txt
-            git status --short > rebase-evidence/status.txt
-            git rev-parse REBASE_HEAD > rebase-evidence/rebase-head.txt
-            git show --no-patch --format=fuller REBASE_HEAD \
-              > rebase-evidence/rebase-commit.txt
-            cp .git/rebase-merge/git-rebase-todo rebase-evidence/rebase-todo.txt
+            conflict_commit="$(git rev-parse REBASE_HEAD 2>/dev/null || printf unknown)"
+            unresolved_paths="$(git diff --name-only --diff-filter=U)"
+
             {
-              echo "### Upstream rebase conflict"
+              echo "changed=false"
+              echo "conflicted=true"
+              echo "old_head=$old_head"
+              echo "upstream_head=$upstream_head"
+              echo "conflict_commit=$conflict_commit"
+              echo "unresolved_paths<<RWKV_PATHS"
+              printf '%s\n' "$unresolved_paths"
+              echo "RWKV_PATHS"
+            } >> "$GITHUB_OUTPUT"
+
+            {
+              echo "## RWKV upstream sync conflict"
               echo
-              echo "- Rebase commit: \`$(git rev-parse REBASE_HEAD)\`"
-              echo "- Unmerged paths:"
-              sed 's/^/  - `/' rebase-evidence/unmerged-paths.txt | sed 's/$/`/'
+              echo "- Baseline head: $old_head"
+              echo "- Upstream head: $upstream_head"
+              echo "- Conflict commit: $conflict_commit"
+              echo "- Unresolved paths:"
+              printf '%s\n' "$unresolved_paths" | sed 's/^/  - /'
             } >> "$GITHUB_STEP_SUMMARY"
+
             git rebase --abort
-            echo "failed=true" >> "$GITHUB_OUTPUT"
+            exit "$rebase_status"
+          fi
+
+          candidate_head="$(git rev-parse HEAD)"
+          if [[ "$candidate_head" == "$old_head" ]]; then
+            echo "rwkv is already based on the latest upstream/main."
+            {
+              echo "changed=false"
+              echo "conflicted=false"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "failed=false" >> "$GITHUB_OUTPUT"
 
-          post_rebase_commit_count="$(git rev-list --count refs/remotes/upstream/main..HEAD)"
+          post_rebase_commit_count="$(git rev-list --count "$upstream_head"..HEAD)"
           if [[ "$post_rebase_commit_count" == "0" ]]; then
-            echo "Rebase removed every rwkv commit; refusing to push."
+            echo "Rebase removed every rwkv commit; refusing to publish a candidate."
             exit 1
           fi
 
-          if [[ "$(git rev-parse HEAD)" == "$old_head" ]]; then
-            echo "rwkv is already based on the latest upstream/main."
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          sensitive_paths="$(
+            git diff --name-only "$old_head" HEAD |
+              grep -Ei '(^|/)(prompt|prompts|template|templates|tokenizer|tokenizers|stop|tool|tools|reward)([^/]*)(/|$)' ||
+              true
+          )"
+          if [[ -n "$sensitive_paths" ]]; then
+            sensitive=true
+          else
+            sensitive=false
           fi
 
           {
             echo "changed=true"
+            echo "conflicted=false"
             echo "old_head=$old_head"
-            echo "upstream_head=$(git rev-parse refs/remotes/upstream/main)"
-            echo "candidate_head=$(git rev-parse HEAD)"
+            echo "upstream_head=$upstream_head"
+            echo "candidate_head=$candidate_head"
+            echo "sensitive=$sensitive"
+            echo "sensitive_paths<<RWKV_PATHS"
+            printf '%s\n' "$sensitive_paths"
+            echo "RWKV_PATHS"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Upload rebase conflict evidence
-        if: steps.rebase.outputs.failed == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: rwkv-rebase-conflict-${{ github.run_id }}
-          path: rebase-evidence
-          if-no-files-found: error
+          {
+            echo "## RWKV upstream sync candidate"
+            echo
+            echo "- Baseline head: $old_head"
+            echo "- Upstream head: $upstream_head"
+            echo "- Candidate head: $candidate_head"
+            echo "- Sensitive-path gate: $sensitive"
+            if [[ -n "$sensitive_paths" ]]; then
+              echo "- Sensitive paths:"
+              printf '%s\n' "$sensitive_paths" | sed 's/^/  - /'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Fail on rebase conflict
-        if: steps.rebase.outputs.failed == 'true'
-        shell: bash
-        run: |
-          echo "The upstream rebase conflicted; inspect the uploaded evidence artifact."
-          exit 1
+      - name: Set up uv
+        if: steps.sync.outputs.changed == 'true'
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
 
       - name: Run lightweight RWKV interface guards
-        if: steps.rebase.outputs.changed == 'true'
+        if: steps.sync.outputs.changed == 'true'
         shell: bash
         run: |
           set -euo pipefail
 
-          python3 - <<'PY'
+          uv run --no-project --python 3.12 python - <<'PY'
           import ast
           from pathlib import Path
 
@@ -164,75 +196,68 @@ jobs:
               raise AssertionError("\n".join(failures))
           PY
 
-      - name: Identify prompt-sensitive paths
-        id: sensitive
-        if: steps.rebase.outputs.changed == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          git diff --name-only \
-            "${{ steps.rebase.outputs.old_head }}"..HEAD > changed-paths.txt
-          sensitive_paths="$(
-            grep -E \
-              '(^|/)(chat_templates?|templates?|tokenizers?|tool_parsers?|reasoning_parsers?|stop_checker|serving_chat|repetition)(/|\.|$)|(^|/)sampling_params\.py$|rwkv_defaults\.py$' \
-              changed-paths.txt || true
-          )"
-          if [[ -z "$sensitive_paths" ]]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "changed=true" >> "$GITHUB_OUTPUT"
-
-          {
-            echo "### Prompt-sensitive changes require owner approval"
-            echo
-            echo "The candidate will be opened as a PR for checks and manual owner approval. Sensitive paths:"
-            while IFS= read -r path; do
-              echo "- \`$path\`"
-            done <<< "$sensitive_paths"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Push rebase candidate and open PR
-        if: steps.rebase.outputs.changed == 'true'
+      - name: Push candidate and open review PR
+        if: steps.sync.outputs.changed == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          OLD_HEAD: ${{ steps.sync.outputs.old_head }}
+          UPSTREAM_HEAD: ${{ steps.sync.outputs.upstream_head }}
+          CANDIDATE_HEAD: ${{ steps.sync.outputs.candidate_head }}
+          SENSITIVE: ${{ steps.sync.outputs.sensitive }}
+          SENSITIVE_PATHS: ${{ steps.sync.outputs.sensitive_paths }}
         run: |
           set -euo pipefail
 
           candidate_branch="automation/rebase-rwkv"
           git fetch origin "$candidate_branch" || true
-          git push --force-with-lease origin HEAD:"$candidate_branch"
+          candidate_remote_head="$(
+            git rev-parse --verify "refs/remotes/origin/$candidate_branch" 2>/dev/null ||
+              true
+          )"
+          if [[ -n "$candidate_remote_head" ]]; then
+            git push               --force-with-lease="refs/heads/$candidate_branch:$candidate_remote_head"               origin HEAD:"$candidate_branch"
+          else
+            git push origin HEAD:"$candidate_branch"
+          fi
 
           body_file="$(mktemp)"
           cat >"$body_file" <<EOF
-          Automated upstream sync candidate for \`rwkv\`.
+          Automated upstream sync candidate for rwkv.
 
-          - Previous \`rwkv\` head: \`${{ steps.rebase.outputs.old_head }}\`
-          - Upstream \`main\` head: \`${{ steps.rebase.outputs.upstream_head }}\`
-          - Candidate head: \`${{ steps.rebase.outputs.candidate_head }}\`
-          - Prompt-sensitive paths: \`${{ steps.sensitive.outputs.changed || 'false' }}\`
+          - Previous rwkv head: $OLD_HEAD
+          - Upstream main head: $UPSTREAM_HEAD
+          - Candidate head: $CANDIDATE_HEAD
+          - Sensitive-path gate: $SENSITIVE
 
-          This workflow no longer updates \`rwkv\` directly. Merge this PR only after RWKV validation passes.
-          If prompt-sensitive paths are present, the repository owner must explicitly approve and manually merge this PR.
+          Sensitive paths:
+          ${SENSITIVE_PATHS:-none}
+
+          This workflow never updates rwkv directly. Merge only after RWKV validation
+          and, when the gate is blocked, explicit sensitive-semantics review.
           EOF
 
-          pr_number="$(gh pr list \
-            --head "$candidate_branch" \
-            --base rwkv \
-            --state open \
-            --json number \
-            --jq '.[0].number // empty')"
+          pr_number="$(
+            gh pr list               --head "$candidate_branch"               --base rwkv               --state open               --json number               --jq '.[0].number // empty'
+          )"
 
           if [[ -z "$pr_number" ]]; then
-            gh pr create \
-              --base rwkv \
-              --head "$candidate_branch" \
-              --title "ci(rwkv): rebase on upstream main" \
-              --body-file "$body_file"
+            gh pr create               --base rwkv               --head "$candidate_branch"               --title "ci(rwkv): rebase on upstream main"               --body-file "$body_file"
+            pr_number="$(
+              gh pr list                 --head "$candidate_branch"                 --base rwkv                 --state open                 --json number                 --jq '.[0].number'
+            )"
           else
-            gh pr edit "$pr_number" \
-              --title "ci(rwkv): rebase on upstream main" \
-              --body-file "$body_file"
+            gh pr edit "$pr_number"               --title "ci(rwkv): rebase on upstream main"               --body-file "$body_file"
           fi
+
+          if [[ "$SENSITIVE" == "true" ]]; then
+            gh label create sensitive-semantics-review-required               --color D73A4A               --description "Requires explicit review of prompt/tokenizer/tool semantics"               --force
+            gh pr edit "$pr_number" --add-label sensitive-semantics-review-required
+          fi
+
+      - name: Fail closed on sensitive paths
+        if: steps.sync.outputs.changed == 'true' && steps.sync.outputs.sensitive == 'true'
+        shell: bash
+        run: |
+          echo "::error::Sensitive paths changed; explicit human review is required."
+          exit 1

@@ -8,9 +8,6 @@ from unittest.mock import Mock
 import pytest
 
 import vllm.model_executor.warmup.kernel_warmup as kernel_warmup_module
-from vllm.v1.worker.gpu.warmup import should_skip_v2_kernel_warmup
-from vllm.v1.worker.gpu.model_states.interface import ModelState
-from vllm.v1.worker.gpu.model_states.rwkv import RWKV7ModelState
 
 
 class _Backend:
@@ -44,15 +41,6 @@ def _make_worker(attn_groups):
             model_config=SimpleNamespace(),
         ),
         get_model=lambda: SimpleNamespace(),
-    )
-
-
-def test_v2_kernel_warmup_uses_model_state_capability():
-    assert ModelState.supports_v2_kernel_warmup
-    assert not RWKV7ModelState.supports_v2_kernel_warmup
-    assert not should_skip_v2_kernel_warmup(SimpleNamespace(model_state=object()))
-    assert should_skip_v2_kernel_warmup(
-        SimpleNamespace(model_state=SimpleNamespace(supports_v2_kernel_warmup=False))
     )
 
 

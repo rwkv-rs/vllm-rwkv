@@ -4,7 +4,7 @@
 import os
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import cloudpickle
 import torch.nn as nn
@@ -42,7 +42,7 @@ from vllm.entrypoints.chat_utils import (
 from vllm.entrypoints.generate.beam_search.offline import BeamSearchOfflineMixin
 from vllm.entrypoints.pooling.offline import PoolingOfflineMixin
 from vllm.entrypoints.serve.utils.api_utils import log_non_default_args
-from vllm.inputs import PromptType
+from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -52,6 +52,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.rwkv_defaults import (
     RWKV_NATIVE_CHAT_TEMPLATE,
+    RWKVPromptTemplateSpec,
     is_rwkv_model_config,
     resolve_rwkv_chat_sampling_params,
     resolve_rwkv_prompt_template,
@@ -63,6 +64,7 @@ from vllm.v1.engine import PauseMode
 from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.v1.sample.logits_processor import LogitsProcessor
 
+from ..renderers import ChatParams
 from .offline_utils import _O, _R, OfflineInferenceMixin
 
 if TYPE_CHECKING:
@@ -372,6 +374,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         self.chat_template = load_chat_template(chat_template)
         self.input_processor = self.llm_engine.input_processor
 
+        self.renderer.warmup(ChatParams(chat_template=self.chat_template))
+
         # The renderer thread pool is only consumed by the async renderer
         # path; the synchronous `LLM` entrypoint runs multimodal
         # preprocessing serially. Warn so the setting is not a silent
@@ -475,7 +479,9 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         if prompt_token_ids is not None:
             if prompts is not None:
                 raise ValueError("prompts and prompt_token_ids are mutually exclusive")
-            prompts = [{"prompt_token_ids": list(ids)} for ids in prompt_token_ids]
+            prompts = [
+                TokensPrompt(prompt_token_ids=list(ids)) for ids in prompt_token_ids
+            ]
         if prompts is None:
             raise ValueError("prompts or prompt_token_ids must be provided")
         runner_type = self.model_config.runner_type
@@ -714,7 +720,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
 
         if sampling_params is None:
             sampling_params = self.get_default_sampling_params()
-        prompt_templates = [None]
+        prompt_templates: list[RWKVPromptTemplateSpec | None] = [None]
         is_native_template = chat_template is None or (
             chat_template.strip() == RWKV_NATIVE_CHAT_TEMPLATE
         )
@@ -727,7 +733,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
                     prompt_template=(chat_template_kwargs or {}).get(
                         "rwkv_prompt_template"
                     ),
-                    messages=conversation,
+                    messages=cast(Sequence[Any], conversation),
                     tools=tools or (),
                 )
                 for conversation in conversations
@@ -814,7 +820,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
 
         if sampling_params is None:
             sampling_params = self.get_default_sampling_params()
-        prompt_templates = [None]
+        prompt_templates: list[RWKVPromptTemplateSpec | None] = [None]
         is_native_template = chat_template is None or (
             chat_template.strip() == RWKV_NATIVE_CHAT_TEMPLATE
         )
@@ -827,7 +833,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
                     prompt_template=(chat_template_kwargs or {}).get(
                         "rwkv_prompt_template"
                     ),
-                    messages=conversation,
+                    messages=cast(Sequence[Any], conversation),
                     tools=tools or (),
                 )
                 for conversation in conversations
@@ -966,9 +972,19 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             "update_weights", kwargs={"update_info": update_info_dict}
         )
 
-    def finish_weight_update(self) -> None:
-        """Finish the current weight update."""
+    def finish_weight_update(self, weight_version: str | None = None) -> None:
+        """Finish the weight update and set its version if provided."""
         self.llm_engine.collective_rpc("finish_weight_update")
+        if weight_version is not None:
+            self.llm_engine.set_weight_version(weight_version)
+
+    def update_weight_version(self, new_version: str) -> None:
+        """Set the weight version without updating weights."""
+        self.llm_engine.set_weight_version(new_version)
+
+    def get_weight_version(self) -> str:
+        """Return the latest committed weight version."""
+        return self.llm_engine.get_weight_version()
 
     def __repr__(self) -> str:
         """Return a transformers-style hierarchical view of the model."""

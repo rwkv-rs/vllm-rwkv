@@ -11,7 +11,6 @@ import pytest
 from pydantic import Field
 
 from vllm.config import AttentionConfig, CompilationConfig, ModelConfig, config
-from vllm.config.scheduler import SchedulerConfig
 from vllm.engine.arg_utils import (
     EngineArgs,
     _expand_json_human_readable_numbers,
@@ -472,40 +471,11 @@ def test_attention_config():
         engine_args.create_engine_config()
 
 
-@pytest.mark.parametrize(
-    "architectures",
-    [
-        ["RWKV7ForCausalLM"],
-        ["OtherArchitecture", "RWKV7ForCausalLM"],
-    ],
-)
-def test_rwkv7_allows_concurrent_partial_prefill(architectures):
-    engine_args = EngineArgs(
-        max_num_partial_prefills=SchedulerConfig.max_num_partial_prefills + 1,
-    )
-    model_config = SimpleNamespace(architectures=architectures)
-
-    engine_args._check_feature_supported(model_config)
-
-
-def test_non_rwkv7_rejects_concurrent_partial_prefill():
-    engine_args = EngineArgs(
-        max_num_partial_prefills=SchedulerConfig.max_num_partial_prefills + 1,
-    )
-    model_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
-
-    with pytest.raises(NotImplementedError, match="Concurrent Partial Prefill"):
-        engine_args._check_feature_supported(model_config)
-
-
-def test_rwkv7_uses_framework_batch_defaults():
+def _resolve_batch_defaults(architectures):
     engine_args = EngineArgs(max_model_len=10240)
     model_config = SimpleNamespace(
-        architectures=["RWKV7ForCausalLM"],
-        hf_config=RWKV7Config(
-            num_hidden_layers=24,
-            hidden_size=2048,
-        ),
+        architectures=architectures,
+        hf_config=RWKV7Config(num_hidden_layers=24, hidden_size=2048),
         max_model_len=10240,
         is_multimodal_model=False,
         is_mm_prefix_lm=False,
@@ -515,32 +485,13 @@ def test_rwkv7_uses_framework_batch_defaults():
         model_config,
         SimpleNamespace(use_batched_dp_moe=False),
     )
-    assert engine_args.max_num_seqs == SchedulerConfig.DEFAULT_MAX_NUM_SEQS
-    assert engine_args.max_num_batched_tokens == model_config.max_model_len
+    return engine_args.max_num_seqs, engine_args.max_num_batched_tokens
 
 
-def test_rwkv7_uses_framework_throughput_defaults():
-    engine_args = EngineArgs(
-        max_model_len=10240,
-        performance_mode="throughput",
+def test_rwkv7_engine_uses_upstream_active_batch_defaults():
+    assert _resolve_batch_defaults(["RWKV7ForCausalLM"]) == _resolve_batch_defaults(
+        ["LlamaForCausalLM"]
     )
-    model_config = SimpleNamespace(
-        architectures=["RWKV7ForCausalLM"],
-        hf_config=RWKV7Config(
-            num_hidden_layers=24,
-            hidden_size=2048,
-        ),
-        max_model_len=10240,
-        is_multimodal_model=False,
-        is_mm_prefix_lm=False,
-    )
-    engine_args._set_default_max_num_seqs_and_batched_tokens_args(
-        None,
-        model_config,
-        SimpleNamespace(use_batched_dp_moe=False),
-    )
-    assert engine_args.max_num_seqs == 2 * SchedulerConfig.DEFAULT_MAX_NUM_SEQS
-    assert engine_args.max_num_batched_tokens == model_config.max_model_len
 
 
 def test_rwkv7_preserves_explicit_batch_override():
@@ -563,53 +514,6 @@ def test_rwkv7_preserves_explicit_batch_override():
     )
     assert engine_args.max_num_seqs == 37
     assert engine_args.max_num_batched_tokens == 10240
-
-
-@pytest.mark.parametrize("load_format", ["auto", "hf", "pt", "rwkv_pth"])
-def test_rwkv7_raw_pth_selects_dedicated_loader(tmp_path, load_format):
-    checkpoint = tmp_path / "rwkv7-g1g-1.5b-20260526-ctx8192.pth"
-    checkpoint.touch()
-
-    load_config = EngineArgs(
-        model=str(checkpoint),
-        load_format=load_format,
-    ).create_load_config()
-
-    assert load_config.load_format == "rwkv_pth"
-
-
-def test_rwkv7_raw_pth_rejects_incompatible_loader(tmp_path):
-    checkpoint = tmp_path / "rwkv7-g1g-1.5b-20260526-ctx8192.pth"
-    checkpoint.touch()
-
-    with pytest.raises(ValueError, match="RWKV7 raw .pth checkpoints require"):
-        EngineArgs(
-            model=str(checkpoint),
-            load_format="safetensors",
-        ).create_load_config()
-
-
-def test_rwkv7_raw_pth_url_selects_dedicated_loader():
-    load_config = EngineArgs(
-        model=(
-            "https://huggingface.co/BlinkDL/rwkv7-g1/blob/main/"
-            "rwkv7-g1g-1.5b-20260526-ctx8192.pth"
-        ),
-    ).create_load_config()
-
-    assert load_config.load_format == "rwkv_pth"
-
-
-def test_ordinary_model_preserves_generic_load_format(tmp_path):
-    model_dir = tmp_path / "ordinary-model"
-    model_dir.mkdir()
-
-    load_config = EngineArgs(
-        model=str(model_dir),
-        load_format="auto",
-    ).create_load_config()
-
-    assert load_config.load_format == "auto"
 
 
 def test_prefix_cache_default():

@@ -182,6 +182,7 @@ def can_use_lowrank_out_fused(hidden_size: int, rows: int) -> bool:
 
 class RWKV7ForCausalLM(nn.Module):
     is_attention_free = True
+    requires_uniform_decode_wave = True
     supports_pp = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:

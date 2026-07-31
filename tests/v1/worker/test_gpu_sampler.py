@@ -498,4 +498,3 @@ def test_rapid_sampler_native_fallback_is_forbidden_when_required(
     assert sampling_param_calls[0]["skip_temperature"] is True
     assert sampling_param_calls[1].get("skip_top_k_top_p", False) is False
     assert sampling_param_calls[1].get("skip_temperature", False) is False
-

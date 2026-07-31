@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 _PROFILE_PATH = Path(__file__).with_name("_build_profile.json")
 _VALID_PROFILES = {"full", "rwkv"}
-_RWKV_LOAD_FORMATS = {"auto", "hf", "pt", "rwkv_pth"}
+_RWKV_LOAD_FORMATS = {"auto", "hf", "pt"}
 
 
 @dataclass(frozen=True)
@@ -205,8 +205,7 @@ def validate_build_profile_capabilities(
     load_format = str(_value(getattr(load_config, "load_format", "auto"))).lower()
     if load_format not in _RWKV_LOAD_FORMATS:
         reasons.append(
-            "requires load format 'auto', 'hf', 'pt', or 'rwkv_pth' "
-            "for a raw .pth checkpoint"
+            "requires load format 'auto', 'hf', or 'pt' for a raw .pth checkpoint"
         )
 
     device_type = getattr(

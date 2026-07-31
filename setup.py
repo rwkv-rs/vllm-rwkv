@@ -18,6 +18,7 @@ import torch
 from packaging.version import Version, parse
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
+from setuptools_rust.build import build_rust
 from setuptools_scm import get_version
 from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME
 
@@ -36,6 +37,7 @@ build_profiles = load_module_from_path(
     "build_profiles", ROOT_DIR / "tools" / "build_profiles.py"
 )
 VLLM_BUILD_PROFILE = build_profiles.resolve_build_profile()
+VLLM_GIT_DESCRIBE_COMMAND = "git describe --dirty --tags --long --match 'v[0-9]*'"
 
 PRECOMPILED_RUST_FRONTEND_PATH = ROOT_DIR / "vllm" / "vllm-rs"
 # setuptools-rust installs PyO3 artifacts as `<module>.<ext-suffix>`, where the
@@ -45,6 +47,9 @@ PRECOMPILED_RUST_EXTENSION_MEMBER_REGEX = re.compile(r"vllm/_rust_[^/]*\.so$")
 # cannot import envs directly because it depends on vllm,
 #  which is not installed yet
 envs = load_module_from_path("envs", os.path.join(ROOT_DIR, "vllm", "envs.py"))
+rust_build = load_module_from_path(
+    "rust_build", os.path.join(ROOT_DIR, "tools", "build_rust.py")
+)
 
 VLLM_TARGET_DEVICE = envs.VLLM_TARGET_DEVICE
 USE_PRECOMPILED_EXTENSIONS = envs.VLLM_USE_PRECOMPILED
@@ -61,8 +66,28 @@ if VLLM_BUILD_PROFILE == "rwkv" and (
     )
 
 
+def should_require_rust_frontend() -> bool:
+    value = os.getenv("VLLM_REQUIRE_RUST_FRONTEND", "")
+    return value.lower() not in ("", "0", "false", "no")
+
+
 def get_precompiled_rust_extension_paths() -> list[Path]:
     return sorted((ROOT_DIR / "vllm").glob("_rust_*.so"))
+
+
+def get_missing_precompiled_rust_extension_modules() -> list[str]:
+    present = {
+        path.name.split(".", 1)[0] for path in get_precompiled_rust_extension_paths()
+    }
+    return [
+        module_name
+        for module_name in rust_build.rust_py_extension_module_names()
+        if module_name not in present
+    ]
+
+
+def has_precompiled_rust_extensions() -> bool:
+    return not get_missing_precompiled_rust_extension_modules()
 
 
 if sys.platform.startswith("darwin") and VLLM_TARGET_DEVICE != "cpu":
@@ -494,6 +519,36 @@ class precompiled_build_ext(build_ext):
         return
 
 
+class precompiled_build_rust(build_rust):
+    """Skips local Rust builds when all precompiled Rust artifacts are present."""
+
+    def run(self) -> None:
+        missing = []
+        if not PRECOMPILED_RUST_FRONTEND_PATH.exists():
+            missing.append(str(PRECOMPILED_RUST_FRONTEND_PATH))
+        missing_rust_extensions = get_missing_precompiled_rust_extension_modules()
+        if missing_rust_extensions:
+            missing.extend(
+                str(ROOT_DIR / "vllm" / f"{module_name}*.so")
+                for module_name in missing_rust_extensions
+            )
+
+        if not missing:
+            logger.info(
+                "Skipping local Rust build: using precompiled %s and %s",
+                PRECOMPILED_RUST_FRONTEND_PATH,
+                get_precompiled_rust_extension_paths(),
+            )
+            return
+
+        logger.warning(
+            "Precompiled wheel did not provide all Rust artifacts (%s); "
+            "falling back to local Rust build.",
+            ", ".join(missing),
+        )
+        super().run()
+
+
 class precompiled_wheel_utils:
     """Extracts libraries and other files from an existing wheel."""
 
@@ -779,6 +834,7 @@ class precompiled_wheel_utils:
                             "vllm/_qutlass_C.abi3.so",
                             "vllm/_flashmla_C.abi3.so",
                             "vllm/_flashmla_extension_C.abi3.so",
+                            "vllm/_flashkda_C.abi3.so",
                             "vllm/_sparse_flashmla_C.abi3.so",
                             "vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so",
                             "vllm/vllm_flash_attn/_vllm_fa3_C.abi3.so",
@@ -1017,9 +1073,15 @@ def get_vllm_version() -> str:
     if env_version := os.getenv("VLLM_VERSION_OVERRIDE"):
         print(f"Overriding VLLM version with {env_version} from VLLM_VERSION_OVERRIDE")
         os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
-        return get_version(write_to="vllm/_version.py")
+        return get_version(
+            write_to="vllm/_version.py",
+            git_describe_command=VLLM_GIT_DESCRIBE_COMMAND,
+        )
 
-    version = get_version(write_to="vllm/_version.py")
+    version = get_version(
+        write_to="vllm/_version.py",
+        git_describe_command=VLLM_GIT_DESCRIBE_COMMAND,
+    )
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
     if _no_device():
@@ -1124,7 +1186,7 @@ if _is_cuda() or _is_hip():
     # copying the relevant .py files from the source repository.
     ext_modules.append(CMakeExtension(name="vllm.triton_kernels", optional=True))
 
-if sys.version_info >= (3, 11):
+if not _is_xpu() and sys.version_info >= (3, 11):
     ext_modules.append(CMakeExtension(name="vllm.spinloop"))
     ext_modules.append(CMakeExtension(name="vllm.fs_io_C"))
 
@@ -1153,6 +1215,10 @@ if _is_cuda():
         ext_modules.append(
             CMakeExtension(name="vllm._flashmla_extension_C", optional=True)
         )
+    if USE_PRECOMPILED_EXTENSIONS or (
+        CUDA_HOME and get_nvcc_cuda_version() >= Version("12.0")
+    ):
+        ext_modules.append(CMakeExtension(name="vllm._flashkda_C", optional=True))
     if envs.VLLM_USE_PRECOMPILED or (
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
     ):
@@ -1261,14 +1327,26 @@ else:
         if USE_PRECOMPILED_EXTENSIONS
         else cmake_build_ext,
     }
+if VLLM_BUILD_PROFILE == "full" and (
+    USE_PRECOMPILED_RUST_FRONTEND
+    or PRECOMPILED_RUST_FRONTEND_PATH.exists()
+    or has_precompiled_rust_extensions()
+):
+    cmdclass["build_rust"] = precompiled_build_rust
+
 # Rust artifacts, built via setuptools-rust and installed into the package
 # directory alongside the Python modules.
-rust_setup_args = {}
+rust_extensions = (
+    rust_build.rust_extensions(optional=not should_require_rust_frontend())
+    if VLLM_BUILD_PROFILE == "full"
+    else []
+)
 
 setup(
     # static metadata should rather go in pyproject.toml
     version=get_vllm_version(),
     ext_modules=ext_modules,
+    rust_extensions=rust_extensions,
     install_requires=get_requirements(),
     extras_require={
         # AMD Zen CPU optimizations via zentorch
@@ -1309,5 +1387,4 @@ setup(
     },
     cmdclass=cmdclass,
     package_data=package_data,
-    **rust_setup_args,
 )

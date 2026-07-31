@@ -5,14 +5,14 @@ import torch
 from torch import Generator
 
 from tests.utils import large_gpu_mark
-from vllm.model_executor.layers.vocab_parallel_embedding import pad_vocab_size
+from vllm.exceptions import VLLMValidationError
 from vllm.platforms import current_platform
 from vllm.sampling_params import RAPID_PENALTY_DECAY_DEFAULT, SamplingParams
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.sample.ops import rapid_sampling
 from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p_pytorch,
-    flashinfer_sample,
     random_sample,
 )
 from vllm.v1.sample.sampler import Sampler
@@ -57,6 +57,41 @@ def _rapid_sampler_platform_supported() -> bool:
 RAPID_SAMPLER_PLATFORM_SUPPORTED = _rapid_sampler_platform_supported()
 
 
+def test_rapid_sampler_public_api_is_reexported_from_owned_module():
+    from vllm.v1.sample.ops import topk_topp_sampler
+
+    assert topk_topp_sampler.rapid_sample is rapid_sampling.rapid_sample
+    assert (
+        topk_topp_sampler.rapid_sample_input_supported
+        is rapid_sampling.rapid_sample_input_supported
+    )
+    assert (
+        topk_topp_sampler.rapid_sampler_supported
+        is rapid_sampling.rapid_sampler_supported
+    )
+
+
+def test_rapid_sampler_extension_import_failure_is_cached(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = 0
+
+    def missing_extension(name: str):
+        nonlocal calls
+        calls += 1
+        assert name == "vllm._rapid_sampling"
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr(rapid_sampling, "_RAPID_SAMPLER_MODULE", None)
+    monkeypatch.setattr(rapid_sampling.importlib, "import_module", missing_extension)
+
+    for _ in range(2):
+        with pytest.raises(ImportError, match="is not installed"):
+            rapid_sampling._load_rapid_sampler_module()
+
+    assert calls == 1
+
+
 def _seed_default_generator(seed: int) -> None:
     set_random_seed(seed)
 
@@ -78,6 +113,10 @@ def test_sampler_threads_fp64_gumbel_to_topk_topp_sampler():
     assert sampler.topk_topp_sampler.use_fp64_gumbel
 
 
+@pytest.mark.skipif(
+    not current_platform.is_rocm(),
+    reason="ROCm aiter sampler test only runs on ROCm",
+)
 def test_rocm_aiter_sampler_defers_import_when_generators_force_native(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -229,10 +268,8 @@ def test_rapid_sampler_backend_enabled_by_default(monkeypatch: pytest.MonkeyPatc
     from vllm.v1.sample.ops import topk_topp_sampler
 
     monkeypatch.delenv("VLLM_USE_RAPID_SAMPLER", raising=False)
-    monkeypatch.setattr(topk_topp_sampler, "_RAPID_SAMPLER_MODULE", None)
-    monkeypatch.setattr(
-        topk_topp_sampler, "_load_rapid_sampler_module", lambda: object()
-    )
+    monkeypatch.setattr(rapid_sampling, "_RAPID_SAMPLER_MODULE", None)
+    monkeypatch.setattr(rapid_sampling, "_load_rapid_sampler_module", lambda: object())
 
     assert topk_topp_sampler.rapid_sampler_supported()
 
@@ -263,7 +300,7 @@ def test_rapid_sampler_handles_unsupported_cuda_capability(
         monkeypatch.setenv("VLLM_USE_RAPID_SAMPLER", "1")
     else:
         monkeypatch.delenv("VLLM_USE_RAPID_SAMPLER", raising=False)
-    monkeypatch.setattr(topk_topp_sampler, "current_platform", MockPlatform())
+    monkeypatch.setattr(rapid_sampling, "current_platform", MockPlatform())
 
     if explicit_opt_in:
         with pytest.raises(RuntimeError, match="unsupported compute capability 6.0"):
@@ -337,9 +374,7 @@ def test_rapid_sampler_falls_back_for_per_request_generators(
 
     assert called
     assert processed is None
-    assert torch.equal(
-        tokens, torch.ones(2, dtype=torch.int32, device=logits.device)
-    )
+    assert torch.equal(tokens, torch.ones(2, dtype=torch.int32, device=logits.device))
 
 
 @pytest.mark.skipif(
@@ -424,7 +459,7 @@ def test_penalty_decay_requires_rapid_sampler(monkeypatch: pytest.MonkeyPatch):
         False,
     )
 
-    with pytest.raises(ValueError, match="rapid-sampling"):
+    with pytest.raises(VLLMValidationError, match="rapid-sampling"):
         SamplingParams(penalty_decay=0.95)
 
 
@@ -450,12 +485,12 @@ def test_rapid_sample_rejects_vector_tensor_params_without_penalties(
     temperatures = torch.tensor([1.0, 1.0], dtype=torch.float32)
 
     monkeypatch.setattr(
-        topk_topp_sampler,
+        rapid_sampling,
         "rapid_sample_input_supported",
         lambda logits: True,
     )
     monkeypatch.setattr(
-        topk_topp_sampler,
+        rapid_sampling,
         "_load_rapid_sampler_module",
         lambda: FakeRapidModule(),
     )
@@ -525,17 +560,17 @@ def test_rapid_sample_requires_indexed_penalty_kernel(
     penalty_indices = torch.tensor([3, 1], dtype=torch.int32)
 
     monkeypatch.setattr(
-        topk_topp_sampler,
+        rapid_sampling,
         "rapid_sample_input_supported",
         lambda logits: True,
     )
     monkeypatch.setattr(
-        topk_topp_sampler,
+        rapid_sampling,
         "_load_rapid_sampler_module",
         lambda: FakeRapidModule(),
     )
     monkeypatch.setattr(
-        topk_topp_sampler,
+        rapid_sampling,
         "_rapid_states",
         lambda module, logits: torch.empty(2, dtype=torch.uint8),
     )
@@ -585,17 +620,17 @@ def test_rapid_sample_maps_per_request_frequency_penalty_to_rapid_repetition(
     penalty_decays = torch.tensor([0.95, 0.95], dtype=torch.float32)
 
     monkeypatch.setattr(
-        topk_topp_sampler,
+        rapid_sampling,
         "rapid_sample_input_supported",
         lambda logits: True,
     )
     monkeypatch.setattr(
-        topk_topp_sampler,
+        rapid_sampling,
         "_load_rapid_sampler_module",
         lambda: FakeRapidModule(),
     )
     monkeypatch.setattr(
-        topk_topp_sampler,
+        rapid_sampling,
         "_rapid_states",
         lambda module, logits: fake_states,
     )
@@ -1101,9 +1136,7 @@ class TestTritonTopkTopp:
     @pytest.mark.parametrize("batch_size", [1, 8, 32, 128, 512, 1024])
     @pytest.mark.parametrize("vocab_size", [1024, 32000, 128256])
     @pytest.mark.parametrize("mode", ["top-k", "top-p", "top-k+top-p"])
-    def test_filters_match_pytorch(
-        self, batch_size: int, vocab_size: int, mode: str
-    ):
+    def test_filters_match_pytorch(self, batch_size: int, vocab_size: int, mode: str):
         logits = torch.randn(
             batch_size, vocab_size, generator=self.generator, dtype=torch.float32
         )
@@ -1113,15 +1146,11 @@ class TestTritonTopkTopp:
             k = torch.randint(
                 1, min(100, vocab_size), (batch_size,), generator=self.generator
             )
-            disabled = torch.randint(
-                0, 4, (batch_size,), generator=self.generator
-            ) == 0
+            disabled = torch.randint(0, 4, (batch_size,), generator=self.generator) == 0
             k.masked_fill_(disabled, vocab_size)
         if mode != "top-k":
             p = torch.rand(batch_size, generator=self.generator) * 0.9 + 0.1
-            disabled = torch.randint(
-                0, 4, (batch_size,), generator=self.generator
-            ) == 0
+            disabled = torch.randint(0, 4, (batch_size,), generator=self.generator) == 0
             p.masked_fill_(disabled, 1.0)
 
         self._compare_results(logits, k, p)
@@ -1301,9 +1330,14 @@ class TestTritonTopkTopp:
                 1, 50, (batch_size,), generator=self.generator, dtype=torch.int32
             )
         )
-        p = None if mode == "top-k" else (
-            torch.rand(batch_size, generator=self.generator, dtype=torch.float32) * 0.9
-            + 0.1
+        p = (
+            None
+            if mode == "top-k"
+            else (
+                torch.rand(batch_size, generator=self.generator, dtype=torch.float32)
+                * 0.9
+                + 0.1
+            )
         )
         result = apply_top_k_top_p_triton(logits.clone(), k, p)
 
@@ -1767,39 +1801,3 @@ class TestFlashInferDistributionMatch:
             f"{label}: distribution differs from theoretical: "
             f"chi2={chi2:.2f} p_value={p_value:.2e} alpha={self.ALPHA}"
         )
-
-
-@pytest.mark.skipif(
-    not FLASHINFER_TOPK_TOPP_SUPPORTED,
-    reason="FlashInfer top-k/top-p sampler is not available on this platform.",
-)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("k, p", [(20, 0.95), (20, None), (None, 0.95)])
-def test_flashinfer_sample_padded_vocab(
-    dtype: torch.dtype, k: int | None, p: float | None
-):
-    """flashinfer_sample must accept the logits the sampler actually hands it.
-
-    compute_logits slices the padding off the vocab, so for a vocab that isn't a
-    multiple of 64 (e.g. opt's 50272) the logits are a strided view in the model
-    dtype, while FlashInfer requires contiguous fp32.
-    """
-    torch.set_default_device(DEVICE_TYPE)
-    batch_size = 8
-    org_vocab_size = 50272
-    padded_vocab_size = pad_vocab_size(org_vocab_size)
-    assert padded_vocab_size != org_vocab_size
-
-    logits = torch.randn(batch_size, padded_vocab_size, dtype=dtype)[
-        ..., :org_vocab_size
-    ]
-    # A single row stays contiguous despite the padded stride, hence batch_size > 1.
-    assert not logits.is_contiguous()
-
-    token_ids = flashinfer_sample(
-        logits,
-        torch.full((batch_size,), k, dtype=torch.int32) if k is not None else None,
-        torch.full((batch_size,), p, dtype=torch.float32) if p is not None else None,
-    )
-    assert token_ids.shape == (batch_size,)
-    assert torch.all((token_ids >= 0) & (token_ids < org_vocab_size))

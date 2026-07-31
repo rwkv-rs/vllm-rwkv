@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -26,25 +27,29 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
+from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
-from vllm.v1.core.sched.decode_wave import UniformDecodeWavePolicy
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.uniform_decode_wave import UniformDecodeWavePolicy
+from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    MambaSpec,
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
-from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():
     scheduler = create_scheduler()
@@ -485,6 +490,9 @@ class _FakeKVCacheManager:
     def get_num_common_prefix_blocks(self, request_id: str) -> list[int]:
         return [0]
 
+    def record_prefix_cache_stats(self, request: Request, num_hits: int) -> None:
+        pass
+
     def take_new_block_ids(self) -> list[int]:
         return []
 
@@ -496,10 +504,13 @@ class _FakeEncoderCacheManager:
     def get_freed_mm_hashes(self) -> list[str]:
         return []
 
+    def get_manager_metadata(self):
+        return None
+
 
 def _new_fake_scheduler(
     *,
-    use_uniform_decode_wave: bool,
+    requires_uniform_decode_wave: bool,
     max_num_scheduled_tokens: int = 16,
     max_num_running_reqs: int = 16,
 ) -> Scheduler:
@@ -518,7 +529,7 @@ def _new_fake_scheduler(
     scheduler.num_sampled_tokens_per_step = 1
     scheduler.num_lookahead_tokens = 0
     scheduler.max_num_encoder_input_tokens = 0
-    scheduler.use_uniform_decode_wave = use_uniform_decode_wave
+    scheduler.requires_uniform_decode_wave = requires_uniform_decode_wave
     scheduler.prefill_capacity_bound = False
     scheduler._pause_state = PauseState.UNPAUSED
     scheduler.policy = SchedulingPolicy.FCFS
@@ -615,7 +626,7 @@ def test_uniform_decode_wave_policy_restarts_after_complete_decode_wave():
 
 
 def test_rwkv_scheduler_waits_when_live_decode_row_is_not_ready():
-    scheduler = _new_fake_scheduler(use_uniform_decode_wave=True)
+    scheduler = _new_fake_scheduler(requires_uniform_decode_wave=True)
     req0 = _new_ready_decode_request("r0")
     req1 = _new_ready_decode_request("r1")
     scheduler.running = [req0, req1]
@@ -630,7 +641,7 @@ def test_rwkv_scheduler_waits_when_live_decode_row_is_not_ready():
 
 
 def test_rwkv_scheduler_allows_running_prefill_chunk_when_decode_wave_unready():
-    scheduler = _new_fake_scheduler(use_uniform_decode_wave=True)
+    scheduler = _new_fake_scheduler(requires_uniform_decode_wave=True)
     ready = _new_ready_decode_request("r0")
     unready = _new_ready_decode_request("r1")
     unready.next_decode_eligible_step = scheduler.current_step + 2
@@ -647,7 +658,7 @@ def test_rwkv_scheduler_allows_running_prefill_chunk_when_decode_wave_unready():
 
 
 def test_rwkv_scheduler_holds_decode_behind_lower_running_prefill_chunk():
-    scheduler = _new_fake_scheduler(use_uniform_decode_wave=True)
+    scheduler = _new_fake_scheduler(requires_uniform_decode_wave=True)
     prefill = _new_running_prefill_chunk_request("p0")
     decode = _new_ready_decode_request("r0")
     scheduler.running = [prefill, decode]
@@ -661,7 +672,7 @@ def test_rwkv_scheduler_holds_decode_behind_lower_running_prefill_chunk():
 
 
 def test_rwkv_scheduler_waits_when_live_decode_row_reaches_max_tokens():
-    scheduler = _new_fake_scheduler(use_uniform_decode_wave=True)
+    scheduler = _new_fake_scheduler(requires_uniform_decode_wave=True)
     req0 = _new_ready_decode_request("r0")
     req1 = _new_ready_decode_request("r1")
     scheduler.running = [req0, req1]
@@ -678,7 +689,7 @@ def test_rwkv_scheduler_waits_when_live_decode_row_reaches_max_tokens():
 
 def test_rwkv_scheduler_requires_complete_ready_decode_wave_budget():
     scheduler = _new_fake_scheduler(
-        use_uniform_decode_wave=True,
+        requires_uniform_decode_wave=True,
         max_num_scheduled_tokens=1,
     )
     scheduler.running = [
@@ -686,13 +697,13 @@ def test_rwkv_scheduler_requires_complete_ready_decode_wave_budget():
         _new_ready_decode_request("r1"),
     ]
 
-    with pytest.raises(ValueError, match="Uniform decode waves"):
+    with pytest.raises(ValueError, match="Uniform decode wave"):
         scheduler.schedule()
 
 
 def test_rwkv_scheduler_keeps_live_decode_running_while_refilling_rows():
     scheduler = _new_fake_scheduler(
-        use_uniform_decode_wave=True,
+        requires_uniform_decode_wave=True,
         max_num_scheduled_tokens=8,
         max_num_running_reqs=3,
     )
@@ -711,7 +722,7 @@ def test_rwkv_scheduler_keeps_live_decode_running_while_refilling_rows():
 
 
 def test_rwkv_scheduler_waits_when_live_decode_row_has_no_token_ready():
-    scheduler = _new_fake_scheduler(use_uniform_decode_wave=True)
+    scheduler = _new_fake_scheduler(requires_uniform_decode_wave=True)
     (req0,) = create_requests(num_requests=1, num_tokens=4, req_ids=["r0"])
     req0.status = RequestStatus.RUNNING
     req0.num_computed_tokens = req0.num_prompt_tokens
@@ -727,7 +738,7 @@ def test_rwkv_scheduler_waits_when_live_decode_row_has_no_token_ready():
 
 def test_rwkv_scheduler_does_not_mix_waiting_prefill_after_decode_wave():
     scheduler = _new_fake_scheduler(
-        use_uniform_decode_wave=True,
+        requires_uniform_decode_wave=True,
         max_num_scheduled_tokens=8,
         max_num_running_reqs=2,
     )
@@ -744,7 +755,7 @@ def test_rwkv_scheduler_does_not_mix_waiting_prefill_after_decode_wave():
 
 
 def test_default_scheduler_still_allows_running_decode_subset():
-    scheduler = _new_fake_scheduler(use_uniform_decode_wave=False)
+    scheduler = _new_fake_scheduler(requires_uniform_decode_wave=False)
     req0 = _new_ready_decode_request("r0")
     req1 = _new_ready_decode_request("r1")
     scheduler.running = [req0, req1]
@@ -1369,6 +1380,156 @@ def test_preempt_during_execution():
     # sampled token id.
     assert len(requests[1].output_token_ids) == 1
     assert requests[1].output_token_ids[0] == 42
+
+
+def test_prefix_cache_query_not_inflated_by_connector_defer():
+    """The GPU prefix-cache query is recorded at admission, so a request the
+    connector defers several times is counted once, not once per retry."""
+    num_defers_before_matching = 3
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(
+            matched_tokens=0,
+            is_async=False,
+            num_defers_before_matching=num_defers_before_matching,
+        ),
+    )
+    request = create_requests(num_requests=1, num_tokens=32, block_size=16)[0]
+    scheduler.add_request(request)
+
+    # Each deferred step re-runs the lookup but records nothing.
+    for _ in range(num_defers_before_matching):
+        assert not scheduler.schedule().scheduled_new_reqs
+
+    output = scheduler.schedule()
+    assert any(r.req_id == request.request_id for r in output.scheduled_new_reqs)
+
+    stats = scheduler.kv_cache_manager.prefix_cache_stats
+    assert stats is not None
+    assert stats.requests == 1
+    assert stats.queries == request.num_tokens
+
+
+def test_preemption_re_records_prefix_cache_query():
+    """A preempted request re-enters the lookup on resume, so its recomputation
+    is counted again into the preempted stats."""
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+    stats = scheduler.kv_cache_manager.prefix_cache_stats
+    assert stats is not None
+    assert (stats.requests, stats.preempted_requests) == (1, 0)
+
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, 0.0)
+    assert request.status == RequestStatus.PREEMPTED
+
+    scheduler.update_from_output(
+        scheduler_output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[1000]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert request.num_stale_output_tokens == 0
+    stats = scheduler.kv_cache_manager.prefix_cache_stats
+    assert stats is not None
+
+    scheduler.schedule()
+    assert request.status == RequestStatus.RUNNING
+    assert stats.preempted_requests == 1
+
+
+def test_prefix_cache_stats_not_recorded_when_caching_disabled():
+    """With prefix caching off there is no local lookup, so admitting a request
+    records no phantom miss."""
+    scheduler = create_scheduler(enable_prefix_caching=False)
+    for request in create_requests(num_requests=2):
+        scheduler.add_request(request)
+
+    scheduler.schedule()
+
+    stats = scheduler.kv_cache_manager.prefix_cache_stats
+    assert stats is not None
+    assert (stats.requests, stats.queries, stats.hits) == (0, 0, 0)
+
+
+def test_prefix_cache_stats_counted_once_for_retried_then_scheduled_request():
+    """A real cache hit rejected once by allocate_slots and admitted on the next
+    step is counted exactly once, hits included."""
+    block_size = 16
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        enable_chunked_prefill=False,
+        block_size=block_size,
+    )
+
+    # Seed the cache so the next request with the same prompt hits it.
+    seed = create_requests(
+        num_requests=1,
+        num_tokens=block_size * 2,
+        max_tokens=2,
+        same_prompt=True,
+        block_size=block_size,
+        req_ids=["seed"],
+    )[0]
+    scheduler.add_request(seed)
+    _step_until_done(
+        scheduler,
+        scheduler.schedule(),
+        ModelRunnerOutput(
+            req_ids=["seed"],
+            req_id_to_index={"seed": 0},
+            sampled_token_ids=[[1000]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    # The seeding step swapped in a fresh accumulator, so re-read it; the
+    # retried request must be the only thing recorded from here on.
+    stats = scheduler.kv_cache_manager.prefix_cache_stats
+    assert stats is not None
+    assert (stats.requests, stats.queries, stats.hits) == (0, 0, 0)
+
+    retried = create_requests(
+        num_requests=1,
+        num_tokens=block_size * 3,
+        max_tokens=1,
+        same_prompt=True,
+        block_size=block_size,
+        req_ids=["retried"],
+    )[0]
+    scheduler.add_request(retried)
+
+    # Reject the first allocation attempt, then delegate to the real one.
+    orig_allocate_slots = scheduler.kv_cache_manager.allocate_slots
+    allocate_results: list = []
+
+    def spy_allocate_slots(*args, **kwargs):
+        result = None if not allocate_results else orig_allocate_slots(*args, **kwargs)
+        allocate_results.append(result)
+        return result
+
+    scheduler.kv_cache_manager.allocate_slots = spy_allocate_slots
+
+    assert not scheduler.schedule().scheduled_new_reqs
+    assert (stats.requests, stats.queries, stats.hits) == (0, 0, 0)
+
+    assert "retried" in scheduler.schedule().num_scheduled_tokens
+    assert allocate_results[0] is None and allocate_results[1] is not None
+    assert (stats.requests, stats.queries, stats.hits) == (
+        1,
+        retried.num_tokens,
+        block_size * 2,
+    )
 
 
 def test_scheduler_reset_prefix_cache():
@@ -3309,6 +3470,58 @@ def test_schedule_skip_tokenizer_init_structured_output_request():
     assert len(scheduler.skipped_waiting) == 1
 
 
+@pytest.mark.parametrize("async_grammar", [True, False])
+def test_grammar_compile_error_finishes_only_request(async_grammar: bool):
+    scheduler = create_scheduler()
+    manager = scheduler.structured_output_manager
+    manager.backend = Mock()
+    manager.backend.compile_grammar.side_effect = RuntimeError(
+        "forced FSM compilation error"
+    )
+    manager._use_async_grammar_compilation = async_grammar
+
+    sampling_params = SamplingParams(
+        max_tokens=16,
+        structured_outputs=StructuredOutputsParams(json='{"type": "object"}'),
+    )
+    sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
+    request = Request(
+        request_id="grammar-error",
+        prompt_token_ids=[0, 1],
+        sampling_params=sampling_params,
+        pooling_params=None,
+    )
+
+    manager.grammar_init(request)
+    assert request.structured_output_request is not None
+    grammar_future = request.structured_output_request._grammar
+    assert isinstance(grammar_future, Future)
+    assert isinstance(grammar_future.exception(timeout=5), RuntimeError)
+
+    scheduler.add_request(request)
+    scheduler_output = scheduler.schedule()
+    assert not scheduler_output.num_scheduled_tokens
+
+    engine_core_outputs = scheduler.update_from_output(
+        scheduler_output,
+        ModelRunnerOutput(req_ids=[], req_id_to_index={}),
+    )
+
+    assert request.status == RequestStatus.FINISHED_ERROR
+    assert request.request_id not in scheduler.requests
+    output = engine_core_outputs[0].outputs[0]
+    assert output.request_id == request.request_id
+    assert output.finish_reason == FinishReason.ERROR
+    assert output.stop_reason is None
+
+    healthy_request = create_requests(num_requests=1, req_ids=["healthy-request"])[0]
+    scheduler.add_request(healthy_request)
+    next_output = scheduler.schedule()
+    assert [req.req_id for req in next_output.scheduled_new_reqs] == [
+        healthy_request.request_id
+    ]
+
+
 def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler = object.__new__(Scheduler)
     sampling_params = SamplingParams(ignore_eos=True, max_tokens=4)
@@ -3322,7 +3535,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
         pooling_params=None,
     )
     request.structured_output_request = Mock()
-    request.structured_output_request.grammar = Mock()
+    request.structured_output_request.grammar = Mock(spec=StructuredOutputGrammar)
     request.structured_output_request.grammar.accept_tokens.return_value = False
     request.status = RequestStatus.RUNNING
     request.num_computed_tokens = request.num_tokens
@@ -3343,6 +3556,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.kv_event_publisher = Mock()
     scheduler.finished_req_ids = set()
     scheduler.finished_req_ids_dict = None
+    scheduler.grammar_compile_error_reqs = set()
     scheduler.vllm_config = Mock()
     scheduler.vllm_config.model_config.enable_return_routed_experts = False
     scheduler.enable_return_routed_experts = False
@@ -5632,3 +5846,197 @@ def test_async_load_reservation_prevents_wedge_e2e():
     assert b.status == RequestStatus.WAITING
     assert b.num_preemptions == 0
     assert b.request_id not in req_to_blocks
+
+
+def _create_hybrid_mamba_connector_scheduler(
+    matched_tokens: int,
+    block_size: int = 16,
+    num_blocks: int = 100,
+) -> Scheduler:
+    """FA + Mamba ("all" cache mode) scheduler with a MockKVConnector."""
+    model_config = ModelConfig(
+        model="facebook/opt-125m",
+        trust_remote_code=True,
+        dtype="float16",
+        seed=42,
+        skip_tokenizer_init=True,
+    )
+    vllm_config = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=4,
+            max_num_batched_tokens=8192,
+            max_model_len=8192,
+            enable_chunked_prefill=True,
+            is_encoder_decoder=False,
+            watermark=0.0,
+        ),
+        model_config=model_config,
+        cache_config=CacheConfig(
+            block_size=block_size,
+            enable_prefix_caching=True,
+            mamba_cache_mode="all",
+        ),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="MockKVConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "matched_tokens": matched_tokens,
+                "is_async": False,
+            },
+        ),
+    )
+    vllm_config.cache_config.num_gpu_blocks = num_blocks
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["fa"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="all",
+                ),
+            ),
+        ],
+    )
+    register_all_kvcache_specs(vllm_config)
+    return Scheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        structured_output_manager=StructuredOutputManager(vllm_config),
+        block_size=block_size,
+        hash_block_size=block_size,
+        log_stats=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "matched_tokens,expected_num_computed",
+    [
+        # No external hit: resume on the deepest locally-consistent boundary
+        # (block 0's state survives for both groups).
+        (0, 16),
+        # One external block on top of the reconciled local boundary.
+        (16, 32),
+    ],
+)
+def test_hybrid_per_group_hit_divergence_with_connector(
+    matched_tokens: int, expected_num_computed: int
+):
+    """Per-group prefix hits can diverge for hybrid models with a connector
+    (#46453): under block pressure the FA prefix tail is evicted while a
+    deeper Mamba state block survives. The scheduler must not report the
+    deeper hit as locally computed (evicted FA blocks are not resident ->
+    engine crash / dirty KV); it falls back to the reconciled boundary that
+    every group is consistent at.
+    """
+    block_size = 16
+    scheduler = _create_hybrid_mamba_connector_scheduler(matched_tokens)
+    manager = scheduler.kv_cache_manager
+    assert isinstance(manager.coordinator, HybridKVCacheCoordinator)
+
+    # Seed a 4-block prefix so both groups cache all four boundaries
+    # (mamba cache mode "all" caches every block's state densely).
+    [fill] = create_requests(
+        num_requests=1,
+        num_tokens=4 * block_size,
+        max_tokens=1,
+        same_prompt=True,
+        block_size=block_size,
+        req_ids=["fill"],
+    )
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(fill)
+    blocks = manager.allocate_slots(
+        fill, fill.num_tokens, num_computed, computed_blocks
+    )
+    fa_ids = [b.block_id for b in blocks.blocks[0]]
+    mamba_ids = [b.block_id for b in blocks.blocks[1]]
+    manager.free(fill)
+
+    # Evict the FA tail and the middle mamba states; block 0 (both groups)
+    # and the deep mamba state at block 3 survive.
+    manager.block_pool.evict_blocks({fa_ids[2], fa_ids[3], mamba_ids[1], mamba_ids[2]})
+
+    # A replay of the prefix plus one extra block now sees diverged
+    # per-group hits: FA stops at the evicted tail, while the mamba lookup
+    # finds the deeper surviving state.
+    [replay] = create_requests(
+        num_requests=1,
+        num_tokens=5 * block_size,
+        max_tokens=1,
+        same_prompt=True,
+        block_size=block_size,
+        req_ids=["replay"],
+    )
+    _, per_group_hits = manager.coordinator.find_longest_cache_hit_per_group(
+        replay.block_hashes, replay.num_tokens - 1
+    )
+    assert per_group_hits == (2 * block_size, 4 * block_size)  # diverged
+
+    scheduler.add_request(replay)
+    output = scheduler.schedule()
+    num_scheduled = output.num_scheduled_tokens[replay.request_id]
+    assert replay.num_tokens - num_scheduled == expected_num_computed
+
+
+def test_hybrid_per_group_hit_divergence_fa_deeper_no_external():
+    """The opposite divergence: the FA prefix survives deeper than the Mamba
+    state and the connector supplies nothing (ext == 0). Reporting the deep FA
+    hit as locally computed would resume with no valid Mamba state at that
+    boundary (silent bad output). The scheduler must fall back to the
+    convergent boundary that every group agrees on (block 0's surviving state).
+    """
+    block_size = 16
+    scheduler = _create_hybrid_mamba_connector_scheduler(matched_tokens=0)
+    manager = scheduler.kv_cache_manager
+    assert isinstance(manager.coordinator, HybridKVCacheCoordinator)
+
+    # Seed a 4-block prefix in both groups.
+    [fill] = create_requests(
+        num_requests=1,
+        num_tokens=4 * block_size,
+        max_tokens=1,
+        same_prompt=True,
+        block_size=block_size,
+        req_ids=["fill"],
+    )
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(fill)
+    blocks = manager.allocate_slots(
+        fill, fill.num_tokens, num_computed, computed_blocks
+    )
+    mamba_ids = [b.block_id for b in blocks.blocks[1]]
+    manager.free(fill)
+
+    # Keep all FA blocks; evict every mamba state but block 0. FA reaches 4
+    # blocks, the mamba hit only reaches 1 -> diverged (FA > Mamba).
+    manager.block_pool.evict_blocks({mamba_ids[1], mamba_ids[2], mamba_ids[3]})
+
+    [replay] = create_requests(
+        num_requests=1,
+        num_tokens=5 * block_size,
+        max_tokens=1,
+        same_prompt=True,
+        block_size=block_size,
+        req_ids=["replay"],
+    )
+    _, per_group_hits = manager.coordinator.find_longest_cache_hit_per_group(
+        replay.block_hashes, replay.num_tokens - 1
+    )
+    assert per_group_hits == (4 * block_size, 1 * block_size)  # FA deeper
+
+    scheduler.add_request(replay)
+    output = scheduler.schedule()
+    num_scheduled = output.num_scheduled_tokens[replay.request_id]
+    # Must resume at the convergent boundary (block 0), not the deep FA hit.
+    assert replay.num_tokens - num_scheduled == block_size

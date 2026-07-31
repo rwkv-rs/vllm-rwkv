@@ -10,16 +10,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import vllm.model_executor.models.rwkv7 as rwkv7
-from vllm.config import ModelConfig
 from vllm.config.compilation import CompilationConfig, CompilationMode, CUDAGraphMode
-from vllm.config.load import LoadConfig
-from vllm.model_executor.model_loader import get_model_loader
-from vllm.model_executor.model_loader.rwkv_pth_loader import RWKV7PthModelLoader
+from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.models.config import RWKV7ForCausalLMConfig
+from vllm.model_executor.models.interfaces import requires_uniform_decode_wave
 from vllm.model_executor.models.rwkv7 import RWKV7ForCausalLM
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.engine.core import _supports_no_kv_cache_chunked_prefill
 from vllm.v1.worker.gpu.model_states.rwkv import RWKV7ModelState
 from vllm.v1.worker.gpu_input_batch import (
     CachedRequestState,
@@ -27,6 +26,10 @@ from vllm.v1.worker.gpu_input_batch import (
 from vllm.v1.worker.gpu_input_batch import (
     InputBatch as LegacyInputBatch,
 )
+
+
+def test_rwkv7_declares_uniform_decode_wave_capability():
+    assert requires_uniform_decode_wave(RWKV7ForCausalLM)
 
 
 def test_rwkv7_cuda_ops_match_torch_reference():
@@ -116,10 +119,12 @@ def _new_rwkv7_for_weight_tests() -> RWKV7ForCausalLM:
     return model
 
 
-def _new_rwkv_pth_loader_for_weight_tests() -> RWKV7PthModelLoader:
-    return RWKV7PthModelLoader(
+def _new_default_loader_for_weight_tests(
+    load_format: str = "auto",
+) -> DefaultModelLoader:
+    return DefaultModelLoader(
         SimpleNamespace(
-            load_format="rwkv_pth",
+            load_format=load_format,
             model_loader_extra_config={},
             download_dir=None,
             ignore_patterns=None,
@@ -579,10 +584,11 @@ def test_rwkv7_init_preserves_process_wide_torch_state(
         torch.set_float32_matmul_precision(old_matmul_precision)
 
 
-def test_rwkv7_raw_pth_file_uses_single_weight_file(tmp_path):
+@pytest.mark.parametrize("load_format", ["auto", "hf"])
+def test_rwkv7_raw_pth_file_uses_single_weight_file(tmp_path, load_format):
     checkpoint = tmp_path / "rwkv7-g1g-1.5b-20260526-ctx8192.pth"
     checkpoint.touch()
-    loader = _new_rwkv_pth_loader_for_weight_tests()
+    loader = _new_default_loader_for_weight_tests(load_format=load_format)
 
     _, weight_files, use_safetensors = loader._prepare_weights(
         str(checkpoint),
@@ -594,25 +600,6 @@ def test_rwkv7_raw_pth_file_uses_single_weight_file(tmp_path):
 
     assert weight_files == [str(checkpoint)]
     assert use_safetensors is False
-
-
-def test_rwkv7_pth_load_format_uses_dedicated_loader():
-    loader = get_model_loader(LoadConfig(load_format="rwkv_pth"))
-
-    assert isinstance(loader, RWKV7PthModelLoader)
-
-
-def test_rwkv7_pth_loader_rejects_non_rwkv_source():
-    loader = _new_rwkv_pth_loader_for_weight_tests()
-
-    with pytest.raises(ValueError, match="requires a supported RWKV-7"):
-        loader._prepare_weights(
-            "ordinary-model",
-            subfolder=None,
-            revision=None,
-            fall_back_to_pt=True,
-            allow_patterns_overrides=None,
-        )
 
 
 def test_rwkv7_raw_pth_url_downloads_single_weight_file(tmp_path, monkeypatch):
@@ -628,7 +615,7 @@ def test_rwkv7_raw_pth_url_downloads_single_weight_file(tmp_path, monkeypatch):
         "vllm.transformers_utils.configs.rwkv7.hf_hub_download",
         fake_hf_hub_download,
     )
-    loader = _new_rwkv_pth_loader_for_weight_tests()
+    loader = _new_default_loader_for_weight_tests()
 
     _, weight_files, use_safetensors = loader._prepare_weights(
         "https://huggingface.co/BlinkDL/rwkv7-g1/blob/main/"
@@ -768,12 +755,16 @@ def test_rwkv7_config_preserves_explicit_cudagraph_sizes(compilation_config):
     )
 
 
-@pytest.mark.parametrize(("is_rwkv7", "expected"), [(True, True), (False, False)])
-def test_no_kv_cache_chunked_prefill_capability(is_rwkv7, expected):
-    supports_chunked_prefill = ModelConfig.supports_no_kv_cache_chunked_prefill.fget
+def test_rwkv7_allows_chunked_prefill_without_kv_cache():
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            runner_type="generate",
+            architectures=["RWKV7ForCausalLM"],
+            hf_config=SimpleNamespace(architectures=[]),
+        )
+    )
 
-    assert supports_chunked_prefill is not None
-    assert supports_chunked_prefill(SimpleNamespace(is_rwkv7=is_rwkv7)) is expected
+    assert _supports_no_kv_cache_chunked_prefill(vllm_config)
 
 
 def test_rwkv7_config_rejects_decode_budget_below_max_running_reqs():
@@ -1560,12 +1551,12 @@ def test_rwkv7_load_weights_preprocesses_full_raw_weights(monkeypatch):
     torch.testing.assert_close(model.z["processed"], torch.tensor([3.0]))
 
 
-def test_rwkv7_pth_loader_validation_uses_raw_weight_names():
+def test_rwkv7_default_loader_validation_uses_raw_weight_names():
     model = _new_rwkv7_for_weight_tests()
     model.raw_weight_names = {"emb.weight", "head.weight"}
 
-    RWKV7PthModelLoader.track_weights_loading(
-        object.__new__(RWKV7PthModelLoader),
+    DefaultModelLoader.track_weights_loading(
+        object.__new__(DefaultModelLoader),
         model,
         {"emb.weight", "head.weight"},
     )
@@ -3724,6 +3715,7 @@ def test_rwkv7_model_state_requires_rapid_sampler():
     state = object.__new__(RWKV7ModelState)
     sampler = SimpleNamespace(use_rapid=True, require_rapid=False)
 
+    assert "uniform recurrent decode waves" in state.get_v2_kernel_warmup_skip_reason()
     assert state.custom_sampler(sampler) == (sampler, None)
     assert sampler.require_rapid is True
 

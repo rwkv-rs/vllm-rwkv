@@ -56,7 +56,7 @@ def resolve_rwkv_prompt_template(
     *,
     prompt_template: str | None = None,
     messages: Sequence[Any] = (),
-    tools: Sequence[dict[str, Any]] = (),
+    tools: Sequence[Any] = (),
 ) -> RWKVPromptTemplateSpec:
     has_tool_history = any(
         _field(message, "role", "") == "tool"

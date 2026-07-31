@@ -51,7 +51,10 @@ from vllm.v1.worker.gpu.lora_utils import LoraState
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner as PackedGPUModelRunner
-from vllm.v1.worker.gpu.warmup import warmup_kernels
+from vllm.v1.worker.gpu.warmup import (
+    get_v2_kernel_warmup_skip_reason,
+    warmup_kernels,
+)
 from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import select_common_block_size
@@ -59,6 +62,17 @@ from vllm.v1.worker.utils import select_common_block_size
 BLOCK_SIZE = 16
 NUM_BLOCKS = 10
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_v2_kernel_warmup_skip_reason_uses_model_state_hook():
+    model_runner = SimpleNamespace(
+        model_state=SimpleNamespace(
+            get_v2_kernel_warmup_skip_reason=lambda: "backend constraint"
+        )
+    )
+
+    assert get_v2_kernel_warmup_skip_reason(model_runner) == "backend constraint"
+    assert get_v2_kernel_warmup_skip_reason(SimpleNamespace()) is None
 
 
 def test_warmup_kernels_handles_no_kv_cache_groups(monkeypatch):
@@ -77,8 +91,11 @@ def test_warmup_kernels_handles_no_kv_cache_groups(monkeypatch):
             max_num_batched_tokens=16,
         ),
         is_pooling_model=False,
+        is_encoder_decoder=False,
         is_last_pp_rank=True,
         model_config=SimpleNamespace(get_vocab_size=lambda: 64),
+        model_state=SimpleNamespace(max_encoder_len=0),
+        kv_block_zeroer=None,
         kv_connector=kv_connector,
     )
     executed: list[Any] = []
@@ -90,16 +107,24 @@ def test_warmup_kernels_handles_no_kv_cache_groups(monkeypatch):
         True,
         False,
     ]
-    assert len(executed) == 3
-    assert len(sampled) == 2
+    assert len(executed) == 5
+    assert len(sampled) == 4
 
-    prefill_output, decode_output, cleanup_output = executed
+    prefill_output = executed[0]
+    decode_outputs = executed[1:-1]
+    cleanup_output = executed[-1]
     assert len(prefill_output.scheduled_new_reqs) == 4
     assert all(req.block_ids == () for req in prefill_output.scheduled_new_reqs)
     assert prefill_output.num_common_prefix_blocks == []
 
-    assert decode_output.scheduled_cached_reqs.new_block_ids == [None] * 4
-    assert decode_output.num_common_prefix_blocks == []
+    assert all(
+        all(
+            block_ids is None
+            for block_ids in output.scheduled_cached_reqs.new_block_ids
+        )
+        for output in decode_outputs
+    )
+    assert all(output.num_common_prefix_blocks == [] for output in decode_outputs)
     assert cleanup_output.finished_req_ids == {f"_warmup_{i}_" for i in range(4)}
 
 
@@ -876,7 +901,7 @@ def test_update_config(model_runner):
     model_runner.update_config({"load_config": {"load_format": "dummy"}})
     assert model_runner.load_config.load_format == "dummy"
     # Raise error on non-existing config
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="do_not_exist_config"):
         model_runner.update_config({"do_not_exist_config": "dummy"})
 
 
@@ -2007,3 +2032,59 @@ def test_mamba_cache_raises_when_max_num_seqs_exceeds_blocks():
 
         with pytest.raises(ValueError, match="max_num_seqs"):
             runner.initialize_kv_cache(kv_cache_config)
+
+
+class TestInitFp8KvScalesHybridModels:
+    """Verify init_fp8_kv_scales handles heterogeneous kv_caches entries.
+
+    Hybrid models (Mamba, DeltaNet) store per-layer state as a list of tensors
+    rather than a single tensor. init_fp8_kv_scales must iterate both forms.
+    """
+
+    @staticmethod
+    def _make_runner_stub(kv_caches):
+        runner = Mock(spec=GPUModelRunner)
+        runner.cache_config = SimpleNamespace(cache_dtype="fp8_e4m3")
+        runner.kv_caches = kv_caches
+        runner.compilation_config = SimpleNamespace(static_forward_context={})
+        runner.init_fp8_kv_scales = GPUModelRunner.init_fp8_kv_scales.__get__(
+            runner, GPUModelRunner
+        )
+        return runner
+
+    def test_zeroes_both_tensor_and_list_entries(self):
+        single_tensor = torch.ones(4, 8)
+        list_tensors = [torch.ones(2, 4), torch.ones(3, 6)]
+
+        runner = self._make_runner_stub([single_tensor, list_tensors])
+        runner.init_fp8_kv_scales()
+
+        assert (single_tensor == 0).all()
+        assert all((t == 0).all() for t in list_tensors)
+
+    def test_skips_none_entries(self):
+        tensor = torch.ones(4, 8)
+        runner = self._make_runner_stub([None, tensor, None])
+        runner.init_fp8_kv_scales()
+
+        assert (tensor == 0).all()
+
+    def test_noop_when_kv_cache_not_quantized(self):
+        tensor = torch.ones(4, 8)
+        runner = self._make_runner_stub([tensor])
+        runner.cache_config.cache_dtype = "auto"
+        runner.init_fp8_kv_scales()
+
+        assert (tensor == 1).all()
+
+    def test_mixed_none_tensor_and_list(self):
+        t1 = torch.ones(2, 2)
+        t2 = torch.ones(3, 3)
+        list_entry = [torch.ones(1, 1), torch.ones(1, 1)]
+
+        runner = self._make_runner_stub([None, t1, list_entry, None, t2])
+        runner.init_fp8_kv_scales()
+
+        assert (t1 == 0).all()
+        assert (t2 == 0).all()
+        assert all((t == 0).all() for t in list_entry)

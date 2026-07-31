@@ -14,7 +14,10 @@ import pytest
 from benchmarks.rwkv7 import benchmark_faster3a as bench
 
 
-def _config(repo_root: Path, model: str | None = "https://example.test/model") -> bench.BenchmarkConfig:
+def _config(
+    repo_root: Path,
+    model: str | None = "https://example.test/model",
+) -> bench.BenchmarkConfig:
     return bench.BenchmarkConfig(
         repo_root=repo_root,
         model=model,
@@ -53,9 +56,7 @@ def _measurement(
 def test_source_metadata_pins_latest_albatross_2607_reference() -> None:
     metadata = bench._source_metadata(_config(Path.cwd()))
 
-    assert metadata["albatross_commit"] == (
-        "ee3308f6922e59f2166c7fac3c5a192340a2b48e"
-    )
+    assert metadata["albatross_commit"] == ("ee3308f6922e59f2166c7fac3c5a192340a2b48e")
     assert metadata["albatross_changes"]["faster3a_2607"] == (
         "63c53f4abf2cd891dd3a18c8f44f5b2cccc8c64b"
     )
@@ -177,14 +178,21 @@ def test_report_records_source_and_runner_check() -> None:
     assert report["overall_status"] == "passed"
     assert set(report["checks"]) == {"runner_steady_decode"}
     assert report["source"]["contracts"]
-    assert report["checks"]["runner_steady_decode"]["metrics"]["runner_tokens_per_s"] == 10000.0
+    assert (
+        report["checks"]["runner_steady_decode"]["metrics"]["runner_tokens_per_s"]
+        == 10000.0
+    )
 
 
 @pytest.mark.parametrize(
     ("measurement", "status", "code"),
     [
         (None, "blocked", "missing_measurement_json"),
-        (_measurement(wkv_mode="fp32io16"), "blocked", "invalid_runner_throughput_contract"),
+        (
+            _measurement(wkv_mode="fp32io16"),
+            "blocked",
+            "invalid_runner_throughput_contract",
+        ),
         (
             _measurement(
                 fixed_model_contract={
@@ -257,7 +265,8 @@ def test_report_blocks_missing_runtime_paths() -> None:
     )
 
     assert report["overall_status"] == "blocked"
-    assert {item["code"] for item in report["checks"]["runner_steady_decode"]["blockers"]} >= {
+    blockers = report["checks"]["runner_steady_decode"]["blockers"]
+    assert {item["code"] for item in blockers} >= {
         "cuda_unavailable",
         "missing_vllm_model",
     }
@@ -326,7 +335,11 @@ def test_measurement_lane_classifies_result(
     expected_rc: int,
 ) -> None:
     output = tmp_path / "runner.json"
-    monkeypatch.setattr(bench, "generate_vllm_runner_measurement", lambda *a, **k: measurement)
+    monkeypatch.setattr(
+        bench,
+        "generate_vllm_runner_measurement",
+        lambda *a, **k: measurement,
+    )
 
     rc = bench.main(
         [
@@ -440,7 +453,9 @@ def test_create_runner_llm_omits_capture_for_eager_mode(
 
 def test_shutdown_runner_uses_engine_core(monkeypatch) -> None:
     calls: list[int] = []
-    engine_core = SimpleNamespace(shutdown=lambda **kwargs: calls.append(kwargs["timeout"]))
+    engine_core = SimpleNamespace(
+        shutdown=lambda **kwargs: calls.append(kwargs["timeout"])
+    )
     llm = SimpleNamespace(llm_engine=SimpleNamespace(engine_core=engine_core))
     monkeypatch.setattr(bench, "_cuda_available", lambda: False)
 
@@ -458,9 +473,7 @@ def test_finish_execute_without_sampling_postprocesses_state() -> None:
     model_runner = SimpleNamespace(
         execute_model_state=SimpleNamespace(input_batch=input_batch),
         model_state=model_state,
-        req_states=SimpleNamespace(
-            num_computed_tokens=SimpleNamespace(gpu="computed")
-        ),
+        req_states=SimpleNamespace(num_computed_tokens=SimpleNamespace(gpu="computed")),
     )
     worker = SimpleNamespace(model_runner=model_runner)
 

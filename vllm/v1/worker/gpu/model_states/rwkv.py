@@ -23,8 +23,6 @@ logger = init_logger(__name__)
 class RWKV7ModelState(ModelState):
     """Dense batched recurrent state for RWKV7."""
 
-    supports_v2_kernel_warmup = False
-
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -224,6 +222,9 @@ class RWKV7ModelState(ModelState):
 
     def get_supported_generation_tasks(self) -> tuple[GenerationTask, ...]:
         return ("generate",)
+
+    def get_v2_kernel_warmup_skip_reason(self) -> str | None:
+        return "uniform recurrent decode waves do not support mixed warmup batches"
 
     def custom_sampler(self, sampler: Any) -> tuple[Any, None]:
         if not sampler.use_rapid:

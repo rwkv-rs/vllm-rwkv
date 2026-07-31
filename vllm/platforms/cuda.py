@@ -25,7 +25,7 @@ from vllm.build_profile import get_build_profile_metadata
 # original mandatory import; a reduced artifact declares exactly which native
 # targets exist in its immutable manifest.
 _build_profile = get_build_profile_metadata()
-if _build_profile.profile == "full" or _build_profile.has_target("_C_stable_libtorch"):
+if _build_profile.unrestricted or _build_profile.has_target("_C_stable_libtorch"):
     import vllm._C_stable_libtorch  # noqa
 
 with contextlib.suppress(ImportError):
@@ -226,7 +226,7 @@ class CudaPlatformBase(Platform):
     @classmethod
     def import_kernels(cls) -> None:
         """Import CUDA kernel extensions (_C_stable_libtorch, optional _qutlass_C)."""
-        if _build_profile.profile == "full" or _build_profile.has_target(
+        if _build_profile.unrestricted or _build_profile.has_target(
             "_C_stable_libtorch"
         ):
             try:
@@ -303,7 +303,8 @@ class CudaPlatformBase(Platform):
             # kernel with limited pinned memory support for CUDA.
             version = _get_wsl_kernel_version()
             if version is None or version < (4, 19, 121):
-                logger.warning_once(
+                # warning_once() causes a circular import on WSL, see #48397.
+                logger.warning(
                     "Using 'pin_memory=False' as WSL is detected and the "
                     "WSL2 kernel version is below 4.19.121. This may slow "
                     "down performance. Please run `wsl --update`."

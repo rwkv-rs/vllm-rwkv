@@ -50,29 +50,25 @@ bool use_3d_mix(int B, int T, int C) {
 }
 
 bool use_cmix_value_split2(int B, int T) {
-  return (B == 1 && (T == 1 || T == 2 || T == 3 || T == 4 || T == 5 ||
-                     T == 7)) ||
+  return (B == 1 &&
+          (T == 1 || T == 2 || T == 3 || T == 4 || T == 5 || T == 7)) ||
          (T == 1 && (B == 2 || B == 3 || B == 5 || B == 7)) ||
          (B == 2 && T == 2) || (B == 3 && T == 2);
 }
 
 bool use_cmix_t512_acc2(int B, int T) {
-  return (B == 8 && T == 1) || (B == 4 && T == 2) ||
-         (B == 3 && T == 3) || (B == 19 && T == 1);
+  return (B == 8 && T == 1) || (B == 4 && T == 2) || (B == 3 && T == 3) ||
+         (B == 19 && T == 1);
 }
 
 bool use_cmix_t512_reuse(int B, int T) {
-  return (B == 1 &&
-          (T == 8 || T == 11 || T == 12 || T == 13 || T == 14 || T == 15 ||
-           T == 16 || T == 17 || T == 19)) ||
-         (T == 1 &&
-          (B == 8 || B == 11 || B == 12 || B == 13 || B == 14 || B == 16 ||
-           B == 19 || B == 20)) ||
-         (B == 2 && (T == 4 || T == 8)) ||
-         (B == 3 && (T == 3 || T == 4)) ||
+  return (B == 1 && (T == 8 || T == 11 || T == 12 || T == 13 || T == 14 ||
+                     T == 15 || T == 16 || T == 17 || T == 19)) ||
+         (T == 1 && (B == 8 || B == 11 || B == 12 || B == 13 || B == 14 ||
+                     B == 16 || B == 19 || B == 20)) ||
+         (B == 2 && (T == 4 || T == 8)) || (B == 3 && (T == 3 || T == 4)) ||
          (B == 4 && (T == 2 || T == 3 || T == 4 || T == 5)) ||
-         (B == 5 && T == 4) || (B == 8 && T == 2) ||
-         (B == 10 && T == 2);
+         (B == 5 && T == 4) || (B == 8 && T == 2) || (B == 10 && T == 2);
 }
 
 __device__ inline __half2 load_h2(const dtype* ptr) {
@@ -178,14 +174,13 @@ __global__ void tmix_mix6_kernel(
 
 template <bool UpdateShift>
 __global__ void tmix_mix6_3d_kernel(
-    int T, int C, const dtype* __restrict__ x,
-    dtype* __restrict__ shift_state, const dtype* __restrict__ x_r,
-    const dtype* __restrict__ x_w, const dtype* __restrict__ x_k,
-    const dtype* __restrict__ x_v, const dtype* __restrict__ x_a,
-    const dtype* __restrict__ x_g, dtype* __restrict__ out_r,
-    dtype* __restrict__ out_w, dtype* __restrict__ out_k,
-    dtype* __restrict__ out_v, dtype* __restrict__ out_a,
-    dtype* __restrict__ out_g) {
+    int T, int C, const dtype* __restrict__ x, dtype* __restrict__ shift_state,
+    const dtype* __restrict__ x_r, const dtype* __restrict__ x_w,
+    const dtype* __restrict__ x_k, const dtype* __restrict__ x_v,
+    const dtype* __restrict__ x_a, const dtype* __restrict__ x_g,
+    dtype* __restrict__ out_r, dtype* __restrict__ out_w,
+    dtype* __restrict__ out_k, dtype* __restrict__ out_v,
+    dtype* __restrict__ out_a, dtype* __restrict__ out_g) {
   const int c_pair = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int c_pairs = C >> 1;
   if (c_pair >= c_pairs) {
@@ -200,9 +195,8 @@ __global__ void tmix_mix6_3d_kernel(
 
   const __half2 cur2 = load_h2(x + idx);
   const __half2 prev2 =
-      (t == 0)
-          ? load_h2(shift_state + static_cast<int64_t>(b) * C + c)
-          : load_h2(x + idx - C);
+      (t == 0) ? load_h2(shift_state + static_cast<int64_t>(b) * C + c)
+               : load_h2(x + idx - C);
   const float2 cur = __half22float2(cur2);
   const float2 prev = __half22float2(prev2);
   const float dx0 = prev.x - cur.x;
@@ -260,8 +254,7 @@ __global__ void update_shift_state_last_2d_kernel(
 
   const int b = static_cast<int>(blockIdx.y);
   const int c = c_pair << 1;
-  const int64_t src_idx =
-      (static_cast<int64_t>(b) * T + (T - 1)) * C + c;
+  const int64_t src_idx = (static_cast<int64_t>(b) * T + (T - 1)) * C + c;
   *reinterpret_cast<__half2*>(shift_state + static_cast<int64_t>(b) * C + c) =
       load_h2(x + src_idx);
 }
@@ -501,21 +494,18 @@ __global__ __launch_bounds__(32) void tmix_lnx_rkvres_xg_warp_kernel(
 
   const float2 xv = __half22float2(load_h2(x + idx));
   float sum = warp_sum(xv.x + xv.y);
-  const float mean =
-      __shfl_sync(0xffffffffu, sum, 0) * (1.0f / HEAD_SIZE);
+  const float mean = __shfl_sync(0xffffffffu, sum, 0) * (1.0f / HEAD_SIZE);
   const float d0 = xv.x - mean;
   const float d1 = xv.y - mean;
   float ss = warp_sum(d0 * d0 + d1 * d1);
-  const float var =
-      __shfl_sync(0xffffffffu, ss, 0) * (1.0f / HEAD_SIZE);
+  const float var = __shfl_sync(0xffffffffu, ss, 0) * (1.0f / HEAD_SIZE);
   const float rstd = rsqrtf(var + TMIX_LN_X_EPS);
 
   const float2 rv = __half22float2(load_h2(r + idx));
   const float2 kv = __half22float2(load_h2(k + idx));
   const float2 vv = __half22float2(load_h2(v + idx));
   const float2 rkv_weight = __half22float2(load_h2(r_k + c));
-  float dot =
-      warp_sum(rv.x * kv.x * rkv_weight.x + rv.y * kv.y * rkv_weight.y);
+  float dot = warp_sum(rv.x * kv.x * rkv_weight.x + rv.y * kv.y * rkv_weight.y);
   const float rkv = __shfl_sync(0xffffffffu, dot, 0);
 
   const float2 ln_weight = __half22float2(load_h2(weight + c));
@@ -567,8 +557,8 @@ __global__ __launch_bounds__(Threads) void tmix_vres_gate_vec2_kernel(
 }
 
 bool is_half2_compatible(const at::Tensor& tensor) {
-  if (tensor.scalar_type() != at::ScalarType::Half ||
-      !tensor.is_contiguous() || (tensor.numel() & 1) != 0) {
+  if (tensor.scalar_type() != at::ScalarType::Half || !tensor.is_contiguous() ||
+      (tensor.numel() & 1) != 0) {
     return false;
   }
   const auto address =
@@ -636,10 +626,10 @@ __global__ void cmix_mix_kernel(int T, int C, const dtype* __restrict__ x,
 }
 
 template <bool UpdateShift>
-__global__ void cmix_mix_3d_kernel(
-    int T, int C, const dtype* __restrict__ x,
-    dtype* __restrict__ shift_state, const dtype* __restrict__ x_k,
-    dtype* __restrict__ out) {
+__global__ void cmix_mix_3d_kernel(int T, int C, const dtype* __restrict__ x,
+                                   dtype* __restrict__ shift_state,
+                                   const dtype* __restrict__ x_k,
+                                   dtype* __restrict__ out) {
   const int c_pair = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int c_pairs = C >> 1;
   if (c_pair >= c_pairs) {
@@ -654,9 +644,8 @@ __global__ void cmix_mix_3d_kernel(
 
   const __half2 cur2 = load_h2(x + idx);
   const __half2 prev2 =
-      (t == 0)
-          ? load_h2(shift_state + static_cast<int64_t>(b) * C + c)
-          : load_h2(x + idx - C);
+      (t == 0) ? load_h2(shift_state + static_cast<int64_t>(b) * C + c)
+               : load_h2(x + idx - C);
   const float2 cur = __half22float2(cur2);
   const float2 prev = __half22float2(prev2);
   const float2 mix = __half22float2(load_h2(x_k + c));
@@ -1056,8 +1045,8 @@ __launch_bounds__(256, 2) void cmix_sparse_spmv_relu_rows_t512_kernel(
 }
 
 template <int Accumulators>
-__global__ __launch_bounds__(
-    256, 2) void cmix_sparse_spmv_relu_rows_t512_reuse_kernel(
+__global__
+__launch_bounds__(256, 2) void cmix_sparse_spmv_relu_rows_t512_reuse_kernel(
     int C, int F, const dtype* __restrict__ preact,
     const dtype* __restrict__ value_fc, dtype* __restrict__ out) {
   static_assert(Accumulators == 1 || Accumulators == 2,
@@ -1156,18 +1145,17 @@ __global__ __launch_bounds__(
     }
     acc = __hadd2(acc, acc1);
   }
-  atomicAdd(reinterpret_cast<__half2*>(
-                out + static_cast<int64_t>(row) * C +
-                c_block * (2 * THREADS) + tid * 2),
+  atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C +
+                                       c_block * (2 * THREADS) + tid * 2),
             acc);
 }
 
-void launch_cmix_sparse_down_relu_one(
-    int C, int F, const dtype* preact, const dtype* value_fc, dtype* out,
-    cudaStream_t stream) {
+void launch_cmix_sparse_down_relu_one(int C, int F, const dtype* preact,
+                                      const dtype* value_fc, dtype* out,
+                                      cudaStream_t stream) {
   cmix_sparse_spmv_relu_one_kernel<true>
-      <<<dim3(F / FFN_TILE, C / (2 * FFN_SPMV_THREADS), 1),
-         FFN_SPMV_THREADS, 0, stream>>>(C, preact, value_fc, out);
+      <<<dim3(F / FFN_TILE, C / (2 * FFN_SPMV_THREADS), 1), FFN_SPMV_THREADS, 0,
+         stream>>>(C, preact, value_fc, out);
 }
 
 }  // namespace
@@ -1204,10 +1192,11 @@ std::vector<at::Tensor> tmix_mix6_cuda(int B, int T, int C, at::Tensor x,
                              x_k, x_v, x_a, x_g);
 }
 
-std::vector<at::Tensor> tmix_mix6_3d_cuda(
-    int B, int T, int C, at::Tensor x, at::Tensor shift_state,
-    at::Tensor x_r, at::Tensor x_w, at::Tensor x_k, at::Tensor x_v,
-    at::Tensor x_a, at::Tensor x_g) {
+std::vector<at::Tensor> tmix_mix6_3d_cuda(int B, int T, int C, at::Tensor x,
+                                          at::Tensor shift_state,
+                                          at::Tensor x_r, at::Tensor x_w,
+                                          at::Tensor x_k, at::Tensor x_v,
+                                          at::Tensor x_a, at::Tensor x_g) {
   auto out_r = at::empty_like(x);
   auto out_w = at::empty_like(x);
   auto out_k = at::empty_like(x);
@@ -1216,9 +1205,9 @@ std::vector<at::Tensor> tmix_mix6_3d_cuda(
   auto out_g = at::empty_like(x);
   constexpr int threads = 256;
   const int c_pairs = C / 2;
-  const dim3 mix_grid(
-      static_cast<unsigned int>(ceil_div(c_pairs, threads)),
-      static_cast<unsigned int>(T), static_cast<unsigned int>(B));
+  const dim3 mix_grid(static_cast<unsigned int>(ceil_div(c_pairs, threads)),
+                      static_cast<unsigned int>(T),
+                      static_cast<unsigned int>(B));
   auto stream = at::cuda::getCurrentCUDAStream();
 
   // Dedicated dense entrypoint from faster3a_2607. The existing generic op
@@ -1241,9 +1230,8 @@ std::vector<at::Tensor> tmix_mix6_3d_cuda(
         out_a.data_ptr<dtype>(), out_g.data_ptr<dtype>());
     // Keep T>1 recurrent writes in a second launch. An in-grid last-token
     // store could race a CTA that has not read the old t==0 state yet.
-    const dim3 state_grid(
-        static_cast<unsigned int>(ceil_div(c_pairs, threads)),
-        static_cast<unsigned int>(B));
+    const dim3 state_grid(static_cast<unsigned int>(ceil_div(c_pairs, threads)),
+                          static_cast<unsigned int>(B));
     update_shift_state_last_2d_kernel<<<state_grid, threads, 0, stream>>>(
         T, C, x.data_ptr<dtype>(), shift_state.data_ptr<dtype>());
   }
@@ -1287,18 +1275,20 @@ std::vector<at::Tensor> tmix_mix6_slot_cuda(int B, int T, int C, at::Tensor x,
           T, C, x.data_ptr<dtype>(), shift_state.data_ptr<dtype>(), slot_ptr,
           x_r.data_ptr<dtype>(), x_w.data_ptr<dtype>(), x_k.data_ptr<dtype>(),
           x_v.data_ptr<dtype>(), x_a.data_ptr<dtype>(), x_g.data_ptr<dtype>(),
-          out_r.data_ptr<dtype>(), out_w.data_ptr<dtype>(), out_k.data_ptr<dtype>(),
-          out_v.data_ptr<dtype>(), out_a.data_ptr<dtype>(), out_g.data_ptr<dtype>(),
-          0);
-    } else {
-      tmix_mix6_kernel<false><<<static_cast<int>(ceil_div(total_pairs, threads)),
-                                threads, 0, stream>>>(
-          T, C, x.data_ptr<dtype>(), shift_state.data_ptr<dtype>(), slot_ptr,
-          x_r.data_ptr<dtype>(), x_w.data_ptr<dtype>(), x_k.data_ptr<dtype>(),
-          x_v.data_ptr<dtype>(), x_a.data_ptr<dtype>(), x_g.data_ptr<dtype>(),
           out_r.data_ptr<dtype>(), out_w.data_ptr<dtype>(),
           out_k.data_ptr<dtype>(), out_v.data_ptr<dtype>(),
-          out_a.data_ptr<dtype>(), out_g.data_ptr<dtype>(), total_pairs);
+          out_a.data_ptr<dtype>(), out_g.data_ptr<dtype>(), 0);
+    } else {
+      tmix_mix6_kernel<false>
+          <<<static_cast<int>(ceil_div(total_pairs, threads)), threads, 0,
+             stream>>>(T, C, x.data_ptr<dtype>(), shift_state.data_ptr<dtype>(),
+                       slot_ptr, x_r.data_ptr<dtype>(), x_w.data_ptr<dtype>(),
+                       x_k.data_ptr<dtype>(), x_v.data_ptr<dtype>(),
+                       x_a.data_ptr<dtype>(), x_g.data_ptr<dtype>(),
+                       out_r.data_ptr<dtype>(), out_w.data_ptr<dtype>(),
+                       out_k.data_ptr<dtype>(), out_v.data_ptr<dtype>(),
+                       out_a.data_ptr<dtype>(), out_g.data_ptr<dtype>(),
+                       total_pairs);
     }
     const int64_t state_pairs = static_cast<int64_t>(B) * (C / 2);
     update_shift_state_last_kernel<<<
@@ -1364,18 +1354,18 @@ std::vector<at::Tensor> tmix_kk_a_gate_cuda(int B, int T, int C, int H,
   return {new_k, neg_kk, kka};
 }
 
-std::vector<at::Tensor> tmix_kk_a_gate_2d_cuda(
-    int B, int T, int C, int H, at::Tensor k, at::Tensor k_k, at::Tensor a0,
-    at::Tensor a12, at::Tensor k_a) {
+std::vector<at::Tensor> tmix_kk_a_gate_2d_cuda(int B, int T, int C, int H,
+                                               at::Tensor k, at::Tensor k_k,
+                                               at::Tensor a0, at::Tensor a12,
+                                               at::Tensor k_a) {
   (void)C;
   assert(C == H * HEAD_SIZE);
   auto new_k = at::empty_like(k);
   auto neg_kk = at::empty_like(k);
   auto kka = at::empty_like(k);
   const int64_t rows = static_cast<int64_t>(B) * T;
-  const dim3 grid(
-      static_cast<unsigned int>(ceil_div(H, WARPS_PER_BLOCK)),
-      static_cast<unsigned int>(rows));
+  const dim3 grid(static_cast<unsigned int>(ceil_div(H, WARPS_PER_BLOCK)),
+                  static_cast<unsigned int>(rows));
   auto stream = at::cuda::getCurrentCUDAStream();
   tmix_kk_a_gate_2d_kernel<<<grid, WARPS_PER_BLOCK * 32, 0, stream>>>(
       H, k.data_ptr<dtype>(), k_k.data_ptr<dtype>(), a0.data_ptr<dtype>(),
@@ -1406,10 +1396,11 @@ at::Tensor tmix_lnx_rkvres_xg_cuda(int B, int T, int C, int H, at::Tensor x,
   return out;
 }
 
-at::Tensor tmix_lnx_rkvres_xg_warp_cuda(
-    int B, int T, int C, int H, at::Tensor x, at::Tensor r, at::Tensor k,
-    at::Tensor v, at::Tensor r_k, at::Tensor weight, at::Tensor bias,
-    at::Tensor g) {
+at::Tensor tmix_lnx_rkvres_xg_warp_cuda(int B, int T, int C, int H,
+                                        at::Tensor x, at::Tensor r,
+                                        at::Tensor k, at::Tensor v,
+                                        at::Tensor r_k, at::Tensor weight,
+                                        at::Tensor bias, at::Tensor g) {
   (void)C;
   assert(C == H * HEAD_SIZE);
   auto out = at::empty_like(x);
@@ -1438,27 +1429,24 @@ at::Tensor tmix_vres_gate_cuda(int B, int T, int C, at::Tensor v,
   // is also the portable CUDA grid.y limit used by this 2D launch.
   const bool use_vec2 =
       C == VRES_VEC2_C && rows >= VRES_VEC2_MIN_ROWS &&
-      rows <= VRES_VEC2_MAX_ROWS &&
-      (C & 1) == 0 && is_half2_compatible(v) &&
+      rows <= VRES_VEC2_MAX_ROWS && (C & 1) == 0 && is_half2_compatible(v) &&
       is_half2_compatible(v_first) && is_half2_compatible(v0) &&
       is_half2_compatible(v12) && is_half2_compatible(out);
   if (use_vec2) {
     const int pairs_per_row = C >> 1;
     if (rows < VRES_VEC2_LARGE_MIN_ROWS) {
-      const dim3 grid(
-          static_cast<unsigned int>(
-              ceil_div(pairs_per_row, VRES_VEC2_SMALL_THREADS)),
-          static_cast<unsigned int>(rows));
+      const dim3 grid(static_cast<unsigned int>(
+                          ceil_div(pairs_per_row, VRES_VEC2_SMALL_THREADS)),
+                      static_cast<unsigned int>(rows));
       tmix_vres_gate_vec2_kernel<VRES_VEC2_SMALL_THREADS>
           <<<grid, VRES_VEC2_SMALL_THREADS, 0, stream>>>(
               C, v.data_ptr<dtype>(), v_first.data_ptr<dtype>(),
               v0.data_ptr<dtype>(), v12.data_ptr<dtype>(),
               out.data_ptr<dtype>(), rows);
     } else {
-      const dim3 grid(
-          static_cast<unsigned int>(
-              ceil_div(pairs_per_row, VRES_VEC2_LARGE_THREADS)),
-          static_cast<unsigned int>(rows));
+      const dim3 grid(static_cast<unsigned int>(
+                          ceil_div(pairs_per_row, VRES_VEC2_LARGE_THREADS)),
+                      static_cast<unsigned int>(rows));
       tmix_vres_gate_vec2_kernel<VRES_VEC2_LARGE_THREADS>
           <<<grid, VRES_VEC2_LARGE_THREADS, 0, stream>>>(
               C, v.data_ptr<dtype>(), v_first.data_ptr<dtype>(),
@@ -1483,9 +1471,9 @@ at::Tensor cmix_sparse_down_relu_one_cuda(int C, int F, at::Tensor preact,
   auto stream = at::cuda::getCurrentCUDAStream();
   zero_vec4_kernel<<<(C / 8 + 127) / 128, 128, 0, stream>>>(
       out.data_ptr<dtype>(), C / 8);
-  launch_cmix_sparse_down_relu_one(
-      C, F, preact.data_ptr<dtype>(), value_fc.data_ptr<dtype>(),
-      out.data_ptr<dtype>(), stream);
+  launch_cmix_sparse_down_relu_one(C, F, preact.data_ptr<dtype>(),
+                                   value_fc.data_ptr<dtype>(),
+                                   out.data_ptr<dtype>(), stream);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
@@ -1494,9 +1482,9 @@ void cmix_sparse_down_relu_one_out_cuda(int C, int F, at::Tensor preact,
                                         at::Tensor value_fc, at::Tensor out) {
   const at::cuda::OptionalCUDAGuard device_guard(device_of(preact));
   auto stream = at::cuda::getCurrentCUDAStream();
-  launch_cmix_sparse_down_relu_one(
-      C, F, preact.data_ptr<dtype>(), value_fc.data_ptr<dtype>(),
-      out.data_ptr<dtype>(), stream);
+  launch_cmix_sparse_down_relu_one(C, F, preact.data_ptr<dtype>(),
+                                   value_fc.data_ptr<dtype>(),
+                                   out.data_ptr<dtype>(), stream);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -1512,15 +1500,15 @@ at::Tensor cmix_sparse_down_relu_rows_cuda(int B, int T, int C, int F,
   if (use_cmix_value_split2(B, T)) {
     cmix_sparse_spmv_relu_rows_kernel<true>
         <<<dim3(F / FFN_TILE, C / (2 * FFN_SPMV_THREADS), rows),
-           FFN_SPMV_THREADS, 0, stream>>>(
-            C, F, preact.data_ptr<dtype>(), value_fc.data_ptr<dtype>(),
-            out.data_ptr<dtype>());
+           FFN_SPMV_THREADS, 0, stream>>>(C, F, preact.data_ptr<dtype>(),
+                                          value_fc.data_ptr<dtype>(),
+                                          out.data_ptr<dtype>());
   } else {
     cmix_sparse_spmv_relu_rows_kernel<false>
         <<<dim3(F / FFN_TILE, C / (2 * FFN_SPMV_THREADS), rows),
-           FFN_SPMV_THREADS, 0, stream>>>(
-            C, F, preact.data_ptr<dtype>(), value_fc.data_ptr<dtype>(),
-            out.data_ptr<dtype>());
+           FFN_SPMV_THREADS, 0, stream>>>(C, F, preact.data_ptr<dtype>(),
+                                          value_fc.data_ptr<dtype>(),
+                                          out.data_ptr<dtype>());
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
@@ -1574,9 +1562,9 @@ at::Tensor cmix_mix_3d_cuda(int B, int T, int C, at::Tensor x,
   auto out = at::empty_like(x);
   constexpr int threads = 256;
   const int c_pairs = C / 2;
-  const dim3 mix_grid(
-      static_cast<unsigned int>(ceil_div(c_pairs, threads)),
-      static_cast<unsigned int>(T), static_cast<unsigned int>(B));
+  const dim3 mix_grid(static_cast<unsigned int>(ceil_div(c_pairs, threads)),
+                      static_cast<unsigned int>(T),
+                      static_cast<unsigned int>(B));
   auto stream = at::cuda::getCurrentCUDAStream();
   if (T == 1) {
     cmix_mix_3d_kernel<true><<<mix_grid, threads, 0, stream>>>(
@@ -1586,9 +1574,8 @@ at::Tensor cmix_mix_3d_cuda(int B, int T, int C, at::Tensor x,
     cmix_mix_3d_kernel<false><<<mix_grid, threads, 0, stream>>>(
         T, C, x.data_ptr<dtype>(), shift_state.data_ptr<dtype>(),
         x_k.data_ptr<dtype>(), out.data_ptr<dtype>());
-    const dim3 state_grid(
-        static_cast<unsigned int>(ceil_div(c_pairs, threads)),
-        static_cast<unsigned int>(B));
+    const dim3 state_grid(static_cast<unsigned int>(ceil_div(c_pairs, threads)),
+                          static_cast<unsigned int>(B));
     update_shift_state_last_2d_kernel<<<state_grid, threads, 0, stream>>>(
         T, C, x.data_ptr<dtype>(), shift_state.data_ptr<dtype>());
   }
@@ -1711,9 +1698,8 @@ at::Tensor add_vec_2d_cuda(int C, at::Tensor x, at::Tensor vec) {
   auto out = at::empty_like(x);
   constexpr int threads = 256;
   const int rows = static_cast<int>(x.numel() / C);
-  const dim3 grid(
-      static_cast<unsigned int>(ceil_div(C / 2, threads)),
-      static_cast<unsigned int>(rows));
+  const dim3 grid(static_cast<unsigned int>(ceil_div(C / 2, threads)),
+                  static_cast<unsigned int>(rows));
   auto stream = at::cuda::getCurrentCUDAStream();
   add_vec_2d_kernel<<<grid, threads, 0, stream>>>(
       C, x.data_ptr<dtype>(), vec.data_ptr<dtype>(), out.data_ptr<dtype>());

@@ -17,16 +17,16 @@ def test_build_profile_defaults_to_full(monkeypatch: pytest.MonkeyPatch) -> None
     assert resolve_build_profile() == "full"
 
 
-def test_build_profile_accepts_rwkv(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("VLLM_BUILD_PROFILE", "rwkv")
-
-    assert resolve_build_profile() == "rwkv"
-
-
 def test_build_profile_accepts_full(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VLLM_BUILD_PROFILE", "full")
 
     assert resolve_build_profile() == "full"
+
+
+def test_build_profile_accepts_rwkv(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_BUILD_PROFILE", "rwkv")
+
+    assert resolve_build_profile() == "rwkv"
 
 
 def test_build_profile_rejects_unknown_value(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -34,12 +34,12 @@ def test_build_profile_rejects_unknown_value(monkeypatch: pytest.MonkeyPatch) ->
 
     with pytest.raises(
         ValueError,
-        match=r"attention.*accepted values.*rwkv",
+        match=r"attention.*accepted values.*full, rwkv",
     ):
         resolve_build_profile()
 
 
-def test_rwkv_profile_selects_only_required_extensions() -> None:
+def test_profiles_select_their_owned_extensions() -> None:
     full_names = [
         "vllm.cumem_allocator",
         "vllm.triton_kernels",
@@ -64,4 +64,4 @@ def test_switching_profile_forces_cmake_reconfiguration() -> None:
     build_temp = "build/temp.linux-x86_64-cpython-312"
 
     assert profile_build_temp(build_temp, "rwkv") == f"{build_temp}-rwkv"
-    assert profile_build_temp(build_temp, "full") == f"{build_temp}-full"
+    assert profile_build_temp(build_temp, "full") == build_temp

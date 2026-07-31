@@ -7,8 +7,9 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 import regex as re
-from huggingface_hub import hf_hub_download
 from transformers import PretrainedConfig
+
+from vllm.transformers_utils.repo_utils import hf_api
 
 BLINKDL_RWKV7_G1_REPO = "BlinkDL/rwkv7-g1"
 
@@ -165,7 +166,7 @@ def download_rwkv7_pth_source(
         return source.local_path
     if source.repo_id is None:
         raise ValueError(f"Cannot download non-Hugging Face RWKV7 source: {source}")
-    resolved = hf_hub_download(
+    resolved = hf_api().hf_hub_download(
         repo_id=source.repo_id,
         filename=source.filename,
         revision=revision or source.revision,

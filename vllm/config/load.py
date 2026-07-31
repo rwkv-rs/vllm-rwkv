@@ -34,7 +34,6 @@ class LoadConfig:
     - "auto" will try to load the weights in the safetensors format and fall
       back to the pytorch bin format if safetensors format is not available.
     - "pt" will load the weights in the pytorch bin format.
-    - "rwkv_pth" will load a single raw RWKV-7 ``.pth`` checkpoint.
     - "safetensors" will load the weights in the safetensors format.
     - "instanttensor" will load the Safetensors weights on CUDA devices using
       InstantTensor, which enables distributed loading with pipelined prefetching

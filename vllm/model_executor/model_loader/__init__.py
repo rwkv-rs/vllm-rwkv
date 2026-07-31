@@ -18,7 +18,6 @@ from vllm.model_executor.model_loader.modelexpress_loader import (
 from vllm.model_executor.model_loader.runai_streamer_loader import (
     RunaiModelStreamerLoader,
 )
-from vllm.model_executor.model_loader.rwkv_pth_loader import RWKV7PthModelLoader
 from vllm.model_executor.model_loader.sharded_state_loader import ShardedStateLoader
 from vllm.model_executor.model_loader.tensorizer_loader import TensorizerLoader
 from vllm.model_executor.model_loader.utils import (
@@ -44,7 +43,6 @@ LoadFormats = Literal[
     "pt",
     "runai_streamer",
     "runai_streamer_sharded",
-    "rwkv_pth",
     "safetensors",
     "sharded_state",
     "tensorizer",
@@ -62,7 +60,6 @@ _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
     "pt": DefaultModelLoader,
     "runai_streamer": RunaiModelStreamerLoader,
     "runai_streamer_sharded": ShardedStateLoader,
-    "rwkv_pth": RWKV7PthModelLoader,
     "safetensors": DefaultModelLoader,
     "sharded_state": ShardedStateLoader,
     "tensorizer": TensorizerLoader,
@@ -158,7 +155,6 @@ __all__ = [
     "DefaultModelLoader",
     "DummyModelLoader",
     "RunaiModelStreamerLoader",
-    "RWKV7PthModelLoader",
     "ShardedStateLoader",
     "TensorizerLoader",
 ]

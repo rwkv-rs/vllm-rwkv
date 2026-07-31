@@ -13,7 +13,7 @@ from vllm.build_profile import (
     load_build_profile_metadata,
     validate_build_profile_capabilities,
 )
-from vllm.config import VllmConfig
+from vllm.config import DeviceConfig, VllmConfig
 
 
 def make_config(
@@ -108,12 +108,8 @@ def test_rwkv_manifest_fixture_matches_runtime_contract() -> None:
     assert load_build_profile_metadata(path) == RWKV_METADATA
 
 
-@pytest.mark.parametrize("load_format", ["auto", "hf", "pt", "rwkv_pth"])
-def test_rwkv_profile_accepts_declared_configuration(load_format: str) -> None:
-    validate_build_profile_capabilities(
-        make_config(load_format=load_format),
-        RWKV_METADATA,
-    )
+def test_rwkv_profile_accepts_declared_configuration() -> None:
+    validate_build_profile_capabilities(make_config(), RWKV_METADATA)
 
 
 def test_rwkv_profile_accepts_sleep_mode_and_cumem_allocator() -> None:
@@ -187,7 +183,7 @@ def test_full_profile_adds_no_rejection() -> None:
 def test_vllm_config_reports_profile_error_before_model_verification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = VllmConfig()
+    config = VllmConfig(device_config=DeviceConfig(device="cuda"))
     config.model_config = make_config(architecture="LlamaForCausalLM").model_config
     monkeypatch.setattr(
         "vllm.build_profile.get_build_profile_metadata", lambda: RWKV_METADATA

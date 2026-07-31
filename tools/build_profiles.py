@@ -36,7 +36,7 @@ def resolve_build_profile() -> str:
 def profile_build_temp(build_temp: str, profile: str) -> str:
     """Return a profile-specific CMake reuse directory."""
     _validate_profile(profile)
-    return f"{build_temp}-{profile}"
+    return f"{build_temp}-rwkv" if profile == "rwkv" else build_temp
 
 
 def select_extension_names(names: Iterable[str], profile: str) -> list[str]:
