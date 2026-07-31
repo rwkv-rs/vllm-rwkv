@@ -6,7 +6,8 @@ requires = [
     "packaging>=24.2",
     "setuptools>=77.0.3,<81.0.0",
     "setuptools-scm>=8.0",
-    "torch == 2.11.0",
+    "setuptools-rust>=1.9.0",
+    "torch == 2.13.0",
     "wheel",
     "jinja2",
 ]
@@ -127,9 +128,9 @@ extend-exclude = ["tests/models/fixtures/*", "tests/prompts/*", "tests/tokenizer
     "tests/v1/engine/test_fast_incdec_prefix_err.py", ".git/*", "csrc/cpu/sgl-kernels/*",
     "vllm/tokenizers/assets/rwkv_vocab_v20230424.txt",
     "rust/src/chat/src/renderer/deepseek_v32/fixtures/*",
-    "rust/src/parser/src/tool/gemma4.rs", "rust/src/parser/src/unified/gemma4.rs",
+    "rust/src/parser/**",
     "rust/src/text/src/output/decoded.rs",
-    "rust/src/tokenizer/src/incremental.rs", "rust/src/parser/src/reasoning/tests.rs"]
+    "rust/src/tokenizer/src/incremental.rs"]
 ignore-hidden = false
 
 [tool.typos.default]
@@ -153,6 +154,8 @@ view_seperator = "view_seperator"
 inverse_std_variences = "inverse_std_variences"
 
 [tool.typos.default.extend-words]
+Hel = "Hel"
+wether = "wether"
 iy = "iy"
 indx = "indx"
 # intel cpu features

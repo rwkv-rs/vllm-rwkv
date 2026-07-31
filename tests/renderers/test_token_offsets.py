@@ -9,6 +9,7 @@ forwarding chain. Endpoint-level coverage lives in
 """
 
 import asyncio
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -18,10 +19,21 @@ from vllm.renderers.params import TokenizeParams
 
 @pytest.fixture
 def fast_tokenizer():
-    """gpt2 ships a Fast tokenizer; use it to test the offsets happy path."""
-    from transformers import AutoTokenizer
+    """Build a local fast tokenizer for deterministic offset tests."""
 
-    return AutoTokenizer.from_pretrained("openai-community/gpt2", use_fast=True)
+    class _LocalFastTokenizer:
+        @property
+        def is_fast(self) -> bool:
+            return True
+
+        def __call__(self, text: str, *, return_offsets_mapping: bool = False, **_):
+            spans = [match.span() for match in re.finditer(r"\S+", text)]
+            encoding = {"input_ids": list(range(1, len(spans) + 1))}
+            if return_offsets_mapping:
+                encoding["offset_mapping"] = spans
+            return encoding
+
+    return _LocalFastTokenizer()
 
 
 def _make_base_renderer_with(tokenizer):
@@ -33,13 +45,16 @@ def _make_base_renderer_with(tokenizer):
     class _StubRenderer(BaseRenderer):
         def __init__(self, tok):
             # Bypass BaseRenderer.__init__ — we don't need a VllmConfig.
-            from vllm.utils.async_utils import make_async
-
             self.tokenizer = tok
             self._executor = None
-            # Mirror BaseRenderer.__init__: the async path offloads the sync
-            # ``_tokenize_prompt`` to a thread pool.
-            self._tokenize_prompt_async = make_async(self._tokenize_prompt)
+
+            async def tokenize_prompt_async(prompt, params):
+                return self._tokenize_prompt(prompt, params)
+
+            # Keep this unit test focused on sync/async data contracts without
+            # leaving the event loop's default executor alive after collection.
+            self._tokenize_prompt_async = tokenize_prompt_async
+            self.model_config = SimpleNamespace(tokenizer_mode=None)
             self.mm_processor = None
 
         def get_tokenizer(self):

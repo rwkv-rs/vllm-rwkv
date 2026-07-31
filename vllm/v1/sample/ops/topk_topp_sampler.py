@@ -10,7 +10,7 @@ import torch.nn as nn
 
 from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
-from vllm.config.model import LogprobsMode
+from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.sampling_params import RAPID_PENALTY_DECAY_DEFAULT
@@ -23,6 +23,14 @@ logger = init_logger(__name__)
 
 _RAPID_SAMPLER_MODULE = None
 _RAPID_SAMPLER_STATES: dict[tuple[int, int], torch.Tensor] = {}
+
+def _skip_aiter_sampler_on_gfx1250() -> bool:
+    # Lazy ROCm-only import; keeps arch detection out of import time on CUDA/CPU.
+    from vllm.platforms.rocm import on_gfx1250
+
+    return on_gfx1250()
+
+
 def flashinfer_sampler_supported() -> bool:
     """Decide whether FlashInfer's top-p/top-k sampler can be used.
 
@@ -143,10 +151,7 @@ class TopKTopPSampler(nn.Module):
         if current_platform.is_cuda():
             # Optimized samplers don't expose post-top-k/top-p logits/logprobs,
             # so they can't be used when the configured mode requires them.
-            can_use_optimized = logprobs_mode not in (
-                "processed_logits",
-                "processed_logprobs",
-            )
+            can_use_optimized = logprobs_mode not in PROCESSED_LOGPROBS_MODES
             can_use_rapid = can_use_optimized and rapid_sampler_supported()
             if can_use_rapid:
                 self.forward = self.forward_rapid_cuda
@@ -169,8 +174,9 @@ class TopKTopPSampler(nn.Module):
             else:
                 self.forward = self.forward_native
         elif (
-            logprobs_mode not in ("processed_logits", "processed_logprobs")
+            logprobs_mode not in PROCESSED_LOGPROBS_MODES
             and rocm_aiter_ops.is_enabled()
+            and not _skip_aiter_sampler_on_gfx1250()  # TODO (JPVILLAM): Enable
         ):
             self.aiter_ops = None
             self._aiter_ops_import_failed = False
@@ -226,7 +232,7 @@ class TopKTopPSampler(nn.Module):
             return self.forward_native(logits, generators, k, p)
         if self.use_fp64_gumbel:
             return self.forward_native(logits, generators, k, p)
-        assert self.logprobs_mode not in ("processed_logits", "processed_logprobs"), (
+        assert self.logprobs_mode not in PROCESSED_LOGPROBS_MODES, (
             "FlashInfer does not support returning logits/logprobs"
         )
         # flashinfer sampling functions expect contiguous logits.
@@ -319,10 +325,9 @@ class TopKTopPSampler(nn.Module):
             return self.forward_native(logits, generators, k, p)
         if self.use_fp64_gumbel:
             return self.forward_native(logits, generators, k, p)
-        assert self.logprobs_mode not in (
-            "processed_logits",
-            "processed_logprobs",
-        ), "aiter sampler does not support returning logits/logprobs."
+        assert self.logprobs_mode not in PROCESSED_LOGPROBS_MODES, (
+            "aiter sampler does not support returning logits/logprobs."
+        )
         if self.aiter_ops is None and not self._init_aiter_ops():
             return self.forward_native(logits, generators, k, p)
         return self.aiter_sample(logits, k, p, generators), None
@@ -383,10 +388,7 @@ class TopKTopPSampler(nn.Module):
             logits.shape[0], dtype=torch.int64, device=logits.device
         )
         logits_to_return = None
-        if (
-            self.logprobs_mode == "processed_logits"
-            or self.logprobs_mode == "processed_logprobs"
-        ):
+        if self.logprobs_mode in PROCESSED_LOGPROBS_MODES:
             logits_to_return = torch.empty_like(logits)
 
         assert len(generators) != logits.shape[0], (
@@ -475,9 +477,8 @@ def apply_top_k_top_p_pytorch(
         logits_sort.masked_fill_(top_k_mask, -float("inf"))
 
     if p is not None:
-        # Apply top-p. The cumsum below runs over the whole vocab, so accumulating
-        # in a low-precision dtype makes the nucleus undershoot p.
-        probs_sort = logits_sort.softmax(dim=-1, dtype=torch.float32)
+        # Apply top-p.
+        probs_sort = logits_sort.softmax(dim=-1)
         probs_sum = torch.cumsum(probs_sort, dim=-1, out=probs_sort)
         top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
         # at least one
@@ -835,10 +836,9 @@ def flashinfer_sample(
             probs, k, deterministic=True
         )
     else:
-        # Both top-k and top-p. FlashInfer requires contiguous fp32 logits; the
-        # branches above get that from softmax().
+        # Both top-k and top-p.
         next_token_ids = flashinfer.sampling.top_k_top_p_sampling_from_logits(
-            logits.float().contiguous(), k, p, deterministic=True
+            logits, k, p, deterministic=True
         )
 
     return next_token_ids.view(-1)

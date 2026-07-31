@@ -13,7 +13,7 @@ from vllm.build_profile import (
     load_build_profile_metadata,
     validate_build_profile_capabilities,
 )
-from vllm.config import VllmConfig
+from vllm.config import DeviceConfig, VllmConfig
 
 
 def make_config(
@@ -183,7 +183,7 @@ def test_full_profile_adds_no_rejection() -> None:
 def test_vllm_config_reports_profile_error_before_model_verification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = VllmConfig()
+    config = VllmConfig(device_config=DeviceConfig(device="cuda"))
     config.model_config = make_config(architecture="LlamaForCausalLM").model_config
     monkeypatch.setattr(
         "vllm.build_profile.get_build_profile_metadata", lambda: RWKV_METADATA

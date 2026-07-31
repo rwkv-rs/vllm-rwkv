@@ -28,7 +28,7 @@ from vllm.sampling_params import (
 )
 from vllm.utils import random_uuid
 
-from ..base.protocol import _LONG_INFO, AudioResponseFormat
+from ..base.protocol import _LONG_INFO, TranscriptionResponseFormat
 
 if TYPE_CHECKING:
     import numpy as np
@@ -89,7 +89,7 @@ class TranscriptionRequest(OpenAIBaseModel):
     should match the audio language.
     """
 
-    response_format: AudioResponseFormat = Field(default="json")
+    response_format: TranscriptionResponseFormat = Field(default="json")
     """
     The format of the output, in one of these options: `json`, `text`, `srt`,
     `verbose_json`, or `vtt`.
@@ -395,7 +395,7 @@ class TranscriptionSegment(OpenAIBaseModel):
 
 
 class TranscriptionResponseVerbose(OpenAIBaseModel):
-    duration: str
+    duration: float
     """The duration of the input audio."""
 
     language: str
@@ -411,6 +411,27 @@ class TranscriptionResponseVerbose(OpenAIBaseModel):
     """Extracted words and their corresponding timestamps."""
 
 
+class TranscriptionDiarizedSegment(OpenAIBaseModel):
+    """A speaker-attributed transcription segment."""
+
+    type: Literal["transcript.text.segment"] = "transcript.text.segment"
+    id: str
+    start: float
+    end: float
+    text: str
+    speaker: str
+
+
+class TranscriptionResponseDiarized(OpenAIBaseModel):
+    """OpenAI-compatible diarized transcription response."""
+
+    task: Literal["transcribe"] = "transcribe"
+    duration: float
+    text: str
+    segments: list[TranscriptionDiarizedSegment]
+    usage: TranscriptionUsageAudio
+
+
 TranscriptionResponseVariant: TypeAlias = (
-    TranscriptionResponse | TranscriptionResponseVerbose
+    TranscriptionResponse | TranscriptionResponseVerbose | TranscriptionResponseDiarized
 )
