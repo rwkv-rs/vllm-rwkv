@@ -21,114 +21,12 @@ _RWKV7_G1_SPECS = {
     "13.3b": (61, 4096),
 }
 
-RWKV7_DEFAULT_MAX_NUM_SEQS = {
-    "1.5b": {
-        24: {"fp16": 1280, "fp32io16": 640},
-        32: {"fp16": 2560, "fp32io16": 1280},
-        48: {"fp16": 2560, "fp32io16": 2560},
-        96: {"fp16": 2560, "fp32io16": 2560},
-    },
-    "2.9b": {
-        24: {"fp16": 640, "fp32io16": 320},
-        32: {"fp16": 1280, "fp32io16": 640},
-        48: {"fp16": 2560, "fp32io16": 1280},
-        96: {"fp16": 2560, "fp32io16": 2560},
-    },
-    "7.2b": {
-        24: {"fp16": 160, "fp32io16": 80},
-        32: {"fp16": 640, "fp32io16": 320},
-        48: {"fp16": 1280, "fp32io16": 640},
-        96: {"fp16": 2560, "fp32io16": 1280},
-    },
-    "13.3b": {
-        24: {"fp16": None, "fp32io16": None},
-        32: {"fp16": None, "fp32io16": None},
-        48: {"fp16": 320, "fp32io16": 160},
-        96: {"fp16": 1280, "fp32io16": 640},
-    },
-}
-
-
-@dataclass(frozen=True)
-class RWKV7BatchDefault:
-    model_size: str
-    memory_tier_gib: int
-    wkv_mode: str
-    max_num_seqs: int
-
-
 _RWKV7_G1_FILENAME_RE = re.compile(
     r"^rwkv7-g1[a-z]-"
     r"(?P<size>0\.1b|0\.4b|1\.5b|2\.9b|7\.2b|13\.3b)-"
     r"(?P<date>\d{8})-ctx(?P<context>\d+)\.pth$",
     re.IGNORECASE,
 )
-
-
-def resolve_rwkv7_batch_default(
-    config: PretrainedConfig,
-    device_memory_bytes: int,
-    wkv_mode: str,
-) -> RWKV7BatchDefault:
-    """Resolve the RWKV7 active batch default for a supported configuration."""
-    if wkv_mode not in {"fp16", "fp32io16"}:
-        raise ValueError(
-            f"Unsupported RWKV7 WKV mode {wkv_mode!r}; "
-            "set max_num_seqs explicitly or use fp16/fp32io16."
-        )
-
-    spec = (config.num_hidden_layers, config.hidden_size)
-    size = next(
-        (
-            name
-            for name, candidate in _RWKV7_G1_SPECS.items()
-            if candidate == spec and name in RWKV7_DEFAULT_MAX_NUM_SEQS
-        ),
-        None,
-    )
-    if size is None:
-        raise ValueError(
-            "No RWKV7 max_num_seqs default for model configuration "
-            f"layers={spec[0]}, hidden_size={spec[1]}; "
-            "set max_num_seqs explicitly."
-        )
-
-    device_memory_gib = device_memory_bytes / (1 << 30)
-    tier = min(
-        RWKV7_DEFAULT_MAX_NUM_SEQS[size],
-        key=lambda candidate: abs(candidate - device_memory_gib),
-    )
-    if abs(tier - device_memory_gib) > 2:
-        raise ValueError(
-            "No RWKV7 max_num_seqs default for GPU memory "
-            f"{device_memory_gib:.1f} GiB; expected a 24, 32, 48, or 96 GiB "
-            "device, or set max_num_seqs explicitly."
-        )
-
-    value = RWKV7_DEFAULT_MAX_NUM_SEQS[size][tier][wkv_mode]
-    if value is None:
-        raise ValueError(
-            f"RWKV7 {size} in {wkv_mode} is unsupported on a {tier} GiB GPU; "
-            "choose a larger GPU or set max_num_seqs explicitly."
-        )
-    return RWKV7BatchDefault(
-        model_size=size,
-        memory_tier_gib=tier,
-        wkv_mode=wkv_mode,
-        max_num_seqs=value,
-    )
-
-
-def resolve_rwkv7_default_max_num_seqs(
-    config: PretrainedConfig,
-    device_memory_bytes: int,
-    wkv_mode: str,
-) -> int:
-    return resolve_rwkv7_batch_default(
-        config,
-        device_memory_bytes,
-        wkv_mode,
-    ).max_num_seqs
 
 
 @dataclass(frozen=True)

@@ -109,7 +109,6 @@ from vllm.plugins import load_general_plugins
 from vllm.ray.lazy_utils import is_in_ray_actor, is_ray_initialized
 from vllm.transformers_utils.config import maybe_override_with_speculators
 from vllm.transformers_utils.configs.rwkv7 import (
-    resolve_rwkv7_batch_default,
     try_parse_rwkv7_pth_source,
 )
 from vllm.transformers_utils.repo_utils import get_model_path
@@ -2736,8 +2735,6 @@ class EngineArgs:
 
         orig_max_num_batched_tokens = self.max_num_batched_tokens
         orig_max_num_seqs = self.max_num_seqs
-        is_rwkv7 = "RWKV7ForCausalLM" in (model_config.architectures or [])
-
         if self.max_num_batched_tokens is None:
             if parallel_config.use_batched_dp_moe:
                 self.max_num_batched_tokens = (
@@ -2750,32 +2747,16 @@ class EngineArgs:
                 )
 
         if self.max_num_seqs is None:
-            if is_rwkv7:
-                batch_default = resolve_rwkv7_batch_default(
-                    model_config.hf_config,
-                    current_platform.get_device_total_memory(),
-                    envs.VLLM_RWKV7_WKV_MODE,
-                )
-                self.max_num_seqs = batch_default.max_num_seqs
-                logger.info(
-                    "Defaulting RWKV7 max_num_seqs to %d for model=%s, "
-                    "memory_tier=%d GiB, wkv_mode=%s.",
-                    batch_default.max_num_seqs,
-                    batch_default.model_size,
-                    batch_default.memory_tier_gib,
-                    batch_default.wkv_mode,
-                )
-            else:
-                self.max_num_seqs = default_max_num_seqs.get(
-                    usage_context,
-                    SchedulerConfig.DEFAULT_MAX_NUM_SEQS,
-                )
+            self.max_num_seqs = default_max_num_seqs.get(
+                usage_context,
+                SchedulerConfig.DEFAULT_MAX_NUM_SEQS,
+            )
 
         # If throughput mode is set, double max_num_batched_tokens and max_num_seqs.
         if self.performance_mode == "throughput":
             if orig_max_num_batched_tokens is None:
                 self.max_num_batched_tokens *= 2
-            if orig_max_num_seqs is None and not is_rwkv7:
+            if orig_max_num_seqs is None:
                 self.max_num_seqs *= 2
 
         if orig_max_num_batched_tokens is None:
@@ -2788,12 +2769,6 @@ class EngineArgs:
                     model_config.max_model_len,
                     self.max_num_batched_tokens,
                 )
-            if is_rwkv7:
-                self.max_num_batched_tokens = max(
-                    self.max_num_seqs,
-                    self.max_num_batched_tokens,
-                )
-
             # For multimodal prefix-LM models (e.g., Gemma 4) that disable
             # chunked MM input, a single multimodal item must fit in one batch.
             # Raise the floor to accommodate the largest per-item token count.
