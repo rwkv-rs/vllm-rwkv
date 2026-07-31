@@ -103,6 +103,7 @@ class RWKV7Config(PretrainedConfig):
         in_context_learning_rank: int = 96,
         value_residual_rank: int = 64,
         gate_rank: int = 256,
+        head_dtype: str = "float32",
         **kwargs,
     ):
         values = {
@@ -141,6 +142,7 @@ class RWKV7Config(PretrainedConfig):
         self.in_context_learning_rank = in_context_learning_rank
         self.value_residual_rank = value_residual_rank
         self.gate_rank = gate_rank
+        self.head_dtype = head_dtype
 
 
 class RWKV7PthConfigParser(ConfigParserBase):

@@ -32,6 +32,13 @@ def test_rwkv7_pth_url_builds_config_from_blinkdl_filename():
     assert config.in_context_learning_rank == 96
     assert config.value_residual_rank == 64
     assert config.gate_rank == 256
+    assert config.head_dtype == "float32"
+
+
+def test_rwkv7_head_dtype_can_follow_model_dtype():
+    config = RWKV7Config(head_dtype="model")
+
+    assert config.head_dtype == "model"
 
 
 def test_rwkv7_local_pth_builds_config_from_filename(tmp_path: Path):
@@ -186,6 +193,7 @@ def test_local_rwkv7_checkpoint_uses_valid_sidecar_config(tmp_path: Path):
     assert config.in_context_learning_rank == 96
     assert config.value_residual_rank == 64
     assert config.gate_rank == 256
+    assert config.head_dtype == "float32"
 
 
 def test_official_checkpoint_legacy_sidecar_uses_audited_shape_catalog(
