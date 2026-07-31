@@ -44,10 +44,3 @@ python-json-logger
 setproctitle
 pybase64
 cbor2
-
-# Source build dependencies.
-cmake>=3.26.1
-ninja
-setuptools>=77.0.3,<81.0.0
-setuptools-scm>=8.0
-wheel
