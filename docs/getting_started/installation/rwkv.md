@@ -1,7 +1,8 @@
 # RWKV source build
 
-This checkout supports only the `rwkv` CUDA build profile for dense RWKV7 raw
-`.pth` checkpoints. It supports the built-in RWKV tokenizer, text
+This checkout keeps vLLM's unrestricted `full` build as the default. The
+explicit reduced `rwkv` CUDA profile targets dense RWKV7 raw `.pth`
+checkpoints and supports the built-in RWKV tokenizer, text
 chat/completions, streaming, stop handling, Prometheus metrics, rapid sampling,
 and sleep/wake GPU-memory release through the CuMem allocator with TP=1, PP=1,
 and DP=1.
@@ -51,9 +52,9 @@ Unsupported configurations fail during `VllmConfig` validation before engine
 workers start. This checkout rejects precompiled non-RWKV extensions rather
 than relabeling them as reduced artifacts.
 
-`VLLM_BUILD_PROFILE` defaults to `rwkv`; setting it to `full` is rejected. For
-another vLLM build profile, use a separate upstream checkout rather than this
-RWKV-only environment.
+`VLLM_BUILD_PROFILE` defaults to `full`, preserving the upstream platform,
+extension, and Rust frontend build paths. Set it to `rwkv` only when producing
+the capability-limited artifact described above.
 
 For clean comparison runs, use:
 

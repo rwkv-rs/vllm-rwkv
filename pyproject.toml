@@ -1,5 +1,5 @@
 [build-system]
-# Build requirements for the only supported RWKV profile.
+# Should be mirrored in requirements/build/cuda.txt
 requires = [
     "cmake>=3.26.1",
     "ninja",

@@ -19,18 +19,18 @@ logger = init_logger(__name__)
 # consistent behavior (similar to IS_AITER_FOUND in _aiter_ops.py).
 _ROCM_FLASH_ATTN_AVAILABLE = False
 
-if current_platform.is_cuda() and get_build_profile_metadata().profile == "rwkv":
+if current_platform.is_cuda() and not get_build_profile_metadata().unrestricted:
 
-    def _rwkv_profile_flash_attention_unavailable(*args: Any, **kwargs: Any) -> Any:
+    def _reduced_build_flash_attention_unavailable(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError(
-            "FlashAttention is unavailable in the RWKV build profile. "
+            "FlashAttention is unavailable in this reduced build artifact. "
             "Install a full build of vLLM to use an attention backend."
         )
 
-    reshape_and_cache_flash = _rwkv_profile_flash_attention_unavailable
-    flash_attn_varlen_func = _rwkv_profile_flash_attention_unavailable
+    reshape_and_cache_flash = _reduced_build_flash_attention_unavailable
+    flash_attn_varlen_func = _reduced_build_flash_attention_unavailable
     compile_flash_attn_varlen_func_from_specs = None
-    get_scheduler_metadata = _rwkv_profile_flash_attention_unavailable
+    get_scheduler_metadata = _reduced_build_flash_attention_unavailable
 elif current_platform.is_cuda():
     from vllm._custom_ops import reshape_and_cache_flash
     from vllm.vllm_flash_attn import (  # type: ignore[attr-defined,assignment]

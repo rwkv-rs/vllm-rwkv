@@ -64,7 +64,7 @@ from vllm.utils.system_utils import decorate_logs, set_ulimit
 from vllm.version import __version__ as VLLM_VERSION
 
 sagemaker_standards_bootstrap: Callable[[FastAPI], FastAPI] | None = None
-if get_build_profile_metadata().profile == "full":
+if get_build_profile_metadata().unrestricted:
     from vllm.entrypoints.serve.sagemaker.api_router import (
         sagemaker_standards_bootstrap,
     )
@@ -228,7 +228,7 @@ def build_app(
 
     register_models_api_router(app)
 
-    if build_profile.profile == "full":
+    if build_profile.unrestricted:
         from vllm.entrypoints.serve.sagemaker.api_router import (
             attach_router as register_sagemaker_api_router,
         )
@@ -356,7 +356,7 @@ def build_app(
                 f"Invalid middleware {middleware}. Must be a function or a class."
             )
 
-    if build_profile.profile == "full":
+    if build_profile.unrestricted:
         assert sagemaker_standards_bootstrap is not None
         app = sagemaker_standards_bootstrap(app)
     return app

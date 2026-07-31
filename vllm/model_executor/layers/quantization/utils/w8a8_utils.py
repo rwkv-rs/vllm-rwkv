@@ -11,7 +11,7 @@ from vllm.platforms import current_platform
 
 def _stable_cutlass_ops_available() -> bool:
     metadata = get_build_profile_metadata()
-    return metadata.profile != "rwkv" or metadata.has_target("_C_stable_libtorch")
+    return metadata.unrestricted or metadata.has_target("_C_stable_libtorch")
 
 
 def cutlass_fp8_supported() -> bool:

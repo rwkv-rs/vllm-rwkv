@@ -18,6 +18,7 @@ import torch
 from packaging.version import Version, parse
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
+from setuptools_rust.build import build_rust
 from setuptools_scm import get_version
 from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME
 
@@ -45,6 +46,9 @@ PRECOMPILED_RUST_EXTENSION_MEMBER_REGEX = re.compile(r"vllm/_rust_[^/]*\.so$")
 # cannot import envs directly because it depends on vllm,
 #  which is not installed yet
 envs = load_module_from_path("envs", os.path.join(ROOT_DIR, "vllm", "envs.py"))
+rust_build = load_module_from_path(
+    "rust_build", os.path.join(ROOT_DIR, "tools", "build_rust.py")
+)
 
 VLLM_TARGET_DEVICE = envs.VLLM_TARGET_DEVICE
 USE_PRECOMPILED_EXTENSIONS = envs.VLLM_USE_PRECOMPILED
@@ -61,8 +65,28 @@ if VLLM_BUILD_PROFILE == "rwkv" and (
     )
 
 
+def should_require_rust_frontend() -> bool:
+    value = os.getenv("VLLM_REQUIRE_RUST_FRONTEND", "")
+    return value.lower() not in ("", "0", "false", "no")
+
+
 def get_precompiled_rust_extension_paths() -> list[Path]:
     return sorted((ROOT_DIR / "vllm").glob("_rust_*.so"))
+
+
+def get_missing_precompiled_rust_extension_modules() -> list[str]:
+    present = {
+        path.name.split(".", 1)[0] for path in get_precompiled_rust_extension_paths()
+    }
+    return [
+        module_name
+        for module_name in rust_build.rust_py_extension_module_names()
+        if module_name not in present
+    ]
+
+
+def has_precompiled_rust_extensions() -> bool:
+    return not get_missing_precompiled_rust_extension_modules()
 
 
 if sys.platform.startswith("darwin") and VLLM_TARGET_DEVICE != "cpu":
@@ -492,6 +516,36 @@ class precompiled_build_ext(build_ext):
     def build_extensions(self) -> None:
         print("Skipping build_ext: using precompiled extensions.")
         return
+
+
+class precompiled_build_rust(build_rust):
+    """Skips local Rust builds when all precompiled Rust artifacts are present."""
+
+    def run(self) -> None:
+        missing = []
+        if not PRECOMPILED_RUST_FRONTEND_PATH.exists():
+            missing.append(str(PRECOMPILED_RUST_FRONTEND_PATH))
+        missing_rust_extensions = get_missing_precompiled_rust_extension_modules()
+        if missing_rust_extensions:
+            missing.extend(
+                str(ROOT_DIR / "vllm" / f"{module_name}*.so")
+                for module_name in missing_rust_extensions
+            )
+
+        if not missing:
+            logger.info(
+                "Skipping local Rust build: using precompiled %s and %s",
+                PRECOMPILED_RUST_FRONTEND_PATH,
+                get_precompiled_rust_extension_paths(),
+            )
+            return
+
+        logger.warning(
+            "Precompiled wheel did not provide all Rust artifacts (%s); "
+            "falling back to local Rust build.",
+            ", ".join(missing),
+        )
+        super().run()
 
 
 class precompiled_wheel_utils:
@@ -1266,14 +1320,26 @@ else:
         if USE_PRECOMPILED_EXTENSIONS
         else cmake_build_ext,
     }
+if VLLM_BUILD_PROFILE == "full" and (
+    USE_PRECOMPILED_RUST_FRONTEND
+    or PRECOMPILED_RUST_FRONTEND_PATH.exists()
+    or has_precompiled_rust_extensions()
+):
+    cmdclass["build_rust"] = precompiled_build_rust
+
 # Rust artifacts, built via setuptools-rust and installed into the package
 # directory alongside the Python modules.
-rust_setup_args = {}
+rust_extensions = (
+    rust_build.rust_extensions(optional=not should_require_rust_frontend())
+    if VLLM_BUILD_PROFILE == "full"
+    else []
+)
 
 setup(
     # static metadata should rather go in pyproject.toml
     version=get_vllm_version(),
     ext_modules=ext_modules,
+    rust_extensions=rust_extensions,
     install_requires=get_requirements(),
     extras_require={
         # AMD Zen CPU optimizations via zentorch
@@ -1314,5 +1380,4 @@ setup(
     },
     cmdclass=cmdclass,
     package_data=package_data,
-    **rust_setup_args,
 )
