@@ -402,6 +402,12 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
             "random": "yujiepan/mamba2-codestral-v0.1-tiny-random",
         },
     ),
+    "RWKV7ForCausalLM": _HfExamplesInfo(
+        "https://huggingface.co/BlinkDL/rwkv7-g1/blob/main/"
+        "rwkv7-g1h-1.5b-20260710-ctx10240.pth",
+        tokenizer_mode="rwkv",
+        is_available_online=False,
+    ),
     "FalconMambaForCausalLM": _HfExamplesInfo("tiiuae/falcon-mamba-7b-instruct"),
     "MiniCPMForCausalLM": _HfExamplesInfo(
         "openbmb/MiniCPM-2B-sft-bf16", trust_remote_code=True
