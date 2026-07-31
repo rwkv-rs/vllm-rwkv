@@ -145,8 +145,7 @@ at::Tensor setup_rand(int64_t seed, int64_t B) {
 }
 
 static void check_cuda_contiguous_1d(const at::Tensor& tensor, const char* name,
-                                     int64_t batch_size,
-                                     at::ScalarType dtype) {
+                                     int64_t batch_size, at::ScalarType dtype) {
   if (!tensor.is_cuda() || !tensor.is_contiguous() || tensor.dim() != 1 ||
       tensor.size(0) != batch_size || tensor.scalar_type() != dtype) {
     throw std::invalid_argument(std::string(name) +
@@ -177,8 +176,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
         const float* __restrict__ presence_penalties,
         const float* __restrict__ repetition_penalties,
         const float* __restrict__ penalty_decays,
-        const float* __restrict__ temperatures,
-        const int* __restrict__ top_ks,
+        const float* __restrict__ temperatures, const int* __restrict__ top_ks,
         const float* __restrict__ top_ps, const float scalar_presence_penalty,
         const float scalar_repetition_penalty, const float scalar_penalty_decay,
         const float scalar_temperature, const int scalar_top_k,
@@ -195,12 +193,12 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
   __builtin_assume(V <= 1048576);
   const int V4 = V / 4;
   float4 l4, p4;
-  const float presence_penalty =
-      presence_penalties == nullptr ? scalar_presence_penalty
-                                    : presence_penalties[b];
-  const float repetition_penalty =
-      repetition_penalties == nullptr ? scalar_repetition_penalty
-                                      : repetition_penalties[b];
+  const float presence_penalty = presence_penalties == nullptr
+                                     ? scalar_presence_penalty
+                                     : presence_penalties[b];
+  const float repetition_penalty = repetition_penalties == nullptr
+                                       ? scalar_repetition_penalty
+                                       : repetition_penalties[b];
   const float penalty_decay =
       penalty_decays == nullptr ? scalar_penalty_decay : penalty_decays[b];
   const float temperature = fminf(
@@ -558,7 +556,8 @@ std::vector<at::Tensor> batch_sampling_repetition_temperature_topk_topp(
     outputs.push_back(out_logprobs);
   }
 
-  batch_sampling_repetition_temperature_topk_topp_kernel<<<B, 1024, 0, stream>>>(
+  batch_sampling_repetition_temperature_topk_topp_kernel<<<B, 1024, 0,
+                                                           stream>>>(
       B, T, V, (float*)logits.data_ptr(), (float*)penalties.data_ptr(), nullptr,
       (int*)out.data_ptr(), output_logprobs, (RAND*)states.data_ptr(),
       (float*)probs.data_ptr(), nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -651,7 +650,8 @@ std::vector<at::Tensor> batch_sampling_repetition_temperature_topk_topp_indexed(
     outputs.push_back(out_logprobs);
   }
 
-  batch_sampling_repetition_temperature_topk_topp_kernel<<<B, 1024, 0, stream>>>(
+  batch_sampling_repetition_temperature_topk_topp_kernel<<<B, 1024, 0,
+                                                           stream>>>(
       B, T, V, (float*)logits.data_ptr(), (float*)penalties.data_ptr(),
       (int*)penalty_indices.data_ptr(), (int*)out.data_ptr(), output_logprobs,
       (RAND*)states.data_ptr(), (float*)probs.data_ptr(), nullptr, nullptr,
@@ -703,14 +703,16 @@ batch_sampling_repetition_temperature_topk_topp_per_request_indexed(
     output_logprobs = (float*)out_logprobs.data_ptr();
     outputs.push_back(out_logprobs);
   }
-  batch_sampling_repetition_temperature_topk_topp_kernel<<<B, 1024, 0, stream>>>(
+  batch_sampling_repetition_temperature_topk_topp_kernel<<<B, 1024, 0,
+                                                           stream>>>(
       B, T, V, (float*)logits.data_ptr(), (float*)penalties.data_ptr(),
       (int*)penalty_indices.data_ptr(), (int*)out.data_ptr(), output_logprobs,
       (RAND*)states.data_ptr(), (float*)probs.data_ptr(),
       (float*)presence_penalties.data_ptr(),
-      (float*)repetition_penalties.data_ptr(), (float*)penalty_decays.data_ptr(),
-      (float*)temperatures.data_ptr(), (int*)top_ks.data_ptr(),
-      (float*)top_ps.data_ptr(), 0.0f, 0.0f, 1.0f, 1.0f, V, 1.0f);
+      (float*)repetition_penalties.data_ptr(),
+      (float*)penalty_decays.data_ptr(), (float*)temperatures.data_ptr(),
+      (int*)top_ks.data_ptr(), (float*)top_ps.data_ptr(), 0.0f, 0.0f, 1.0f,
+      1.0f, V, 1.0f);
   return outputs;
 }
 

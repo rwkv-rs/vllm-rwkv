@@ -276,11 +276,7 @@ def test_check_stop_contract(
     [
         pytest.param(
             RepetitionDetectionParams(**OCCURRENCE_16),
-            [
-                [*range(16), 1000 + index]
-                for index in range(5)
-            ]
-            + [list(range(16))],
+            [[*range(16), 1000 + index] for index in range(5)] + [list(range(16))],
             id="default-sixteen-gram-rule",
         ),
         pytest.param(

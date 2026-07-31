@@ -23,21 +23,17 @@ torch::Tensor linear_f16_cuda(torch::Tensor x, torch::Tensor weight,
                               bool allow_fp16_accumulation);
 torch::Tensor linear_f16_lt_cfg_cuda(torch::Tensor x, torch::Tensor weight,
                                      int64_t workspace_mb,
-                                     int64_t heuristic_index,
-                                     bool strict_algo);
-torch::Tensor linear_f16_fp32_lt_cuda(torch::Tensor x,
-                                      torch::Tensor weight);
+                                     int64_t heuristic_index, bool strict_algo);
+torch::Tensor linear_f16_fp32_lt_cuda(torch::Tensor x, torch::Tensor weight);
 torch::Tensor linear_f16_m1_splitk_cuda(torch::Tensor x, torch::Tensor weight);
 torch::Tensor linear_f16_m1_splitk_fp32_cuda(torch::Tensor x,
                                              torch::Tensor weight);
-std::tuple<torch::Tensor, torch::Tensor>
-linear_f16_m1_splitk_prepare_zero_cuda(torch::Tensor x,
-                                       torch::Tensor weight,
-                                       int64_t zero_features);
+std::tuple<torch::Tensor, torch::Tensor> linear_f16_m1_splitk_prepare_zero_cuda(
+    torch::Tensor x, torch::Tensor weight, int64_t zero_features);
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-linear_rkv_f16_m1_splitk_cuda(
-    torch::Tensor x_r, torch::Tensor x_k, torch::Tensor x_v,
-    torch::Tensor weight_r, torch::Tensor weight_k, torch::Tensor weight_v);
+linear_rkv_f16_m1_splitk_cuda(torch::Tensor x_r, torch::Tensor x_k,
+                              torch::Tensor x_v, torch::Tensor weight_r,
+                              torch::Tensor weight_k, torch::Tensor weight_v);
 torch::Tensor linear_t_f16_cuda(torch::Tensor x, torch::Tensor weight_t);
 torch::Tensor linear_t_act_f16_cuda(torch::Tensor x, torch::Tensor weight_t,
                                     int64_t act);
@@ -164,8 +160,7 @@ torch::Tensor linear_f16(torch::Tensor x, torch::Tensor weight,
 }
 
 torch::Tensor linear_f16_lt_cfg(torch::Tensor x, torch::Tensor weight,
-                                int64_t workspace_mb,
-                                int64_t heuristic_index,
+                                int64_t workspace_mb, int64_t heuristic_index,
                                 bool strict_algo) {
   check_half_cuda_contig(x, "x");
   check_half_cuda_contig(weight, "weight");
@@ -173,8 +168,7 @@ torch::Tensor linear_f16_lt_cfg(torch::Tensor x, torch::Tensor weight,
   TORCH_CHECK(weight.dim() == 2, "weight must have shape [K, N]");
   TORCH_CHECK(x.device() == weight.device(),
               "x and weight must be on the same device");
-  TORCH_CHECK(x.size(-1) == weight.size(0),
-              "linear_f16_lt_cfg shape mismatch");
+  TORCH_CHECK(x.size(-1) == weight.size(0), "linear_f16_lt_cfg shape mismatch");
   TORCH_CHECK(workspace_mb >= 0 && workspace_mb <= 128,
               "linear_f16_lt_cfg workspace_mb must be in [0, 128]");
   TORCH_CHECK(heuristic_index >= 0 && heuristic_index < 64,
@@ -209,8 +203,7 @@ torch::Tensor linear_f16_m1_splitk(torch::Tensor x, torch::Tensor weight) {
   return linear_f16_m1_splitk_cuda(x, weight);
 }
 
-torch::Tensor linear_f16_m1_splitk_fp32(torch::Tensor x,
-                                        torch::Tensor weight) {
+torch::Tensor linear_f16_m1_splitk_fp32(torch::Tensor x, torch::Tensor weight) {
   check_half_cuda_contig(x, "x");
   check_half_cuda_contig(weight, "weight");
   check_half2_aligned(weight, "weight");
@@ -224,9 +217,8 @@ torch::Tensor linear_f16_m1_splitk_fp32(torch::Tensor x,
   return linear_f16_m1_splitk_fp32_cuda(x, weight);
 }
 
-std::tuple<torch::Tensor, torch::Tensor>
-linear_f16_m1_splitk_prepare_zero(torch::Tensor x, torch::Tensor weight,
-                                  int64_t zero_features) {
+std::tuple<torch::Tensor, torch::Tensor> linear_f16_m1_splitk_prepare_zero(
+    torch::Tensor x, torch::Tensor weight, int64_t zero_features) {
   check_half_cuda_contig(x, "x");
   check_half_cuda_contig(weight, "weight");
   check_half2_aligned(weight, "weight");
@@ -250,9 +242,9 @@ linear_f16_m1_splitk_prepare_zero(torch::Tensor x, torch::Tensor weight,
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-linear_rkv_f16_m1_splitk(
-    torch::Tensor x_r, torch::Tensor x_k, torch::Tensor x_v,
-    torch::Tensor weight_r, torch::Tensor weight_k, torch::Tensor weight_v) {
+linear_rkv_f16_m1_splitk(torch::Tensor x_r, torch::Tensor x_k,
+                         torch::Tensor x_v, torch::Tensor weight_r,
+                         torch::Tensor weight_k, torch::Tensor weight_v) {
   check_half_cuda_contig(x_r, "x_r");
   check_half_cuda_contig(x_k, "x_k");
   check_half_cuda_contig(x_v, "x_v");
@@ -264,21 +256,18 @@ linear_rkv_f16_m1_splitk(
   check_half2_aligned(weight_v, "weight_v");
   TORCH_CHECK(x_r.dim() >= 2 && x_k.dim() >= 2 && x_v.dim() >= 2,
               "x_r, x_k, and x_v must each have at least 2 dims");
-  TORCH_CHECK(weight_r.dim() == 2 && weight_k.dim() == 2 &&
-                  weight_v.dim() == 2,
+  TORCH_CHECK(weight_r.dim() == 2 && weight_k.dim() == 2 && weight_v.dim() == 2,
               "weight_r, weight_k, and weight_v must each have shape [K, N]");
-  TORCH_CHECK(
-      x_r.device() == x_k.device() && x_r.device() == x_v.device() &&
-          x_r.device() == weight_r.device() &&
-          x_r.device() == weight_k.device() &&
-          x_r.device() == weight_v.device(),
-      "all inputs and weights must be on the same device");
+  TORCH_CHECK(x_r.device() == x_k.device() && x_r.device() == x_v.device() &&
+                  x_r.device() == weight_r.device() &&
+                  x_r.device() == weight_k.device() &&
+                  x_r.device() == weight_v.device(),
+              "all inputs and weights must be on the same device");
   TORCH_CHECK(x_r.size(-1) == weight_r.size(0) &&
                   x_k.size(-1) == weight_k.size(0) &&
                   x_v.size(-1) == weight_v.size(0),
               "linear_rkv_f16_m1_splitk input/weight shape mismatch");
-  TORCH_CHECK(x_r.size(-1) == x_k.size(-1) &&
-                  x_r.size(-1) == x_v.size(-1),
+  TORCH_CHECK(x_r.size(-1) == x_k.size(-1) && x_r.size(-1) == x_v.size(-1),
               "linear_rkv_f16_m1_splitk requires a common K");
   TORCH_CHECK(weight_r.size(1) == weight_k.size(1) &&
                   weight_r.size(1) == weight_v.size(1),
@@ -288,8 +277,8 @@ linear_rkv_f16_m1_splitk(
   check_single_row(x_v, "linear_rkv_f16_m1_splitk");
   TORCH_CHECK((weight_r.size(1) % 64) == 0,
               "linear_rkv_f16_m1_splitk requires N multiple of 64");
-  return linear_rkv_f16_m1_splitk_cuda(
-      x_r, x_k, x_v, weight_r, weight_k, weight_v);
+  return linear_rkv_f16_m1_splitk_cuda(x_r, x_k, x_v, weight_r, weight_k,
+                                       weight_v);
 }
 
 torch::Tensor linear_t_f16(torch::Tensor x, torch::Tensor weight_t) {

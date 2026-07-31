@@ -23,8 +23,8 @@ std::vector<torch::Tensor> tmix_mix6_cuda(int B, int T, int C, torch::Tensor x,
                                           torch::Tensor x_a, torch::Tensor x_g);
 std::vector<torch::Tensor> tmix_mix6_3d_cuda(
     int B, int T, int C, torch::Tensor x, torch::Tensor shift_state,
-    torch::Tensor x_r, torch::Tensor x_w, torch::Tensor x_k,
-    torch::Tensor x_v, torch::Tensor x_a, torch::Tensor x_g);
+    torch::Tensor x_r, torch::Tensor x_w, torch::Tensor x_k, torch::Tensor x_v,
+    torch::Tensor x_a, torch::Tensor x_g);
 std::vector<torch::Tensor> tmix_mix6_slot_cuda(
     int B, int T, int C, torch::Tensor x, torch::Tensor shift_state,
     torch::Tensor slot_indices, torch::Tensor x_r, torch::Tensor x_w,
@@ -46,10 +46,12 @@ torch::Tensor tmix_lnx_rkvres_xg_cuda(int B, int T, int C, int H,
                                       torch::Tensor k, torch::Tensor v,
                                       torch::Tensor r_k, torch::Tensor weight,
                                       torch::Tensor bias, torch::Tensor g);
-torch::Tensor tmix_lnx_rkvres_xg_warp_cuda(
-    int B, int T, int C, int H, torch::Tensor x, torch::Tensor r,
-    torch::Tensor k, torch::Tensor v, torch::Tensor r_k,
-    torch::Tensor weight, torch::Tensor bias, torch::Tensor g);
+torch::Tensor tmix_lnx_rkvres_xg_warp_cuda(int B, int T, int C, int H,
+                                           torch::Tensor x, torch::Tensor r,
+                                           torch::Tensor k, torch::Tensor v,
+                                           torch::Tensor r_k,
+                                           torch::Tensor weight,
+                                           torch::Tensor bias, torch::Tensor g);
 
 torch::Tensor tmix_vres_gate_cuda(int B, int T, int C, torch::Tensor v,
                                   torch::Tensor v_first, torch::Tensor v0,
@@ -72,8 +74,7 @@ torch::Tensor cmix_sparse_down_relu_rows_t512_cuda(int B, int T, int C, int F,
 torch::Tensor cmix_mix_cuda(int B, int T, int C, torch::Tensor x,
                             torch::Tensor shift_state, torch::Tensor x_k);
 torch::Tensor cmix_mix_3d_cuda(int B, int T, int C, torch::Tensor x,
-                               torch::Tensor shift_state,
-                               torch::Tensor x_k);
+                               torch::Tensor shift_state, torch::Tensor x_k);
 torch::Tensor cmix_mix_slot_cuda(int B, int T, int C, torch::Tensor x,
                                  torch::Tensor shift_state,
                                  torch::Tensor slot_indices, torch::Tensor x_k);
@@ -143,15 +144,13 @@ void check_vec(const torch::Tensor& x, int64_t C, const char* name) {
   TORCH_CHECK(x.dim() == 1 && x.size(0) == C, name, " must have shape [C]");
 }
 
-void check_cmix_sparse_down_relu_one_inputs(
-    int64_t C, int64_t F, const torch::Tensor& preact,
-    const torch::Tensor& value_fc) {
+void check_cmix_sparse_down_relu_one_inputs(int64_t C, int64_t F,
+                                            const torch::Tensor& preact,
+                                            const torch::Tensor& value_fc) {
   checked_int_arg(C, "C");
   checked_int_arg(F, "F");
-  TORCH_CHECK((C % CMIX_SPARSE_C_TILE) == 0,
-              "C must be divisible by 256");
-  TORCH_CHECK((F % CMIX_SPARSE_F_TILE) == 0,
-              "F must be divisible by 128");
+  TORCH_CHECK((C % CMIX_SPARSE_C_TILE) == 0, "C must be divisible by 256");
+  TORCH_CHECK((F % CMIX_SPARSE_F_TILE) == 0, "F must be divisible by 128");
   TORCH_CHECK(C / CMIX_SPARSE_C_TILE <= CUDA_PORTABLE_GRID_LIMIT,
               "C / 256 exceeds the portable CUDA grid limit");
   TORCH_CHECK(F / CMIX_SPARSE_F_TILE <= CUDA_PORTABLE_GRID_LIMIT,
@@ -235,15 +234,14 @@ void check_grid_3d(int64_t B, int64_t T, const char* op_name) {
               " requires 1 <= T <= 65535");
 }
 
-void check_tmix_mix6_3d(
-    const torch::Tensor& x, const torch::Tensor& shift_state,
-    const torch::Tensor& x_r, const torch::Tensor& x_w,
-    const torch::Tensor& x_k, const torch::Tensor& x_v,
-    const torch::Tensor& x_a, const torch::Tensor& x_g, int64_t B, int64_t T,
-    int64_t C) {
+void check_tmix_mix6_3d(const torch::Tensor& x,
+                        const torch::Tensor& shift_state,
+                        const torch::Tensor& x_r, const torch::Tensor& x_w,
+                        const torch::Tensor& x_k, const torch::Tensor& x_v,
+                        const torch::Tensor& x_a, const torch::Tensor& x_g,
+                        int64_t B, int64_t T, int64_t C) {
   check_grid_3d(B, T, "tmix_mix6_3d");
-  check_tmix_mix6_dense(x, shift_state, x_r, x_w, x_k, x_v, x_a, x_g, B, T,
-                        C);
+  check_tmix_mix6_dense(x, shift_state, x_r, x_w, x_k, x_v, x_a, x_g, B, T, C);
   check_half2_aligned(x, "x");
   check_half2_aligned(shift_state, "shift_state");
   check_half2_aligned(x_r, "x_r");
@@ -268,22 +266,22 @@ std::vector<torch::Tensor> tmix_mix6(int64_t B, int64_t T, int64_t C,
                                      torch::Tensor x_r, torch::Tensor x_w,
                                      torch::Tensor x_k, torch::Tensor x_v,
                                      torch::Tensor x_a, torch::Tensor x_g) {
-  check_tmix_mix6_dense(x, shift_state, x_r, x_w, x_k, x_v, x_a, x_g, B, T,
-                        C);
+  check_tmix_mix6_dense(x, shift_state, x_r, x_w, x_k, x_v, x_a, x_g, B, T, C);
   return tmix_mix6_cuda(checked_int_arg(B, "B"), checked_int_arg(T, "T"),
                         checked_int_arg(C, "C"), x, shift_state, x_r, x_w, x_k,
                         x_v, x_a, x_g);
 }
 
-std::vector<torch::Tensor> tmix_mix6_3d(
-    int64_t B, int64_t T, int64_t C, torch::Tensor x,
-    torch::Tensor shift_state, torch::Tensor x_r, torch::Tensor x_w,
-    torch::Tensor x_k, torch::Tensor x_v, torch::Tensor x_a,
-    torch::Tensor x_g) {
+std::vector<torch::Tensor> tmix_mix6_3d(int64_t B, int64_t T, int64_t C,
+                                        torch::Tensor x,
+                                        torch::Tensor shift_state,
+                                        torch::Tensor x_r, torch::Tensor x_w,
+                                        torch::Tensor x_k, torch::Tensor x_v,
+                                        torch::Tensor x_a, torch::Tensor x_g) {
   check_tmix_mix6_3d(x, shift_state, x_r, x_w, x_k, x_v, x_a, x_g, B, T, C);
-  return tmix_mix6_3d_cuda(
-      checked_int_arg(B, "B"), checked_int_arg(T, "T"),
-      checked_int_arg(C, "C"), x, shift_state, x_r, x_w, x_k, x_v, x_a, x_g);
+  return tmix_mix6_3d_cuda(checked_int_arg(B, "B"), checked_int_arg(T, "T"),
+                           checked_int_arg(C, "C"), x, shift_state, x_r, x_w,
+                           x_k, x_v, x_a, x_g);
 }
 
 std::vector<torch::Tensor> tmix_mix6_slot(
@@ -346,8 +344,7 @@ std::vector<torch::Tensor> tmix_kk_a_gate(int64_t B, int64_t T, int64_t C,
 
 std::vector<torch::Tensor> tmix_kk_a_gate_2d(
     int64_t B, int64_t T, int64_t C, int64_t H, torch::Tensor k,
-    torch::Tensor k_k, torch::Tensor a0, torch::Tensor a12,
-    torch::Tensor k_a) {
+    torch::Tensor k_k, torch::Tensor a0, torch::Tensor a12, torch::Tensor k_a) {
   const int b = checked_int_arg(B, "B");
   const int t = checked_int_arg(T, "T");
   const int c = checked_int_arg(C, "C");
@@ -387,10 +384,12 @@ torch::Tensor tmix_lnx_rkvres_xg(int64_t B, int64_t T, int64_t C, int64_t H,
       checked_int_arg(H, "H"), x, r, k, v, r_k, weight, bias, g);
 }
 
-torch::Tensor tmix_lnx_rkvres_xg_warp(
-    int64_t B, int64_t T, int64_t C, int64_t H, torch::Tensor x,
-    torch::Tensor r, torch::Tensor k, torch::Tensor v, torch::Tensor r_k,
-    torch::Tensor weight, torch::Tensor bias, torch::Tensor g) {
+torch::Tensor tmix_lnx_rkvres_xg_warp(int64_t B, int64_t T, int64_t C,
+                                      int64_t H, torch::Tensor x,
+                                      torch::Tensor r, torch::Tensor k,
+                                      torch::Tensor v, torch::Tensor r_k,
+                                      torch::Tensor weight, torch::Tensor bias,
+                                      torch::Tensor g) {
   TORCH_CHECK(C == 4096 && H == 64,
               "tmix_lnx_rkvres_xg_warp requires C=4096 and H=64");
   check_3d(x, B, T, C, "x");
@@ -408,9 +407,8 @@ torch::Tensor tmix_lnx_rkvres_xg_warp(
                   g.device() == device,
               "all tensors must be on the same CUDA device");
   return tmix_lnx_rkvres_xg_warp_cuda(
-      checked_int_arg(B, "B"), checked_int_arg(T, "T"),
-      checked_int_arg(C, "C"), checked_int_arg(H, "H"), x, r, k, v, r_k,
-      weight, bias, g);
+      checked_int_arg(B, "B"), checked_int_arg(T, "T"), checked_int_arg(C, "C"),
+      checked_int_arg(H, "H"), x, r, k, v, r_k, weight, bias, g);
 }
 
 torch::Tensor tmix_vres_gate(int64_t B, int64_t T, int64_t C, torch::Tensor v,
@@ -432,8 +430,7 @@ torch::Tensor cmix_sparse_down_relu_one(int64_t C, int64_t F,
       checked_int_arg(C, "C"), checked_int_arg(F, "F"), preact, value_fc);
 }
 
-void cmix_sparse_down_relu_one_out(int64_t C, int64_t F,
-                                   torch::Tensor preact,
+void cmix_sparse_down_relu_one_out(int64_t C, int64_t F, torch::Tensor preact,
                                    torch::Tensor value_fc, torch::Tensor out) {
   check_cmix_sparse_down_relu_one_inputs(C, F, preact, value_fc);
   check_half_cuda_contig(out, "out");
@@ -494,8 +491,7 @@ torch::Tensor cmix_mix_3d(int64_t B, int64_t T, int64_t C, torch::Tensor x,
   check_half2_aligned(x_k, "x_k");
   check_same_device(x, shift_state, "shift_state");
   check_same_device(x, x_k, "x_k");
-  return cmix_mix_3d_cuda(checked_int_arg(B, "B"),
-                          checked_int_arg(T, "T"),
+  return cmix_mix_3d_cuda(checked_int_arg(B, "B"), checked_int_arg(T, "T"),
                           checked_int_arg(C, "C"), x, shift_state, x_k);
 }
 

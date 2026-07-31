@@ -195,8 +195,7 @@ __device__ __forceinline__ float2 linear_f16_m1_splitk_reduce_pair(
 }
 
 __device__ __forceinline__ float2 linear_f16_m1_splitk_reduce_pair_warp(
-    int chunks, int N, int pair, int lane,
-    const float* __restrict__ partial) {
+    int chunks, int N, int pair, int lane, const float* __restrict__ partial) {
   float acc0 = 0.0f;
   float acc1 = 0.0f;
   for (int c = lane; c < chunks; c += 32) {
@@ -224,15 +223,16 @@ __global__ __launch_bounds__(128, 2) void linear_f16_m1_splitk_partial_kernel(
   if (n >= N) {
     return;
   }
-  const float2 value = linear_f16_m1_splitk_partial_dot<ChunkK>(
-      K, N, blockIdx.y, n, x, weight);
-  reinterpret_cast<float2*>(partial + static_cast<int64_t>(blockIdx.y) *
-                                          N)[pair] = value;
+  const float2 value =
+      linear_f16_m1_splitk_partial_dot<ChunkK>(K, N, blockIdx.y, n, x, weight);
+  reinterpret_cast<float2*>(partial +
+                            static_cast<int64_t>(blockIdx.y) * N)[pair] = value;
 }
 
 template <bool OutputFp32>
 __global__ void linear_f16_m1_splitk_reduce_kernel(
-    int chunks, int N, const float* __restrict__ partial, void* __restrict__ y) {
+    int chunks, int N, const float* __restrict__ partial,
+    void* __restrict__ y) {
   const int pair = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int n = pair << 1;
   if (n >= N) {
@@ -243,14 +243,14 @@ __global__ void linear_f16_m1_splitk_reduce_kernel(
   if constexpr (OutputFp32) {
     reinterpret_cast<float2*>(y)[pair] = value;
   } else {
-    reinterpret_cast<__half2*>(y)[pair] =
-        __floats2half2_rn(value.x, value.y);
+    reinterpret_cast<__half2*>(y)[pair] = __floats2half2_rn(value.x, value.y);
   }
 }
 
 template <bool OutputFp32>
 __global__ void linear_f16_m1_splitk_reduce_warp_kernel(
-    int chunks, int N, const float* __restrict__ partial, void* __restrict__ y) {
+    int chunks, int N, const float* __restrict__ partial,
+    void* __restrict__ y) {
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   const int pair = blockIdx.x * 4 + warp;
@@ -264,8 +264,7 @@ __global__ void linear_f16_m1_splitk_reduce_warp_kernel(
     if constexpr (OutputFp32) {
       reinterpret_cast<float2*>(y)[pair] = value;
     } else {
-      reinterpret_cast<__half2*>(y)[pair] =
-          __floats2half2_rn(value.x, value.y);
+      reinterpret_cast<__half2*>(y)[pair] = __floats2half2_rn(value.x, value.y);
     }
   }
 }
@@ -275,8 +274,7 @@ __device__ __forceinline__ void zero_f16_int4_grid_stride(
   const int64_t vector_count = zero_features / 8;
   const int64_t thread_index =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t thread_count =
-      static_cast<int64_t>(gridDim.x) * blockDim.x;
+  const int64_t thread_count = static_cast<int64_t>(gridDim.x) * blockDim.x;
   auto* output_int4 = reinterpret_cast<int4*>(output);
   for (int64_t index = thread_index; index < vector_count;
        index += thread_count) {
@@ -286,9 +284,8 @@ __device__ __forceinline__ void zero_f16_int4_grid_stride(
 
 template <bool PrepareZero>
 __global__ void linear_f16_m1_splitk_reduce_f16_kernel(
-    int chunks, int N, const float* __restrict__ partial,
-    dtype* __restrict__ y, dtype* __restrict__ zero_output,
-    int zero_features) {
+    int chunks, int N, const float* __restrict__ partial, dtype* __restrict__ y,
+    dtype* __restrict__ zero_output, int zero_features) {
   if constexpr (PrepareZero) {
     zero_f16_int4_grid_stride(zero_output, zero_features);
   }
@@ -299,15 +296,13 @@ __global__ void linear_f16_m1_splitk_reduce_f16_kernel(
   }
   const float2 value =
       linear_f16_m1_splitk_reduce_pair(chunks, N, pair, partial);
-  reinterpret_cast<__half2*>(y)[pair] =
-      __floats2half2_rn(value.x, value.y);
+  reinterpret_cast<__half2*>(y)[pair] = __floats2half2_rn(value.x, value.y);
 }
 
 template <bool PrepareZero>
 __global__ void linear_f16_m1_splitk_reduce_f16_warp_kernel(
-    int chunks, int N, const float* __restrict__ partial,
-    dtype* __restrict__ y, dtype* __restrict__ zero_output,
-    int zero_features) {
+    int chunks, int N, const float* __restrict__ partial, dtype* __restrict__ y,
+    dtype* __restrict__ zero_output, int zero_features) {
   if constexpr (PrepareZero) {
     zero_f16_int4_grid_stride(zero_output, zero_features);
   }
@@ -321,8 +316,7 @@ __global__ void linear_f16_m1_splitk_reduce_f16_warp_kernel(
   const float2 value =
       linear_f16_m1_splitk_reduce_pair_warp(chunks, N, pair, lane, partial);
   if (lane == 0) {
-    reinterpret_cast<__half2*>(y)[pair] =
-        __floats2half2_rn(value.x, value.y);
+    reinterpret_cast<__half2*>(y)[pair] = __floats2half2_rn(value.x, value.y);
   }
 }
 
@@ -331,15 +325,13 @@ __global__
 __launch_bounds__(128, 2) void linear_rkv_f16_m1_splitk_partial_kernel(
     int K, int N, int chunks, const dtype* __restrict__ x_r,
     const dtype* __restrict__ x_k, const dtype* __restrict__ x_v,
-    const dtype* __restrict__ weight_r,
-    const dtype* __restrict__ weight_k,
+    const dtype* __restrict__ weight_r, const dtype* __restrict__ weight_k,
     const dtype* __restrict__ weight_v, float* __restrict__ partial) {
   const int group = static_cast<int>(blockIdx.z);
   const dtype* x = group == 0 ? x_r : (group == 1 ? x_k : x_v);
   const dtype* weight =
       group == 0 ? weight_r : (group == 1 ? weight_k : weight_v);
-  float* group_partial =
-      partial + static_cast<int64_t>(group) * chunks * N;
+  float* group_partial = partial + static_cast<int64_t>(group) * chunks * N;
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   const int pair = (blockIdx.x * Warps + warp) * 32 + lane;
@@ -347,17 +339,15 @@ __launch_bounds__(128, 2) void linear_rkv_f16_m1_splitk_partial_kernel(
   if (n >= N) {
     return;
   }
-  const float2 value = linear_f16_m1_splitk_partial_dot<ChunkK>(
-      K, N, blockIdx.y, n, x, weight);
-  reinterpret_cast<float2*>(
-      group_partial + static_cast<int64_t>(blockIdx.y) * N)[pair] =
-      value;
+  const float2 value =
+      linear_f16_m1_splitk_partial_dot<ChunkK>(K, N, blockIdx.y, n, x, weight);
+  reinterpret_cast<float2*>(group_partial +
+                            static_cast<int64_t>(blockIdx.y) * N)[pair] = value;
 }
 
 __global__ void linear_rkv_f16_m1_splitk_reduce_kernel(
     int chunks, int N, const float* __restrict__ partial,
-    dtype* __restrict__ y_r, dtype* __restrict__ y_k,
-    dtype* __restrict__ y_v) {
+    dtype* __restrict__ y_r, dtype* __restrict__ y_k, dtype* __restrict__ y_v) {
   const int group = static_cast<int>(blockIdx.y);
   const float* group_partial =
       partial + static_cast<int64_t>(group) * chunks * N;
@@ -369,14 +359,12 @@ __global__ void linear_rkv_f16_m1_splitk_reduce_kernel(
   }
   const float2 value =
       linear_f16_m1_splitk_reduce_pair(chunks, N, pair, group_partial);
-  reinterpret_cast<__half2*>(y)[pair] =
-      __floats2half2_rn(value.x, value.y);
+  reinterpret_cast<__half2*>(y)[pair] = __floats2half2_rn(value.x, value.y);
 }
 
 __global__ void linear_rkv_f16_m1_splitk_reduce_warp_kernel(
     int chunks, int N, const float* __restrict__ partial,
-    dtype* __restrict__ y_r, dtype* __restrict__ y_k,
-    dtype* __restrict__ y_v) {
+    dtype* __restrict__ y_r, dtype* __restrict__ y_k, dtype* __restrict__ y_v) {
   const int group = static_cast<int>(blockIdx.y);
   const float* group_partial =
       partial + static_cast<int64_t>(group) * chunks * N;
@@ -391,8 +379,7 @@ __global__ void linear_rkv_f16_m1_splitk_reduce_warp_kernel(
   const float2 value = linear_f16_m1_splitk_reduce_pair_warp(
       chunks, N, pair, lane, group_partial);
   if (lane == 0) {
-    reinterpret_cast<__half2*>(y)[pair] =
-        __floats2half2_rn(value.x, value.y);
+    reinterpret_cast<__half2*>(y)[pair] = __floats2half2_rn(value.x, value.y);
   }
 }
 
@@ -1536,9 +1523,10 @@ __launch_bounds__(Threads, 1) void add_layer_norm_cmix_mix_f16_scalar_stats_kern
   }
 }
 
-__device__ __forceinline__ void welford_merge_equal(
-    float& mean, float& m2, float other_mean, float other_m2,
-    float correction_factor) {
+__device__ __forceinline__ void welford_merge_equal(float& mean, float& m2,
+                                                    float other_mean,
+                                                    float other_m2,
+                                                    float correction_factor) {
   // Every merge in this kernel combines equal-sized groups.
   const float delta = other_mean - mean;
   mean = fmaf(delta, 0.5f, mean);
@@ -1556,8 +1544,7 @@ __device__ __forceinline__ void block_welford_256(float& mean, float& m2) {
     const float other_mean = __shfl_down_sync(0xffffffffu, mean, offset);
     const float other_m2 = __shfl_down_sync(0xffffffffu, m2, offset);
     if (lane < offset) {
-      welford_merge_equal(mean, m2, other_mean, other_m2,
-                          group_count * 0.5f);
+      welford_merge_equal(mean, m2, other_mean, other_m2, group_count * 0.5f);
     }
     group_count *= 2.0f;
   }
@@ -1576,8 +1563,7 @@ __device__ __forceinline__ void block_welford_256(float& mean, float& m2) {
       const float other_mean = __shfl_down_sync(0xffffffffu, mean, offset);
       const float other_m2 = __shfl_down_sync(0xffffffffu, m2, offset);
       if (lane < offset) {
-        welford_merge_equal(mean, m2, other_mean, other_m2,
-                            group_count * 0.5f);
+        welford_merge_equal(mean, m2, other_mean, other_m2, group_count * 0.5f);
       }
       group_count *= 2.0f;
     }
@@ -1592,9 +1578,9 @@ __device__ __forceinline__ void block_welford_256(float& mean, float& m2) {
 }
 
 template <bool CacheRounded>
-__device__ __forceinline__ float2 load_add_pair(
-    const dtype* __restrict__ x, const dtype* __restrict__ residual,
-    dtype* __restrict__ x_out, int64_t pair_index) {
+__device__ __forceinline__ float2
+load_add_pair(const dtype* __restrict__ x, const dtype* __restrict__ residual,
+              dtype* __restrict__ x_out, int64_t pair_index) {
   const float2 xv =
       __half22float2(reinterpret_cast<const __half2*>(x)[pair_index]);
   const float2 rv =
@@ -1609,12 +1595,10 @@ __device__ __forceinline__ float2 load_add_pair(
 }
 
 template <bool CacheRounded>
-__global__
-__launch_bounds__(256, 1) void add_layer_norm_f16_welford_kernel(
+__global__ __launch_bounds__(256, 1) void add_layer_norm_f16_welford_kernel(
     const dtype* __restrict__ x, const dtype* __restrict__ residual,
     const dtype* __restrict__ weight, const dtype* __restrict__ bias,
-    dtype* __restrict__ x_out, dtype* __restrict__ y, int64_t rows,
-    float eps) {
+    dtype* __restrict__ x_out, dtype* __restrict__ y, int64_t rows, float eps) {
   const int64_t row = blockIdx.x;
   if (row >= rows) {
     return;
@@ -1643,8 +1627,7 @@ __launch_bounds__(256, 1) void add_layer_norm_f16_welford_kernel(
     m2 = fmaf(delta * delta, old_count * 2.0f * inv_count, m2 + pair_m2);
   }
   block_welford_256(mean, m2);
-  const float rstd =
-      rsqrtf(m2 * (1.0f / static_cast<float>(LN_SMALL_C)) + eps);
+  const float rstd = rsqrtf(m2 * (1.0f / static_cast<float>(LN_SMALL_C)) + eps);
 
   // CacheRounded stores x_out before block_welford_256. Its CTA barriers are
   // required for visibility here.
@@ -1654,8 +1637,7 @@ __launch_bounds__(256, 1) void add_layer_norm_f16_welford_kernel(
         base2 + threadIdx.x + static_cast<int64_t>(k) * Threads;
     float2 sum;
     if constexpr (CacheRounded) {
-      sum =
-          __half22float2(reinterpret_cast<const __half2*>(x_out)[pair_index]);
+      sum = __half22float2(reinterpret_cast<const __half2*>(x_out)[pair_index]);
     } else {
       sum = load_add_pair<false>(x, residual, x_out, pair_index);
       reinterpret_cast<__half2*>(x_out)[pair_index] =
@@ -1667,8 +1649,7 @@ __launch_bounds__(256, 1) void add_layer_norm_f16_welford_kernel(
     const float2 b =
         __half22float2(reinterpret_cast<const __half2*>(bias)[pair_c]);
     reinterpret_cast<__half2*>(y)[pair_index] = __floats2half2_rn(
-        (sum.x - mean) * rstd * w.x + b.x,
-        (sum.y - mean) * rstd * w.y + b.y);
+        (sum.x - mean) * rstd * w.x + b.x, (sum.y - mean) * rstd * w.y + b.y);
   }
 }
 
@@ -1691,8 +1672,7 @@ __launch_bounds__(256, 1) void add_layer_norm_cmix_mix_f16_welford_cache_kernel(
           ? base2
           : static_cast<int64_t>(slot_indices[row]) * (LN_SMALL_C / 2);
 
-  float2 pair =
-      load_add_pair<true>(x, residual, x_out, base2 + threadIdx.x);
+  float2 pair = load_add_pair<true>(x, residual, x_out, base2 + threadIdx.x);
   float delta = pair.y - pair.x;
   float mean = (pair.x + pair.y) * 0.5f;
   float m2 = delta * delta * 0.5f;
@@ -1711,8 +1691,7 @@ __launch_bounds__(256, 1) void add_layer_norm_cmix_mix_f16_welford_cache_kernel(
     m2 = fmaf(delta * delta, old_count * 2.0f * inv_count, m2 + pair_m2);
   }
   block_welford_256(mean, m2);
-  const float rstd =
-      rsqrtf(m2 * (1.0f / static_cast<float>(LN_SMALL_C)) + eps);
+  const float rstd = rsqrtf(m2 * (1.0f / static_cast<float>(LN_SMALL_C)) + eps);
 
   // block_welford_256 contains the CTA barriers needed before x_out is
   // reloaded. Each thread also owns the corresponding shift-state half2.
@@ -1734,8 +1713,7 @@ __launch_bounds__(256, 1) void add_layer_norm_cmix_mix_f16_welford_cache_kernel(
     const float2 mix =
         __half22float2(reinterpret_cast<const __half2*>(x_k)[pair_c]);
     const __half2 normalized = __floats2half2_rn(
-        (sum.x - mean) * rstd * w.x + b.x,
-        (sum.y - mean) * rstd * w.y + b.y);
+        (sum.x - mean) * rstd * w.x + b.x, (sum.y - mean) * rstd * w.y + b.y);
     const float2 normalized_f = __half22float2(normalized);
     reinterpret_cast<__half2*>(mixed)[pair_index] = __floats2half2_rn(
         normalized_f.x + (previous.x - normalized_f.x) * mix.x,
@@ -1768,8 +1746,7 @@ __launch_bounds__(256, 1) void add_layer_norm_tmix_mix6_f16_welford_cache_kernel
           ? base2
           : static_cast<int64_t>(slot_indices[row]) * (LN_SMALL_C / 2);
 
-  float2 pair =
-      load_add_pair<true>(x, residual, x_out, base2 + threadIdx.x);
+  float2 pair = load_add_pair<true>(x, residual, x_out, base2 + threadIdx.x);
   float delta = pair.y - pair.x;
   float mean = (pair.x + pair.y) * 0.5f;
   float m2 = delta * delta * 0.5f;
@@ -1788,8 +1765,7 @@ __launch_bounds__(256, 1) void add_layer_norm_tmix_mix6_f16_welford_cache_kernel
     m2 = fmaf(delta * delta, old_count * 2.0f * inv_count, m2 + pair_m2);
   }
   block_welford_256(mean, m2);
-  const float rstd =
-      rsqrtf(m2 * (1.0f / static_cast<float>(LN_SMALL_C)) + eps);
+  const float rstd = rsqrtf(m2 * (1.0f / static_cast<float>(LN_SMALL_C)) + eps);
 
 #pragma unroll
   for (int k = 0; k < PairsPerThread; ++k) {
@@ -1807,8 +1783,7 @@ __launch_bounds__(256, 1) void add_layer_norm_tmix_mix6_f16_welford_cache_kernel
     const float2 previous = __half22float2(
         reinterpret_cast<const __half2*>(shift_state)[state_pair_index]);
     const __half2 normalized = __floats2half2_rn(
-        (sum.x - mean) * rstd * w.x + b.x,
-        (sum.y - mean) * rstd * w.y + b.y);
+        (sum.x - mean) * rstd * w.x + b.x, (sum.y - mean) * rstd * w.y + b.y);
     const float2 normalized_f = __half22float2(normalized);
     const float dx0 = previous.x - normalized_f.x;
     const float dx1 = previous.y - normalized_f.y;
@@ -2535,13 +2510,12 @@ std::vector<at::Tensor> add_layer_norm_cmix_mix_f16_cuda(
   const int64_t rows = x.numel() / C;
   auto stream = at::cuda::getCurrentCUDAStream();
   if (C == LN_SMALL_C && rows >= 192 && rows <= 1024) {
-    add_layer_norm_cmix_mix_f16_welford_cache_kernel
-        <<<static_cast<int>(rows), 256, 0, stream>>>(
-            x.data_ptr<dtype>(), residual.data_ptr<dtype>(),
-            shift_state.data_ptr<dtype>(), weight.data_ptr<dtype>(),
-            bias.data_ptr<dtype>(), x_k.data_ptr<dtype>(),
-            x_out.data_ptr<dtype>(), mixed.data_ptr<dtype>(), nullptr, rows,
-            static_cast<float>(eps));
+    add_layer_norm_cmix_mix_f16_welford_cache_kernel<<<static_cast<int>(rows),
+                                                       256, 0, stream>>>(
+        x.data_ptr<dtype>(), residual.data_ptr<dtype>(),
+        shift_state.data_ptr<dtype>(), weight.data_ptr<dtype>(),
+        bias.data_ptr<dtype>(), x_k.data_ptr<dtype>(), x_out.data_ptr<dtype>(),
+        mixed.data_ptr<dtype>(), nullptr, rows, static_cast<float>(eps));
   } else if (C == LN_SMALL_C) {
     add_layer_norm_cmix_mix_f16_scalar_stats_kernel<LN_SMALL_THREADS>
         <<<static_cast<int>(rows), LN_SMALL_THREADS, 0, stream>>>(
@@ -2575,13 +2549,12 @@ std::vector<at::Tensor> add_layer_norm_cmix_mix_f16_slots_cuda(
   const int* slots = slot_indices.data_ptr<int>();
   auto stream = at::cuda::getCurrentCUDAStream();
   if (C == LN_SMALL_C && rows >= 192 && rows <= 1024) {
-    add_layer_norm_cmix_mix_f16_welford_cache_kernel
-        <<<static_cast<int>(rows), 256, 0, stream>>>(
-            x.data_ptr<dtype>(), residual.data_ptr<dtype>(),
-            shift_state.data_ptr<dtype>(), weight.data_ptr<dtype>(),
-            bias.data_ptr<dtype>(), x_k.data_ptr<dtype>(),
-            x_out.data_ptr<dtype>(), mixed.data_ptr<dtype>(), slots, rows,
-            static_cast<float>(eps));
+    add_layer_norm_cmix_mix_f16_welford_cache_kernel<<<static_cast<int>(rows),
+                                                       256, 0, stream>>>(
+        x.data_ptr<dtype>(), residual.data_ptr<dtype>(),
+        shift_state.data_ptr<dtype>(), weight.data_ptr<dtype>(),
+        bias.data_ptr<dtype>(), x_k.data_ptr<dtype>(), x_out.data_ptr<dtype>(),
+        mixed.data_ptr<dtype>(), slots, rows, static_cast<float>(eps));
   } else if (C == LN_SMALL_C) {
     add_layer_norm_cmix_mix_f16_scalar_stats_kernel<LN_SMALL_THREADS>
         <<<static_cast<int>(rows), LN_SMALL_THREADS, 0, stream>>>(
@@ -2620,18 +2593,16 @@ std::vector<at::Tensor> add_layer_norm_tmix_mix6_f16_cuda(
   const int64_t rows = x.numel() / C;
   auto stream = at::cuda::getCurrentCUDAStream();
   if (C == LN_SMALL_C && rows >= 192 && rows <= 1024) {
-    add_layer_norm_tmix_mix6_f16_welford_cache_kernel
-        <<<static_cast<int>(rows), 256, 0, stream>>>(
-            x.data_ptr<dtype>(), residual.data_ptr<dtype>(),
-            shift_state.data_ptr<dtype>(), weight.data_ptr<dtype>(),
-            bias.data_ptr<dtype>(), x_r.data_ptr<dtype>(),
-            x_w.data_ptr<dtype>(), x_k.data_ptr<dtype>(),
-            x_v.data_ptr<dtype>(), x_a.data_ptr<dtype>(),
-            x_g.data_ptr<dtype>(), x_out.data_ptr<dtype>(),
-            out_r.data_ptr<dtype>(), out_w.data_ptr<dtype>(),
-            out_k.data_ptr<dtype>(), out_v.data_ptr<dtype>(),
-            out_a.data_ptr<dtype>(), out_g.data_ptr<dtype>(), nullptr, rows,
-            static_cast<float>(eps));
+    add_layer_norm_tmix_mix6_f16_welford_cache_kernel<<<static_cast<int>(rows),
+                                                        256, 0, stream>>>(
+        x.data_ptr<dtype>(), residual.data_ptr<dtype>(),
+        shift_state.data_ptr<dtype>(), weight.data_ptr<dtype>(),
+        bias.data_ptr<dtype>(), x_r.data_ptr<dtype>(), x_w.data_ptr<dtype>(),
+        x_k.data_ptr<dtype>(), x_v.data_ptr<dtype>(), x_a.data_ptr<dtype>(),
+        x_g.data_ptr<dtype>(), x_out.data_ptr<dtype>(), out_r.data_ptr<dtype>(),
+        out_w.data_ptr<dtype>(), out_k.data_ptr<dtype>(),
+        out_v.data_ptr<dtype>(), out_a.data_ptr<dtype>(),
+        out_g.data_ptr<dtype>(), nullptr, rows, static_cast<float>(eps));
   } else if (C == LN_SMALL_C) {
     add_layer_norm_tmix_mix6_f16_scalar_stats_kernel<LN_SMALL_THREADS>
         <<<static_cast<int>(rows), LN_SMALL_THREADS, 0, stream>>>(
@@ -2680,18 +2651,16 @@ std::vector<at::Tensor> add_layer_norm_tmix_mix6_f16_slots_cuda(
   const int* slots = slot_indices.data_ptr<int>();
   auto stream = at::cuda::getCurrentCUDAStream();
   if (C == LN_SMALL_C && rows >= 192 && rows <= 1024) {
-    add_layer_norm_tmix_mix6_f16_welford_cache_kernel
-        <<<static_cast<int>(rows), 256, 0, stream>>>(
-            x.data_ptr<dtype>(), residual.data_ptr<dtype>(),
-            shift_state.data_ptr<dtype>(), weight.data_ptr<dtype>(),
-            bias.data_ptr<dtype>(), x_r.data_ptr<dtype>(),
-            x_w.data_ptr<dtype>(), x_k.data_ptr<dtype>(),
-            x_v.data_ptr<dtype>(), x_a.data_ptr<dtype>(),
-            x_g.data_ptr<dtype>(), x_out.data_ptr<dtype>(),
-            out_r.data_ptr<dtype>(), out_w.data_ptr<dtype>(),
-            out_k.data_ptr<dtype>(), out_v.data_ptr<dtype>(),
-            out_a.data_ptr<dtype>(), out_g.data_ptr<dtype>(), slots, rows,
-            static_cast<float>(eps));
+    add_layer_norm_tmix_mix6_f16_welford_cache_kernel<<<static_cast<int>(rows),
+                                                        256, 0, stream>>>(
+        x.data_ptr<dtype>(), residual.data_ptr<dtype>(),
+        shift_state.data_ptr<dtype>(), weight.data_ptr<dtype>(),
+        bias.data_ptr<dtype>(), x_r.data_ptr<dtype>(), x_w.data_ptr<dtype>(),
+        x_k.data_ptr<dtype>(), x_v.data_ptr<dtype>(), x_a.data_ptr<dtype>(),
+        x_g.data_ptr<dtype>(), x_out.data_ptr<dtype>(), out_r.data_ptr<dtype>(),
+        out_w.data_ptr<dtype>(), out_k.data_ptr<dtype>(),
+        out_v.data_ptr<dtype>(), out_a.data_ptr<dtype>(),
+        out_g.data_ptr<dtype>(), slots, rows, static_cast<float>(eps));
   } else if (C == LN_SMALL_C) {
     add_layer_norm_tmix_mix6_f16_scalar_stats_kernel<LN_SMALL_THREADS>
         <<<static_cast<int>(rows), LN_SMALL_THREADS, 0, stream>>>(
@@ -2793,8 +2762,7 @@ struct LtFp32PlanKey {
     return device == other.device && m == other.m && k == other.k &&
            n == other.n && a_alignment == other.a_alignment &&
            b_alignment == other.b_alignment &&
-           c_alignment == other.c_alignment &&
-           d_alignment == other.d_alignment;
+           c_alignment == other.c_alignment && d_alignment == other.d_alignment;
   }
 };
 
@@ -2802,8 +2770,8 @@ struct LtFp32PlanKeyHash {
   size_t operator()(const LtFp32PlanKey& key) const {
     size_t value = std::hash<int>{}(key.device);
     const auto combine = [&value](int item) {
-      value ^= std::hash<int>{}(item) + 0x9e3779b9U + (value << 6) +
-               (value >> 2);
+      value ^=
+          std::hash<int>{}(item) + 0x9e3779b9U + (value << 6) + (value >> 2);
     };
     combine(key.m);
     combine(key.k);
@@ -2824,71 +2792,58 @@ struct LtFp32Plan {
   cublasLtMatmulPreference_t preference = nullptr;
   cublasLtMatmulAlgo_t algo{};
 
-  LtFp32Plan(cublasLtHandle_t handle, int m, int k, int n,
-             uint32_t a_alignment, uint32_t b_alignment,
-             uint32_t c_alignment, uint32_t d_alignment) {
+  LtFp32Plan(cublasLtHandle_t handle, int m, int k, int n, uint32_t a_alignment,
+             uint32_t b_alignment, uint32_t c_alignment, uint32_t d_alignment) {
     try {
       check_cublaslt(
-          cublasLtMatmulDescCreate(
-              &op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F),
+          cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F),
           "linear_f16_fp32_lt matmul descriptor");
       const cublasOperation_t trans = CUBLAS_OP_N;
       check_cublaslt(
-          cublasLtMatmulDescSetAttribute(
-              op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans, sizeof(trans)),
+          cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA,
+                                         &trans, sizeof(trans)),
           "linear_f16_fp32_lt transa");
       check_cublaslt(
-          cublasLtMatmulDescSetAttribute(
-              op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &trans, sizeof(trans)),
+          cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB,
+                                         &trans, sizeof(trans)),
           "linear_f16_fp32_lt transb");
-      check_cublaslt(
-          cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_16F, n, k, n),
-          "linear_f16_fp32_lt a layout");
-      check_cublaslt(
-          cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_16F, k, m, k),
-          "linear_f16_fp32_lt b layout");
-      check_cublaslt(
-          cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_32F, n, m, n),
-          "linear_f16_fp32_lt c layout");
-      check_cublaslt(
-          cublasLtMatmulPreferenceCreate(&preference),
-          "linear_f16_fp32_lt preference");
+      check_cublaslt(cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_16F, n, k, n),
+                     "linear_f16_fp32_lt a layout");
+      check_cublaslt(cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_16F, k, m, k),
+                     "linear_f16_fp32_lt b layout");
+      check_cublaslt(cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_32F, n, m, n),
+                     "linear_f16_fp32_lt c layout");
+      check_cublaslt(cublasLtMatmulPreferenceCreate(&preference),
+                     "linear_f16_fp32_lt preference");
       constexpr size_t workspace_size = 0;
-      check_cublaslt(
-          cublasLtMatmulPreferenceSetAttribute(
-              preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-              &workspace_size, sizeof(workspace_size)),
-          "linear_f16_fp32_lt workspace");
-      check_cublaslt(
-          cublasLtMatmulPreferenceSetAttribute(
-              preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES,
-              &a_alignment, sizeof(a_alignment)),
-          "linear_f16_fp32_lt A alignment");
-      check_cublaslt(
-          cublasLtMatmulPreferenceSetAttribute(
-              preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,
-              &b_alignment, sizeof(b_alignment)),
-          "linear_f16_fp32_lt B alignment");
-      check_cublaslt(
-          cublasLtMatmulPreferenceSetAttribute(
-              preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES,
-              &c_alignment, sizeof(c_alignment)),
-          "linear_f16_fp32_lt C alignment");
-      check_cublaslt(
-          cublasLtMatmulPreferenceSetAttribute(
-              preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES,
-              &d_alignment, sizeof(d_alignment)),
-          "linear_f16_fp32_lt D alignment");
+      check_cublaslt(cublasLtMatmulPreferenceSetAttribute(
+                         preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                         &workspace_size, sizeof(workspace_size)),
+                     "linear_f16_fp32_lt workspace");
+      check_cublaslt(cublasLtMatmulPreferenceSetAttribute(
+                         preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES,
+                         &a_alignment, sizeof(a_alignment)),
+                     "linear_f16_fp32_lt A alignment");
+      check_cublaslt(cublasLtMatmulPreferenceSetAttribute(
+                         preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,
+                         &b_alignment, sizeof(b_alignment)),
+                     "linear_f16_fp32_lt B alignment");
+      check_cublaslt(cublasLtMatmulPreferenceSetAttribute(
+                         preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES,
+                         &c_alignment, sizeof(c_alignment)),
+                     "linear_f16_fp32_lt C alignment");
+      check_cublaslt(cublasLtMatmulPreferenceSetAttribute(
+                         preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES,
+                         &d_alignment, sizeof(d_alignment)),
+                     "linear_f16_fp32_lt D alignment");
 
       cublasLtMatmulHeuristicResult_t heuristic{};
       int returned = 0;
-      check_cublaslt(
-          cublasLtMatmulAlgoGetHeuristic(
-              handle, op_desc, a_desc, b_desc, c_desc, c_desc, preference, 1,
-              &heuristic, &returned),
-          "linear_f16_fp32_lt heuristic");
-      TORCH_CHECK(returned > 0,
-                  "linear_f16_fp32_lt found no algorithm");
+      check_cublaslt(cublasLtMatmulAlgoGetHeuristic(
+                         handle, op_desc, a_desc, b_desc, c_desc, c_desc,
+                         preference, 1, &heuristic, &returned),
+                     "linear_f16_fp32_lt heuristic");
+      TORCH_CHECK(returned > 0, "linear_f16_fp32_lt found no algorithm");
       TORCH_CHECK(
           heuristic.state == CUBLAS_STATUS_SUCCESS,
           "linear_f16_fp32_lt heuristic returned an unrunnable algorithm; "
@@ -2936,11 +2891,12 @@ struct LtFp32Plan {
   }
 };
 
-LtFp32Plan& get_linear_f16_fp32_lt_plan(
-    const LtFp32PlanKey& key, cublasLtHandle_t handle, cudaStream_t stream) {
+LtFp32Plan& get_linear_f16_fp32_lt_plan(const LtFp32PlanKey& key,
+                                        cublasLtHandle_t handle,
+                                        cudaStream_t stream) {
   static std::mutex cache_mutex;
-  static std::unordered_map<
-      LtFp32PlanKey, std::unique_ptr<LtFp32Plan>, LtFp32PlanKeyHash>
+  static std::unordered_map<LtFp32PlanKey, std::unique_ptr<LtFp32Plan>,
+                            LtFp32PlanKeyHash>
       cache;
   std::lock_guard<std::mutex> lock(cache_mutex);
   const auto found = cache.find(key);
@@ -2950,13 +2906,12 @@ LtFp32Plan& get_linear_f16_fp32_lt_plan(
 
   cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
   C10_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
-  TORCH_CHECK(
-      capture_status == cudaStreamCaptureStatusNone,
-      "linear_f16_fp32_lt plan cache miss during CUDA graph capture; "
-      "warm this shape once before capture");
-  auto plan = std::make_unique<LtFp32Plan>(
-      handle, key.m, key.k, key.n, key.a_alignment, key.b_alignment,
-      key.c_alignment, key.d_alignment);
+  TORCH_CHECK(capture_status == cudaStreamCaptureStatusNone,
+              "linear_f16_fp32_lt plan cache miss during CUDA graph capture; "
+              "warm this shape once before capture");
+  auto plan = std::make_unique<LtFp32Plan>(handle, key.m, key.k, key.n,
+                                           key.a_alignment, key.b_alignment,
+                                           key.c_alignment, key.d_alignment);
   auto* result = plan.get();
   cache.emplace(key, std::move(plan));
   return *result;
@@ -2982,8 +2937,7 @@ struct LtFp16PlanKey {
            strict_algo == other.strict_algo &&
            a_alignment == other.a_alignment &&
            b_alignment == other.b_alignment &&
-           c_alignment == other.c_alignment &&
-           d_alignment == other.d_alignment;
+           c_alignment == other.c_alignment && d_alignment == other.d_alignment;
   }
 };
 
@@ -2991,8 +2945,8 @@ struct LtFp16PlanKeyHash {
   size_t operator()(const LtFp16PlanKey& key) const {
     size_t value = std::hash<int>{}(key.device);
     const auto combine = [&value](int item) {
-      value ^= std::hash<int>{}(item) + 0x9e3779b9U + (value << 6) +
-               (value >> 2);
+      value ^=
+          std::hash<int>{}(item) + 0x9e3779b9U + (value << 6) + (value >> 2);
     };
     combine(key.m);
     combine(key.k);
@@ -3018,93 +2972,74 @@ struct LtFp16Plan {
   size_t workspace_size = 0;
 
   LtFp16Plan(cublasLtHandle_t handle, int m, int k, int n, int workspace_mb,
-             int heuristic_index, bool strict_algo,
-             uint32_t a_alignment, uint32_t b_alignment,
-             uint32_t c_alignment, uint32_t d_alignment) {
+             int heuristic_index, bool strict_algo, uint32_t a_alignment,
+             uint32_t b_alignment, uint32_t c_alignment, uint32_t d_alignment) {
     try {
       check_cublaslt(
-          cublasLtMatmulDescCreate(
-              &op_desc, CUBLAS_COMPUTE_16F, CUDA_R_16F),
+          cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_16F, CUDA_R_16F),
           "linear_f16_lt_cfg matmul descriptor");
       const cublasOperation_t transa = CUBLAS_OP_N;
       const cublasOperation_t transb = CUBLAS_OP_N;
       check_cublaslt(
-          cublasLtMatmulDescSetAttribute(
-              op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa,
-              sizeof(transa)),
+          cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA,
+                                         &transa, sizeof(transa)),
           "linear_f16_lt_cfg transa");
       check_cublaslt(
-          cublasLtMatmulDescSetAttribute(
-              op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb,
-              sizeof(transb)),
+          cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB,
+                                         &transb, sizeof(transb)),
           "linear_f16_lt_cfg transb");
-      check_cublaslt(
-          cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_16F, n, k, n),
-          "linear_f16_lt_cfg a layout");
-      check_cublaslt(
-          cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_16F, k, m, k),
-          "linear_f16_lt_cfg b layout");
-      check_cublaslt(
-          cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_16F, n, m, n),
-          "linear_f16_lt_cfg c layout");
-      check_cublaslt(
-          cublasLtMatmulPreferenceCreate(&preference),
-          "linear_f16_lt_cfg preference");
-      const size_t workspace_limit =
-          static_cast<size_t>(workspace_mb) << 20;
-      check_cublaslt(
-          cublasLtMatmulPreferenceSetAttribute(
-              preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-              &workspace_limit, sizeof(workspace_limit)),
-          "linear_f16_lt_cfg workspace");
-      check_cublaslt(
-          cublasLtMatmulPreferenceSetAttribute(
-              preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES,
-              &a_alignment, sizeof(a_alignment)),
-          "linear_f16_lt_cfg A alignment");
-      check_cublaslt(
-          cublasLtMatmulPreferenceSetAttribute(
-              preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,
-              &b_alignment, sizeof(b_alignment)),
-          "linear_f16_lt_cfg B alignment");
-      check_cublaslt(
-          cublasLtMatmulPreferenceSetAttribute(
-              preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES,
-              &c_alignment, sizeof(c_alignment)),
-          "linear_f16_lt_cfg C alignment");
-      check_cublaslt(
-          cublasLtMatmulPreferenceSetAttribute(
-              preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES,
-              &d_alignment, sizeof(d_alignment)),
-          "linear_f16_lt_cfg D alignment");
+      check_cublaslt(cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_16F, n, k, n),
+                     "linear_f16_lt_cfg a layout");
+      check_cublaslt(cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_16F, k, m, k),
+                     "linear_f16_lt_cfg b layout");
+      check_cublaslt(cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_16F, n, m, n),
+                     "linear_f16_lt_cfg c layout");
+      check_cublaslt(cublasLtMatmulPreferenceCreate(&preference),
+                     "linear_f16_lt_cfg preference");
+      const size_t workspace_limit = static_cast<size_t>(workspace_mb) << 20;
+      check_cublaslt(cublasLtMatmulPreferenceSetAttribute(
+                         preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                         &workspace_limit, sizeof(workspace_limit)),
+                     "linear_f16_lt_cfg workspace");
+      check_cublaslt(cublasLtMatmulPreferenceSetAttribute(
+                         preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES,
+                         &a_alignment, sizeof(a_alignment)),
+                     "linear_f16_lt_cfg A alignment");
+      check_cublaslt(cublasLtMatmulPreferenceSetAttribute(
+                         preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,
+                         &b_alignment, sizeof(b_alignment)),
+                     "linear_f16_lt_cfg B alignment");
+      check_cublaslt(cublasLtMatmulPreferenceSetAttribute(
+                         preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES,
+                         &c_alignment, sizeof(c_alignment)),
+                     "linear_f16_lt_cfg C alignment");
+      check_cublaslt(cublasLtMatmulPreferenceSetAttribute(
+                         preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES,
+                         &d_alignment, sizeof(d_alignment)),
+                     "linear_f16_lt_cfg D alignment");
 
       std::vector<cublasLtMatmulHeuristicResult_t> heuristics(64);
       int returned = 0;
-      check_cublaslt(
-          cublasLtMatmulAlgoGetHeuristic(
-              handle, op_desc, a_desc, b_desc, c_desc, c_desc, preference,
-              static_cast<int>(heuristics.size()), heuristics.data(),
-              &returned),
-          "linear_f16_lt_cfg heuristic");
-      TORCH_CHECK(returned > 0,
-                  "linear_f16_lt_cfg found no algorithm");
+      check_cublaslt(cublasLtMatmulAlgoGetHeuristic(
+                         handle, op_desc, a_desc, b_desc, c_desc, c_desc,
+                         preference, static_cast<int>(heuristics.size()),
+                         heuristics.data(), &returned),
+                     "linear_f16_lt_cfg heuristic");
+      TORCH_CHECK(returned > 0, "linear_f16_lt_cfg found no algorithm");
       if (strict_algo) {
-        TORCH_CHECK(
-            heuristic_index < returned,
-            "linear_f16_lt_cfg requested heuristic index ", heuristic_index,
-            " but only ", returned, " algorithms are available");
+        TORCH_CHECK(heuristic_index < returned,
+                    "linear_f16_lt_cfg requested heuristic index ",
+                    heuristic_index, " but only ", returned,
+                    " algorithms are available");
       }
-      const int selected =
-          heuristic_index < returned ? heuristic_index : 0;
-      TORCH_CHECK(
-          heuristics[selected].state == CUBLAS_STATUS_SUCCESS,
-          "linear_f16_lt_cfg selected an unrunnable algorithm; state=",
-          static_cast<int>(heuristics[selected].state));
-      TORCH_CHECK(
-          heuristics[selected].workspaceSize <= workspace_limit,
-          "linear_f16_lt_cfg selected an algorithm requiring ",
-          heuristics[selected].workspaceSize, " workspace bytes, limit is ",
-          workspace_limit);
+      const int selected = heuristic_index < returned ? heuristic_index : 0;
+      TORCH_CHECK(heuristics[selected].state == CUBLAS_STATUS_SUCCESS,
+                  "linear_f16_lt_cfg selected an unrunnable algorithm; state=",
+                  static_cast<int>(heuristics[selected].state));
+      TORCH_CHECK(heuristics[selected].workspaceSize <= workspace_limit,
+                  "linear_f16_lt_cfg selected an algorithm requiring ",
+                  heuristics[selected].workspaceSize,
+                  " workspace bytes, limit is ", workspace_limit);
       algo = heuristics[selected].algo;
       workspace_size = heuristics[selected].workspaceSize;
       cublasLtMatmulPreferenceDestroy(preference);
@@ -3145,11 +3080,12 @@ struct LtFp16Plan {
   }
 };
 
-LtFp16Plan& get_linear_f16_lt_cfg_plan(
-    const LtFp16PlanKey& key, cublasLtHandle_t handle, cudaStream_t stream) {
+LtFp16Plan& get_linear_f16_lt_cfg_plan(const LtFp16PlanKey& key,
+                                       cublasLtHandle_t handle,
+                                       cudaStream_t stream) {
   static std::mutex cache_mutex;
-  static std::unordered_map<
-      LtFp16PlanKey, std::unique_ptr<LtFp16Plan>, LtFp16PlanKeyHash>
+  static std::unordered_map<LtFp16PlanKey, std::unique_ptr<LtFp16Plan>,
+                            LtFp16PlanKeyHash>
       cache;
   std::lock_guard<std::mutex> lock(cache_mutex);
   const auto found = cache.find(key);
@@ -3159,10 +3095,9 @@ LtFp16Plan& get_linear_f16_lt_cfg_plan(
 
   cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
   C10_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
-  TORCH_CHECK(
-      capture_status == cudaStreamCaptureStatusNone,
-      "linear_f16_lt_cfg plan cache miss during CUDA graph capture; "
-      "warm this shape once before capture");
+  TORCH_CHECK(capture_status == cudaStreamCaptureStatusNone,
+              "linear_f16_lt_cfg plan cache miss during CUDA graph capture; "
+              "warm this shape once before capture");
   auto plan = std::make_unique<LtFp16Plan>(
       handle, key.m, key.k, key.n, key.workspace_mb, key.heuristic_index,
       key.strict_algo, key.a_alignment, key.b_alignment, key.c_alignment,
@@ -3172,9 +3107,10 @@ LtFp16Plan& get_linear_f16_lt_cfg_plan(
   return *result;
 }
 
-at::Tensor linear_f16_lt_cfg_cuda_impl(
-    at::Tensor x, at::Tensor weight, int64_t workspace_mb,
-    int64_t heuristic_index, bool strict_algo) {
+at::Tensor linear_f16_lt_cfg_cuda_impl(at::Tensor x, at::Tensor weight,
+                                       int64_t workspace_mb,
+                                       int64_t heuristic_index,
+                                       bool strict_algo) {
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const int64_t k64 = x.size(-1);
   const int64_t n64 = weight.size(1);
@@ -3210,14 +3146,12 @@ at::Tensor linear_f16_lt_cfg_cuda_impl(
       pointer_alignment_bytes(y.data_ptr()),
       pointer_alignment_bytes(y.data_ptr()),
   };
-  const auto& plan =
-      get_linear_f16_lt_cfg_plan(key, lt_handle, stream);
+  const auto& plan = get_linear_f16_lt_cfg_plan(key, lt_handle, stream);
   at::Tensor workspace;
   void* workspace_ptr = nullptr;
   if (plan.workspace_size > 0) {
-    workspace = at::empty(
-        {static_cast<int64_t>(plan.workspace_size)},
-        x.options().dtype(at::kByte));
+    workspace = at::empty({static_cast<int64_t>(plan.workspace_size)},
+                          x.options().dtype(at::kByte));
     workspace_ptr = workspace.data_ptr();
     TORCH_INTERNAL_ASSERT(
         reinterpret_cast<uintptr_t>(workspace_ptr) % 256 == 0,
@@ -3227,9 +3161,9 @@ at::Tensor linear_f16_lt_cfg_cuda_impl(
   const __half beta = __float2half(0.0f);
   const auto matmul_status = cublasLtMatmul(
       lt_handle, plan.op_desc, &alpha, weight.data_ptr<dtype>(), plan.a_desc,
-      x.data_ptr<dtype>(), plan.b_desc, &beta, y.data_ptr<dtype>(),
-      plan.c_desc, y.data_ptr<dtype>(), plan.c_desc, &plan.algo,
-      workspace_ptr, plan.workspace_size, stream);
+      x.data_ptr<dtype>(), plan.b_desc, &beta, y.data_ptr<dtype>(), plan.c_desc,
+      y.data_ptr<dtype>(), plan.c_desc, &plan.algo, workspace_ptr,
+      plan.workspace_size, stream);
   check_cublaslt(matmul_status, "linear_f16_lt_cfg matmul");
   return y;
 }
@@ -3237,11 +3171,10 @@ at::Tensor linear_f16_lt_cfg_cuda_impl(
 }  // namespace
 
 at::Tensor linear_f16_lt_cfg_cuda(at::Tensor x, at::Tensor weight,
-                                  int64_t workspace_mb,
-                                  int64_t heuristic_index,
+                                  int64_t workspace_mb, int64_t heuristic_index,
                                   bool strict_algo) {
-  return linear_f16_lt_cfg_cuda_impl(
-      x, weight, workspace_mb, heuristic_index, strict_algo);
+  return linear_f16_lt_cfg_cuda_impl(x, weight, workspace_mb, heuristic_index,
+                                     strict_algo);
 }
 
 at::Tensor linear_f16_fp32_lt_cuda(at::Tensor x, at::Tensor weight) {
@@ -3278,15 +3211,13 @@ at::Tensor linear_f16_fp32_lt_cuda(at::Tensor x, at::Tensor weight) {
       pointer_alignment_bytes(y.data_ptr()),
       pointer_alignment_bytes(y.data_ptr()),
   };
-  const auto& plan =
-      get_linear_f16_fp32_lt_plan(key, lt_handle, stream);
+  const auto& plan = get_linear_f16_fp32_lt_plan(key, lt_handle, stream);
   const float alpha = 1.0f;
   const float beta = 0.0f;
   const auto matmul_status = cublasLtMatmul(
       lt_handle, plan.op_desc, &alpha, weight.data_ptr<dtype>(), plan.a_desc,
-      x.data_ptr<dtype>(), plan.b_desc, &beta, y.data_ptr<float>(),
-      plan.c_desc, y.data_ptr<float>(), plan.c_desc, &plan.algo, nullptr, 0,
-      stream);
+      x.data_ptr<dtype>(), plan.b_desc, &beta, y.data_ptr<float>(), plan.c_desc,
+      y.data_ptr<float>(), plan.c_desc, &plan.algo, nullptr, 0, stream);
   check_cublaslt(matmul_status, "linear_f16_fp32_lt matmul");
   return y;
 }
@@ -3328,9 +3259,9 @@ at::Tensor linear_f16_m1_splitk_cuda_impl(at::Tensor x, at::Tensor weight) {
           partial.data_ptr<float>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   if constexpr (WarpReduce) {
-    linear_f16_m1_splitk_reduce_warp_kernel<OutputFp32><<<
-        static_cast<int>(ceil_div(N / 2, 4)), 128, 0, stream>>>(
-        chunks, N, partial.data_ptr<float>(), y.data_ptr());
+    linear_f16_m1_splitk_reduce_warp_kernel<OutputFp32>
+        <<<static_cast<int>(ceil_div(N / 2, 4)), 128, 0, stream>>>(
+            chunks, N, partial.data_ptr<float>(), y.data_ptr());
   } else {
     linear_f16_m1_splitk_reduce_kernel<OutputFp32>
         <<<static_cast<int>(ceil_div(N / 2, 128)), 128, 0, stream>>>(
@@ -3369,8 +3300,9 @@ at::Tensor linear_f16_m1_splitk_cuda(at::Tensor x, at::Tensor weight) {
   const int64_t N = weight.size(1);
   return dispatch_linear_f16_m1_splitk(K, N, [&](auto config) {
     using Config = decltype(config);
-    return linear_f16_m1_splitk_cuda_impl<
-        Config::chunk_k, Config::warps, Config::warp_reduce, false>(x, weight);
+    return linear_f16_m1_splitk_cuda_impl<Config::chunk_k, Config::warps,
+                                          Config::warp_reduce, false>(x,
+                                                                      weight);
   });
 }
 
@@ -3379,15 +3311,14 @@ at::Tensor linear_f16_m1_splitk_fp32_cuda(at::Tensor x, at::Tensor weight) {
   const int64_t N = weight.size(1);
   return dispatch_linear_f16_m1_splitk(K, N, [&](auto config) {
     using Config = decltype(config);
-    return linear_f16_m1_splitk_cuda_impl<
-        Config::chunk_k, Config::warps, Config::warp_reduce, true>(x, weight);
+    return linear_f16_m1_splitk_cuda_impl<Config::chunk_k, Config::warps,
+                                          Config::warp_reduce, true>(x, weight);
   });
 }
 
 template <int ChunkK, int Warps, bool WarpReduce = false>
-std::tuple<at::Tensor, at::Tensor>
-linear_f16_m1_splitk_prepare_zero_cuda_impl(at::Tensor x, at::Tensor weight,
-                                             int64_t zero_features64) {
+std::tuple<at::Tensor, at::Tensor> linear_f16_m1_splitk_prepare_zero_cuda_impl(
+    at::Tensor x, at::Tensor weight, int64_t zero_features64) {
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const int64_t k64 = x.size(-1);
   const int64_t n64 = weight.size(1);
@@ -3405,13 +3336,11 @@ linear_f16_m1_splitk_prepare_zero_cuda_impl(at::Tensor x, at::Tensor weight,
     TORCH_CHECK(x.size(dim) == 1,
                 "linear_f16_m1_splitk_prepare_zero requires M=1");
   }
-  TORCH_CHECK(
-      (N % 64) == 0,
-      "linear_f16_m1_splitk_prepare_zero requires N multiple of 64");
+  TORCH_CHECK((N % 64) == 0,
+              "linear_f16_m1_splitk_prepare_zero requires N multiple of 64");
   const int64_t chunks64 = ceil_div(k64, static_cast<int64_t>(ChunkK));
-  TORCH_CHECK(
-      chunks64 <= 65535,
-      "linear_f16_m1_splitk_prepare_zero chunks must be <= 65535");
+  TORCH_CHECK(chunks64 <= 65535,
+              "linear_f16_m1_splitk_prepare_zero chunks must be <= 65535");
 
   std::vector<int64_t> out_sizes(x.sizes().begin(), x.sizes().end());
   out_sizes.back() = n64;
@@ -3426,8 +3355,7 @@ linear_f16_m1_splitk_prepare_zero_cuda_impl(at::Tensor x, at::Tensor weight,
     return std::make_tuple(y, at::zeros(zero_sizes, x.options()));
   }
   auto zero_output = at::empty(zero_sizes, x.options());
-  const auto zero_address =
-      reinterpret_cast<uintptr_t>(zero_output.data_ptr());
+  const auto zero_address = reinterpret_cast<uintptr_t>(zero_output.data_ptr());
   TORCH_CHECK(
       (zero_address & 0xFU) == 0,
       "linear_f16_m1_splitk_prepare_zero internal output must be 16-byte "
@@ -3442,10 +3370,10 @@ linear_f16_m1_splitk_prepare_zero_cuda_impl(at::Tensor x, at::Tensor weight,
           partial.data_ptr<float>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   if constexpr (WarpReduce) {
-    linear_f16_m1_splitk_reduce_f16_warp_kernel<true><<<
-        static_cast<int>(ceil_div(N / 2, 4)), 128, 0, stream>>>(
-        chunks, N, partial.data_ptr<float>(), y.data_ptr<dtype>(),
-        zero_output.data_ptr<dtype>(), zero_features);
+    linear_f16_m1_splitk_reduce_f16_warp_kernel<true>
+        <<<static_cast<int>(ceil_div(N / 2, 4)), 128, 0, stream>>>(
+            chunks, N, partial.data_ptr<float>(), y.data_ptr<dtype>(),
+            zero_output.data_ptr<dtype>(), zero_features);
   } else {
     linear_f16_m1_splitk_reduce_f16_kernel<true>
         <<<static_cast<int>(ceil_div(N / 2, 128)), 128, 0, stream>>>(
@@ -3456,24 +3384,23 @@ linear_f16_m1_splitk_prepare_zero_cuda_impl(at::Tensor x, at::Tensor weight,
   return std::make_tuple(y, zero_output);
 }
 
-std::tuple<at::Tensor, at::Tensor>
-linear_f16_m1_splitk_prepare_zero_cuda(at::Tensor x, at::Tensor weight,
-                                       int64_t zero_features) {
+std::tuple<at::Tensor, at::Tensor> linear_f16_m1_splitk_prepare_zero_cuda(
+    at::Tensor x, at::Tensor weight, int64_t zero_features) {
   const int64_t K = x.size(-1);
   const int64_t N = weight.size(1);
   return dispatch_linear_f16_m1_splitk(K, N, [&](auto config) {
     using Config = decltype(config);
     return linear_f16_m1_splitk_prepare_zero_cuda_impl<
-        Config::chunk_k, Config::warps, Config::warp_reduce>(
-        x, weight, zero_features);
+        Config::chunk_k, Config::warps, Config::warp_reduce>(x, weight,
+                                                             zero_features);
   });
 }
 
 template <int ChunkK, int Warps, bool WarpReduce = false>
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
-linear_rkv_f16_m1_splitk_cuda_impl(
-    at::Tensor x_r, at::Tensor x_k, at::Tensor x_v, at::Tensor weight_r,
-    at::Tensor weight_k, at::Tensor weight_v) {
+linear_rkv_f16_m1_splitk_cuda_impl(at::Tensor x_r, at::Tensor x_k,
+                                   at::Tensor x_v, at::Tensor weight_r,
+                                   at::Tensor weight_k, at::Tensor weight_v) {
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x_r));
   const int64_t k64 = x_r.size(-1);
   const int64_t n64 = weight_r.size(1);
@@ -3513,9 +3440,8 @@ linear_rkv_f16_m1_splitk_cuda_impl(
   }
 
   const int chunks = static_cast<int>(chunks64);
-  auto partial =
-      at::empty({3, static_cast<int64_t>(chunks), n64},
-                x_r.options().dtype(at::kFloat));
+  auto partial = at::empty({3, static_cast<int64_t>(chunks), n64},
+                           x_r.options().dtype(at::kFloat));
   auto stream = at::cuda::getCurrentCUDAStream();
   linear_rkv_f16_m1_splitk_partial_kernel<ChunkK, Warps>
       <<<dim3(ceil_div(N, Warps * 64), chunks, 3), Warps * 32, 0, stream>>>(
@@ -3530,8 +3456,8 @@ linear_rkv_f16_m1_splitk_cuda_impl(
         chunks, N, partial.data_ptr<float>(), y_r.data_ptr<dtype>(),
         y_k.data_ptr<dtype>(), y_v.data_ptr<dtype>());
   } else {
-    linear_rkv_f16_m1_splitk_reduce_kernel<<<
-        dim3(ceil_div(N / 2, 128), 3, 1), 128, 0, stream>>>(
+    linear_rkv_f16_m1_splitk_reduce_kernel<<<dim3(ceil_div(N / 2, 128), 3, 1),
+                                             128, 0, stream>>>(
         chunks, N, partial.data_ptr<float>(), y_r.data_ptr<dtype>(),
         y_k.data_ptr<dtype>(), y_v.data_ptr<dtype>());
   }
@@ -3539,8 +3465,7 @@ linear_rkv_f16_m1_splitk_cuda_impl(
   return std::make_tuple(y_r, y_k, y_v);
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor>
-linear_rkv_f16_m1_splitk_cuda(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> linear_rkv_f16_m1_splitk_cuda(
     at::Tensor x_r, at::Tensor x_k, at::Tensor x_v, at::Tensor weight_r,
     at::Tensor weight_k, at::Tensor weight_v) {
   const int64_t K = x_r.size(-1);
@@ -3553,8 +3478,8 @@ linear_rkv_f16_m1_splitk_cuda(
   }
   return dispatch_linear_f16_m1_splitk(K, N, [&](auto config) {
     using Config = decltype(config);
-    return linear_rkv_f16_m1_splitk_cuda_impl<
-        Config::chunk_k, Config::warps, Config::warp_reduce>(
+    return linear_rkv_f16_m1_splitk_cuda_impl<Config::chunk_k, Config::warps,
+                                              Config::warp_reduce>(
         x_r, x_k, x_v, weight_r, weight_k, weight_v);
   });
 }
