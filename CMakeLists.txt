@@ -382,16 +382,12 @@ endif()
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   set(RWKV7_CUDA_SRCS
-    "csrc/rwkv7/rwkv7_fast_ops_fp16.cu"
-    "csrc/rwkv7/rwkv7_v3a_ops.cu"
     "csrc/rwkv7/rwkv7_wkv_fp16_v2.cu"
     "csrc/rwkv7/rwkv7_wkv_fp32_v2.cu")
 
   set(RWKV7_EXT_SRC
-    "csrc/rwkv7/rwkv7_fast_ops_fp16.cpp"
     ${RWKV7_CUDA_SRCS}
     "csrc/rwkv7/rwkv7_registration.cpp"
-    "csrc/rwkv7/rwkv7_v3a_ops.cpp"
     "csrc/rwkv7/rwkv7_wkv_fp16_v2.cpp"
     "csrc/rwkv7/rwkv7_wkv_fp32_v2.cpp")
 
@@ -399,8 +395,6 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     PROPERTIES COMPILE_FLAGS
     "--extra-device-vectorization -Xptxas -O3")
   set_source_files_properties(
-    "csrc/rwkv7/rwkv7_fast_ops_fp16.cu"
-    "csrc/rwkv7/rwkv7_v3a_ops.cu"
     "csrc/rwkv7/rwkv7_wkv_fp32_v2.cu"
     PROPERTIES COMPILE_FLAGS
     "--use_fast_math --extra-device-vectorization -Xptxas -O3")
@@ -425,7 +419,6 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   if(VLLM_BUILD_PROFILE STREQUAL "rwkv")
     target_compile_definitions(rwkv7_ops PRIVATE VLLM_RWKV_ONLY_BUILD)
   endif()
-  target_link_libraries(rwkv7_ops PRIVATE CUDA::cublas CUDA::cublasLt)
 endif()
 
 if(VLLM_BUILD_PROFILE STREQUAL "rwkv")

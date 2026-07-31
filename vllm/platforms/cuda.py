@@ -23,6 +23,7 @@ from vllm.logger import init_logger
 from vllm.platforms.cuda_kernel_loader import (
     import_kernels as import_cuda_kernels,
 )
+from vllm.platforms.cuda_kernel_loader import is_rwkv_only_artifact
 from vllm.utils.import_utils import import_pynvml
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -218,6 +219,15 @@ class CudaPlatformBase(Platform):
     def import_kernels(cls) -> None:
         """Import the CUDA extensions provided by the installed artifact."""
         import_cuda_kernels()
+
+    @classmethod
+    def verify_model_arch(cls, model_arch: str) -> None:
+        if is_rwkv_only_artifact() and model_arch != "RWKV7ForCausalLM":
+            raise ValueError(
+                "The RWKV-only vLLM artifact supports only "
+                f"'RWKV7ForCausalLM', not {model_arch!r}. "
+                "Install a full vLLM build for other model architectures."
+            )
 
     @property
     def supported_dtypes(self) -> list[torch.dtype]:

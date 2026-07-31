@@ -61,6 +61,18 @@ def test_rwkv7_extension_preserves_full_upstream_build() -> None:
     assert 'CMakeExtension(name="vllm._moe_C_stable_libtorch")' in setup
 
 
+def test_rwkv7_extension_contains_only_runtime_wkv_kernels() -> None:
+    cmake = (ROOT / "CMakeLists.txt").read_text()
+    runtime = (ROOT / "vllm/rwkv7.py").read_text()
+
+    assert "rwkv7_wkv_fp16_v2" in cmake
+    assert "rwkv7_wkv_fp32_v2" in cmake
+    assert "rwkv7_fast_ops_fp16" not in cmake
+    assert "rwkv7_v3a_ops" not in cmake
+    assert "rwkv7_fast_ops_fp16" not in runtime
+    assert "rwkv7_v3a_ops" not in runtime
+
+
 def test_rwkv7_profile_only_selects_build_targets() -> None:
     cmake = (ROOT / "CMakeLists.txt").read_text()
     setup = (ROOT / "setup.py").read_text()
@@ -173,3 +185,49 @@ def test_cuda_kernel_loader_preserves_full_build_eager_imports(
         "vllm._moe_C_stable_libtorch",
         "vllm._qutlass_C",
     ]
+
+
+def test_full_artifact_detection_does_not_probe_rwkv_extension(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = ROOT / "vllm/platforms/cuda_kernel_loader.py"
+    imported: list[str] = []
+
+    def import_module(name: str):
+        imported.append(name)
+        return types.ModuleType(name)
+
+    monkeypatch.setattr(importlib, "import_module", import_module)
+    namespace = runpy.run_path(str(loader))
+
+    assert not namespace["is_rwkv_only_artifact"]()
+    assert imported == ["vllm._C_stable_libtorch"]
+
+
+@pytest.mark.parametrize(
+    ("rwkv_only", "model_arch", "raises"),
+    [
+        (False, "LlamaForCausalLM", False),
+        (True, "RWKV7ForCausalLM", False),
+        (True, "LlamaForCausalLM", True),
+    ],
+)
+def test_cuda_platform_rejects_unsupported_rwkv_only_models(
+    monkeypatch: pytest.MonkeyPatch,
+    rwkv_only: bool,
+    model_arch: str,
+    raises: bool,
+) -> None:
+    import vllm.platforms.cuda as cuda_platform
+
+    monkeypatch.setattr(
+        cuda_platform,
+        "is_rwkv_only_artifact",
+        lambda: rwkv_only,
+    )
+
+    if raises:
+        with pytest.raises(ValueError, match="RWKV-only.*full vLLM build"):
+            cuda_platform.CudaPlatformBase.verify_model_arch(model_arch)
+    else:
+        cuda_platform.CudaPlatformBase.verify_model_arch(model_arch)
