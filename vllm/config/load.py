@@ -49,6 +49,7 @@ class LoadConfig:
       Streamer.
     - "runai_streamer_sharded" will load weights from pre-sharded checkpoint
       files using Run:ai Model Streamer.
+    - "rwkv_pth" will load a raw RWKV-7 `.pth` checkpoint.
     - "bitsandbytes" will load the weights using bitsandbytes quantization.
     - "sharded_state" will load weights from pre-sharded checkpoint files,
       supporting efficient loading of tensor-parallel models.

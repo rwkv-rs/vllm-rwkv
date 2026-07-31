@@ -119,6 +119,11 @@ def _rwkv7_vllm_config(
     *,
     enable_prefix_caching: bool,
     speculative_config: object | None,
+    model: str = (
+        "https://huggingface.co/BlinkDL/rwkv7-g1/blob/main/"
+        "rwkv7-g1h-1.5b-20260710-ctx10240.pth"
+    ),
+    load_format: str = "auto",
 ) -> SimpleNamespace:
     return SimpleNamespace(
         cache_config=SimpleNamespace(
@@ -128,7 +133,9 @@ def _rwkv7_vllm_config(
             mamba_page_size_padded=None,
         ),
         speculative_config=speculative_config,
+        load_config=SimpleNamespace(load_format=load_format),
         model_config=SimpleNamespace(
+            model=model,
             max_model_len=4096,
             dtype=torch.float16,
             hf_config=SimpleNamespace(
@@ -159,6 +166,42 @@ def test_rwkv7_config_disables_unsupported_prefix_caching() -> None:
     RWKV7ModelConfig.verify_and_update_config(vllm_config)
 
     assert not vllm_config.cache_config.enable_prefix_caching
+
+
+@pytest.mark.parametrize("load_format", ["auto", "hf", "pt", "rwkv_pth"])
+def test_rwkv7_config_selects_raw_pth_loader(load_format: str) -> None:
+    vllm_config = _rwkv7_vllm_config(
+        enable_prefix_caching=False,
+        speculative_config=None,
+        load_format=load_format,
+    )
+
+    RWKV7ModelConfig.verify_and_update_config(vllm_config)
+
+    assert vllm_config.load_config.load_format == "rwkv_pth"
+
+
+def test_rwkv7_config_rejects_incompatible_raw_pth_loader() -> None:
+    vllm_config = _rwkv7_vllm_config(
+        enable_prefix_caching=False,
+        speculative_config=None,
+        load_format="safetensors",
+    )
+
+    with pytest.raises(ValueError, match="RWKV7 raw .pth checkpoints require"):
+        RWKV7ModelConfig.verify_and_update_config(vllm_config)
+
+
+def test_rwkv7_config_rejects_rwkv_loader_for_non_raw_source() -> None:
+    vllm_config = _rwkv7_vllm_config(
+        enable_prefix_caching=False,
+        speculative_config=None,
+        model="ordinary/model",
+        load_format="rwkv_pth",
+    )
+
+    with pytest.raises(ValueError, match="requires a supported RWKV-7"):
+        RWKV7ModelConfig.verify_and_update_config(vllm_config)
 
 
 @pytest.mark.parametrize(

@@ -671,6 +671,28 @@ class RWKV7ModelConfig(VerifyAndUpdateConfig):
 
     @classmethod
     def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        from vllm.transformers_utils.configs.rwkv7 import (
+            try_parse_rwkv7_pth_source,
+        )
+
+        model = vllm_config.model_config.model
+        load_config = vllm_config.load_config
+        is_raw_pth = try_parse_rwkv7_pth_source(model) is not None
+        if is_raw_pth:
+            if load_config.load_format in {"auto", "hf", "pt"}:
+                load_config.load_format = "rwkv_pth"
+            elif load_config.load_format != "rwkv_pth":
+                raise ValueError(
+                    "RWKV7 raw .pth checkpoints require load_format='auto', "
+                    f"'hf', 'pt', or 'rwkv_pth', but got "
+                    f"{load_config.load_format!r}."
+                )
+        elif load_config.load_format == "rwkv_pth":
+            raise ValueError(
+                "load_format='rwkv_pth' requires a supported RWKV-7 "
+                f"raw .pth source, but got {model!r}."
+            )
+
         cache_config = vllm_config.cache_config
         if cache_config.enable_prefix_caching:
             cache_config.enable_prefix_caching = False
