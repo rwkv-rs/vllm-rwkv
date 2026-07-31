@@ -681,10 +681,10 @@ class RWKV7ModelConfig(VerifyAndUpdateConfig):
         if is_raw_pth:
             if load_config.load_format in {"auto", "hf", "pt"}:
                 load_config.load_format = "rwkv_pth"
-            elif load_config.load_format != "rwkv_pth":
+            elif load_config.load_format not in {"dummy", "rwkv_pth"}:
                 raise ValueError(
                     "RWKV7 raw .pth checkpoints require load_format='auto', "
-                    f"'hf', 'pt', or 'rwkv_pth', but got "
+                    f"'hf', 'pt', 'dummy', or 'rwkv_pth', but got "
                     f"{load_config.load_format!r}."
                 )
         elif load_config.load_format == "rwkv_pth":

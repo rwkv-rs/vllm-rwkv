@@ -181,6 +181,18 @@ def test_rwkv7_config_selects_raw_pth_loader(load_format: str) -> None:
     assert vllm_config.load_config.load_format == "rwkv_pth"
 
 
+def test_rwkv7_config_preserves_dummy_loader_for_initialization() -> None:
+    vllm_config = _rwkv7_vllm_config(
+        enable_prefix_caching=False,
+        speculative_config=None,
+        load_format="dummy",
+    )
+
+    RWKV7ModelConfig.verify_and_update_config(vllm_config)
+
+    assert vllm_config.load_config.load_format == "dummy"
+
+
 def test_rwkv7_config_rejects_incompatible_raw_pth_loader() -> None:
     vllm_config = _rwkv7_vllm_config(
         enable_prefix_caching=False,
