@@ -7,9 +7,9 @@ from urllib.parse import urlsplit
 import regex as re
 
 FLA_RWKV_REPOSITORY = "https://github.com/rwkv-rs/fla-rwkv.git"
-FLA_RWKV_REVISION = "a4a8aa98df6ec5322f194a80ec57363dd045adfc"
+FLA_RWKV_REVISION = "f1888c9a81cb24bfa46d84dc9ab38c4abd746225"
 FLASH_RWKV_REPOSITORY = "https://github.com/rwkv-rs/FlashRWKV.git"
-FLASH_RWKV_REVISION = "866aafd2eed146b0eda1ce03444009ae030f89e3"
+FLASH_RWKV_REVISION = "9fe104c8c748771ba981058a6efcd95c150e453d"
 
 _GITHUB_REPOSITORY_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
