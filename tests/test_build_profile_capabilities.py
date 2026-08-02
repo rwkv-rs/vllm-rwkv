@@ -84,6 +84,7 @@ RWKV_METADATA = BuildProfileMetadata(
         "openai_chat",
         "openai_completions",
         "streaming",
+        "structured_outputs",
         "stop",
         "prometheus_metrics",
         "rapid_sampling",

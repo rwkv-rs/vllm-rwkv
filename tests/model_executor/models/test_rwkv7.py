@@ -3937,6 +3937,53 @@ def test_rwkv7_model_state_rejects_unavailable_rapid_sampler():
         state.custom_sampler(sampler)
 
 
+def test_rwkv7_rapid_sampler_receives_grammar_masked_logits():
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    runner = object.__new__(GPUModelRunner)
+    logits = torch.tensor([[4.0, 3.0, 2.0]], dtype=torch.float32)
+    input_batch = SimpleNamespace(
+        logits_indices=torch.tensor([0]),
+        num_draft_tokens=0,
+    )
+    grammar_output = SimpleNamespace(
+        structured_output_request_ids=["rwkv-request"],
+        grammar_bitmask=np.array([[1]], dtype=np.int32),
+    )
+    calls = []
+
+    class Model:
+        def compute_sampling_logits(self, *_args):
+            return logits
+
+    class StructuredOutputsWorker:
+        def apply_grammar_bitmask(
+            self, masked_logits, _batch, request_ids, grammar_bitmask
+        ):
+            calls.append("grammar")
+            assert request_ids == ["rwkv-request"]
+            assert grammar_bitmask is grammar_output.grammar_bitmask
+            masked_logits[:, 0] = -torch.inf
+
+    def rapid_sampler(masked_logits, _batch):
+        calls.append("rapid")
+        assert torch.isneginf(masked_logits[:, 0]).all()
+        return SimpleNamespace(
+            num_sampled=torch.tensor([1]),
+            num_rejected=torch.tensor([0]),
+        )
+
+    runner.model = Model()
+    runner.structured_outputs_worker = StructuredOutputsWorker()
+    runner.sampler = rapid_sampler
+    runner.rejection_sampler = None
+    runner.speculator = None
+
+    GPUModelRunner.sample(runner, torch.empty(0), input_batch, grammar_output)
+
+    assert calls == ["grammar", "rapid"]
+
+
 def test_rwkv7_dummy_inputs_cover_all_tokens():
     hf_config = SimpleNamespace(
         num_hidden_layers=1,

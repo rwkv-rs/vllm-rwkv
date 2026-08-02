@@ -15,9 +15,12 @@ from vllm.entrypoints.generate.api_router import (
 )
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.engine.input_processor import InputProcessor
+from vllm.v1.structured_output.backend_xgrammar import XgrammarGrammar
 
 
-def _metadata(*, unrestricted: bool) -> BuildProfileMetadata:
+def _metadata(
+    *, unrestricted: bool, structured_outputs: bool = False
+) -> BuildProfileMetadata:
     return BuildProfileMetadata(
         profile="full" if unrestricted else "rwkv",
         configured_targets=(
@@ -25,7 +28,11 @@ def _metadata(*, unrestricted: bool) -> BuildProfileMetadata:
         ),
         external_projects=(),
         unrestricted=unrestricted,
-        supported_serving_features=("text_generation",),
+        supported_serving_features=(
+            ("text_generation", "streaming", "structured_outputs")
+            if structured_outputs
+            else ("text_generation",)
+        ),
     )
 
 
@@ -143,3 +150,62 @@ def test_rwkv_profile_rejects_structured_outputs_before_backend_loading(
 
     with pytest.raises(ValueError, match="does not support structured outputs"):
         processor._validate_params(params, ("generate",))
+
+
+@pytest.mark.parametrize(
+    "structured_outputs",
+    [
+        pytest.param(
+            StructuredOutputsParams(json={"type": "object"}), id="json-schema"
+        ),
+        pytest.param(StructuredOutputsParams(regex=r"yes|no"), id="regex"),
+        pytest.param(StructuredOutputsParams(choice=["yes", "no"]), id="choice"),
+    ],
+)
+def test_rwkv_profile_accepts_upstream_structured_output_constraints(
+    structured_outputs: StructuredOutputsParams,
+) -> None:
+    processor = object.__new__(InputProcessor)
+    processor.build_profile = _metadata(
+        unrestricted=False,
+        structured_outputs=True,
+    )
+    processor.model_config = SimpleNamespace(
+        max_logprobs=-1,
+        get_vocab_size=lambda: 32,
+        logits_processors=[],
+        is_diffusion=False,
+    )
+    processor.speculative_config = None
+    processor.structured_outputs_config = StructuredOutputsConfig()
+    processor.renderer = SimpleNamespace(tokenizer=object())
+    params = SamplingParams(structured_outputs=structured_outputs)
+
+    processor._validate_params(params, ("generate",))
+
+    assert params.structured_outputs is structured_outputs
+    assert params.structured_outputs._backend == "xgrammar"
+    assert "streaming" in processor.build_profile.supported_serving_features
+
+
+def test_rwkv_profile_reuses_xgrammar_streaming_state_progression() -> None:
+    class Matcher:
+        def __init__(self) -> None:
+            self.accepted = []
+
+        def accept_token(self, token_id: int) -> bool:
+            self.accepted.append(token_id)
+            return True
+
+        def is_terminated(self) -> bool:
+            return len(self.accepted) == 3
+
+    matcher = Matcher()
+    grammar = XgrammarGrammar(vocab_size=32, matcher=matcher, ctx=object())
+
+    assert grammar.accept_tokens("rwkv-request", [4])
+    assert not grammar.is_terminated()
+    assert grammar.accept_tokens("rwkv-request", [7, 9])
+    assert grammar.is_terminated()
+    assert grammar.num_processed_tokens == 3
+    assert matcher.accepted == [4, 7, 9]

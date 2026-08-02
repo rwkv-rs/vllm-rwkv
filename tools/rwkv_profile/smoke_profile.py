@@ -49,6 +49,7 @@ def main() -> None:
     assert not metadata.external_projects, metadata
     assert "rapid_sampling" in metadata.supported_serving_features, metadata
     assert "openai_chat" in metadata.supported_serving_features, metadata
+    assert "structured_outputs" in metadata.supported_serving_features, metadata
     assert "sleep_mode" in metadata.supported_serving_features, metadata
     assert "cumem_allocator" in metadata.supported_serving_features, metadata
 
