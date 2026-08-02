@@ -21,7 +21,9 @@ FLA_RWKV_TEST_REVISION = "02093e6be24e07f285d466ab7fb62ce0597891dc"
 TRANSFORMERS_RWKV_TEST_REVISION = "fb78db2e04868fc005ea622791ed6ee2175e82f0"
 
 EXPECTED_GPU_NAME = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+BOS_TOKEN_ID = 0
 PROMPT_TOKEN_IDS = [1, 7, 11, 3]
+NORMALIZED_PROMPT_TOKEN_IDS = [BOS_TOKEN_ID, *PROMPT_TOKEN_IDS]
 DECODE_TOKENS = 2
 
 pytestmark = pytest.mark.skipif(
@@ -125,8 +127,8 @@ def _write_tiny_standard_hf_artifact(artifact: Path) -> None:
         num_hidden_layers=2,
         head_size=64,
         context_length=16,
-        bos_token_id=0,
-        eos_token_id=0,
+        bos_token_id=BOS_TOKEN_ID,
+        eos_token_id=BOS_TOKEN_ID,
     )
     model = Rwkv7ForCausalLM(config).eval().to(dtype=torch.bfloat16)
     model.save_pretrained(artifact, safe_serialization=True)
@@ -280,7 +282,7 @@ def test_tiny_hf_artifact_generates_through_public_recurrent_flash_chain(
                 llm.shutdown()
 
     assert len(outputs) == 1
-    assert outputs[0].prompt_token_ids == PROMPT_TOKEN_IDS
+    assert outputs[0].prompt_token_ids == NORMALIZED_PROMPT_TOKEN_IDS
     assert len(outputs[0].outputs) == 1
     generated_token_ids = list(outputs[0].outputs[0].token_ids)
     assert len(generated_token_ids) == DECODE_TOKENS
@@ -294,7 +296,7 @@ def test_tiny_hf_artifact_generates_through_public_recurrent_flash_chain(
     assert len(calls_by_state) == 2
     for layer_calls in calls_by_state.values():
         assert [call["offsets"] for call in layer_calls] == [
-            [0, len(PROMPT_TOKEN_IDS)],
+            [0, len(NORMALIZED_PROMPT_TOKEN_IDS)],
             [0, 1],
             [0, 1],
         ]
@@ -311,7 +313,8 @@ def test_tiny_hf_artifact_generates_through_public_recurrent_flash_chain(
         "provider": get_last_rwkv7_provider(),
         "transformers_config_module": provenance["config_module"],
         "transformers_model_module": provenance["causal_lm_module"],
-        "prompt_token_ids": PROMPT_TOKEN_IDS,
+        "requested_prompt_token_ids": PROMPT_TOKEN_IDS,
+        "normalized_prompt_token_ids": NORMALIZED_PROMPT_TOKEN_IDS,
         "generated_token_ids": generated_token_ids,
         "wkv_calls": calls,
     }
