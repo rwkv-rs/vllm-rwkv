@@ -19,7 +19,7 @@ from vllm.transformers_utils.rwkv7_runtime_contract import (
 
 TRANSFORMERS_RWKV_DISTRIBUTION = "transformers"
 TRANSFORMERS_RWKV_REPOSITORY = "https://github.com/rwkv-rs/transformers-rwkv.git"
-TRANSFORMERS_RWKV_REVISION = "2696927df9363b5fa175076bb827ba4da2c4e581"
+TRANSFORMERS_RWKV_REVISION = "2bf8c01b7993f6b351678418664bb7bd798d0c71"
 TRANSFORMERS_RWKV_REQUIREMENT = (
     f"{TRANSFORMERS_RWKV_DISTRIBUTION} @ "
     f"git+{TRANSFORMERS_RWKV_REPOSITORY}@{TRANSFORMERS_RWKV_REVISION}"
@@ -125,10 +125,12 @@ def validate_transformers_rwkv7_runtime_provenance() -> dict[str, Any]:
     )
 
     expected_config_origin = Path(
-        distribution.locate_file("transformers/models/rwkv7/configuration_rwkv7.py")
+        str(
+            distribution.locate_file("transformers/models/rwkv7/configuration_rwkv7.py")
+        )
     ).resolve()
     expected_model_origin = Path(
-        distribution.locate_file("transformers/models/rwkv7/modeling_rwkv7.py")
+        str(distribution.locate_file("transformers/models/rwkv7/modeling_rwkv7.py"))
     ).resolve()
     if (
         Rwkv7Config.__module__ != _RWKV7_CONFIG_MODULE

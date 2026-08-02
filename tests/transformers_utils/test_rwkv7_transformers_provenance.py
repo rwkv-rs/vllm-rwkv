@@ -31,8 +31,8 @@ def _rwkv_requirements() -> dict[str, Requirement]:
     return {
         requirement.name: requirement
         for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.startswith("#")
-        for requirement in (Requirement(line),)
+        if (normalized := line.strip()) and not normalized.startswith(("#", "-r "))
+        for requirement in (Requirement(normalized),)
     }
 
 
