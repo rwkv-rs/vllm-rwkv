@@ -58,6 +58,8 @@ pybase64
 cbor2
 
 # Source build and first-use rapid-sampler JIT.
+-r build/rust.txt
+
 cmake>=3.26.1
 ninja
 setuptools>=77.0.3,<81.0.0

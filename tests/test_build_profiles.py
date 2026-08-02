@@ -96,3 +96,17 @@ def test_rwkv_nvfp4_dependency_delta_is_profile_local() -> None:
     ) == Requirement(
         next(line for line in nvfp4.splitlines() if line.startswith("compressed"))
     )
+
+
+def test_rwkv_profile_includes_no_isolation_rust_build_requirements() -> None:
+    requirements = Path(__file__).parents[1] / "requirements"
+    dense = (requirements / "rwkv.txt").read_text(encoding="utf-8")
+    rust_build = (requirements / "build" / "rust.txt").read_text(encoding="utf-8")
+
+    assert "-r build/rust.txt" in dense
+    parsed = {
+        Requirement(line).name
+        for line in rust_build.splitlines()
+        if line and not line.startswith("#")
+    }
+    assert "setuptools-rust" in parsed
