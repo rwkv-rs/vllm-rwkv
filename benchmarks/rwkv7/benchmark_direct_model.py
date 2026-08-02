@@ -677,13 +677,13 @@ def _run_worker_canonical_benchmark(
     return {
         "device": torch.cuda.get_device_name(),
         "hardware": {
-            "device_index": torch.cuda.current_device(),
+            "device_index": torch.accelerator.current_device_index(),
             "device_name": torch.cuda.get_device_name(),
             "compute_capability": ".".join(
                 str(part) for part in torch.cuda.get_device_capability()
             ),
             "total_memory_bytes": torch.cuda.get_device_properties(
-                torch.cuda.current_device()
+                torch.accelerator.current_device_index()
             ).total_memory,
             "torch_version": torch.__version__,
             "cuda_version": torch.version.cuda,

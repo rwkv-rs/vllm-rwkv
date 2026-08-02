@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Shared RWKV7 source provenance contract."""
 
-import re
 from urllib.parse import urlsplit
+
+import regex as re
 
 FLA_RWKV_REPOSITORY = "https://github.com/rwkv-rs/fla-rwkv.git"
 FLA_RWKV_REVISION = "a4a8aa98df6ec5322f194a80ec57363dd045adfc"
