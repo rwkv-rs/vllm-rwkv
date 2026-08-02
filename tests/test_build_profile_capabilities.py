@@ -19,7 +19,7 @@ from vllm.config import DeviceConfig, VllmConfig
 def make_config(
     *,
     architecture: str = "RWKV7ForCausalLM",
-    model: str = "/weights/rwkv7-g1g-7.2b-20260523-ctx8192.pth",
+    model: str = "/models/rwkv7-g1i-1.5b-hf",
     quantization: str | None = None,
     multimodal: bool = False,
     speculative: bool = False,
@@ -76,7 +76,6 @@ RWKV_METADATA = BuildProfileMetadata(
     external_projects=(),
     unrestricted=False,
     supported_architectures=("RWKV7ForCausalLM",),
-    supported_weight_suffixes=(".pth",),
     supported_device_types=("cuda",),
     supported_runner_types=("generate",),
     supported_serving_features=(
@@ -109,8 +108,20 @@ def test_rwkv_manifest_fixture_matches_runtime_contract() -> None:
     assert load_build_profile_metadata(path) == RWKV_METADATA
 
 
-def test_rwkv_profile_accepts_declared_configuration() -> None:
-    validate_build_profile_capabilities(make_config(), RWKV_METADATA)
+@pytest.mark.parametrize(
+    ("model", "load_format"),
+    [
+        ("/models/rwkv7-g1i-1.5b-hf", "auto"),
+        ("rwkv-rs/rwkv7-g1i-1.5b", "hf"),
+        ("/models/rwkv7-g1i-1.5b-hf", "safetensors"),
+    ],
+)
+def test_rwkv_profile_accepts_standard_hf_artifact(
+    model: str, load_format: str
+) -> None:
+    validate_build_profile_capabilities(
+        make_config(model=model, load_format=load_format), RWKV_METADATA
+    )
 
 
 def test_rwkv_profile_accepts_sleep_mode_and_cumem_allocator() -> None:
@@ -132,13 +143,16 @@ def test_rwkv_profile_rejects_sleep_mode_without_cumem_target() -> None:
     ("overrides", "reason"),
     [
         ({"architecture": "LlamaForCausalLM"}, "RWKV7ForCausalLM"),
-        ({"model": "/weights/model.safetensors"}, "raw .pth"),
+        (
+            {"model": "/weights/rwkv7-g1g-7.2b-20260523-ctx8192.pth"},
+            "standard Transformers/Hugging Face artifact",
+        ),
         ({"quantization": "awq"}, "quantization"),
         ({"multimodal": True}, "multimodal"),
         ({"speculative": True}, "speculative"),
         ({"tensor_parallel_size": 2}, "TP=1"),
         ({"pipeline_parallel_size": 2}, "PP=1"),
-        ({"load_format": "safetensors"}, "load format"),
+        ({"load_format": "pt"}, "load format"),
         ({"cpu_offload_gb": 1}, "model offload"),
         ({"data_parallel_size": 2}, "DP=1"),
         ({"prefill_context_parallel_size": 2}, "prefill context parallel"),
