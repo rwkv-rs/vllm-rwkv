@@ -85,6 +85,7 @@ M1_RKV_GROUPED_ROWS = {1}
 # The M=1 no-fc path prepares the sparse-down accumulator while reducing the
 # FFN key split-K result, eliminating one zeroing launch per layer.
 M1_CMIX_PREZERO_ROWS = {1}
+STANDARD_HF_WEIGHT_PREFIX = "model."
 
 
 @dataclass(frozen=True)
@@ -170,6 +171,14 @@ def use_ln1_tmix_fusion(B: int, T: int) -> bool:
 
 def is_lowrank_weight(key: str) -> bool:
     return key.endswith(LOWRANK_SUFFIXES)
+
+
+def _projection_ranks(hidden_size: int) -> tuple[int, int, int]:
+    return (
+        max(32, round(2.5 * hidden_size**0.5 / 32) * 32),
+        max(32, round(1.7 * hidden_size**0.5 / 32) * 32),
+        max(32, round(5.0 * hidden_size**0.5 / 32) * 32),
+    )
 
 
 def can_use_lowrank_fused(hidden_size: int, rows: int) -> bool:
@@ -401,18 +410,19 @@ class RWKV7ForCausalLM(nn.Module):
             loaded_names = set()
             for name, weight in weights:
                 loaded_names.add(name)
-                if self._weight_update_error is not None:
-                    pending.setdefault(name, None)
-                    continue
                 try:
+                    raw_name = self._checkpoint_name_to_raw(name)
+                    if self._weight_update_error is not None:
+                        pending.setdefault(raw_name, None)
+                        continue
                     if (
                         self.raw_weight_names is None
-                        or name not in self.raw_weight_names
+                        or raw_name not in self.raw_weight_names
                     ):
                         raise ValueError(
                             f"RWKV7 weight update received unexpected key {name!r}"
                         )
-                    if name in pending:
+                    if raw_name in pending:
                         raise ValueError(
                             f"RWKV7 weight update received duplicate key {name!r}"
                         )
@@ -420,43 +430,186 @@ class RWKV7ForCausalLM(nn.Module):
                     detached = weight.detach()
                     expected_shape = (
                         getattr(self, "raw_weight_shapes", None) or {}
-                    ).get(name)
+                    ).get(raw_name)
                     if self._streaming_weight_update and expected_shape is None:
                         raise RuntimeError(
-                            f"RWKV7 streaming update has no raw shape for {name!r}"
+                            f"RWKV7 streaming update has no raw shape for {raw_name!r}"
                         )
                     actual_shape = tuple(detached.shape)
                     if expected_shape is not None and actual_shape != expected_shape:
                         raise ValueError(
                             "RWKV7 raw weight shape mismatch for "
-                            f"{name}: expected {expected_shape}, got {actual_shape}"
+                            f"{raw_name}: expected {expected_shape}, got {actual_shape}"
                         )
 
                     if self._streaming_weight_update:
                         if (
-                            name in self._embedding_update_keys()
-                            and self._is_weight_needed_on_rank(name)
+                            raw_name in self._embedding_update_keys()
+                            and self._is_weight_needed_on_rank(raw_name)
                         ):
-                            pending[name] = detached.to(device="cpu", copy=True)
+                            pending[raw_name] = detached.to(device="cpu", copy=True)
                         else:
-                            self._copy_raw_weight_to_runtime(name, detached)
-                            pending[name] = None
+                            self._copy_raw_weight_to_runtime(raw_name, detached)
+                            pending[raw_name] = None
                     else:
-                        pending[name] = detached.to(device="cpu", copy=True)
+                        pending[raw_name] = detached.to(device="cpu", copy=True)
                 except Exception as exc:
                     self._record_weight_update_error(exc)
                     pending.setdefault(name, None)
             return loaded_names
 
-        z = {name: weight.detach().cpu() for name, weight in weights}
+        z, loaded_names, source_format = self._normalize_checkpoint_weights(weights)
         raw_weight_names = set(z.keys())
+        self.weight_source_format = source_format
         self.raw_weight_names = raw_weight_names
         self.raw_weight_shapes = {
             name: tuple(weight.shape) for name, weight in z.items()
         }
         self._preprocess_weights(z)
         self._commit_preprocessed_weights(z)
-        return raw_weight_names
+        return loaded_names
+
+    @staticmethod
+    def _standard_hf_name_to_raw(name: str) -> str | None:
+        if name == "model.embeddings.weight":
+            return "emb.weight"
+        if name == "head.weight":
+            return name
+        if name.startswith("model.blocks.") or name.startswith("model.ln_out."):
+            return name.removeprefix(STANDARD_HF_WEIGHT_PREFIX)
+        return None
+
+    def _checkpoint_name_to_raw(self, name: str) -> str:
+        if getattr(self, "weight_source_format", "legacy_pth") == "standard_hf":
+            raw_name = self._standard_hf_name_to_raw(name)
+            if raw_name is None:
+                raise ValueError(
+                    "RWKV7 standard Hugging Face weight update received "
+                    f"unexpected key {name!r}"
+                )
+            return raw_name
+        return name
+
+    def _normalize_checkpoint_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> tuple[dict[str, torch.Tensor], set[str], str]:
+        source: dict[str, torch.Tensor] = {}
+        for name, weight in weights:
+            if name in source:
+                raise ValueError(f"RWKV7 checkpoint contains duplicate key {name!r}")
+            source[name] = weight.detach().cpu()
+        loaded_names = set(source)
+        source_format = (
+            "standard_hf"
+            if any(name.startswith(STANDARD_HF_WEIGHT_PREFIX) for name in source)
+            else "legacy_pth"
+        )
+        if source_format == "legacy_pth":
+            return source, loaded_names, source_format
+
+        mapped: dict[str, torch.Tensor] = {}
+        mapped_sources: dict[str, str] = {}
+        for name, weight in source.items():
+            raw_name = self._standard_hf_name_to_raw(name)
+            if raw_name is None:
+                raise ValueError(
+                    "RWKV7 standard Hugging Face artifact contains "
+                    f"unsupported key {name!r}"
+                )
+            if raw_name in mapped:
+                raise ValueError(
+                    "RWKV7 standard Hugging Face artifact has a mapping conflict: "
+                    f"{mapped_sources[raw_name]!r} and {name!r} both map to "
+                    f"{raw_name!r}"
+                )
+            mapped[raw_name] = weight
+            mapped_sources[raw_name] = name
+        self._validate_standard_hf_weights(mapped)
+        return mapped, loaded_names, source_format
+
+    def _expected_standard_raw_shapes(self) -> dict[str, tuple[int, ...]]:
+        if bool(getattr(self.config, "embedding_layer_norm_fused", False)):
+            raise ValueError(
+                "RWKV7 vLLM loading currently requires an unfused standard artifact; "
+                "convert without embedding_layer_norm_fused."
+            )
+        hidden_size = int(self.config.hidden_size)
+        vocab_size = int(self.config.vocab_size)
+        num_layers = int(self.config.num_hidden_layers)
+        head_size = int(self.config.head_size)
+        num_heads = hidden_size // head_size
+        intermediate_size = int(
+            getattr(self.config, "intermediate_size", None) or 4 * hidden_size
+        )
+        decay_rank, value_rank, gate_rank = _projection_ranks(hidden_size)
+        shapes = {
+            "emb.weight": (vocab_size, hidden_size),
+            "head.weight": (vocab_size, hidden_size),
+            "ln_out.weight": (hidden_size,),
+            "ln_out.bias": (hidden_size,),
+        }
+        vectors = ("x_r", "x_w", "x_k", "x_v", "x_a", "x_g", "w0", "a0", "k_k", "k_a")
+        for layer_id in range(num_layers):
+            block = f"blocks.{layer_id}"
+            if layer_id == 0:
+                shapes[f"{block}.ln0.weight"] = (hidden_size,)
+                shapes[f"{block}.ln0.bias"] = (hidden_size,)
+            for norm in ("ln1", "ln2"):
+                shapes[f"{block}.{norm}.weight"] = (hidden_size,)
+                shapes[f"{block}.{norm}.bias"] = (hidden_size,)
+            attention = f"{block}.att"
+            for name in vectors:
+                shapes[f"{attention}.{name}"] = (1, 1, hidden_size)
+            if layer_id > 0:
+                shapes[f"{attention}.v0"] = (1, 1, hidden_size)
+                shapes[f"{attention}.v1"] = (hidden_size, value_rank)
+                shapes[f"{attention}.v2"] = (value_rank, hidden_size)
+            shapes.update(
+                {
+                    f"{attention}.w1": (hidden_size, decay_rank),
+                    f"{attention}.w2": (decay_rank, hidden_size),
+                    f"{attention}.a1": (hidden_size, decay_rank),
+                    f"{attention}.a2": (decay_rank, hidden_size),
+                    f"{attention}.g1": (hidden_size, gate_rank),
+                    f"{attention}.g2": (gate_rank, hidden_size),
+                    f"{attention}.r_k": (num_heads, head_size),
+                    f"{attention}.ln_x.weight": (hidden_size,),
+                    f"{attention}.ln_x.bias": (hidden_size,),
+                }
+            )
+            for projection in ("receptance", "key", "value", "output"):
+                shapes[f"{attention}.{projection}.weight"] = (
+                    hidden_size,
+                    hidden_size,
+                )
+            feed_forward = f"{block}.ffn"
+            shapes[f"{feed_forward}.x_k"] = (1, 1, hidden_size)
+            shapes[f"{feed_forward}.key.weight"] = (
+                intermediate_size,
+                hidden_size,
+            )
+            shapes[f"{feed_forward}.value.weight"] = (
+                hidden_size,
+                intermediate_size,
+            )
+        return shapes
+
+    def _validate_standard_hf_weights(self, weights: dict[str, torch.Tensor]) -> None:
+        expected = self._expected_standard_raw_shapes()
+        missing = sorted(expected.keys() - weights.keys())
+        unexpected = sorted(weights.keys() - expected.keys())
+        if missing or unexpected:
+            raise ValueError(
+                "RWKV7 standard Hugging Face artifact key mismatch: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        for name, shape in expected.items():
+            actual = tuple(weights[name].shape)
+            if actual != shape:
+                raise ValueError(
+                    "RWKV7 standard Hugging Face artifact shape mismatch for "
+                    f"{name}: expected {shape}, got {actual}"
+                )
 
     def start_weight_update(self) -> bool:
         """Handle checkpoint-format dense weight update chunks internally."""

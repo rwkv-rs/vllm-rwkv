@@ -1551,6 +1551,114 @@ def test_rwkv7_load_weights_preprocesses_full_raw_weights(monkeypatch):
     torch.testing.assert_close(model.z["processed"], torch.tensor([3.0]))
 
 
+def _standard_hf_weights_for_test(
+    model: RWKV7ForCausalLM,
+) -> dict[str, torch.Tensor]:
+    weights = {}
+    for raw_name, shape in model._expected_standard_raw_shapes().items():
+        if raw_name == "emb.weight":
+            name = "model.embeddings.weight"
+        elif raw_name == "head.weight":
+            name = raw_name
+        else:
+            name = f"model.{raw_name}"
+        weights[name] = torch.zeros(shape)
+    return weights
+
+
+def test_rwkv7_load_weights_maps_complete_standard_hf_artifact(monkeypatch):
+    model = _new_rwkv7_for_weight_tests()
+    model.config = SimpleNamespace(
+        vocab_size=17,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        head_size=64,
+        embedding_layer_norm_fused=False,
+    )
+    standard = _standard_hf_weights_for_test(model)
+    assert len(standard) == 69
+    assert {
+        "model.embeddings.weight",
+        "model.blocks.0.ln0.weight",
+        "model.blocks.0.att.r_k",
+        "model.blocks.1.att.v2",
+        "model.ln_out.weight",
+        "head.weight",
+    }.issubset(standard)
+    captured = {}
+
+    def capture_preprocess(self, weights):
+        captured.update(weights)
+
+    monkeypatch.setattr(
+        RWKV7ForCausalLM,
+        "_preprocess_weights",
+        capture_preprocess,
+    )
+    monkeypatch.setattr(
+        RWKV7ForCausalLM,
+        "_commit_preprocessed_weights",
+        lambda self, weights: setattr(self, "z", weights),
+    )
+
+    loaded = model.load_weights(standard.items())
+
+    assert loaded == set(standard)
+    assert model.weight_source_format == "standard_hf"
+    assert model.raw_weight_names == set(model._expected_standard_raw_shapes())
+    assert set(captured) == model.raw_weight_names
+    torch.testing.assert_close(
+        captured["emb.weight"], standard["model.embeddings.weight"]
+    )
+    torch.testing.assert_close(
+        captured["blocks.1.att.v2"], standard["model.blocks.1.att.v2"]
+    )
+    torch.testing.assert_close(captured["head.weight"], standard["head.weight"])
+
+
+@pytest.mark.parametrize("failure", ["missing", "unknown", "shape", "mixed"])
+def test_rwkv7_standard_hf_weights_fail_closed(failure):
+    model = _new_rwkv7_for_weight_tests()
+    model.config = SimpleNamespace(
+        vocab_size=17,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        head_size=64,
+        embedding_layer_norm_fused=False,
+    )
+    weights = _standard_hf_weights_for_test(model)
+    if failure == "missing":
+        del weights["head.weight"]
+        match = "key mismatch.*head.weight"
+    elif failure == "unknown":
+        weights["model.unexpected.weight"] = torch.zeros(1)
+        match = "unsupported key"
+    elif failure == "shape":
+        weights["model.blocks.0.att.r_k"] = torch.zeros(2, 64)
+        match = "shape mismatch.*blocks.0.att.r_k"
+    else:
+        weights["emb.weight"] = weights["model.embeddings.weight"]
+        match = "unsupported key.*emb.weight"
+
+    with pytest.raises(ValueError, match=match):
+        model.load_weights(weights.items())
+
+
+def test_rwkv7_standard_hf_weights_reject_duplicate_source_key():
+    model = _new_rwkv7_for_weight_tests()
+    duplicate = torch.zeros(2, 2)
+
+    with pytest.raises(ValueError, match="duplicate key.*model.embeddings.weight"):
+        model.load_weights(
+            [
+                ("model.embeddings.weight", duplicate),
+                ("model.embeddings.weight", duplicate),
+            ]
+        )
+
+
 def test_rwkv7_default_loader_validation_uses_raw_weight_names():
     model = _new_rwkv7_for_weight_tests()
     model.raw_weight_names = {"emb.weight", "head.weight"}
@@ -4242,8 +4350,8 @@ def test_rwkv7_vllm_pp_non_last_stage_returns_v_first(monkeypatch):
     model.end_layer = 1
     model._is_pp_first_rank = lambda: True
     model._is_pp_last_rank = lambda: False
-    model.embed = (
-        lambda tokens: tokens.to(torch.float32).unsqueeze(-1).expand(*tokens.shape, 3)
+    model.embed = lambda tokens: (
+        tokens.to(torch.float32).unsqueeze(-1).expand(*tokens.shape, 3)
     )
     seen_calls: list[tuple[Any, ...]] = []
 
