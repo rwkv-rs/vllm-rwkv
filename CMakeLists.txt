@@ -546,15 +546,64 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   target_compile_definitions(_C PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
 endif() # _C HIP endif
 
-# The canonical RWKV+NVFP4 artifact needs only Marlin A16 weight repacking and
-# GEMM in addition to the self-owned RWKV kernels. Keep this target independent
-# from the unrestricted extension so the profile does not acquire unrelated
-# attention, MoE, speculative-decoding, or CUTLASS runtime ownership.
+# The canonical RWKV+NVFP4 artifacts need Marlin A16 weight repacking/GEMM and
+# the CUTLASS W4A4 quantize/GEMM pair in addition to the self-owned RWKV
+# kernels. Keep this target independent from the unrestricted extension so the
+# profile does not acquire unrelated attention, MoE, or speculative-decoding
+# runtime ownership.
 if(VLLM_RWKV_NVFP4_BUILD)
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_LESS 12.8)
+    message(FATAL_ERROR
+      "VLLM_BUILD_PROFILE='rwkv-nvfp4' requires CUDA >= 12.8 for NVFP4 W4A4")
+  endif()
+
+  set(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
+  set(CUTLASS_REVISION "v4.4.2")
+  if(DEFINED ENV{VLLM_CUTLASS_SRC_DIR})
+    set(VLLM_CUTLASS_SRC_DIR $ENV{VLLM_CUTLASS_SRC_DIR})
+  endif()
+  if(VLLM_CUTLASS_SRC_DIR)
+    if(NOT IS_ABSOLUTE VLLM_CUTLASS_SRC_DIR)
+      get_filename_component(VLLM_CUTLASS_SRC_DIR
+        "${VLLM_CUTLASS_SRC_DIR}" ABSOLUTE)
+    endif()
+    message(STATUS
+      "The VLLM_CUTLASS_SRC_DIR is set, using ${VLLM_CUTLASS_SRC_DIR} for compilation")
+    FetchContent_Declare(cutlass SOURCE_DIR ${VLLM_CUTLASS_SRC_DIR})
+  else()
+    FetchContent_Declare(
+      cutlass
+      GIT_REPOSITORY https://github.com/nvidia/cutlass.git
+      GIT_TAG ${CUTLASS_REVISION}
+      GIT_PROGRESS TRUE
+      GIT_SHALLOW TRUE)
+  endif()
+  FetchContent_MakeAvailable(cutlass)
+  set(CUTLASS_INCLUDE_DIR "${cutlass_SOURCE_DIR}/include")
+  set(CUTLASS_TOOLS_UTIL_INCLUDE_DIR "${cutlass_SOURCE_DIR}/tools/util/include")
+
   set(RWKV_NVFP4_MARLIN_SRC
     "csrc/libtorch_stable/rwkv_nvfp4_bindings.cpp"
+    "csrc/libtorch_stable/cutlass_extensions/common.cpp"
+    "csrc/libtorch_stable/cuda_utils_kernels.cu"
+    "csrc/libtorch_stable/quantization/fp4/nvfp4_quant_entry.cu"
+    "csrc/libtorch_stable/quantization/fp4/nvfp4_scaled_mm_entry.cu"
+    "csrc/libtorch_stable/quantization/fp4/nvfp4_quant_kernels.cu"
+    "csrc/libtorch_stable/quantization/fp4/nvfp4_scaled_mm_sm120_kernels.cu"
     "csrc/libtorch_stable/quantization/marlin/marlin.cu"
     "csrc/libtorch_stable/quantization/marlin/gptq_marlin_repack.cu")
+
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+    cuda_archs_loose_intersection(RWKV_NVFP4_CUTLASS_ARCHS
+      "12.0f" "${CUDA_ARCHS}")
+  else()
+    cuda_archs_loose_intersection(RWKV_NVFP4_CUTLASS_ARCHS
+      "12.0a;12.1a" "${CUDA_ARCHS}")
+  endif()
+  if(NOT RWKV_NVFP4_CUTLASS_ARCHS)
+    message(FATAL_ERROR
+      "VLLM_BUILD_PROFILE='rwkv-nvfp4' requires an SM12x CUDA architecture")
+  endif()
 
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
     cuda_archs_loose_intersection(RWKV_NVFP4_MARLIN_ARCHS
@@ -572,16 +621,19 @@ if(VLLM_RWKV_NVFP4_BUILD)
 
   set(RWKV_NVFP4_MARLIN_GEN_SCRIPT
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/libtorch_stable/quantization/marlin/generate_kernels.py)
+  set(RWKV_NVFP4_MARLIN_GENERATED_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/rwkv_nvfp4_marlin_generated")
   file(MD5 ${RWKV_NVFP4_MARLIN_GEN_SCRIPT} RWKV_NVFP4_MARLIN_GEN_SCRIPT_HASH)
   list(JOIN CUDA_ARCHS "," RWKV_NVFP4_CUDA_ARCHS_STR)
   set(RWKV_NVFP4_MARLIN_CACHE_KEY
     "${RWKV_NVFP4_MARLIN_GEN_SCRIPT_HASH}(ARCH:${RWKV_NVFP4_CUDA_ARCHS_STR})")
   if(NOT DEFINED CACHE{RWKV_NVFP4_MARLIN_CACHE_KEY} OR
-     NOT $CACHE{RWKV_NVFP4_MARLIN_CACHE_KEY} STREQUAL ${RWKV_NVFP4_MARLIN_CACHE_KEY})
+     NOT $CACHE{RWKV_NVFP4_MARLIN_CACHE_KEY} STREQUAL ${RWKV_NVFP4_MARLIN_CACHE_KEY} OR
+     NOT EXISTS "${RWKV_NVFP4_MARLIN_GENERATED_DIR}/kernel_selector.h")
     execute_process(
       COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=$ENV{PYTHONPATH}
         ${Python_EXECUTABLE} ${RWKV_NVFP4_MARLIN_GEN_SCRIPT}
-        ${RWKV_NVFP4_CUDA_ARCHS_STR}
+        ${RWKV_NVFP4_CUDA_ARCHS_STR} ${RWKV_NVFP4_MARLIN_GENERATED_DIR}
       RESULT_VARIABLE rwkv_nvfp4_marlin_generation_result
       OUTPUT_FILE ${CMAKE_CURRENT_BINARY_DIR}/rwkv_nvfp4_marlin_generation.log
       ERROR_FILE ${CMAKE_CURRENT_BINARY_DIR}/rwkv_nvfp4_marlin_generation.log)
@@ -598,8 +650,8 @@ if(VLLM_RWKV_NVFP4_BUILD)
   # though the public profile exposes only the A16 NVFP4 path; omitting an
   # unselected specialization would still leave an unresolved function pointer.
   file(GLOB RWKV_NVFP4_MARLIN_TEMPLATE_SRC
-    "csrc/libtorch_stable/quantization/marlin/sm80_kernel_*.cu"
-    "csrc/libtorch_stable/quantization/marlin/sm89_kernel_*.cu")
+    "${RWKV_NVFP4_MARLIN_GENERATED_DIR}/sm80_kernel_*.cu"
+    "${RWKV_NVFP4_MARLIN_GENERATED_DIR}/sm89_kernel_*.cu")
   if(NOT RWKV_NVFP4_MARLIN_TEMPLATE_SRC)
     message(FATAL_ERROR "RWKV NVFP4 Marlin generated no kernels")
   endif()
@@ -609,6 +661,9 @@ if(VLLM_RWKV_NVFP4_BUILD)
   set_gencode_flags_for_srcs(
     SRCS "csrc/libtorch_stable/quantization/marlin/marlin.cu;csrc/libtorch_stable/quantization/marlin/gptq_marlin_repack.cu"
     CUDA_ARCHS "${RWKV_NVFP4_MARLIN_OTHER_ARCHS}")
+  set_gencode_flags_for_srcs(
+    SRCS "csrc/libtorch_stable/quantization/fp4/nvfp4_quant_entry.cu;csrc/libtorch_stable/quantization/fp4/nvfp4_scaled_mm_entry.cu;csrc/libtorch_stable/quantization/fp4/nvfp4_quant_kernels.cu;csrc/libtorch_stable/quantization/fp4/nvfp4_scaled_mm_sm120_kernels.cu"
+    CUDA_ARCHS "${RWKV_NVFP4_CUTLASS_ARCHS}")
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
     set_source_files_properties(
       ${RWKV_NVFP4_MARLIN_TEMPLATE_SRC}
@@ -625,11 +680,19 @@ if(VLLM_RWKV_NVFP4_BUILD)
     SOURCES ${RWKV_NVFP4_MARLIN_SRC}
     COMPILE_FLAGS ${VLLM_GPU_FLAGS}
     ARCHITECTURES ${VLLM_GPU_ARCHES}
+    INCLUDE_DIRECTORIES
+      ${RWKV_NVFP4_MARLIN_GENERATED_DIR}
+      ${CMAKE_CURRENT_SOURCE_DIR}/csrc/libtorch_stable/quantization/marlin
+      ${CUTLASS_INCLUDE_DIR}
+      ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
     USE_SABI 3
     WITH_SOABI)
   target_compile_definitions(_C_stable_libtorch PRIVATE
     TORCH_TARGET_VERSION=0x020B000000000000ULL
-    USE_CUDA)
+    USE_CUDA
+    ENABLE_NVFP4_SM120=1
+    VLLM_NVFP4_LINEAR_ONLY=1
+    CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
 endif()
 
 if((VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP") AND
@@ -856,6 +919,8 @@ if((VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP") AND
       # Generate sources:
       set(MARLIN_GEN_SCRIPT
         ${CMAKE_CURRENT_SOURCE_DIR}/csrc/libtorch_stable/quantization/marlin/generate_kernels.py)
+      set(MARLIN_GENERATED_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/marlin_generated")
       file(MD5 ${MARLIN_GEN_SCRIPT} MARLIN_GEN_SCRIPT_HASH)
       list(JOIN CUDA_ARCHS "," CUDA_ARCHS_STR)
       set(MARLIN_GEN_SCRIPT_HASH_AND_ARCH "${MARLIN_GEN_SCRIPT_HASH}(ARCH:${CUDA_ARCHS_STR})")
@@ -864,11 +929,13 @@ if((VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP") AND
       message(STATUS "Last run Marlin generate script hash: $CACHE{MARLIN_GEN_SCRIPT_HASH_AND_ARCH}")
 
       if (NOT DEFINED CACHE{MARLIN_GEN_SCRIPT_HASH_AND_ARCH}
-          OR NOT $CACHE{MARLIN_GEN_SCRIPT_HASH_AND_ARCH} STREQUAL ${MARLIN_GEN_SCRIPT_HASH_AND_ARCH})
+          OR NOT $CACHE{MARLIN_GEN_SCRIPT_HASH_AND_ARCH} STREQUAL ${MARLIN_GEN_SCRIPT_HASH_AND_ARCH}
+          OR NOT EXISTS "${MARLIN_GENERATED_DIR}/kernel_selector.h")
         execute_process(
           COMMAND ${CMAKE_COMMAND} -E env
           PYTHONPATH=$ENV{PYTHONPATH}
             ${Python_EXECUTABLE} ${MARLIN_GEN_SCRIPT} ${CUDA_ARCHS_STR}
+            ${MARLIN_GENERATED_DIR}
           RESULT_VARIABLE marlin_generation_result
           OUTPUT_VARIABLE marlin_generation_result
           OUTPUT_FILE ${CMAKE_CURRENT_BINARY_DIR}/marlin_generation.log
@@ -890,7 +957,8 @@ if((VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP") AND
       endif()
 
       if (MARLIN_ARCHS)
-        file(GLOB MARLIN_TEMPLATE_KERNEL_SRC "csrc/libtorch_stable/quantization/marlin/sm80_kernel_*_float16.cu")
+        file(GLOB MARLIN_TEMPLATE_KERNEL_SRC
+          "${MARLIN_GENERATED_DIR}/sm80_kernel_*_float16.cu")
         set_gencode_flags_for_srcs(
           SRCS "${MARLIN_TEMPLATE_KERNEL_SRC}"
           CUDA_ARCHS "${MARLIN_ARCHS}")
@@ -900,7 +968,8 @@ if((VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP") AND
         endif()
         list(APPEND VLLM_STABLE_EXT_SRC ${MARLIN_TEMPLATE_KERNEL_SRC})
 
-        file(GLOB MARLIN_TEMPLATE_BF16_KERNEL_SRC "csrc/libtorch_stable/quantization/marlin/sm80_kernel_*_bfloat16.cu")
+        file(GLOB MARLIN_TEMPLATE_BF16_KERNEL_SRC
+          "${MARLIN_GENERATED_DIR}/sm80_kernel_*_bfloat16.cu")
         set_gencode_flags_for_srcs(
           SRCS "${MARLIN_TEMPLATE_BF16_KERNEL_SRC}"
           CUDA_ARCHS "${MARLIN_BF16_ARCHS}")
@@ -912,7 +981,8 @@ if((VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP") AND
       endif()
 
       if (MARLIN_SM75_ARCHS)
-        file(GLOB MARLIN_TEMPLATE_SM75_KERNEL_SRC "csrc/libtorch_stable/quantization/marlin/sm75_kernel_*.cu")
+        file(GLOB MARLIN_TEMPLATE_SM75_KERNEL_SRC
+          "${MARLIN_GENERATED_DIR}/sm75_kernel_*.cu")
         set_gencode_flags_for_srcs(
           SRCS "${MARLIN_TEMPLATE_SM75_KERNEL_SRC}"
           CUDA_ARCHS "${MARLIN_SM75_ARCHS}")
@@ -924,7 +994,8 @@ if((VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP") AND
       endif()
 
       if (MARLIN_FP8_ARCHS)
-        file(GLOB MARLIN_TEMPLATE_FP8_KERNEL_SRC "csrc/libtorch_stable/quantization/marlin/sm89_kernel_*.cu")
+        file(GLOB MARLIN_TEMPLATE_FP8_KERNEL_SRC
+          "${MARLIN_GENERATED_DIR}/sm89_kernel_*.cu")
         set_gencode_flags_for_srcs(
           SRCS "${MARLIN_TEMPLATE_FP8_KERNEL_SRC}"
           CUDA_ARCHS "${MARLIN_FP8_ARCHS}")
@@ -1392,6 +1463,12 @@ if((VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP") AND
     INCLUDE_DIRECTORIES ${CUTLASS_INCLUDE_DIR} ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
     USE_SABI 3
     WITH_SOABI)
+
+  if(MARLIN_GENERATED_DIR)
+    target_include_directories(_C_stable_libtorch PRIVATE
+      ${MARLIN_GENERATED_DIR}
+      ${CMAKE_CURRENT_SOURCE_DIR}/csrc/libtorch_stable/quantization/marlin)
+  endif()
 
   # Set TORCH_TARGET_VERSION for stable ABI compatibility.
   # This ensures we only use C-shim APIs available in PyTorch 2.11.

@@ -8,6 +8,15 @@ import sys
 
 import jinja2
 
+if len(sys.argv) not in (2, 3):
+    raise SystemExit("usage: generate_kernels.py <cuda-archs> [output-directory]")
+
+OUTPUT_DIR = (
+    os.path.abspath(sys.argv[2])
+    if len(sys.argv) == 3
+    else os.path.dirname(os.path.abspath(__file__))
+)
+
 ARCHS = []
 SUPPORT_FP8 = False
 SUPPORT_SM75 = False
@@ -163,10 +172,11 @@ QUANT_CONFIGS = [
 
 
 def remove_old_kernels():
-    for filename in glob.glob(os.path.dirname(__file__) + "/*kernel_*.cu"):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    for filename in glob.glob(os.path.join(OUTPUT_DIR, "*kernel_*.cu")):
         subprocess.call(["rm", "-f", filename])
 
-    filename = os.path.dirname(__file__) + "/kernel_selector.h"
+    filename = os.path.join(OUTPUT_DIR, "kernel_selector.h")
     subprocess.call(["rm", "-f", filename])
 
 
@@ -297,7 +307,7 @@ def generate_new_kernels():
 
             filename = filename.lower()
 
-            with open(os.path.join(os.path.dirname(__file__), filename), "w") as f:
+            with open(os.path.join(OUTPUT_DIR, filename), "w") as f:
                 f.write(file_content)
 
     if not SUPPORT_FP8 and kernel_selector_str != FILE_HEAD_COMMENT:
@@ -307,7 +317,7 @@ def generate_new_kernels():
             '"marlin kernel with fp8 activation is not built.");'
         )
 
-    with open(os.path.join(os.path.dirname(__file__), "kernel_selector.h"), "w") as f:
+    with open(os.path.join(OUTPUT_DIR, "kernel_selector.h"), "w") as f:
         f.write(kernel_selector_str)
 
 

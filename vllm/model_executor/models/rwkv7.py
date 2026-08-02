@@ -49,15 +49,6 @@ LOWRANK_SUFFIXES = (
     "att.v1",
     "att.v2",
 )
-RWKV7_QUANTIZED_LINEAR_SUFFIXES = (
-    ".att.receptance",
-    ".att.key",
-    ".att.value",
-    ".att.output",
-    ".ffn.key",
-    ".ffn.value",
-    *(f".{suffix}" for suffix in LOWRANK_SUFFIXES),
-)
 LOWRANK_IN_ROWS_T = 7
 LOWRANK_OUT_ROWS_T = 4
 LOWRANK_FUSED_MIN_C = 1024
@@ -279,17 +270,6 @@ class RWKV7ForCausalLM(nn.Module):
             parent = child
         parent.add_module(parts[-1], module)
 
-    @staticmethod
-    def _is_supported_quantized_linear_target(target: str) -> bool:
-        parts = target.split(".")
-        return (
-            len(parts) >= 5
-            and parts[0] == "model"
-            and parts[1] == "blocks"
-            and parts[2].isdigit()
-            and target.endswith(RWKV7_QUANTIZED_LINEAR_SUFFIXES)
-        )
-
     def _initialize_quantized_linears(self) -> None:
         packed_format = validate_rwkv7_quantization_artifact_for_load(self.config)
         if packed_format is None:
@@ -319,13 +299,8 @@ class RWKV7ForCausalLM(nn.Module):
 
         expected_shapes = rwkv7_checkpoint_weight_shapes(self.config)
         for target in targets:
-            if not isinstance(
-                target, str
-            ) or not self._is_supported_quantized_linear_target(target):
-                raise RuntimeError(
-                    "RWKV7 NVFP4 target is not yet supported by the standard "
-                    f"compressed-tensors consumer: {target!r}"
-                )
+            if not isinstance(target, str):
+                raise RuntimeError("RWKV7 quantized module inventory is invalid")
             weight_name = f"{target}.weight"
             shape = expected_shapes.get(weight_name)
             if shape is None or len(shape) != 2:
@@ -337,6 +312,11 @@ class RWKV7ForCausalLM(nn.Module):
                 input_size=input_size,
                 output_size=output_size,
                 bias=False,
+                params_dtype=getattr(
+                    getattr(self, "model_config", None),
+                    "dtype",
+                    DTYPE,
+                ),
                 quant_config=self.quant_config,
                 prefix=target,
                 return_bias=False,

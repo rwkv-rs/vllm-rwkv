@@ -48,6 +48,7 @@ def make_config(
             runner_type=runner_type,
             enable_sleep_mode=sleep_mode,
             enable_cumem_allocator=cumem_allocator,
+            hf_config=SimpleNamespace(),
         ),
         load_config=SimpleNamespace(load_format=load_format),
         parallel_config=SimpleNamespace(
@@ -125,7 +126,13 @@ def test_rwkv_nvfp4_manifest_fixture_matches_runtime_contract() -> None:
     assert load_build_profile_metadata(path) == RWKV_NVFP4_METADATA
 
 
-def test_rwkv_nvfp4_profile_accepts_only_compressed_tensors() -> None:
+def test_rwkv_nvfp4_profile_accepts_only_compressed_tensors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "vllm.transformers_utils.configs.rwkv7.rwkv7_nvfp4_consumer_requirement",
+        lambda _config: "vllm-rwkv-nvfp4-w4a16",
+    )
     validate_build_profile_capabilities(
         make_config(quantization="compressed-tensors"), RWKV_NVFP4_METADATA
     )
@@ -135,6 +142,24 @@ def test_rwkv_nvfp4_profile_accepts_only_compressed_tensors() -> None:
             validate_build_profile_capabilities(
                 make_config(quantization=quantization), RWKV_NVFP4_METADATA
             )
+
+
+@pytest.mark.parametrize(
+    "consumer_requirement",
+    ["vllm-rwkv-nvfp4-w4a4", "vllm-rwkv-nvfp4-w4a16"],
+)
+def test_rwkv_nvfp4_profile_accepts_exact_w4a4_or_w4a16_capability(
+    consumer_requirement: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "vllm.transformers_utils.configs.rwkv7.rwkv7_nvfp4_consumer_requirement",
+        lambda _config: consumer_requirement,
+    )
+
+    validate_build_profile_capabilities(
+        make_config(quantization="compressed-tensors"), RWKV_NVFP4_METADATA
+    )
 
 
 @pytest.mark.parametrize(

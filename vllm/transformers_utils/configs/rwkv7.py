@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import hashlib
+import json
 import re
 from collections.abc import Mapping
 
@@ -15,6 +17,11 @@ RWKV7_KNOWN_PACKED_FORMATS = frozenset(("nvfp4-pack-quantized", "pack-quantized"
 # Add a format here only after that runtime consumes the corresponding
 # compressed-tensors scheme without dequantizing it through private glue.
 RWKV7_SUPPORTED_PACKED_FORMATS = frozenset(("nvfp4-pack-quantized",))
+RWKV7_NVFP4_W4A4_CONSUMER = "vllm-rwkv-nvfp4-w4a4"
+RWKV7_NVFP4_W4A16_CONSUMER = "vllm-rwkv-nvfp4-w4a16"
+_RWKV7_TRANSFORMERS_CONSUMER = "transformers-rwkv-compressed-tensors"
+_RWKV7_TARGET_SCHEMA_VERSION = 1
+_RWKV7_COMPRESSED_TENSORS_VERSION = "0.17.2.a20260731"
 _RWKV7_LOW_RANK_MODULE_RE = re.compile(
     r"^model\.blocks\.\d+\.att\."
     r"(?:w1|w2|a1|a2|v1|v2|g1|g2)$"
@@ -98,6 +105,105 @@ def _rwkv7_metadata_names(
     return value
 
 
+def _rwkv7_target_fqns_digest(names: list[str]) -> str:
+    serialized = json.dumps(names, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _rwkv7_nvfp4_candidate_targets(
+    candidate: str,
+    num_hidden_layers: int,
+) -> list[str]:
+    if candidate == "nvfp4-w4a4":
+        return [
+            f"model.blocks.{layer_id}.ffn.{name}"
+            for layer_id in range(num_hidden_layers)
+            for name in ("key", "value")
+        ]
+    if candidate == "nvfp4-w4a16-protection-ablation":
+        if num_hidden_layers < 2:
+            raise ValueError(
+                "RWKV7 W4A16 protection ablation requires at least two layers"
+            )
+        layer_zero = "model.blocks.0.att"
+        targets = [
+            *(f"{layer_zero}.{name}" for name in ("w1", "w2", "a1", "a2", "g1", "g2")),
+            *(f"{layer_zero}.{name}" for name in ("receptance", "key", "output")),
+        ]
+        targets.extend(
+            target
+            for layer_id in range(1, num_hidden_layers)
+            for target in (
+                *(
+                    f"model.blocks.{layer_id}.att.{name}"
+                    for name in (
+                        "w1",
+                        "w2",
+                        "a1",
+                        "a2",
+                        "v1",
+                        "v2",
+                        "g1",
+                        "g2",
+                    )
+                ),
+                *(
+                    f"model.blocks.{layer_id}.att.{name}"
+                    for name in ("receptance", "key", "value", "output")
+                ),
+            )
+        )
+        return targets
+    raise ValueError(f"RWKV7 NVFP4 candidate is unsupported: {candidate!r}")
+
+
+def _rwkv7_quantization_args_match(
+    value: object,
+    *,
+    activation: bool,
+) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    scale_dtype = str(value.get("scale_dtype", "")).removeprefix("torch.")
+    return (
+        value.get("num_bits") == 4
+        and value.get("type") == "float"
+        and value.get("strategy") == "tensor_group"
+        and value.get("symmetric") is True
+        and value.get("group_size") == 16
+        and value.get("dynamic") == ("local" if activation else False)
+        and scale_dtype == "float8_e4m3fn"
+    )
+
+
+def _validate_rwkv7_nvfp4_scheme(
+    quantization: Mapping[str, object],
+    *,
+    candidate: str,
+    expected_targets: list[str],
+) -> None:
+    groups = quantization.get("config_groups")
+    if not isinstance(groups, Mapping) or len(groups) != 1:
+        raise ValueError(
+            "RWKV7 NVFP4 quantization_config must contain exactly one config_group"
+        )
+    group = next(iter(groups.values()))
+    if not isinstance(group, Mapping) or group.get("targets") != expected_targets:
+        raise ValueError(
+            "RWKV7 NVFP4 config_group targets must match the exact candidate inventory"
+        )
+    if not _rwkv7_quantization_args_match(group.get("weights"), activation=False):
+        raise ValueError("RWKV7 NVFP4 weight quantization arguments are invalid")
+    input_activations = group.get("input_activations")
+    if candidate == "nvfp4-w4a4":
+        if not _rwkv7_quantization_args_match(input_activations, activation=True):
+            raise ValueError(
+                "RWKV7 W4A4 requires exact dynamic-local NVFP4 input_activations"
+            )
+    elif input_activations is not None:
+        raise ValueError("RWKV7 W4A16 requires input_activations=None")
+
+
 def validate_rwkv7_quantization_artifact_metadata(config: object) -> str | None:
     """Validate the producer-owned schema before any checkpoint tensor is read."""
     serialized = _rwkv7_config_value(config, RWKV7_QUANTIZATION_METADATA_KEY)
@@ -123,6 +229,44 @@ def validate_rwkv7_quantization_artifact_metadata(config: object) -> str | None:
             "RWKV7 quantization metadata schema_version must be "
             f"{RWKV7_QUANTIZATION_SCHEMA_VERSION}"
         )
+    candidate = contract.get("candidate")
+    if candidate not in {
+        "nvfp4-w4a4",
+        "nvfp4-w4a16-protection-ablation",
+    }:
+        raise ValueError(
+            "RWKV7 quantization metadata candidate must be the canonical W4A4 "
+            "or W4A16 protection-ablation consumer artifact"
+        )
+
+    target_policy = _rwkv7_metadata_mapping(
+        contract.get("target_policy"), "target_policy"
+    )
+    if (
+        target_policy.get("policy") != "rwkv7"
+        or target_policy.get("policy_version") != 2
+        or target_policy.get("model_type") != "rwkv7"
+        or target_policy.get("base_model_prefix") != "model"
+    ):
+        raise ValueError("RWKV7 quantization target policy identity is invalid")
+    recipe = _rwkv7_metadata_mapping(
+        target_policy.get("recipe"), "target_policy.recipe"
+    )
+    framework_versions = _rwkv7_metadata_mapping(
+        recipe.get("framework_versions"),
+        "target_policy.recipe.framework_versions",
+    )
+    if (
+        recipe.get("schema_version") != 1
+        or recipe.get("candidate") != candidate
+        or framework_versions.get("compressed_tensors")
+        != _RWKV7_COMPRESSED_TENSORS_VERSION
+    ):
+        raise ValueError(
+            "RWKV7 quantization recipe candidate or compressed-tensors version "
+            "is invalid"
+        )
+
     vllm = _rwkv7_metadata_mapping(contract.get("vllm"), "vllm")
     required_identity = {
         "architecture": STANDARD_RWKV7_ARCHITECTURE,
@@ -168,6 +312,46 @@ def validate_rwkv7_quantization_artifact_metadata(config: object) -> str | None:
             "RWKV7 quantization metadata disagrees with config.json quantization_config"
         )
 
+    num_hidden_layers = _rwkv7_config_value(config, "num_hidden_layers")
+    if (
+        not isinstance(num_hidden_layers, int)
+        or isinstance(num_hidden_layers, bool)
+        or vllm.get("target_schema_version") != _RWKV7_TARGET_SCHEMA_VERSION
+        or vllm.get("num_hidden_layers") != num_hidden_layers
+    ):
+        raise ValueError(
+            "RWKV7 quantization target schema version or layer count is invalid"
+        )
+    expected_targets = _rwkv7_nvfp4_candidate_targets(str(candidate), num_hidden_layers)
+    expected_schema = {
+        "nvfp4-w4a4": "rwkv7-nvfp4-critical-high-v1",
+        "nvfp4-w4a16-protection-ablation": (
+            "rwkv7-nvfp4-protection-ablation-no-ffn-v1"
+        ),
+    }[str(candidate)]
+    expected_consumer = {
+        "nvfp4-w4a4": RWKV7_NVFP4_W4A4_CONSUMER,
+        "nvfp4-w4a16-protection-ablation": RWKV7_NVFP4_W4A16_CONSUMER,
+    }[str(candidate)]
+    consumer_revision = vllm.get("vllm_consumer_revision")
+    if (
+        vllm.get("target_schema") != expected_schema
+        or vllm.get("vllm_consumer_requirement") != expected_consumer
+        or vllm.get("consumer_capabilities")
+        != [_RWKV7_TRANSFORMERS_CONSUMER, expected_consumer]
+        or not isinstance(consumer_revision, str)
+        or re.fullmatch(r"[0-9a-f]{40}", consumer_revision) is None
+    ):
+        raise ValueError(
+            "RWKV7 quantization metadata lacks the exact candidate consumer "
+            "capability and revision"
+        )
+    _validate_rwkv7_nvfp4_scheme(
+        quantization,
+        candidate=str(candidate),
+        expected_targets=expected_targets,
+    )
+
     inventory_names = (
         "quantized_modules",
         "quantized_weight_names",
@@ -180,9 +364,18 @@ def validate_rwkv7_quantization_artifact_metadata(config: object) -> str | None:
         "protected_state_tensors",
         "protected_modules",
         "protected_tensors",
+        "protected_parameter_keys",
     )
     inventories = {name: _rwkv7_metadata_names(vllm, name) for name in inventory_names}
     quantized_modules = inventories["quantized_modules"]
+    if quantized_modules != expected_targets:
+        raise ValueError(
+            "RWKV7 quantized modules differ from the exact candidate inventory"
+        )
+    if vllm.get("quantized_target_fqns_digest") != _rwkv7_target_fqns_digest(
+        quantized_modules
+    ):
+        raise ValueError("RWKV7 quantized target FQN digest is invalid")
     expected_weight_names = [f"{name}.weight" for name in quantized_modules]
     if inventories["quantized_weight_names"] != expected_weight_names:
         raise ValueError(
@@ -216,6 +409,28 @@ def validate_rwkv7_quantization_artifact_metadata(config: object) -> str | None:
         raise ValueError("RWKV7 protected module categories must be disjoint")
     if inventories["protected_state_tensors"] != inventories["protected_tensors"]:
         raise ValueError("RWKV7 protected state tensor inventory is incomplete")
+    expected_protected_parameter_keys = [
+        *(f"{name}.weight" for name in inventories["protected_linear_modules"]),
+        *(f"{name}.weight" for name in inventories["protected_embedding_modules"]),
+        *(
+            parameter_name
+            for name in inventories["protected_normalization_modules"]
+            for parameter_name in (f"{name}.weight", f"{name}.bias")
+        ),
+        *inventories["protected_state_tensors"],
+    ]
+    if inventories["protected_parameter_keys"] != expected_protected_parameter_keys:
+        raise ValueError("RWKV7 protected parameter key inventory is incomplete")
+    quantized_weight_names = set(inventories["quantized_weight_names"])
+    protected_parameter_keys = set(inventories["protected_parameter_keys"])
+    expected_checkpoint_keys = set(_rwkv7_checkpoint_weight_shapes_unvalidated(config))
+    if (
+        quantized_weight_names & protected_parameter_keys
+        or quantized_weight_names | protected_parameter_keys != expected_checkpoint_keys
+    ):
+        raise ValueError(
+            "RWKV7 quantized and protected parameter keys must close the whole model"
+        )
     quantized_low_rank = set(inventories["quantized_low_rank_modules"])
     protected_v_first = set(inventories["protected_v_first_linear_modules"])
     if (
@@ -234,17 +449,55 @@ def validate_rwkv7_quantization_artifact_metadata(config: object) -> str | None:
     ):
         raise ValueError("RWKV7 layer-0 v_first producer must be protected")
 
-    target_policy = _rwkv7_metadata_mapping(
-        contract.get("target_policy"), "target_policy"
-    )
     selection = _rwkv7_metadata_mapping(
         target_policy.get("selection"), "target_policy.selection"
     )
-    if _rwkv7_metadata_names(selection, "names") != quantized_modules:
+    if (
+        selection.get("kind") != "module"
+        or _rwkv7_metadata_names(selection, "names") != quantized_modules
+        or recipe.get("targets") != quantized_modules
+    ):
         raise ValueError(
             "RWKV7 quantization target policy disagrees with vLLM ownership"
         )
+    protections = target_policy.get("protections")
+    if not isinstance(protections, list) or any(
+        not isinstance(decision, Mapping) for decision in protections
+    ):
+        raise ValueError("RWKV7 quantization target protections are invalid")
+    policy_protected_modules = [
+        name
+        for decision in protections
+        if decision.get("kind") == "module"
+        for name in _rwkv7_metadata_names(decision, "names")
+    ]
+    policy_protected_tensors = [
+        name
+        for decision in protections
+        if decision.get("kind") == "tensor"
+        for name in _rwkv7_metadata_names(decision, "names")
+    ]
+    if (
+        policy_protected_modules != inventories["protected_modules"]
+        or policy_protected_tensors != inventories["protected_tensors"]
+        or quantization.get("ignore") != inventories["protected_modules"]
+    ):
+        raise ValueError(
+            "RWKV7 protection policy, compressed-tensors ignore list, and loader "
+            "ownership disagree"
+        )
     return str(packed_format)
+
+
+def rwkv7_nvfp4_consumer_requirement(config: object) -> str | None:
+    packed_format = validate_rwkv7_quantization_artifact_metadata(config)
+    if packed_format is None:
+        return None
+    contract = _rwkv7_metadata_mapping(
+        _rwkv7_config_value(config, RWKV7_QUANTIZATION_METADATA_KEY), "root"
+    )
+    vllm = _rwkv7_metadata_mapping(contract.get("vllm"), "vllm")
+    return str(vllm["vllm_consumer_requirement"])
 
 
 def validate_rwkv7_quantization_artifact_for_load(config: object) -> str | None:
@@ -348,10 +601,9 @@ def _projection_ranks(hidden_size: int) -> tuple[int, int, int]:
     )
 
 
-def rwkv7_legacy_checkpoint_weight_shapes(
+def _rwkv7_legacy_checkpoint_weight_shapes_unvalidated(
     config: object,
 ) -> dict[str, tuple[int, ...]]:
-    validate_rwkv7_hf_artifact_config(config)
     if bool(_rwkv7_config_value(config, "embedding_layer_norm_fused")):
         raise ValueError(
             "RWKV7 vLLM loading requires an unfused standard artifact; "
@@ -418,11 +670,21 @@ def rwkv7_legacy_checkpoint_weight_shapes(
     return shapes
 
 
-def rwkv7_checkpoint_weight_shapes(config: object) -> dict[str, tuple[int, ...]]:
+def rwkv7_legacy_checkpoint_weight_shapes(
+    config: object,
+) -> dict[str, tuple[int, ...]]:
+    validate_rwkv7_hf_artifact_config(config)
+    return _rwkv7_legacy_checkpoint_weight_shapes_unvalidated(config)
+
+
+def _rwkv7_checkpoint_weight_shapes_unvalidated(
+    config: object,
+) -> dict[str, tuple[int, ...]]:
     standard_shapes = {}
-    for internal_name, legacy_shape in rwkv7_legacy_checkpoint_weight_shapes(
-        config
-    ).items():
+    for (
+        internal_name,
+        legacy_shape,
+    ) in _rwkv7_legacy_checkpoint_weight_shapes_unvalidated(config).items():
         hf_name = rwkv7_internal_to_hf_weight_name(internal_name)
         if hf_name is None:
             raise ValueError(
@@ -434,3 +696,8 @@ def rwkv7_checkpoint_weight_shapes(config: object) -> dict[str, tuple[int, ...]]
             else legacy_shape
         )
     return standard_shapes
+
+
+def rwkv7_checkpoint_weight_shapes(config: object) -> dict[str, tuple[int, ...]]:
+    validate_rwkv7_hf_artifact_config(config)
+    return _rwkv7_checkpoint_weight_shapes_unvalidated(config)

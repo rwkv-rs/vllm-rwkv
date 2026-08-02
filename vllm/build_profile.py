@@ -176,6 +176,26 @@ def validate_build_profile_capabilities(
                 "requires compressed-tensors NVFP4 quantization and rejects "
                 f"quantization={sorted(quantization_names)!r}"
             )
+        hf_config = getattr(model_config, "hf_config", None)
+        try:
+            from vllm.transformers_utils.configs.rwkv7 import (
+                RWKV7_NVFP4_W4A4_CONSUMER,
+                RWKV7_NVFP4_W4A16_CONSUMER,
+                rwkv7_nvfp4_consumer_requirement,
+            )
+
+            consumer_requirement = rwkv7_nvfp4_consumer_requirement(hf_config)
+        except (KeyError, TypeError, ValueError) as error:
+            reasons.append(f"rejects invalid RWKV7 NVFP4 artifact metadata: {error}")
+        else:
+            if consumer_requirement not in {
+                RWKV7_NVFP4_W4A4_CONSUMER,
+                RWKV7_NVFP4_W4A16_CONSUMER,
+            }:
+                reasons.append(
+                    "requires an exact W4A4 or W4A16 RWKV7 NVFP4 consumer "
+                    f"capability, got {consumer_requirement!r}"
+                )
     elif quantization is not None or quantization_config is not None:
         reasons.append("does not support quantization")
     if _is_multimodal(model_config):

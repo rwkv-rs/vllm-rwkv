@@ -30,8 +30,9 @@ void scaled_fp4_quant_sm1xxa(torch::stable::Tensor const& output,
                              bool is_sf_swizzled_layout);
 #endif
 
-#if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
-    (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
+#if !defined(VLLM_NVFP4_LINEAR_ONLY) &&                     \
+    ((defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
+     (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120))
 void scaled_fp4_experts_quant_sm1xxa(
     torch::stable::Tensor& output, torch::stable::Tensor& output_scale,
     torch::stable::Tensor const& input,
@@ -40,16 +41,18 @@ void scaled_fp4_experts_quant_sm1xxa(
     torch::stable::Tensor const& output_scale_offset_by_experts);
 #endif
 
-#if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
-    (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
+#if !defined(VLLM_NVFP4_LINEAR_ONLY) &&                     \
+    ((defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
+     (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120))
 void silu_and_mul_nvfp4_quant_sm1xxa(torch::stable::Tensor& output,
                                      torch::stable::Tensor& output_sf,
                                      torch::stable::Tensor& input,
                                      torch::stable::Tensor& input_sf);
 #endif
 
-#if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
-    (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
+#if !defined(VLLM_NVFP4_LINEAR_ONLY) &&                     \
+    ((defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
+     (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120))
 void silu_and_mul_scaled_fp4_experts_quant_sm1xxa(
     torch::stable::Tensor& output, torch::stable::Tensor& output_scale,
     torch::stable::Tensor const& input,
@@ -117,14 +120,15 @@ std::tuple<torch::stable::Tensor, torch::stable::Tensor> scaled_fp4_quant_func(
   return {output, output_sf};
 }
 
+#if !defined(VLLM_NVFP4_LINEAR_ONLY)
 void scaled_fp4_experts_quant(
     torch::stable::Tensor& output, torch::stable::Tensor& output_scale,
     torch::stable::Tensor const& input,
     torch::stable::Tensor const& input_global_scale,
     torch::stable::Tensor const& input_offset_by_experts,
     torch::stable::Tensor const& output_scale_offset_by_experts) {
-#if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
-    (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
+  #if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
+      (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
   STD_TORCH_CHECK(nvfp4_quant_sm_supported(),
                   "No compiled nvfp4 experts quantization kernel for SM ",
                   get_sm_version_num(),
@@ -132,7 +136,7 @@ void scaled_fp4_experts_quant(
   return scaled_fp4_experts_quant_sm1xxa(
       output, output_scale, input, input_global_scale, input_offset_by_experts,
       output_scale_offset_by_experts);
-#endif
+  #endif
   STD_TORCH_CHECK_NOT_IMPLEMENTED(
       false, "No compiled nvfp4 experts quantization kernel");
 }
@@ -141,14 +145,14 @@ void silu_and_mul_nvfp4_quant(torch::stable::Tensor& output,
                               torch::stable::Tensor& output_sf,
                               torch::stable::Tensor& input,
                               torch::stable::Tensor& input_sf) {
-#if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
-    (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
+  #if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
+      (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
   STD_TORCH_CHECK(nvfp4_quant_sm_supported(),
                   "No compiled silu_and_mul nvfp4 quantization kernel for SM ",
                   get_sm_version_num(),
                   ". Recompile with the appropriate CUDA arch.");
   return silu_and_mul_nvfp4_quant_sm1xxa(output, output_sf, input, input_sf);
-#endif
+  #endif
   STD_TORCH_CHECK_NOT_IMPLEMENTED(
       false, "No compiled silu_and_mul nvfp4 quantization kernel");
 }
@@ -159,8 +163,8 @@ void silu_and_mul_scaled_fp4_experts_quant(
     torch::stable::Tensor const& input_global_scale,
     torch::stable::Tensor const& input_offset_by_experts,
     torch::stable::Tensor const& output_scale_offset_by_experts) {
-#if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
-    (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
+  #if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
+      (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
   STD_TORCH_CHECK(nvfp4_quant_sm_supported(),
                   "No compiled silu_and_mul nvfp4 experts quantization kernel "
                   "for SM ",
@@ -169,7 +173,8 @@ void silu_and_mul_scaled_fp4_experts_quant(
   return silu_and_mul_scaled_fp4_experts_quant_sm1xxa(
       output, output_scale, input, input_global_scale, input_offset_by_experts,
       output_scale_offset_by_experts);
-#endif
+  #endif
   STD_TORCH_CHECK_NOT_IMPLEMENTED(
       false, "No compiled silu_and_mul nvfp4 experts quantization kernel");
 }
+#endif
