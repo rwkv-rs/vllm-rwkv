@@ -909,6 +909,29 @@ def test_rwkv7_config_rejects_torch_compile(compilation_mode):
         RWKV7ForCausalLMConfig.verify_and_update_config(vllm_config)
 
 
+def test_rwkv7_config_checks_transformers_runtime_provenance(monkeypatch):
+    from vllm.transformers_utils import rwkv7_provenance
+
+    def reject_unpinned_runtime():
+        raise RuntimeError("unpinned Transformers-RWKV")
+
+    monkeypatch.setattr(
+        rwkv7_provenance,
+        "validate_transformers_rwkv7_runtime_provenance",
+        reject_unpinned_runtime,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="rwkv7"),
+            enforce_eager=False,
+        ),
+        compilation_config=CompilationConfig(),
+    )
+
+    with pytest.raises(RuntimeError, match="unpinned Transformers-RWKV"):
+        RWKV7ForCausalLMConfig.verify_and_update_config(vllm_config)
+
+
 def test_rwkv7_config_defaults_to_no_compile():
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=False),

@@ -123,7 +123,6 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     step3_text="Step3TextConfig",
     step3p5="Step3p5Config",
     qianfan_ocr="QianfanOCRConfig",
-    rwkv7="RWKV7Config",
     qwen3_asr="Qwen3ASRConfig",
     qwen3_next="Qwen3NextConfig",
     qwen3_5="Qwen3_5Config",
@@ -284,6 +283,13 @@ class HFConfigParser(ConfigParserBase):
 
         if extra_layer_types := _PATCH_HF_ALLOWED_LAYER_TYPES.get(model_type):
             _patch_hf_transformers_allowed_layer_types(extra_layer_types)
+
+        if model_type == "rwkv7":
+            from vllm.transformers_utils.rwkv7_provenance import (
+                validate_transformers_rwkv7_runtime_provenance,
+            )
+
+            validate_transformers_rwkv7_runtime_provenance()
 
         if model_type in _SPECULATIVE_DECODING_CONFIGS:
             config_class = _CONFIG_REGISTRY[model_type]
