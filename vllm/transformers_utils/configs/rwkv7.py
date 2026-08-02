@@ -195,6 +195,12 @@ def _validate_rwkv7_nvfp4_scheme(
             "RWKV7 NVFP4 config_group targets must be exactly ['Linear']; "
             "expanded candidate FQNs are owned by rwkv7_quantization_metadata"
         )
+    if group.get("format") != "nvfp4-pack-quantized":
+        raise ValueError(
+            "RWKV7 NVFP4 config_group format must be exactly 'nvfp4-pack-quantized'"
+        )
+    if group.get("output_activations") is not None:
+        raise ValueError("RWKV7 NVFP4 config_group requires output_activations=None")
     if not _rwkv7_quantization_args_match(group.get("weights"), activation=False):
         raise ValueError("RWKV7 NVFP4 weight quantization arguments are invalid")
     input_activations = group.get("input_activations")
