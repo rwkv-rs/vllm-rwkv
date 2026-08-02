@@ -17,6 +17,7 @@ _PROFILE_PATH = Path(__file__).with_name("_build_profile.json")
 _VALID_PROFILES = {"full", "rwkv", "rwkv-nvfp4"}
 _RWKV_LOAD_FORMATS = {"auto", "hf", "safetensors"}
 _LEGACY_RWKV_WEIGHT_SUFFIXES = (".pth",)
+_RWKV7_ARCHITECTURE_ALIASES = {"Rwkv7ForCausalLM": "RWKV7ForCausalLM"}
 _RWKV_TARGETS = ("_rapid_sampling", "cumem_allocator", "rwkv7_ops")
 _RWKV_NVFP4_TARGETS = (
     "_C_stable_libtorch",
@@ -144,7 +145,8 @@ def validate_build_profile_capabilities(
     if architecture is None:
         architectures = getattr(model_config, "architectures", ())
         architecture = architectures[0] if architectures else None
-    if architecture not in metadata.supported_architectures:
+    profile_architecture = _RWKV7_ARCHITECTURE_ALIASES.get(architecture, architecture)
+    if profile_architecture not in metadata.supported_architectures:
         reasons.append(
             "requires architecture " + ", ".join(metadata.supported_architectures)
         )

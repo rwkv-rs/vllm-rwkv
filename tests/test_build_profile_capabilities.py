@@ -178,6 +178,12 @@ def test_rwkv_profile_accepts_standard_hf_artifact(
     )
 
 
+def test_rwkv_profile_accepts_standard_transformers_architecture() -> None:
+    validate_build_profile_capabilities(
+        make_config(architecture="Rwkv7ForCausalLM"), RWKV_METADATA
+    )
+
+
 def test_rwkv_profile_accepts_sleep_mode_and_cumem_allocator() -> None:
     validate_build_profile_capabilities(
         make_config(sleep_mode=True, cumem_allocator=True), RWKV_METADATA
