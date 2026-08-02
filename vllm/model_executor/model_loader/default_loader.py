@@ -4,7 +4,7 @@ import dataclasses
 import glob
 import os
 import time
-from collections.abc import Generator, Iterable
+from collections.abc import Generator, Iterable, Mapping
 from typing import cast
 
 import torch
@@ -413,6 +413,19 @@ class DefaultModelLoader(BaseModelLoader):
 
     @instrument(span_name="Load weights")
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+        hf_config = model_config.hf_config
+        rwkv7_metadata = getattr(hf_config, "rwkv7_quantization_metadata", None)
+        if (
+            getattr(hf_config, "model_type", None) == "rwkv7"
+            and isinstance(rwkv7_metadata, Mapping)
+            and rwkv7_metadata.get("schema_version") == 3
+        ):
+            from vllm.transformers_utils.configs.rwkv7 import (
+                validate_rwkv7_quantization_artifact_for_load,
+            )
+
+            validate_rwkv7_quantization_artifact_for_load(hf_config)
+
         if model_config.quantization == "torchao":
             quant_config = get_quant_config(model_config, self.load_config)
             if (

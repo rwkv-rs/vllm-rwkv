@@ -1,10 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import re
+from collections.abc import Mapping
+
 from transformers import PretrainedConfig
 
 STANDARD_RWKV7_ARCHITECTURE = "Rwkv7ForCausalLM"
 RWKV7_LOW_RANK_PROJECTIONS = frozenset(("w1", "w2", "a1", "a2", "v1", "v2", "g1", "g2"))
+RWKV7_QUANTIZATION_METADATA_KEY = "rwkv7_quantization_metadata"
+RWKV7_QUANTIZATION_SCHEMA_VERSION = 3
+RWKV7_KNOWN_PACKED_FORMATS = frozenset(("nvfp4-pack-quantized", "pack-quantized"))
+# RWKV7 owns dense custom GEMM tensors rather than vLLM LinearBase modules.
+# Add a format here only after that runtime consumes the corresponding
+# compressed-tensors scheme without dequantizing it through private glue.
+RWKV7_SUPPORTED_PACKED_FORMATS: frozenset[str] = frozenset()
+_RWKV7_LOW_RANK_MODULE_RE = re.compile(
+    r"^model\.blocks\.\d+\.att\."
+    r"(?:w1|w2|a1|a2|v1|v2|g1|g2)$"
+)
 
 
 class RWKV7Config(PretrainedConfig):
@@ -59,6 +73,199 @@ def _rwkv7_config_value(config: object, name: str) -> object:
     return getattr(config, name, None)
 
 
+def _rwkv7_metadata_mapping(
+    value: object,
+    label: str,
+) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"RWKV7 quantization metadata {label} must be an object")
+    return value
+
+
+def _rwkv7_metadata_names(
+    metadata: Mapping[str, object],
+    name: str,
+) -> list[str]:
+    value = metadata.get(name)
+    if (
+        not isinstance(value, list)
+        or any(not isinstance(item, str) or not item for item in value)
+        or len(value) != len(set(value))
+    ):
+        raise ValueError(
+            f"RWKV7 quantization metadata {name} must be a unique string list"
+        )
+    return value
+
+
+def validate_rwkv7_quantization_artifact_metadata(config: object) -> str | None:
+    """Validate the producer-owned schema before any checkpoint tensor is read."""
+    serialized = _rwkv7_config_value(config, RWKV7_QUANTIZATION_METADATA_KEY)
+    quantization_value = _rwkv7_config_value(config, "quantization_config")
+    quantization = (
+        quantization_value if isinstance(quantization_value, Mapping) else None
+    )
+    is_compressed_tensors = (
+        quantization is not None
+        and quantization.get("quant_method") == "compressed-tensors"
+    )
+    if serialized is None:
+        if is_compressed_tensors:
+            raise ValueError(
+                "RWKV7 compressed-tensors artifact is missing "
+                f"{RWKV7_QUANTIZATION_METADATA_KEY} schema v3"
+            )
+        return None
+
+    contract = _rwkv7_metadata_mapping(serialized, "root")
+    if contract.get("schema_version") != RWKV7_QUANTIZATION_SCHEMA_VERSION:
+        raise ValueError(
+            "RWKV7 quantization metadata schema_version must be "
+            f"{RWKV7_QUANTIZATION_SCHEMA_VERSION}"
+        )
+    vllm = _rwkv7_metadata_mapping(contract.get("vllm"), "vllm")
+    required_identity = {
+        "architecture": STANDARD_RWKV7_ARCHITECTURE,
+        "model_type": "rwkv7",
+        "source_format": "standard_hf",
+        "load_format": "safetensors",
+        "quant_method": "compressed-tensors",
+        "quantization_target_type": "Linear",
+        "linear_weight_suffix": "weight",
+        "linear_weight_layout": "out-in",
+        "legacy_pth_direct_load": False,
+    }
+    drifted_identity = {
+        name: (vllm.get(name), expected)
+        for name, expected in required_identity.items()
+        if vllm.get(name) != expected
+    }
+    if drifted_identity:
+        raise ValueError(
+            "RWKV7 quantization metadata model/loader identity is invalid: "
+            f"{drifted_identity}"
+        )
+    if _rwkv7_config_value(config, "model_type") != vllm[
+        "model_type"
+    ] or _rwkv7_config_value(config, "architectures") != [vllm["architecture"]]:
+        raise ValueError(
+            "RWKV7 quantization metadata model identity does not match config.json"
+        )
+
+    packed_format = vllm.get("quantization_format")
+    if packed_format not in RWKV7_KNOWN_PACKED_FORMATS:
+        raise ValueError(
+            "RWKV7 quantization metadata has unsupported producer format "
+            f"{packed_format!r}"
+        )
+    if (
+        not is_compressed_tensors
+        or quantization is None
+        or quantization.get("quantization_status") != "compressed"
+        or quantization.get("format") != packed_format
+    ):
+        raise ValueError(
+            "RWKV7 quantization metadata disagrees with config.json quantization_config"
+        )
+
+    inventory_names = (
+        "quantized_modules",
+        "quantized_weight_names",
+        "low_rank_linear_modules",
+        "quantized_low_rank_modules",
+        "protected_v_first_linear_modules",
+        "protected_linear_modules",
+        "protected_embedding_modules",
+        "protected_normalization_modules",
+        "protected_state_tensors",
+        "protected_modules",
+        "protected_tensors",
+    )
+    inventories = {name: _rwkv7_metadata_names(vllm, name) for name in inventory_names}
+    quantized_modules = inventories["quantized_modules"]
+    expected_weight_names = [f"{name}.weight" for name in quantized_modules]
+    if inventories["quantized_weight_names"] != expected_weight_names:
+        raise ValueError(
+            "RWKV7 quantization targets must use standard *.weight Linear keys"
+        )
+    low_rank_modules = set(inventories["low_rank_linear_modules"])
+    if any(
+        _RWKV7_LOW_RANK_MODULE_RE.fullmatch(name) is None for name in low_rank_modules
+    ):
+        raise ValueError(
+            "RWKV7 low-rank targets must use standard "
+            "model.blocks.{L}.att.{w1,w2,a1,a2,v1,v2,g1,g2} module keys"
+        )
+
+    quantized = set(quantized_modules)
+    protected = set(inventories["protected_modules"])
+    protected_categories = (
+        set(inventories["protected_linear_modules"]),
+        set(inventories["protected_embedding_modules"]),
+        set(inventories["protected_normalization_modules"]),
+    )
+    if quantized & protected:
+        raise ValueError("RWKV7 quantized and protected modules must be disjoint")
+    if set.union(*protected_categories) != protected:
+        raise ValueError("RWKV7 protected module categories are incomplete")
+    if any(
+        left & right
+        for index, left in enumerate(protected_categories)
+        for right in protected_categories[index + 1 :]
+    ):
+        raise ValueError("RWKV7 protected module categories must be disjoint")
+    if inventories["protected_state_tensors"] != inventories["protected_tensors"]:
+        raise ValueError("RWKV7 protected state tensor inventory is incomplete")
+    quantized_low_rank = set(inventories["quantized_low_rank_modules"])
+    protected_v_first = set(inventories["protected_v_first_linear_modules"])
+    if (
+        not quantized_low_rank <= low_rank_modules
+        or not quantized_low_rank <= quantized
+    ):
+        raise ValueError("RWKV7 quantized low-rank inventory is inconsistent")
+    if not low_rank_modules <= quantized | protected:
+        raise ValueError("RWKV7 low-rank module inventory is incomplete")
+    if not protected_v_first <= protected or protected_v_first & quantized:
+        raise ValueError("RWKV7 v_first Linear protection is incomplete")
+    layer_zero_producer = vllm.get("layer_zero_v_first_producer")
+    if (
+        layer_zero_producer != "model.blocks.0.att.value"
+        or layer_zero_producer not in protected_categories[0]
+    ):
+        raise ValueError("RWKV7 layer-0 v_first producer must be protected")
+
+    target_policy = _rwkv7_metadata_mapping(
+        contract.get("target_policy"), "target_policy"
+    )
+    selection = _rwkv7_metadata_mapping(
+        target_policy.get("selection"), "target_policy.selection"
+    )
+    if _rwkv7_metadata_names(selection, "names") != quantized_modules:
+        raise ValueError(
+            "RWKV7 quantization target policy disagrees with vLLM ownership"
+        )
+    return str(packed_format)
+
+
+def validate_rwkv7_quantization_artifact_for_load(config: object) -> None:
+    """Reject packed formats that the dense RWKV7 runtime cannot execute."""
+    packed_format = validate_rwkv7_quantization_artifact_metadata(config)
+    if packed_format is None or packed_format in RWKV7_SUPPORTED_PACKED_FORMATS:
+        return
+    blackwell_gate = (
+        " Blackwell kernel, quality, and performance validation is still required."
+        if packed_format == "nvfp4-pack-quantized"
+        else ""
+    )
+    raise RuntimeError(
+        "vLLM RWKV7 cannot execute compressed-tensors format "
+        f"{packed_format!r}: its custom GEMM runtime currently consumes only "
+        "dense standard HF *.weight tensors. Use the Transformers RWKV7 "
+        "consumer for this packed artifact or export an unquantized standard "
+        f"HF safetensors artifact.{blackwell_gate}"
+    )
+
+
 def validate_rwkv7_hf_artifact_config(config: object) -> None:
     required_values = (
         "vocab_size",
@@ -89,6 +296,7 @@ def validate_rwkv7_hf_artifact_config(config: object) -> None:
             "vocab_size/hidden_size/head_size/num_hidden_layers/"
             "max_position_embeddings, and hidden_size divisible by head_size."
         )
+    validate_rwkv7_quantization_artifact_metadata(config)
 
 
 def rwkv7_hf_to_internal_weight_name(name: str) -> str | None:
