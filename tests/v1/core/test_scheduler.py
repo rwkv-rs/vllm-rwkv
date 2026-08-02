@@ -120,6 +120,27 @@ def test_add_requests():
         assert len(scheduler.waiting) == i + 1
 
 
+def test_rwkv_sized_request_pool_drains_more_requests_in_waiting_waves():
+    scheduler = create_scheduler(max_num_seqs=2)
+    requests = create_requests(
+        num_requests=5,
+        req_ids=[f"rwkv-{i}" for i in range(5)],
+    )
+    for request in requests:
+        scheduler.add_request(request)
+
+    completed = []
+    while scheduler.get_num_unfinished_requests():
+        output = scheduler.schedule()
+        admitted = [request.req_id for request in output.scheduled_new_reqs]
+        assert 0 < len(admitted) <= 2
+        for req_id in admitted:
+            scheduler.finish_requests(req_id, RequestStatus.FINISHED_STOPPED)
+            completed.append(req_id)
+
+    assert completed == [f"rwkv-{i}" for i in range(5)]
+
+
 def test_finish_request():
     scheduler = create_scheduler()
     requests = create_requests(num_requests=10)
