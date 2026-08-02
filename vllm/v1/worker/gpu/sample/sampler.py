@@ -59,33 +59,87 @@ class Sampler:
         self.require_rapid = False
         self.rapid_penalties: torch.Tensor | None = None
         self.rapid_penalty_native_fallback = np.zeros(max_num_reqs, dtype=bool)
+        self.request_requires_rapid = np.zeros(max_num_reqs, dtype=bool)
 
-    def add_request(
-        self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
-    ) -> None:
-        self.rapid_penalty_native_fallback[req_idx] = False
-        if (
-            not self.use_rapid
-            and sampling_params.penalty_decay != RAPID_PENALTY_DECAY_DEFAULT
-        ):
-            raise RuntimeError(
-                "penalty_decay is only supported when rapid-sampling is enabled."
-            )
-        if (
-            self.use_rapid
-            and sampling_params.repetition_penalty != 1.0
-            and (
-                self.require_rapid
-                or (
-                    envs.is_set("VLLM_USE_RAPID_SAMPLER")
-                    and envs.VLLM_USE_RAPID_SAMPLER
+    def validate_sampling_params(self, sampling_params: SamplingParams) -> None:
+        """Reject request-scoped rapid incompatibilities before state mutation."""
+        rapid_explicitly_enabled = (
+            envs.is_set("VLLM_USE_RAPID_SAMPLER") and envs.VLLM_USE_RAPID_SAMPLER
+        )
+        rapid_required = (
+            self.require_rapid
+            or rapid_explicitly_enabled
+            or (self.use_rapid and sampling_params.structured_outputs is not None)
+        )
+        if not self.use_rapid:
+            if self.require_rapid:
+                raise RuntimeError("RWKV7 requires rapid-sampling on CUDA.")
+            if sampling_params.penalty_decay != RAPID_PENALTY_DECAY_DEFAULT:
+                raise RuntimeError(
+                    "penalty_decay is only supported when rapid-sampling is enabled."
                 )
+            return
+        if not rapid_required:
+            return
+
+        if sampling_params.temperature == 0.0:
+            raise RuntimeError(
+                "rapid-sampling does not support greedy requests. "
+                "Set temperature to a positive value."
             )
-        ):
+        if sampling_params.seed is not None:
+            raise RuntimeError(
+                "rapid-sampling does not support per-request seeds. Remove seed."
+            )
+        if sampling_params.min_p != 0.0:
+            raise RuntimeError("rapid-sampling does not support min_p. Set min_p=0.0.")
+        if sampling_params.repetition_penalty != 1.0:
             raise RuntimeError(
                 "rapid-sampling does not support repetition_penalty. "
                 "Set repetition_penalty=1.0."
             )
+
+        num_logprobs = sampling_params.num_logprobs
+        if num_logprobs is not None:
+            if self.logprobs_mode == "processed_logits":
+                raise RuntimeError(
+                    "rapid-sampling cannot return exact processed_logits. "
+                    "Use processed_logprobs with logprobs=0 for the exact "
+                    "sampled-token distribution."
+                )
+            if self.logprobs_mode == "processed_logprobs" and num_logprobs != 0:
+                raise RuntimeError(
+                    "rapid-sampling only supports the sampled token for exact "
+                    "processed_logprobs. Set logprobs=0 and do not request "
+                    "logprob_token_ids."
+                )
+
+        vocab_size = self.req_states.vocab_size
+        if vocab_size <= 0 or vocab_size > 1048576 or vocab_size % 4 != 0:
+            raise RuntimeError(
+                "rapid-sampling requires vocab size in (0, 1048576] and divisible by 4."
+            )
+        rapid_penalty_active = (
+            sampling_params.presence_penalty != 0.0
+            or sampling_params.frequency_penalty != 0.0
+            or sampling_params.penalty_decay != RAPID_PENALTY_DECAY_DEFAULT
+        )
+        if rapid_penalty_active and self.num_speculative_tokens > 1:
+            raise RuntimeError(
+                "rapid-sampling penalties do not support speculative expanded "
+                "logits. Disable speculative decoding."
+            )
+
+    def add_request(
+        self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
+    ) -> None:
+        self.validate_sampling_params(sampling_params)
+        self.rapid_penalty_native_fallback[req_idx] = False
+        self.request_requires_rapid[req_idx] = bool(
+            self.require_rapid
+            or (envs.is_set("VLLM_USE_RAPID_SAMPLER") and envs.VLLM_USE_RAPID_SAMPLER)
+            or (self.use_rapid and sampling_params.structured_outputs is not None)
+        )
         use_rapid_penalty = self.use_rapid and (
             sampling_params.presence_penalty != 0.0
             or sampling_params.frequency_penalty != 0.0
@@ -323,8 +377,10 @@ class Sampler:
             np.any(self.rapid_penalty_native_fallback[idx_mapping_np])
         )
         use_rapid = self.use_rapid and not rapid_penalty_native_fallback
-        rapid_sampler_forced = self.require_rapid or (
-            envs.is_set("VLLM_USE_RAPID_SAMPLER") and envs.VLLM_USE_RAPID_SAMPLER
+        rapid_sampler_forced = (
+            self.require_rapid
+            or (envs.is_set("VLLM_USE_RAPID_SAMPLER") and envs.VLLM_USE_RAPID_SAMPLER)
+            or bool(np.any(self.request_requires_rapid[idx_mapping_np]))
         )
         if rapid_penalty_native_fallback and rapid_sampler_forced:
             raise RuntimeError(
