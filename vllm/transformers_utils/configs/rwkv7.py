@@ -4,6 +4,7 @@
 import hashlib
 import json
 from collections.abc import Mapping
+from typing import cast
 
 import regex as re
 from transformers import PretrainedConfig
@@ -561,8 +562,15 @@ def validate_rwkv7_hf_artifact_config(config: object) -> None:
         not isinstance(value, bool) and isinstance(value, int) and value > 0
         for value in values.values()
     )
-    divisible_head_size = valid_values and (
-        int(values["hidden_size"]) % int(values["head_size"]) == 0
+    hidden_size = values["hidden_size"]
+    head_size = values["head_size"]
+    divisible_head_size = (
+        not isinstance(hidden_size, bool)
+        and isinstance(hidden_size, int)
+        and not isinstance(head_size, bool)
+        and isinstance(head_size, int)
+        and head_size > 0
+        and hidden_size % head_size == 0
     )
     if (
         _rwkv7_config_value(config, "model_type") != "rwkv7"
@@ -636,13 +644,13 @@ def _rwkv7_legacy_checkpoint_weight_shapes_unvalidated(
             "RWKV7 vLLM loading requires an unfused standard artifact; "
             "convert without embedding_layer_norm_fused."
         )
-    hidden_size = int(_rwkv7_config_value(config, "hidden_size"))
-    vocab_size = int(_rwkv7_config_value(config, "vocab_size"))
-    num_layers = int(_rwkv7_config_value(config, "num_hidden_layers"))
-    head_size = int(_rwkv7_config_value(config, "head_size"))
+    hidden_size = cast(int, _rwkv7_config_value(config, "hidden_size"))
+    vocab_size = cast(int, _rwkv7_config_value(config, "vocab_size"))
+    num_layers = cast(int, _rwkv7_config_value(config, "num_hidden_layers"))
+    head_size = cast(int, _rwkv7_config_value(config, "head_size"))
     num_heads = hidden_size // head_size
     intermediate_size_value = _rwkv7_config_value(config, "intermediate_size")
-    intermediate_size = int(intermediate_size_value or 4 * hidden_size)
+    intermediate_size = cast(int, intermediate_size_value or 4 * hidden_size)
     decay_rank, value_rank, gate_rank = _projection_ranks(hidden_size)
     shapes = {
         "emb.weight": (vocab_size, hidden_size),
