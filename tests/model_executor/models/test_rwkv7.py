@@ -1760,6 +1760,87 @@ def test_rwkv7_standard_hf_weights_reject_duplicate_source_key():
         )
 
 
+def test_rwkv7_pp_weight_ownership_is_unique_across_first_middle_last_stages():
+    stages = []
+    for start_layer, end_layer in ((0, 1), (1, 3), (3, 4)):
+        model = _new_rwkv7_for_weight_tests()
+        model.start_layer = start_layer
+        model.end_layer = end_layer
+        model.total_num_layers = 4
+        stages.append(model)
+
+    expected_owner = {
+        "emb.weight": 0,
+        "blocks.0.ln0.weight": 0,
+        "blocks.0.att.r_k": 0,
+        "blocks.1.att.r_k": 1,
+        "blocks.2.ffn.key.weight": 1,
+        "blocks.3.att.output.weight": 2,
+        "ln_out.weight": 2,
+        "head.weight": 2,
+    }
+    for global_key, owner in expected_owner.items():
+        consumers = [
+            rank
+            for rank, stage in enumerate(stages)
+            if stage._is_weight_needed_on_rank(global_key)
+        ]
+        assert consumers == [owner]
+
+
+def test_rwkv7_tp_shards_reconstruct_dense_vocab_head_and_attention_weights():
+    dense_vocab = torch.arange(20).reshape(5, 4)
+    dense_heads = torch.arange(24).reshape(6, 4)
+    dense_output = torch.arange(24).reshape(4, 6)
+    shards = []
+    for rank in range(2):
+        model = _new_rwkv7_for_weight_tests()
+        model.tp_size = 2
+        model.tp_rank = rank
+        model.tp_hidden_size = 3
+        model.vocab_size = 5
+        shards.append(
+            (
+                model._shard_weight_for_tp("head.weight", dense_vocab),
+                model._shard_weight_for_tp(
+                    "blocks.0.att.receptance.weight", dense_heads
+                ),
+                model._shard_weight_for_tp("blocks.0.att.output.weight", dense_output),
+            )
+        )
+
+    torch.testing.assert_close(torch.cat([s[0] for s in shards])[:5], dense_vocab)
+    torch.testing.assert_close(torch.cat([s[1] for s in shards], dim=0), dense_heads)
+    torch.testing.assert_close(torch.cat([s[2] for s in shards], dim=1), dense_output)
+
+    single = _new_rwkv7_for_weight_tests()
+    single.tp_size = 1
+    assert single._shard_weight_for_tp("head.weight", dense_vocab) is dense_vocab
+
+
+@pytest.mark.parametrize(
+    ("source_format", "update_key"),
+    [
+        ("standard_hf", "emb.weight"),
+        ("legacy_pth", "model.embeddings.weight"),
+    ],
+)
+def test_rwkv7_online_update_cannot_mix_standard_and_legacy_rank_formats(
+    source_format, update_key
+):
+    model = _new_rwkv7_for_weight_tests()
+    model.weight_source_format = source_format
+    model.raw_weight_names = {"emb.weight"}
+    model.raw_weight_shapes = {"emb.weight": (1,)}
+    model.z = {"emb.weight": torch.zeros(1)}
+    model.start_weight_update()
+
+    model.load_weights([(update_key, torch.ones(1))])
+
+    with pytest.raises(ValueError, match="unexpected key"):
+        model.finish_weight_update()
+
+
 def test_rwkv7_default_loader_validation_uses_raw_weight_names():
     model = _new_rwkv7_for_weight_tests()
     model.raw_weight_names = {"emb.weight", "head.weight"}
