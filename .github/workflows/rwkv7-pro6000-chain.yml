@@ -21,10 +21,7 @@ jobs:
       LD_LIBRARY_PATH: /usr/local/cuda/lib64
       HTTP_PROXY: http://127.0.0.1:58011
       HTTPS_PROXY: http://127.0.0.1:58011
-      http_proxy: http://127.0.0.1:58011
-      https_proxy: http://127.0.0.1:58011
       NO_PROXY: 127.0.0.1,localhost
-      no_proxy: 127.0.0.1,localhost
       UV_LINK_MODE: copy
       VLLM_BUILD_PROFILE: rwkv
     steps:
