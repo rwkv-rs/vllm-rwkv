@@ -263,7 +263,7 @@ def test_tiny_hf_artifact_generates_through_public_recurrent_flash_chain(
     test_only_provenance: dict[str, Any],
 ) -> None:
     assert torch.cuda.is_available()
-    assert torch.cuda.device_count() == 1
+    assert torch.accelerator.device_count() == 1
     assert torch.cuda.get_device_name(0) == EXPECTED_GPU_NAME
 
     dependencies = _assert_controlled_test_dependencies()

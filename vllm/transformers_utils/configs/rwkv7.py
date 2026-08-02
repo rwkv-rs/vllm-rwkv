@@ -3,9 +3,9 @@
 
 import hashlib
 import json
-import re
 from collections.abc import Mapping
 
+import regex as re
 from transformers import PretrainedConfig
 
 STANDARD_RWKV7_ARCHITECTURE = "Rwkv7ForCausalLM"

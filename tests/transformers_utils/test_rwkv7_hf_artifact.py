@@ -1052,7 +1052,7 @@ def test_default_loader_nvfp4_candidate_reaches_native_gpu_kernel(
     runtime_name = runtime_target.removeprefix("model.")
     output = model._apply_quantized_linear(runtime_name, input_value)
     assert output is not None
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert torch.isfinite(output).all()
 
     assert type(linear.scheme.kernel) is kernel_type
@@ -1064,7 +1064,7 @@ def test_default_loader_nvfp4_candidate_reaches_native_gpu_kernel(
     else:
         second_output = model._apply_quantized_linear(runtime_name, input_value * 0.5)
         assert second_output is not None
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         assert len(quant_calls) == 2
         assert all(call["backend"] == "cutlass" for call in quant_calls)
         assert all(call["swizzled"] is True for call in quant_calls)
