@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from pathlib import Path
+
 import pytest
+from packaging.requirements import Requirement
 
 from tools.build_profiles import (
     RWKV_EXTENSION_NAMES,
+    RWKV_NVFP4_EXTENSION_NAMES,
     profile_build_temp,
     resolve_build_profile,
     select_extension_names,
@@ -29,12 +33,18 @@ def test_build_profile_accepts_rwkv(monkeypatch: pytest.MonkeyPatch) -> None:
     assert resolve_build_profile() == "rwkv"
 
 
+def test_build_profile_accepts_rwkv_nvfp4(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_BUILD_PROFILE", "rwkv-nvfp4")
+
+    assert resolve_build_profile() == "rwkv-nvfp4"
+
+
 def test_build_profile_rejects_unknown_value(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VLLM_BUILD_PROFILE", "attention")
 
     with pytest.raises(
         ValueError,
-        match=r"attention.*accepted values.*full, rwkv",
+        match=r"attention.*accepted values.*full, rwkv, rwkv-nvfp4",
     ):
         resolve_build_profile()
 
@@ -57,6 +67,9 @@ def test_profiles_select_their_owned_extensions() -> None:
     ]
 
     assert select_extension_names(full_names, "rwkv") == list(RWKV_EXTENSION_NAMES)
+    assert select_extension_names(full_names, "rwkv-nvfp4") == list(
+        RWKV_NVFP4_EXTENSION_NAMES
+    )
     assert select_extension_names(full_names, "full") == full_names
 
 
@@ -64,4 +77,17 @@ def test_switching_profile_forces_cmake_reconfiguration() -> None:
     build_temp = "build/temp.linux-x86_64-cpython-312"
 
     assert profile_build_temp(build_temp, "rwkv") == f"{build_temp}-rwkv"
+    assert profile_build_temp(build_temp, "rwkv-nvfp4") == (f"{build_temp}-rwkv-nvfp4")
     assert profile_build_temp(build_temp, "full") == build_temp
+
+
+def test_rwkv_nvfp4_dependency_delta_is_profile_local() -> None:
+    requirements = Path(__file__).parents[1] / "requirements"
+    dense = (requirements / "rwkv.txt").read_text(encoding="utf-8")
+    nvfp4 = (requirements / "rwkv-nvfp4.txt").read_text(encoding="utf-8")
+
+    assert "compressed-tensors" not in dense
+    assert "-r rwkv.txt" in nvfp4
+    assert Requirement("compressed-tensors==0.17.0") == Requirement(
+        next(line for line in nvfp4.splitlines() if line.startswith("compressed"))
+    )

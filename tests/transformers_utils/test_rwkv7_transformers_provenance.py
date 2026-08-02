@@ -5,7 +5,6 @@ import json
 import os
 import subprocess
 import sys
-import textwrap
 from pathlib import Path
 
 from packaging.requirements import Requirement
@@ -47,39 +46,107 @@ def test_rwkv_profile_pins_transformers_and_operator_forks() -> None:
     )
 
 
-def test_fresh_process_accepts_pinned_rwkv7_or_fails_closed() -> None:
-    code = textwrap.dedent(
-        """
-        import json
-
-        from vllm.transformers_utils.rwkv7_provenance import (
-            validate_transformers_rwkv7_runtime_provenance,
-        )
-
-        try:
-            provenance = validate_transformers_rwkv7_runtime_provenance()
-        except RuntimeError as error:
-            print(json.dumps({"status": "rejected", "error": str(error)}))
-        else:
-            print(json.dumps({"status": "accepted", "provenance": provenance}))
-        """
+def _write_fake_transformers_distribution(
+    root: Path,
+    *,
+    requested_revision: str = TRANSFORMERS_RWKV_REVISION,
+    commit_id: str = TRANSFORMERS_RWKV_REVISION,
+) -> None:
+    package = root / "transformers"
+    rwkv7 = package / "models" / "rwkv7"
+    rwkv7.mkdir(parents=True)
+    (package / "models" / "__init__.py").write_text("", encoding="utf-8")
+    (rwkv7 / "configuration_rwkv7.py").write_text(
+        "class Rwkv7Config:\n    pass\n",
+        encoding="utf-8",
     )
-    completed = subprocess.run(
+    (rwkv7 / "modeling_rwkv7.py").write_text(
+        "\n".join(
+            (
+                "class Rwkv7ForCausalLM:",
+                "    pass",
+                "",
+                "def validate_rwkv7_runtime_provenance():",
+                "    return {",
+                f"        'revision': {FLA_RWKV_REVISION!r},",
+                f"        'flash_rwkv_revision': {FLASH_RWKV_REVISION!r},",
+                "    }",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    (rwkv7 / "__init__.py").write_text(
+        "from .configuration_rwkv7 import Rwkv7Config\n"
+        "from .modeling_rwkv7 import Rwkv7ForCausalLM\n",
+        encoding="utf-8",
+    )
+    (package / "__init__.py").write_text(
+        "from .models.rwkv7 import Rwkv7Config, Rwkv7ForCausalLM\n"
+        "class AutoConfig:\n"
+        "    @staticmethod\n"
+        "    def for_model(name):\n"
+        "        assert name == 'rwkv7'\n"
+        "        return Rwkv7Config()\n"
+        "class AutoModelForCausalLM:\n"
+        "    _model_mapping = {Rwkv7Config: Rwkv7ForCausalLM}\n",
+        encoding="utf-8",
+    )
+
+    dist_info = root / "transformers-0.0.0.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: transformers\nVersion: 0.0.0\n",
+        encoding="utf-8",
+    )
+    (dist_info / "direct_url.json").write_text(
+        json.dumps(
+            {
+                "url": TRANSFORMERS_RWKV_REPOSITORY,
+                "vcs_info": {
+                    "vcs": "git",
+                    "requested_revision": requested_revision,
+                    "commit_id": commit_id,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _run_fresh_provenance(root: Path) -> subprocess.CompletedProcess[str]:
+    repo = Path(__file__).parents[2]
+    code = """
+import json
+from vllm.transformers_utils.rwkv7_provenance import (
+    validate_transformers_rwkv7_runtime_provenance,
+)
+print(json.dumps(validate_transformers_rwkv7_runtime_provenance()))
+"""
+    python_path = os.pathsep.join(
+        [str(root), str(repo), os.environ.get("PYTHONPATH", "")]
+    )
+    return subprocess.run(
         [sys.executable, "-c", code],
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
-        env={**os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
+        cwd=repo,
+        env={
+            **os.environ,
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "PYTHONPATH": python_path,
+        },
     )
-    result = json.loads(completed.stdout.splitlines()[-1])
 
-    if result["status"] == "rejected":
-        assert TRANSFORMERS_RWKV_REQUIREMENT in result["error"] or (
-            "flash-linear-attention[flash-rwkv]" in result["error"]
-        )
-        return
 
-    provenance = result["provenance"]
+def test_fresh_process_accepts_exact_pinned_rwkv7_provenance(tmp_path: Path) -> None:
+    _write_fake_transformers_distribution(tmp_path)
+    completed = _run_fresh_provenance(tmp_path)
+
+    assert completed.returncode == 0, completed.stderr
+    provenance = json.loads(completed.stdout.splitlines()[-1])
     assert provenance["repository"] == TRANSFORMERS_RWKV_REPOSITORY
     assert provenance["revision"] == TRANSFORMERS_RWKV_REVISION
     assert provenance["config_module"] == (
@@ -90,3 +157,17 @@ def test_fresh_process_accepts_pinned_rwkv7_or_fails_closed() -> None:
     )
     assert provenance["operator_runtime"]["revision"] == FLA_RWKV_REVISION
     assert provenance["operator_runtime"]["flash_rwkv_revision"] == FLASH_RWKV_REVISION
+
+
+def test_fresh_process_rejects_wrong_transformers_revision(tmp_path: Path) -> None:
+    wrong_revision = "0" * 40
+    _write_fake_transformers_distribution(
+        tmp_path,
+        requested_revision=wrong_revision,
+        commit_id=wrong_revision,
+    )
+    completed = _run_fresh_provenance(tmp_path)
+
+    assert completed.returncode != 0
+    assert "Transformers provenance mismatch" in completed.stderr
+    assert TRANSFORMERS_RWKV_REQUIREMENT in completed.stderr

@@ -1,0 +1,5 @@
+# RWKV7 schema-v3 NVFP4 Hugging Face artifact inference. Keep the dense RWKV
+# dependency boundary unchanged and add only the canonical packed loader.
+-r rwkv.txt
+
+compressed-tensors==0.17.0
