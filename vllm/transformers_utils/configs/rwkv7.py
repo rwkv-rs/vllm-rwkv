@@ -61,6 +61,43 @@ class RWKV7Config(PretrainedConfig):
         self.max_position_embeddings = max_position_embeddings
 
 
+def _rwkv7_config_value(config: object, name: str) -> object:
+    if isinstance(config, dict):
+        return config.get(name)
+    return getattr(config, name, None)
+
+
+def validate_rwkv7_hf_artifact_config(config: object) -> None:
+    required_values = (
+        "vocab_size",
+        "hidden_size",
+        "head_size",
+        "num_hidden_layers",
+        "max_position_embeddings",
+    )
+    architectures = _rwkv7_config_value(config, "architectures")
+    values = {name: _rwkv7_config_value(config, name) for name in required_values}
+    valid_values = all(
+        not isinstance(value, bool) and isinstance(value, int) and value > 0
+        for value in values.values()
+    )
+    divisible_head_size = valid_values and (
+        int(values["hidden_size"]) % int(values["head_size"]) == 0
+    )
+    if (
+        _rwkv7_config_value(config, "model_type") != "rwkv7"
+        or architectures != ["RWKV7ForCausalLM"]
+        or not valid_values
+        or not divisible_head_size
+    ):
+        raise ValueError(
+            "Invalid RWKV7 Hugging Face artifact config: expected model_type="
+            "'rwkv7', architectures=['RWKV7ForCausalLM'], positive integer "
+            "vocab_size/hidden_size/head_size/num_hidden_layers/"
+            "max_position_embeddings, and hidden_size divisible by head_size."
+        )
+
+
 def try_parse_rwkv7_pth_source(model: str | Path) -> RWKV7PthSource | None:
     model_str = str(model)
     path = Path(model_str)
@@ -111,25 +148,12 @@ def build_rwkv7_config_from_pth(model: str | Path) -> RWKV7Config | None:
                 ) from error
             if not isinstance(raw_config, dict):
                 raise ValueError(f"Invalid RWKV7 checkpoint config: {config_path}")
-            required_values = {
-                "vocab_size",
-                "hidden_size",
-                "head_size",
-                "num_hidden_layers",
-                "max_position_embeddings",
-            }
-            if (
-                raw_config.get("model_type") != "rwkv7"
-                or raw_config.get("architectures") != ["RWKV7ForCausalLM"]
-                or any(
-                    isinstance(raw_config.get(key), bool)
-                    or not isinstance(raw_config.get(key), int)
-                    or raw_config[key] <= 0
-                    for key in required_values
-                )
-                or raw_config["hidden_size"] % raw_config["head_size"] != 0
-            ):
-                raise ValueError(f"Invalid RWKV7 checkpoint config: {config_path}")
+            try:
+                validate_rwkv7_hf_artifact_config(raw_config)
+            except ValueError as error:
+                raise ValueError(
+                    f"Invalid RWKV7 checkpoint config: {config_path}"
+                ) from error
             return RWKV7Config(
                 vocab_size=raw_config["vocab_size"],
                 hidden_size=raw_config["hidden_size"],

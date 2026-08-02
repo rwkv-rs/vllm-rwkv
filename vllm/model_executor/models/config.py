@@ -671,6 +671,15 @@ class MambaModelConfig(VerifyAndUpdateConfig):
 class RWKV7ForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        from vllm.transformers_utils.configs.rwkv7 import (
+            validate_rwkv7_hf_artifact_config,
+        )
+
+        model_config = getattr(vllm_config, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        if hf_config is not None:
+            validate_rwkv7_hf_artifact_config(hf_config)
+
         wkv_mode = envs.VLLM_RWKV7_WKV_MODE
         if wkv_mode not in {"fp16", "fp32io16"}:
             raise ValueError(

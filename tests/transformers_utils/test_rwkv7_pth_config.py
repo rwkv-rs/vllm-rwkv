@@ -3,6 +3,7 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,7 +11,45 @@ from vllm.transformers_utils.config import get_config, get_hf_image_processor_co
 from vllm.transformers_utils.configs import rwkv7
 from vllm.transformers_utils.configs.rwkv7 import (
     try_parse_rwkv7_pth_source,
+    validate_rwkv7_hf_artifact_config,
 )
+
+
+def _standard_rwkv7_hf_config(**overrides: object) -> SimpleNamespace:
+    values = {
+        "architectures": ["RWKV7ForCausalLM"],
+        "model_type": "rwkv7",
+        "vocab_size": 65536,
+        "hidden_size": 2048,
+        "head_size": 64,
+        "num_hidden_layers": 24,
+        "max_position_embeddings": 8192,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_standard_rwkv7_hf_artifact_config_is_accepted() -> None:
+    validate_rwkv7_hf_artifact_config(_standard_rwkv7_hf_config())
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"model_type": "rwkv"},
+        {"architectures": None},
+        {"architectures": ["AutoModelForCausalLM"]},
+        {"hidden_size": 0},
+        {"head_size": 96},
+        {"num_hidden_layers": True},
+        {"max_position_embeddings": None},
+    ],
+)
+def test_invalid_rwkv7_hf_artifact_config_fails_closed(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="Invalid RWKV7 Hugging Face artifact"):
+        validate_rwkv7_hf_artifact_config(_standard_rwkv7_hf_config(**overrides))
 
 
 def test_rwkv7_pth_url_builds_config_from_blinkdl_filename():
