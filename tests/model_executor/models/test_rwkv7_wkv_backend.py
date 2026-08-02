@@ -1,12 +1,94 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import inspect
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+from packaging.requirements import Requirement
 
 from vllm.model_executor.models import rwkv7_wkv_backend
+
+
+def test_rwkv_requirements_pin_fla_and_flashrwkv_source_revisions() -> None:
+    requirements_path = Path(__file__).parents[3] / "requirements" / "rwkv.txt"
+    requirement_lines = [
+        line
+        for line in requirements_path.read_text().splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    requirements = {
+        requirement.name: requirement
+        for line in requirement_lines
+        for requirement in (Requirement(line),)
+    }
+
+    assert requirements["flash-linear-attention"].url == (
+        "git+https://github.com/rwkv-rs/fla-rwkv.git@"
+        f"{rwkv7_wkv_backend.FLA_RWKV_REVISION}"
+    )
+    assert requirements["flash-rwkv"].url == (
+        "git+https://github.com/rwkv-rs/FlashRWKV.git@"
+        f"{rwkv7_wkv_backend.FLASH_RWKV_REVISION}"
+    )
+
+
+def test_real_local_fla_source_exposes_stateful_contract() -> None:
+    checkout_value = os.environ.get("VLLM_TEST_FLA_RWKV_CHECKOUT")
+    if checkout_value is None:
+        pytest.skip("VLLM_TEST_FLA_RWKV_CHECKOUT is not set")
+    checkout = Path(checkout_value).resolve()
+    revision = subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert revision == rwkv7_wkv_backend.FLA_RWKV_REVISION
+
+    script = textwrap.dedent(
+        """
+        import inspect
+        import sys
+
+        sys.path.insert(0, sys.argv[1])
+        from vllm.model_executor.models.rwkv7_wkv_backend import (
+            _load_fla_rwkv7_contract,
+        )
+
+        chunk_rwkv7, _ = _load_fla_rwkv7_contract()
+        parameters = inspect.signature(chunk_rwkv7).parameters
+        assert {"state_indices", "mode"} <= parameters.keys()
+        """
+    )
+    subprocess.run(
+        [sys.executable, "-c", script, str(checkout)],
+        check=True,
+        cwd=Path(__file__).parents[3],
+    )
+
+
+def test_fla_import_error_reports_required_source_revisions(monkeypatch) -> None:
+    def reject_import(name):
+        raise ImportError(name)
+
+    monkeypatch.setattr(
+        rwkv7_wkv_backend.importlib,
+        "import_module",
+        reject_import,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        rwkv7_wkv_backend._load_fla_rwkv7_contract()
+
+    message = str(exc_info.value)
+    assert f"fla-rwkv@{rwkv7_wkv_backend.FLA_RWKV_REVISION}" in message
+    assert f"FlashRWKV@{rwkv7_wkv_backend.FLASH_RWKV_REVISION}" in message
 
 
 def _inputs():
