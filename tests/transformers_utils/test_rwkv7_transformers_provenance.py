@@ -7,10 +7,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from packaging.requirements import Requirement
 
 from vllm.model_executor.models.rwkv7_wkv_backend import (
+    FLA_RWKV_REPOSITORY,
     FLA_RWKV_REVISION,
+    FLASH_RWKV_REPOSITORY,
     FLASH_RWKV_REVISION,
 )
 from vllm.transformers_utils.rwkv7_provenance import (
@@ -39,18 +42,23 @@ def test_rwkv_profile_pins_transformers_and_operator_forks() -> None:
     )
     assert requirements["flash-linear-attention"].extras == {"flash-rwkv"}
     assert requirements["flash-linear-attention"].url == (
-        f"git+https://github.com/rwkv-rs/fla-rwkv.git@{FLA_RWKV_REVISION}"
+        f"git+{FLA_RWKV_REPOSITORY}@{FLA_RWKV_REVISION}"
     )
     assert requirements["flash-rwkv"].url == (
-        f"git+https://github.com/rwkv-rs/FlashRWKV.git@{FLASH_RWKV_REVISION}"
+        f"git+{FLASH_RWKV_REPOSITORY}@{FLASH_RWKV_REVISION}"
     )
 
 
 def _write_fake_transformers_distribution(
     root: Path,
     *,
+    repository_url: str = TRANSFORMERS_RWKV_REPOSITORY,
     requested_revision: str = TRANSFORMERS_RWKV_REVISION,
     commit_id: str = TRANSFORMERS_RWKV_REVISION,
+    fla_repository: str = FLA_RWKV_REPOSITORY,
+    fla_revision: str = FLA_RWKV_REVISION,
+    flash_rwkv_repository: str = FLASH_RWKV_REPOSITORY,
+    flash_rwkv_revision: str = FLASH_RWKV_REVISION,
 ) -> None:
     package = root / "transformers"
     rwkv7 = package / "models" / "rwkv7"
@@ -68,8 +76,10 @@ def _write_fake_transformers_distribution(
                 "",
                 "def validate_rwkv7_runtime_provenance():",
                 "    return {",
-                f"        'revision': {FLA_RWKV_REVISION!r},",
-                f"        'flash_rwkv_revision': {FLASH_RWKV_REVISION!r},",
+                f"        'repository': {fla_repository!r},",
+                f"        'revision': {fla_revision!r},",
+                f"        'flash_rwkv_repository': {flash_rwkv_repository!r},",
+                f"        'flash_rwkv_revision': {flash_rwkv_revision!r},",
                 "    }",
                 "",
             )
@@ -102,7 +112,7 @@ def _write_fake_transformers_distribution(
     (dist_info / "direct_url.json").write_text(
         json.dumps(
             {
-                "url": TRANSFORMERS_RWKV_REPOSITORY,
+                "url": repository_url,
                 "vcs_info": {
                     "vcs": "git",
                     "requested_revision": requested_revision,
@@ -141,8 +151,22 @@ print(json.dumps(validate_transformers_rwkv7_runtime_provenance()))
     )
 
 
-def test_fresh_process_accepts_exact_pinned_rwkv7_provenance(tmp_path: Path) -> None:
-    _write_fake_transformers_distribution(tmp_path)
+@pytest.mark.parametrize(
+    "repository_url",
+    [
+        TRANSFORMERS_RWKV_REPOSITORY,
+        "https://GitHub.COM/RWKV-RS/TRANSFORMERS-RWKV.git",
+        "https://github.com/rwkv-rs/transformers-rwkv",
+        "https://github.com/rwkv-rs/transformers-rwkv/",
+        "git+https://github.com/rwkv-rs/transformers-rwkv.git",
+        "git+https://github.com/RWKV-RS/TRANSFORMERS-RWKV/",
+    ],
+)
+def test_fresh_process_accepts_canonical_pinned_rwkv7_provenance(
+    tmp_path: Path,
+    repository_url: str,
+) -> None:
+    _write_fake_transformers_distribution(tmp_path, repository_url=repository_url)
     completed = _run_fresh_provenance(tmp_path)
 
     assert completed.returncode == 0, completed.stderr
@@ -156,7 +180,39 @@ def test_fresh_process_accepts_exact_pinned_rwkv7_provenance(tmp_path: Path) -> 
         "transformers.models.rwkv7.modeling_rwkv7"
     )
     assert provenance["operator_runtime"]["revision"] == FLA_RWKV_REVISION
+    assert provenance["operator_runtime"]["repository"] == FLA_RWKV_REPOSITORY
     assert provenance["operator_runtime"]["flash_rwkv_revision"] == FLASH_RWKV_REVISION
+    assert (
+        provenance["operator_runtime"]["flash_rwkv_repository"] == FLASH_RWKV_REPOSITORY
+    )
+
+
+@pytest.mark.parametrize(
+    "repository_url",
+    [
+        "https://user@github.com/rwkv-rs/transformers-rwkv.git",
+        "https://github.com:443/rwkv-rs/transformers-rwkv.git",
+        "https://github.com/rwkv-rs/transformers-rwkv.git?ref=main",
+        "https://github.com/rwkv-rs/transformers-rwkv.git#main",
+        "https://github.com/rwkv-rs/transformers-rwkvé.git",
+        "https://github.com/rwkv-rs%2Ftransformers-rwkv.git",
+        "https://github.com/rwkv-rs//transformers-rwkv.git",
+        "https://example.com/rwkv-rs/transformers-rwkv.git",
+        "https://github.com/some-fork/transformers-rwkv.git",
+        "https://github.com/rwkv-rs/another-repository.git",
+        "https://github.com/rwkv-rs/transformers-rwkv.git.git",
+    ],
+)
+def test_fresh_process_rejects_noncanonical_rwkv7_repository(
+    tmp_path: Path,
+    repository_url: str,
+) -> None:
+    _write_fake_transformers_distribution(tmp_path, repository_url=repository_url)
+    completed = _run_fresh_provenance(tmp_path)
+
+    assert completed.returncode != 0
+    assert "Transformers provenance mismatch" in completed.stderr
+    assert TRANSFORMERS_RWKV_REQUIREMENT in completed.stderr
 
 
 def test_fresh_process_rejects_wrong_transformers_revision(tmp_path: Path) -> None:
@@ -171,3 +227,23 @@ def test_fresh_process_rejects_wrong_transformers_revision(tmp_path: Path) -> No
     assert completed.returncode != 0
     assert "Transformers provenance mismatch" in completed.stderr
     assert TRANSFORMERS_RWKV_REQUIREMENT in completed.stderr
+
+
+@pytest.mark.parametrize(
+    "operator_overrides",
+    [
+        {"fla_revision": "0" * 40},
+        {"flash_rwkv_revision": "0" * 40},
+        {"fla_repository": "https://github.com/some-fork/fla-rwkv.git"},
+        {"flash_rwkv_repository": ("https://github.com/some-fork/FlashRWKV.git")},
+    ],
+)
+def test_fresh_process_rejects_mismatched_operator_provenance(
+    tmp_path: Path,
+    operator_overrides: dict[str, str],
+) -> None:
+    _write_fake_transformers_distribution(tmp_path, **operator_overrides)
+    completed = _run_fresh_provenance(tmp_path)
+
+    assert completed.returncode != 0
+    assert "RWKV7 operator provenance mismatch" in completed.stderr

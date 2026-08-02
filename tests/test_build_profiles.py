@@ -13,6 +13,9 @@ from tools.build_profiles import (
     resolve_build_profile,
     select_extension_names,
 )
+from vllm.transformers_utils.configs.rwkv7 import (
+    RWKV7_COMPRESSED_TENSORS_VERSION,
+)
 
 
 def test_build_profile_defaults_to_full(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -88,6 +91,8 @@ def test_rwkv_nvfp4_dependency_delta_is_profile_local() -> None:
 
     assert "compressed-tensors" not in dense
     assert "-r rwkv.txt" in nvfp4
-    assert Requirement("compressed-tensors==0.17.0") == Requirement(
+    assert Requirement(
+        f"compressed-tensors=={RWKV7_COMPRESSED_TENSORS_VERSION}"
+    ) == Requirement(
         next(line for line in nvfp4.splitlines() if line.startswith("compressed"))
     )

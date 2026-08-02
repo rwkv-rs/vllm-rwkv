@@ -26,6 +26,8 @@ from vllm.model_executor.models.rwkv7 import RWKV7ForCausalLM
 from vllm.tokenizers.rwkv import RWKVTokenizer
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.configs.rwkv7 import (
+    RWKV7_COMPRESSED_TENSORS_VERSION,
+    RWKV7_NVFP4_CONSUMER_SEMANTIC_REVISION,
     RWKV7_SUPPORTED_PACKED_FORMATS,
     RWKV7Config,
     rwkv7_checkpoint_weight_shapes,
@@ -175,7 +177,7 @@ def _nvfp4_consumer_config(
                 "candidate": candidate,
                 "targets": targets,
                 "framework_versions": {
-                    "compressed_tensors": "0.17.2.a20260731",
+                    "compressed_tensors": RWKV7_COMPRESSED_TENSORS_VERSION,
                     "transformers": "5.15.0.dev0",
                 },
             },
@@ -198,7 +200,7 @@ def _nvfp4_consumer_config(
                 consumer,
             ],
             "vllm_consumer_requirement": consumer,
-            "vllm_consumer_revision": "1" * 40,
+            "vllm_consumer_revision": RWKV7_NVFP4_CONSUMER_SEMANTIC_REVISION,
             "legacy_pth_direct_load": False,
             "quantization_target_type": "Linear",
             "linear_weight_suffix": "weight",
@@ -306,6 +308,12 @@ def test_rwkv7_schema_v3_quantization_metadata_is_validated() -> None:
     validate_rwkv7_hf_artifact_config(config)
 
 
+def test_rwkv7_nvfp4_consumer_revision_is_immutable_semantic_parent() -> None:
+    assert RWKV7_NVFP4_CONSUMER_SEMANTIC_REVISION == (
+        "6df9bfb41d7ec091fc9e13210ca4249389518114"
+    )
+
+
 @pytest.mark.parametrize(
     ("case", "match"),
     [
@@ -361,7 +369,7 @@ def test_invalid_rwkv7_quantization_metadata_fails_closed(
     elif case == "candidate":
         metadata["candidate"] = "nvfp4-w4a16"
     elif case == "consumer":
-        vllm_metadata["vllm_consumer_revision"] = None
+        vllm_metadata["vllm_consumer_revision"] = "1" * 40
     elif case == "consumer_capability":
         vllm_metadata["consumer_capabilities"] = [
             "transformers-rwkv-compressed-tensors"

@@ -11,8 +11,13 @@ from typing import Any
 
 import torch
 
-FLA_RWKV_REVISION = "a4a8aa98df6ec5322f194a80ec57363dd045adfc"
-FLASH_RWKV_REVISION = "866aafd2eed146b0eda1ce03444009ae030f89e3"
+from vllm.transformers_utils.rwkv7_runtime_contract import (
+    FLA_RWKV_REPOSITORY,
+    FLA_RWKV_REVISION,
+    FLASH_RWKV_REPOSITORY,
+    FLASH_RWKV_REVISION,
+)
+
 _REQUIRED_RECURRENT_PARAMETERS = frozenset(
     {
         "initial_state",
@@ -143,7 +148,9 @@ def run_fla_rwkv7_recurrent(
 
 
 __all__ = [
+    "FLASH_RWKV_REPOSITORY",
     "FLASH_RWKV_REVISION",
+    "FLA_RWKV_REPOSITORY",
     "FLA_RWKV_REVISION",
     "run_fla_rwkv7_recurrent",
 ]
