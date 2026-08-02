@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only RWKV7 model."""
 
+import math
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.models.rwkv7_wkv_backend import run_fla_rwkv7_stateful
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.rwkv7 import (
     rwkv7_checkpoint_weight_shapes,
@@ -2147,48 +2149,33 @@ class RWKV7ForCausalLM(nn.Module):
         y: torch.Tensor,
         elapsed_t: torch.Tensor,
     ) -> None:
-        """Run the canonical packed-varlen WKV operator for this precision."""
+        """Run the FLA-owned packed-varlen WKV operator."""
+        del elapsed_t
         hidden_size = r.shape[-1]
-        r_rows = r.view(-1, hidden_size).contiguous()
-        w_rows = w.view(-1, hidden_size).contiguous()
-        k_rows = k.view(-1, hidden_size).contiguous()
-        v_rows = v.view(-1, hidden_size).contiguous()
-        neg_kk_rows = neg_kk.view(-1, hidden_size).contiguous()
-        kka_rows = kka.view(-1, hidden_size).contiguous()
-        y_rows = y.view(-1, hidden_size)
-        if self.wkv_mode == "fp32io16":
-            w_rows = torch.ops.rwkv7_fast_ops_fp16.add_vec(
-                hidden_size,
-                w_rows,
-                w0,
+        if hidden_size % self.head_size != 0:
+            raise ValueError(
+                f"RWKV7 hidden size {hidden_size} is not divisible by head size "
+                f"{self.head_size}"
             )
-            torch.ops.rwkv7_wkv_fp32_v2.wkv(
-                query_start_loc,
-                slot_indices,
-                state,
-                r_rows,
-                w_rows,
-                k_rows,
-                v_rows,
-                neg_kk_rows,
-                kka_rows,
-                y_rows,
-            )
-            return
-        torch.ops.rwkv7_wkv_fp16_v2.wkv(
-            query_start_loc,
-            slot_indices,
-            state,
-            r_rows,
-            w_rows,
-            w0,
-            k_rows,
-            v_rows,
-            neg_kk_rows,
-            kka_rows,
-            y_rows,
-            elapsed_t,
+        total_tokens = r.numel() // hidden_size
+        packed_shape = (1, total_tokens, hidden_size // self.head_size, self.head_size)
+        decay_logits = w.view(-1, hidden_size) + w0.view(1, hidden_size)
+        log_decay = (-math.exp(-0.5) * torch.sigmoid(decay_logits.float())).to(
+            dtype=w.dtype
         )
+        output = run_fla_rwkv7_stateful(
+            r.view(packed_shape).contiguous(),
+            log_decay.view(packed_shape).contiguous(),
+            k.view(packed_shape).contiguous(),
+            v.view(packed_shape).contiguous(),
+            neg_kk.view(packed_shape).contiguous(),
+            kka.view(packed_shape).contiguous(),
+            state_pool=state,
+            cu_seqlens=query_start_loc,
+            state_indices=slot_indices,
+            mode=self.wkv_mode,
+        )
+        y.copy_(output.view_as(y))
 
     def tmix(
         self,
