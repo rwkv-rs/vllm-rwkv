@@ -244,7 +244,9 @@ def test_rwkv7_auxiliary_tuned_shape_guards() -> None:
 
 
 @pytest.mark.parametrize("wkv_mode", ["fp16", "fp32io16"])
-def test_rwkv7_run_wkv_passes_packed_state_pool_to_fla(monkeypatch, wkv_mode) -> None:
+def test_rwkv7_run_wkv_passes_packed_state_pool_to_recurrent_backend(
+    monkeypatch, wkv_mode
+) -> None:
     query_start_loc = torch.tensor([0, 2, 3], dtype=torch.int32)
     slot_indices = torch.tensor([3, 1], dtype=torch.int32)
     state_dtype = torch.float32 if wkv_mode == "fp32io16" else torch.float16
@@ -261,7 +263,7 @@ def test_rwkv7_run_wkv_passes_packed_state_pool_to_fla(monkeypatch, wkv_mode) ->
         calls.append((args, kwargs))
         return expected_output
 
-    monkeypatch.setattr(rwkv7, "run_fla_rwkv7_stateful", run_fla)
+    monkeypatch.setattr(rwkv7, "run_fla_rwkv7_recurrent", run_fla)
     model = _new_rwkv7_forward_test_model(
         wkv_mode=wkv_mode,
         hidden_size=128,
