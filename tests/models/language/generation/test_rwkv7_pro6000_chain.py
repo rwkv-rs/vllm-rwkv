@@ -5,11 +5,14 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import os
 from collections import defaultdict
+from collections.abc import Iterator
 from importlib import metadata as importlib_metadata
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -27,7 +30,7 @@ NORMALIZED_PROMPT_TOKEN_IDS = [BOS_TOKEN_ID, *PROMPT_TOKEN_IDS]
 RECURRENT_DECODE_STEPS = 2
 GENERATED_TOKENS = RECURRENT_DECODE_STEPS + 1
 
-pytestmark = pytest.mark.skipif(
+requires_pro6000_chain = pytest.mark.skipif(
     os.getenv("RWKV7_RUN_PRO6000_CHAIN") != "1",
     reason="set RWKV7_RUN_PRO6000_CHAIN=1 in the focused PRO6000 job",
 )
@@ -67,12 +70,11 @@ def _assert_controlled_test_dependencies() -> dict[str, dict[str, str]]:
 
 def _install_test_only_provenance(
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    hf_rwkv7: Any,
+    vllm_provenance: Any,
 ) -> dict[str, Any]:
     """Point validators at installed test heads without changing product pins."""
-    import transformers.models.rwkv7.modeling_rwkv7 as hf_rwkv7
-
-    import vllm.transformers_utils.rwkv7_provenance as vllm_provenance
-
     monkeypatch.setattr(
         hf_rwkv7,
         "RWKV7_FLA_REVISION",
@@ -117,6 +119,97 @@ def _install_test_only_provenance(
     return vllm_provenance.validate_transformers_rwkv7_runtime_provenance()
 
 
+@contextlib.contextmanager
+def _test_only_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    hf_rwkv7: Any,
+    vllm_provenance: Any,
+) -> Iterator[dict[str, Any]]:
+    try:
+        yield _install_test_only_provenance(
+            monkeypatch,
+            hf_rwkv7=hf_rwkv7,
+            vllm_provenance=vllm_provenance,
+        )
+    finally:
+        hf_rwkv7._load_fla_rwkv7_contract.cache_clear()
+        vllm_provenance.validate_transformers_rwkv7_runtime_provenance.cache_clear()
+
+
+@pytest.fixture
+def test_only_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[dict[str, Any]]:
+    import transformers.models.rwkv7.modeling_rwkv7 as hf_rwkv7
+
+    import vllm.transformers_utils.rwkv7_provenance as vllm_provenance
+
+    with _test_only_provenance(
+        monkeypatch,
+        hf_rwkv7=hf_rwkv7,
+        vllm_provenance=vllm_provenance,
+    ) as provenance:
+        yield provenance
+
+
+def test_test_only_provenance_does_not_leak_into_later_validation() -> None:
+    @functools.cache
+    def fake_hf_contract() -> str:
+        return fake_hf_rwkv7.RWKV7_FLA_REVISION
+
+    fake_hf_rwkv7 = SimpleNamespace(
+        RWKV7_FLA_REVISION="product-fla",
+        RWKV7_FLA_REQUIREMENT="product-requirement",
+        RWKV7_FLASH_RWKV_REVISION="product-flash",
+        _load_fla_rwkv7_contract=fake_hf_contract,
+    )
+
+    @functools.cache
+    def fake_validator() -> dict[str, str]:
+        return {
+            "transformers": fake_vllm_provenance.TRANSFORMERS_RWKV_REVISION,
+            "fla": fake_vllm_provenance.FLA_RWKV_REVISION,
+            "flash": fake_vllm_provenance.FLASH_RWKV_REVISION,
+            "hf_fla": fake_hf_contract(),
+        }
+
+    fake_vllm_provenance = SimpleNamespace(
+        TRANSFORMERS_RWKV_REVISION="product-transformers",
+        TRANSFORMERS_RWKV_REQUIREMENT="product-requirement",
+        FLA_RWKV_REVISION="product-fla",
+        FLASH_RWKV_REVISION="product-flash",
+        validate_transformers_rwkv7_runtime_provenance=fake_validator,
+    )
+    product_provenance = fake_validator()
+    fake_validator.cache_clear()
+    fake_hf_contract.cache_clear()
+
+    for _ in range(2):
+        with pytest.MonkeyPatch.context() as provenance_patch:
+            with _test_only_provenance(
+                provenance_patch,
+                hf_rwkv7=fake_hf_rwkv7,
+                vllm_provenance=fake_vllm_provenance,
+            ) as synthetic_provenance:
+                assert synthetic_provenance != product_provenance
+                assert fake_validator.cache_info().currsize == 1
+                assert fake_hf_contract.cache_info().currsize == 1
+
+            assert fake_validator.cache_info().currsize == 0
+            assert fake_hf_contract.cache_info().currsize == 0
+
+        assert (
+            product_provenance["transformers"]
+            == fake_vllm_provenance.TRANSFORMERS_RWKV_REVISION
+        )
+        assert product_provenance["fla"] == fake_vllm_provenance.FLA_RWKV_REVISION
+        assert product_provenance["flash"] == fake_vllm_provenance.FLASH_RWKV_REVISION
+        assert product_provenance["hf_fla"] == fake_hf_rwkv7.RWKV7_FLA_REVISION
+        assert fake_hf_contract() == product_provenance["hf_fla"]
+        assert fake_validator() == product_provenance
+
+
 def _write_tiny_standard_hf_artifact(artifact: Path) -> None:
     from transformers.models.rwkv7 import Rwkv7Config, Rwkv7ForCausalLM
 
@@ -148,6 +241,7 @@ def _write_tiny_standard_hf_artifact(artifact: Path) -> None:
     assert not list(artifact.glob("*.pth"))
 
 
+@requires_pro6000_chain
 def test_controlled_heads_remain_rejected_by_final_product_provenance() -> None:
     """The development chain must never silently become the product chain."""
     from vllm.transformers_utils.rwkv7_provenance import (
@@ -162,16 +256,18 @@ def test_controlled_heads_remain_rejected_by_final_product_provenance() -> None:
         validate_transformers_rwkv7_runtime_provenance()
 
 
+@requires_pro6000_chain
 def test_tiny_hf_artifact_generates_through_public_recurrent_flash_chain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    test_only_provenance: dict[str, Any],
 ) -> None:
     assert torch.cuda.is_available()
     assert torch.cuda.device_count() == 1
     assert torch.cuda.get_device_name(0) == EXPECTED_GPU_NAME
 
     dependencies = _assert_controlled_test_dependencies()
-    provenance = _install_test_only_provenance(monkeypatch)
+    provenance = test_only_provenance
     assert provenance["config_module"] == (
         "transformers.models.rwkv7.configuration_rwkv7"
     )
