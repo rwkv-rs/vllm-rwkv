@@ -14,7 +14,7 @@ RWKV7_KNOWN_PACKED_FORMATS = frozenset(("nvfp4-pack-quantized", "pack-quantized"
 # RWKV7 owns dense custom GEMM tensors rather than vLLM LinearBase modules.
 # Add a format here only after that runtime consumes the corresponding
 # compressed-tensors scheme without dequantizing it through private glue.
-RWKV7_SUPPORTED_PACKED_FORMATS: frozenset[str] = frozenset()
+RWKV7_SUPPORTED_PACKED_FORMATS = frozenset(("nvfp4-pack-quantized",))
 _RWKV7_LOW_RANK_MODULE_RE = re.compile(
     r"^model\.blocks\.\d+\.att\."
     r"(?:w1|w2|a1|a2|v1|v2|g1|g2)$"
@@ -247,11 +247,11 @@ def validate_rwkv7_quantization_artifact_metadata(config: object) -> str | None:
     return str(packed_format)
 
 
-def validate_rwkv7_quantization_artifact_for_load(config: object) -> None:
+def validate_rwkv7_quantization_artifact_for_load(config: object) -> str | None:
     """Reject packed formats that the dense RWKV7 runtime cannot execute."""
     packed_format = validate_rwkv7_quantization_artifact_metadata(config)
     if packed_format is None or packed_format in RWKV7_SUPPORTED_PACKED_FORMATS:
-        return
+        return packed_format
     blackwell_gate = (
         " Blackwell kernel, quality, and performance validation is still required."
         if packed_format == "nvfp4-pack-quantized"

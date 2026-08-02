@@ -4,7 +4,7 @@
 
 import math
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,13 +22,16 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models.rwkv7_wkv_backend import run_fla_rwkv7_stateful
+from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.rwkv7 import (
     rwkv7_checkpoint_weight_shapes,
     rwkv7_hf_to_internal_weight_name,
     rwkv7_is_legacy_low_rank_weight_name,
+    validate_rwkv7_quantization_artifact_for_load,
 )
 
 logger = init_logger(__name__)
@@ -45,6 +48,11 @@ LOWRANK_SUFFIXES = (
     "att.g2",
     "att.v1",
     "att.v2",
+)
+RWKV7_QUANTIZED_LINEAR_SUFFIXES = (
+    ".ffn.key",
+    ".ffn.value",
+    *(f".{suffix}" for suffix in LOWRANK_SUFFIXES),
 )
 LOWRANK_IN_ROWS_T = 7
 LOWRANK_OUT_ROWS_T = 4
@@ -198,6 +206,7 @@ class RWKV7ForCausalLM(nn.Module):
         self.config = vllm_config.model_config.hf_config
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
+        self.quant_config = getattr(vllm_config, "quant_config", None)
         self.prefix = prefix
         self._validate_torch_compile_unsupported()
 
@@ -245,8 +254,119 @@ class RWKV7ForCausalLM(nn.Module):
         self.wkv_mode = self.execution_profile.wkv_mode
         self.wkv_state_dtype = self.execution_profile.wkv_state_dtype
         self.allow_fp16_accumulation = self.execution_profile.allow_fp16_accumulation
+        self._quantized_linears: dict[str, ReplicatedLinear] = {}
+        self._initialize_quantized_linears()
         self.logits_processor = LogitsProcessor(vocab_size, logits_as_input=True)
         self.register_buffer("_dummy_param", torch.empty(0), persistent=False)
+
+    @staticmethod
+    def _register_module_path(
+        root: nn.Module,
+        path: str,
+        module: nn.Module,
+    ) -> None:
+        parts = path.split(".")
+        parent = root
+        for part in parts[:-1]:
+            child = parent._modules.get(part)
+            if child is None:
+                child = nn.Module()
+                parent.add_module(part, child)
+            parent = child
+        parent.add_module(parts[-1], module)
+
+    @staticmethod
+    def _is_supported_quantized_linear_target(target: str) -> bool:
+        parts = target.split(".")
+        return (
+            len(parts) >= 5
+            and parts[0] == "model"
+            and parts[1] == "blocks"
+            and parts[2].isdigit()
+            and target.endswith(RWKV7_QUANTIZED_LINEAR_SUFFIXES)
+        )
+
+    def _initialize_quantized_linears(self) -> None:
+        packed_format = validate_rwkv7_quantization_artifact_for_load(self.config)
+        if packed_format is None:
+            return
+        if self.quant_config is None or self.quant_config.get_name() != (
+            "compressed-tensors"
+        ):
+            raise RuntimeError(
+                "RWKV7 schema-v3 NVFP4 artifacts require vLLM's "
+                "compressed-tensors quantization config"
+            )
+        if self.tp_size != 1:
+            raise RuntimeError(
+                "RWKV7 compressed-tensors NVFP4 currently supports "
+                "tensor_parallel_size=1 only"
+            )
+
+        contract = self.config.rwkv7_quantization_metadata
+        if not isinstance(contract, Mapping):
+            raise RuntimeError("RWKV7 quantization metadata was not preserved")
+        loader_metadata = contract.get("vllm")
+        if not isinstance(loader_metadata, Mapping):
+            raise RuntimeError("RWKV7 quantization loader metadata is missing")
+        targets = loader_metadata.get("quantized_modules")
+        if not isinstance(targets, list):
+            raise RuntimeError("RWKV7 quantized module inventory is missing")
+
+        expected_shapes = rwkv7_checkpoint_weight_shapes(self.config)
+        for target in targets:
+            if not isinstance(
+                target, str
+            ) or not self._is_supported_quantized_linear_target(target):
+                raise RuntimeError(
+                    "RWKV7 NVFP4 target is not yet supported by the standard "
+                    f"compressed-tensors consumer: {target!r}"
+                )
+            weight_name = f"{target}.weight"
+            shape = expected_shapes.get(weight_name)
+            if shape is None or len(shape) != 2:
+                raise RuntimeError(
+                    f"RWKV7 NVFP4 target has no standard Linear shape: {target!r}"
+                )
+            output_size, input_size = shape
+            linear = ReplicatedLinear(
+                input_size=input_size,
+                output_size=output_size,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=target,
+                return_bias=False,
+                disable_tp=True,
+            )
+            self._register_module_path(self, target, linear)
+            self._quantized_linears[target] = linear
+
+    def _quantized_target_for_checkpoint_name(self, name: str) -> str | None:
+        for target in self._quantized_linears:
+            if name.startswith(f"{target}."):
+                return target
+        return None
+
+    def _quantized_linear_for_runtime_name(
+        self,
+        runtime_name: str,
+    ) -> ReplicatedLinear | None:
+        return getattr(self, "_quantized_linears", {}).get(f"model.{runtime_name}")
+
+    def _apply_quantized_linear(
+        self,
+        runtime_name: str,
+        value: torch.Tensor,
+    ) -> torch.Tensor | None:
+        linear = self._quantized_linear_for_runtime_name(runtime_name)
+        if linear is None:
+            return None
+        output = linear(value)
+        if not isinstance(output, torch.Tensor):
+            raise RuntimeError(
+                f"RWKV7 quantized Linear {runtime_name!r} returned a bias tuple"
+            )
+        return output
 
     def _get_layer_range(self) -> tuple[int, int]:
         parallel_config = getattr(self.vllm_config, "parallel_config", None)
@@ -403,6 +523,12 @@ class RWKV7ForCausalLM(nn.Module):
         return RWKV7ModelState
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        quantized_linears = getattr(self, "_quantized_linears", {})
+        if quantized_linears and hasattr(self, "_pending_weight_update"):
+            raise RuntimeError(
+                "RWKV7 packed compressed-tensors weights do not support online "
+                "checkpoint-format updates"
+            )
         if hasattr(self, "_pending_weight_update"):
             pending = self._pending_weight_update
             loaded_names = set()
@@ -457,11 +583,45 @@ class RWKV7ForCausalLM(nn.Module):
                     pending.setdefault(name, None)
             return loaded_names
 
-        checkpoint_weights, loaded_names = self._normalize_checkpoint_weights(weights)
-        self.checkpoint_weight_names = set(loaded_names)
-        self.checkpoint_weight_shapes = {
-            name: tuple(weight.shape) for name, weight in checkpoint_weights.items()
+        checkpoint_shapes: dict[str, tuple[int, ...]] = {}
+        dense_weights: list[tuple[str, torch.Tensor]] = []
+
+        def packed_weights() -> Iterable[tuple[str, torch.Tensor]]:
+            for name, weight in weights:
+                checkpoint_shapes[name] = tuple(weight.shape)
+                if self._quantized_target_for_checkpoint_name(name) is not None:
+                    yield name, weight
+                else:
+                    dense_weights.append((name, weight))
+
+        packed_loaded = (
+            AutoWeightsLoader(self).load_weights(packed_weights())
+            if quantized_linears
+            else set()
+        )
+        expected_packed = {
+            f"{target}.{parameter_name}"
+            for target, linear in quantized_linears.items()
+            for parameter_name, _ in linear.named_parameters(recurse=False)
         }
+        missing_packed = expected_packed - packed_loaded
+        if missing_packed:
+            raise ValueError(
+                "RWKV7 NVFP4 artifact is missing compressed-tensors parameters: "
+                f"{sorted(missing_packed)}"
+            )
+        if not quantized_linears:
+            dense_weights = list(weights)
+            checkpoint_shapes = {
+                name: tuple(weight.shape) for name, weight in dense_weights
+            }
+
+        checkpoint_weights, dense_loaded = self._normalize_checkpoint_weights(
+            dense_weights
+        )
+        loaded_names = packed_loaded | dense_loaded
+        self.checkpoint_weight_names = set(loaded_names)
+        self.checkpoint_weight_shapes = checkpoint_shapes
         z = self._checkpoint_weights_to_runtime_layout(checkpoint_weights)
         self._preprocess_weights(z)
         self._commit_preprocessed_weights(z)
@@ -505,7 +665,10 @@ class RWKV7ForCausalLM(nn.Module):
         return runtime_weights
 
     def _expected_checkpoint_weight_shapes(self) -> dict[str, tuple[int, ...]]:
-        return rwkv7_checkpoint_weight_shapes(self.config)
+        expected = rwkv7_checkpoint_weight_shapes(self.config)
+        for target in getattr(self, "_quantized_linears", {}):
+            expected.pop(f"{target}.weight", None)
+        return expected
 
     def _validate_standard_hf_weights(self, weights: dict[str, torch.Tensor]) -> None:
         expected = self._expected_checkpoint_weight_shapes()
@@ -526,6 +689,11 @@ class RWKV7ForCausalLM(nn.Module):
 
     def start_weight_update(self) -> bool:
         """Handle checkpoint-format dense weight update chunks internally."""
+        if getattr(self, "_quantized_linears", {}):
+            raise RuntimeError(
+                "RWKV7 packed compressed-tensors weights do not support online "
+                "checkpoint-format updates"
+            )
         if hasattr(self, "_pending_weight_update"):
             raise RuntimeError("RWKV7 weight update is already active")
         streaming_weight_update = self._can_stream_weight_update()
@@ -1894,8 +2062,16 @@ class RWKV7ForCausalLM(nn.Module):
         r, k, v = self.project_att_rkv(xr, xk, xv, p, path.rows)
         local_c = r.shape[-1]
         local_h = local_c // self.head_size
-        use_lowrank_in = can_use_lowrank_fused(self.hidden_size, path.rows)
-        use_lowrank_out = can_use_lowrank_out_fused(self.hidden_size, path.rows)
+        has_quantized_lowrank = any(
+            self._quantized_linear_for_runtime_name(p + name) is not None
+            for name in ("w1", "w2", "a1", "a2", "g1", "g2", "v1", "v2")
+        )
+        use_lowrank_in = not has_quantized_lowrank and can_use_lowrank_fused(
+            self.hidden_size, path.rows
+        )
+        use_lowrank_out = not has_quantized_lowrank and can_use_lowrank_out_fused(
+            self.hidden_size, path.rows
+        )
 
         v1 = None
         if use_lowrank_in and use_lowrank_out and layer != 0:
@@ -1919,9 +2095,27 @@ class RWKV7ForCausalLM(nn.Module):
                 z[p + "g1.t"],
             )
         else:
-            w1 = self.linear_rank_in(xw, z.get(p + "w1"), z.get(p + "w1.t"), path.rows)
-            a1 = self.linear_rank_in(xa, z.get(p + "a1"), z.get(p + "a1.t"), path.rows)
-            g1 = self.linear_rank_in(xg, z.get(p + "g1"), z.get(p + "g1.t"), path.rows)
+            w1 = self.linear_rank_in(
+                xw,
+                z.get(p + "w1"),
+                z.get(p + "w1.t"),
+                path.rows,
+                p + "w1",
+            )
+            a1 = self.linear_rank_in(
+                xa,
+                z.get(p + "a1"),
+                z.get(p + "a1.t"),
+                path.rows,
+                p + "a1",
+            )
+            g1 = self.linear_rank_in(
+                xg,
+                z.get(p + "g1"),
+                z.get(p + "g1.t"),
+                path.rows,
+                p + "g1",
+            )
 
         v_done = False
         if use_lowrank_out and layer != 0 and v1 is not None:
@@ -1950,11 +2144,27 @@ class RWKV7ForCausalLM(nn.Module):
             )
         else:
             w = self.linear_rank_out_act(
-                w1, z.get(p + "w2"), z.get(p + "w2.t"), path.rows, 1
+                w1,
+                z.get(p + "w2"),
+                z.get(p + "w2.t"),
+                path.rows,
+                1,
+                p + "w2",
             )
-            a = self.linear_rank_out(a1, z.get(p + "a2"), z.get(p + "a2.t"), path.rows)
+            a = self.linear_rank_out(
+                a1,
+                z.get(p + "a2"),
+                z.get(p + "a2.t"),
+                path.rows,
+                p + "a2",
+            )
             g = self.linear_rank_out_act(
-                g1, z.get(p + "g2"), z.get(p + "g2.t"), path.rows, 2
+                g1,
+                z.get(p + "g2"),
+                z.get(p + "g2.t"),
+                path.rows,
+                2,
+                p + "g2",
             )
 
         value_shape = (batch_size, time_steps, local_c)
@@ -1987,7 +2197,11 @@ class RWKV7ForCausalLM(nn.Module):
             if use_lowrank_out:
                 if v1 is None:
                     v1 = self.linear_rank_in(
-                        xv, z.get(p + "v1"), z.get(p + "v1.t"), path.rows
+                        xv,
+                        z.get(p + "v1"),
+                        z.get(p + "v1.t"),
+                        path.rows,
+                        p + "v1",
                     )
                 v = torch.ops.rwkv7_v3a_ops.linear_t_vres_f16(
                     v1.contiguous(),
@@ -1999,11 +2213,16 @@ class RWKV7ForCausalLM(nn.Module):
             else:
                 v12 = self.linear_rank_out(
                     self.linear_rank_in(
-                        xv, z.get(p + "v1"), z.get(p + "v1.t"), path.rows
+                        xv,
+                        z.get(p + "v1"),
+                        z.get(p + "v1.t"),
+                        path.rows,
+                        p + "v1",
                     ),
                     z.get(p + "v2"),
                     z.get(p + "v2.t"),
                     path.rows,
+                    p + "v2",
                 )
                 v = ops.tmix_vres_gate(
                     batch_size,
@@ -2326,6 +2545,29 @@ class RWKV7ForCausalLM(nn.Module):
         z = self.z
         ops = torch.ops.rwkv7_fast_ops_fp16
         B, T, _ = mixed.shape
+        quantized_key = self._apply_quantized_linear(p + "key", mixed)
+        quantized_value = self._quantized_linear_for_runtime_name(p + "value")
+        if quantized_key is not None or quantized_value is not None:
+            hid = (
+                quantized_key
+                if quantized_key is not None
+                else self.linear(mixed, z[p + "key.weight"])
+            )
+            activated = ops.relu_square(hid.contiguous())
+            out = (
+                quantized_value(activated)
+                if quantized_value is not None
+                else self.linear_ffn_down(
+                    activated,
+                    z[p + "value.weight"],
+                    path.rows,
+                )
+            )
+            if not isinstance(out, torch.Tensor):
+                raise RuntimeError(
+                    f"RWKV7 quantized Linear {p + 'value'!r} returned a bias tuple"
+                )
+            return self._tp_all_reduce(out)
         if path.cmix_mode == CMIX_B1T1_NOFC:
             key_weight = z[p + "key.weight"]
             value_weight = z[p + "value.weight"]
@@ -2490,8 +2732,22 @@ class RWKV7ForCausalLM(nn.Module):
         return self.linear(x, weight)
 
     def linear_rank_in(
-        self, x: torch.Tensor, weight: torch.Tensor, weight_t: torch.Tensor, rows: int
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor | None,
+        weight_t: torch.Tensor | None,
+        rows: int,
+        runtime_name: str | None = None,
     ) -> torch.Tensor:
+        quantized = (
+            self._apply_quantized_linear(runtime_name, x)
+            if runtime_name is not None
+            else None
+        )
+        if quantized is not None:
+            return quantized
+        if weight is None or weight_t is None:
+            raise RuntimeError(f"RWKV7 dense Linear {runtime_name!r} is missing")
         if rows <= LOWRANK_IN_ROWS_T:
             return torch.ops.rwkv7_v3a_ops.linear_t_f16(x.contiguous(), weight_t)
         cfg = LOWRANK_IN_FP16_LT_4096.get((rows, weight.size(1)))
@@ -2512,8 +2768,22 @@ class RWKV7ForCausalLM(nn.Module):
         return self.linear(x, weight)
 
     def linear_rank_out(
-        self, x: torch.Tensor, weight: torch.Tensor, weight_t: torch.Tensor, rows: int
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor | None,
+        weight_t: torch.Tensor | None,
+        rows: int,
+        runtime_name: str | None = None,
     ) -> torch.Tensor:
+        quantized = (
+            self._apply_quantized_linear(runtime_name, x)
+            if runtime_name is not None
+            else None
+        )
+        if quantized is not None:
+            return quantized
+        if weight is None or weight_t is None:
+            raise RuntimeError(f"RWKV7 dense Linear {runtime_name!r} is missing")
         if self.hidden_size >= LOWRANK_FUSED_MIN_C and rows <= LOWRANK_OUT_ROWS_T:
             return torch.ops.rwkv7_v3a_ops.linear_t_f16(x.contiguous(), weight_t)
         cfg = LOWRANK_OUT_FP16_LT_4096.get((rows, weight.size(0)))
@@ -2536,12 +2806,24 @@ class RWKV7ForCausalLM(nn.Module):
     def linear_rank_out_act(
         self,
         x: torch.Tensor,
-        weight: torch.Tensor,
-        weight_t: torch.Tensor,
+        weight: torch.Tensor | None,
+        weight_t: torch.Tensor | None,
         rows: int,
         act: int,
+        runtime_name: str | None = None,
     ) -> torch.Tensor:
-        if self.hidden_size >= LOWRANK_FUSED_MIN_C and rows <= LOWRANK_OUT_ROWS_T:
+        quantized_linear = (
+            self._quantized_linear_for_runtime_name(runtime_name)
+            if runtime_name is not None
+            else None
+        )
+        if (
+            quantized_linear is None
+            and self.hidden_size >= LOWRANK_FUSED_MIN_C
+            and rows <= LOWRANK_OUT_ROWS_T
+        ):
+            if weight_t is None:
+                raise RuntimeError(f"RWKV7 dense Linear {runtime_name!r} is missing")
             return torch.ops.rwkv7_v3a_ops.linear_t_act_f16(
                 x.contiguous(), weight_t, act
             )
@@ -2551,7 +2833,9 @@ class RWKV7ForCausalLM(nn.Module):
             if act == 1
             else ops.act_sigmoid(x.contiguous())
         )
-        return self.linear_rank_out(x, weight, weight_t, rows)
+        if runtime_name is None:
+            return self.linear_rank_out(x, weight, weight_t, rows)
+        return self.linear_rank_out(x, weight, weight_t, rows, runtime_name)
 
     def add(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         return torch.ops.rwkv7_v3a_ops.add_f16(x.contiguous(), y.contiguous())

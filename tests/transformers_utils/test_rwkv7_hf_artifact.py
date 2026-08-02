@@ -13,10 +13,15 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from safetensors.torch import load_file
+import torch.nn as nn
+from safetensors.torch import load_file, save_file
 
 from vllm.config.load import LoadConfig
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+    CompressedTensorsConfig,
+)
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+from vllm.model_executor.models.rwkv7 import RWKV7ForCausalLM
 from vllm.tokenizers.rwkv import RWKVTokenizer
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.configs.rwkv7 import (
@@ -123,6 +128,66 @@ def _quantized_rwkv7_config(
     )
 
 
+def _nvfp4_eight_low_rank_config() -> SimpleNamespace:
+    metadata = _rwkv7_quantization_metadata("nvfp4-pack-quantized")
+    loader_metadata = metadata["vllm"]
+    assert isinstance(loader_metadata, dict)
+    targets = [
+        f"model.blocks.1.att.{name}"
+        for name in ("w1", "w2", "a1", "a2", "v1", "v2", "g1", "g2")
+    ]
+    protected_linear = ["head", "model.blocks.0.att.value"]
+    protected_embedding = ["model.embeddings"]
+    protected_normalization = ["model.blocks.0.ln0", "model.ln_out"]
+    loader_metadata.update(
+        {
+            "quantized_modules": targets,
+            "quantized_weight_names": [f"{target}.weight" for target in targets],
+            "low_rank_linear_modules": targets,
+            "quantized_low_rank_modules": targets,
+            "protected_v_first_linear_modules": [],
+            "protected_linear_modules": protected_linear,
+            "protected_embedding_modules": protected_embedding,
+            "protected_normalization_modules": protected_normalization,
+            "protected_modules": [
+                *protected_linear,
+                *protected_embedding,
+                *protected_normalization,
+            ],
+        }
+    )
+    target_policy = metadata["target_policy"]
+    assert isinstance(target_policy, dict)
+    selection = target_policy["selection"]
+    assert isinstance(selection, dict)
+    selection["names"] = targets
+    quantization_config = {
+        "quant_method": "compressed-tensors",
+        "quantization_status": "compressed",
+        "format": "nvfp4-pack-quantized",
+        "config_groups": {
+            "group_0": {
+                "targets": targets,
+                "weights": {
+                    "num_bits": 4,
+                    "type": "float",
+                    "symmetric": True,
+                    "strategy": "tensor_group",
+                    "group_size": 16,
+                    "dynamic": False,
+                    "scale_dtype": "float8_e4m3fn",
+                },
+            }
+        },
+        "ignore": loader_metadata["protected_modules"],
+    }
+    return _standard_rwkv7_hf_config(
+        vocab_size=32,
+        rwkv7_quantization_metadata=metadata,
+        quantization_config=quantization_config,
+    )
+
+
 def _write_legacy_checkpoint(checkpoint: Path) -> dict[str, torch.Tensor]:
     config = _standard_rwkv7_hf_config()
     weights = {}
@@ -165,7 +230,7 @@ def test_rwkv7_schema_v3_quantization_metadata_is_validated() -> None:
     config = _quantized_rwkv7_config()
 
     assert validate_rwkv7_quantization_artifact_metadata(config) == ("pack-quantized")
-    assert frozenset() == RWKV7_SUPPORTED_PACKED_FORMATS
+    assert frozenset({"nvfp4-pack-quantized"}) == RWKV7_SUPPORTED_PACKED_FORMATS
     validate_rwkv7_hf_artifact_config(config)
 
 
@@ -299,14 +364,10 @@ def test_default_loader_rwkv7_quantization_preflight_is_otherwise_a_noop(
     loader.load_weights(model, model_config)
 
 
-@pytest.mark.parametrize(
-    "packed_format",
-    ["pack-quantized", "nvfp4-pack-quantized"],
-)
 def test_default_loader_rejects_rwkv7_packed_format_before_weight_iterator(
-    packed_format: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    packed_format = "pack-quantized"
     loader = DefaultModelLoader(LoadConfig(load_format="safetensors"))
     monkeypatch.setattr(
         loader,
@@ -327,6 +388,146 @@ def test_default_loader_rejects_rwkv7_packed_format_before_weight_iterator(
 
     with pytest.raises(RuntimeError, match=packed_format):
         loader.load_weights(SimpleNamespace(), model_config)
+
+
+def test_default_loader_loads_nvfp4_into_rwkv7_standard_linear_owners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.model_executor.parameter as parameter_module
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+        compressed_tensors_w4a4_nvfp4,
+    )
+
+    kernel_calls: list[nn.Module] = []
+
+    class OwnershipKernel:
+        @staticmethod
+        def input_quant_key():
+            return None
+
+        @staticmethod
+        def process_weights_after_loading(_layer: nn.Module) -> None:
+            return None
+
+        @staticmethod
+        def apply_weights(
+            *,
+            layer: nn.Module,
+            x: torch.Tensor,
+            bias: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            assert bias is None
+            kernel_calls.append(layer)
+            return x.new_zeros((*x.shape[:-1], layer.output_size))
+
+    monkeypatch.setattr(
+        compressed_tensors_w4a4_nvfp4,
+        "init_nvfp4_linear_kernel",
+        lambda **_kwargs: OwnershipKernel(),
+    )
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module,
+        "get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+
+    config = _nvfp4_eight_low_rank_config()
+    validate_rwkv7_hf_artifact_config(config)
+    quant_config = CompressedTensorsConfig.from_config(
+        deepcopy(config.quantization_config)
+    )
+    model = object.__new__(RWKV7ForCausalLM)
+    nn.Module.__init__(model)
+    model.config = config
+    model.quant_config = quant_config
+    model.tp_size = 1
+    model._quantized_linears = {}
+    model._initialize_quantized_linears()
+
+    targets = config.rwkv7_quantization_metadata["vllm"]["quantized_modules"]
+    assert len(targets) == 8
+    assert set(model._quantized_linears) == set(targets)
+    parameter_identities: dict[str, int] = {}
+    artifact_tensors: dict[str, torch.Tensor] = {}
+    for index, target in enumerate(targets, start=1):
+        linear = model.get_submodule(target)
+        assert set(dict(linear.named_parameters(recurse=False))) == {
+            "weight_packed",
+            "weight_scale",
+            "weight_global_scale",
+        }
+        assert not hasattr(linear, "weight")
+        for parameter_name, parameter in linear.named_parameters(recurse=False):
+            full_name = f"{target}.{parameter_name}"
+            parameter_identities[full_name] = id(parameter)
+            parameter.data.zero_()
+            fill_value = index if parameter.dtype == torch.uint8 else 1
+            artifact_tensors[full_name] = torch.full(
+                tuple(parameter.shape),
+                fill_value,
+                dtype=parameter.dtype,
+            )
+
+    expected_shapes = rwkv7_checkpoint_weight_shapes(config)
+    quantized_dense_names = {f"{target}.weight" for target in targets}
+    for index, (name, shape) in enumerate(expected_shapes.items(), start=1):
+        if name in quantized_dense_names:
+            continue
+        artifact_tensors[name] = torch.full(
+            shape,
+            (index % 7 + 1) / 16,
+            dtype=torch.float16,
+        )
+    protected_value = artifact_tensors["model.blocks.0.att.value.weight"].clone()
+    protected_state = artifact_tensors["model.blocks.0.ffn.x_k"].clone()
+
+    artifact = tmp_path / "rwkv7-nvfp4"
+    artifact.mkdir()
+    (artifact / "config.json").write_text(
+        json.dumps(vars(config)),
+        encoding="utf-8",
+    )
+    save_file(artifact_tensors, artifact / "model.safetensors")
+
+    model._preprocess_weights = lambda _weights: None
+    model._commit_preprocessed_weights = lambda weights: setattr(model, "z", weights)
+    loader = DefaultModelLoader(LoadConfig(load_format="safetensors"))
+    monkeypatch.setattr(loader, "_init_ep_weight_filter", lambda _config: None)
+    model_config = SimpleNamespace(
+        hf_config=config,
+        quantization="compressed-tensors",
+        model=str(artifact),
+        revision=None,
+    )
+
+    loader.load_weights(model, model_config)
+
+    for full_name, identity in parameter_identities.items():
+        target, parameter_name = full_name.rsplit(".", 1)
+        parameter = dict(model.get_submodule(target).named_parameters(recurse=False))[
+            parameter_name
+        ]
+        assert id(parameter) == identity
+        torch.testing.assert_close(parameter, artifact_tensors[full_name])
+        assert not hasattr(model.get_submodule(target), "weight")
+    assert quantized_dense_names.isdisjoint(model.checkpoint_weight_names)
+    for target in targets:
+        internal_name = model._checkpoint_name_to_internal(f"{target}.weight")
+        assert internal_name not in model.z
+    torch.testing.assert_close(
+        model.z["blocks.0.att.value.weight"],
+        protected_value,
+    )
+    torch.testing.assert_close(model.z["blocks.0.ffn.x_k"], protected_state)
+
+    output = model._apply_quantized_linear(
+        "blocks.1.att.w1",
+        torch.ones((2, 64), dtype=torch.float16),
+    )
+    assert output is not None and output.shape == (2, 32)
+    assert kernel_calls == [model.get_submodule("model.blocks.1.att.w1")]
 
 
 def test_fresh_process_rejects_rwkv7_packed_format_before_file_open(
