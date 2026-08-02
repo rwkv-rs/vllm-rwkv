@@ -326,8 +326,8 @@ def _rwkv7_add_layer_norm_tmix_mix6_f16_slots_fake(
     return [_rwkv7_empty_like(x) for _ in range(7)]
 
 
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_mix6")
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_mix6_3d")
+@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::tmix_mix6")
+@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::tmix_mix6_3d")
 def _rwkv7_tmix_mix6_fake(
     B: int,
     T: int,
@@ -344,7 +344,7 @@ def _rwkv7_tmix_mix6_fake(
     return [_rwkv7_empty_like(x) for _ in range(6)]
 
 
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_mix6_slot")
+@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::tmix_mix6_slot")
 def _rwkv7_tmix_mix6_slot_fake(
     B: int,
     T: int,
@@ -362,7 +362,7 @@ def _rwkv7_tmix_mix6_slot_fake(
     return [_rwkv7_empty_like(x) for _ in range(6)]
 
 
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_mix6_varlen")
+@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::tmix_mix6_varlen")
 def _rwkv7_tmix_mix6_varlen_fake(
     B: int,
     total_tokens: int,
@@ -382,8 +382,8 @@ def _rwkv7_tmix_mix6_varlen_fake(
     return [_rwkv7_empty_like(x) for _ in range(6)]
 
 
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_kk_a_gate")
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_kk_a_gate_2d")
+@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::tmix_kk_a_gate")
+@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::tmix_kk_a_gate_2d")
 def _rwkv7_tmix_kk_a_gate_fake(
     B: int,
     T: int,
@@ -398,8 +398,8 @@ def _rwkv7_tmix_kk_a_gate_fake(
     return [_rwkv7_empty_like(k) for _ in range(3)]
 
 
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_lnx_rkvres_xg")
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_lnx_rkvres_xg_warp")
+@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::tmix_lnx_rkvres_xg")
+@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::tmix_lnx_rkvres_xg_warp")
 def _rwkv7_tmix_lnx_rkvres_xg_fake(
     B: int,
     T: int,
@@ -417,7 +417,7 @@ def _rwkv7_tmix_lnx_rkvres_xg_fake(
     return _rwkv7_empty_like(x)
 
 
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_vres_gate")
+@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::tmix_vres_gate")
 def _rwkv7_tmix_vres_gate_fake(
     B: int,
     T: int,
@@ -430,7 +430,7 @@ def _rwkv7_tmix_vres_gate_fake(
     return _rwkv7_empty_like(v)
 
 
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_sparse_down_relu_one")
+@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::cmix_sparse_down_relu_one")
 def _rwkv7_cmix_sparse_down_relu_one_fake(
     C: int,
     F: int,
@@ -440,7 +440,7 @@ def _rwkv7_cmix_sparse_down_relu_one_fake(
     return torch.empty((1, 1, C), device=preact.device, dtype=preact.dtype)
 
 
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_sparse_down_relu_one_out")
+@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::cmix_sparse_down_relu_one_out")
 def _rwkv7_cmix_sparse_down_relu_one_out_fake(
     C: int,
     F: int,
@@ -451,8 +451,8 @@ def _rwkv7_cmix_sparse_down_relu_one_out_fake(
     return None
 
 
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_sparse_down_relu_rows")
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_sparse_down_relu_rows_t512")
+@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::cmix_sparse_down_relu_rows")
+@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::cmix_sparse_down_relu_rows_t512")
 def _rwkv7_cmix_sparse_down_relu_rows_fake(
     B: int,
     T: int,
@@ -464,8 +464,8 @@ def _rwkv7_cmix_sparse_down_relu_rows_fake(
     return torch.empty((B, T, C), device=preact.device, dtype=preact.dtype)
 
 
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_mix")
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_mix_3d")
+@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::cmix_mix")
+@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::cmix_mix_3d")
 def _rwkv7_cmix_mix_fake(
     B: int,
     T: int,
@@ -477,7 +477,7 @@ def _rwkv7_cmix_mix_fake(
     return _rwkv7_empty_like(x)
 
 
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_mix_slot")
+@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::cmix_mix_slot")
 def _rwkv7_cmix_mix_slot_fake(
     B: int,
     T: int,
@@ -490,7 +490,7 @@ def _rwkv7_cmix_mix_slot_fake(
     return _rwkv7_empty_like(x)
 
 
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_mix_varlen")
+@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::cmix_mix_varlen")
 def _rwkv7_cmix_mix_varlen_fake(
     B: int,
     total_tokens: int,
@@ -505,15 +505,15 @@ def _rwkv7_cmix_mix_varlen_fake(
     return _rwkv7_empty_like(x)
 
 
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::relu_square")
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::act_tanh")
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::act_sigmoid")
+@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::relu_square")
+@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::act_tanh")
+@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::act_sigmoid")
 def _rwkv7_unary_fake(x: torch.Tensor) -> torch.Tensor:
     return _rwkv7_empty_like(x)
 
 
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::add_vec")
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::add_vec_2d")
+@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::add_vec")
+@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::add_vec_2d")
 def _rwkv7_add_vec_fake(C: int, x: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
     return _rwkv7_empty_like(x)
 

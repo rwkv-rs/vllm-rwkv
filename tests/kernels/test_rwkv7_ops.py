@@ -315,7 +315,7 @@ V3A_RETURNING_CASES = [
 
 FAST_RETURNING_CASES = [
     OpCase(
-        "rwkv7_fast_ops_fp16::tmix_mix6",
+        "vllm_rwkv7_fast_ops_fp16::tmix_mix6",
         lambda d: (
             2,
             3,
@@ -327,7 +327,7 @@ FAST_RETURNING_CASES = [
         _same(3, 6),
     ),
     OpCase(
-        "rwkv7_fast_ops_fp16::tmix_mix6_3d",
+        "vllm_rwkv7_fast_ops_fp16::tmix_mix6_3d",
         lambda d: (
             2,
             3,
@@ -339,7 +339,7 @@ FAST_RETURNING_CASES = [
         _same(3, 6),
     ),
     OpCase(
-        "rwkv7_fast_ops_fp16::tmix_mix6_slot",
+        "vllm_rwkv7_fast_ops_fp16::tmix_mix6_slot",
         lambda d: (
             2,
             3,
@@ -352,7 +352,7 @@ FAST_RETURNING_CASES = [
         _same(3, 6),
     ),
     OpCase(
-        "rwkv7_fast_ops_fp16::tmix_mix6_varlen",
+        "vllm_rwkv7_fast_ops_fp16::tmix_mix6_varlen",
         lambda d: (
             2,
             5,
@@ -367,7 +367,7 @@ FAST_RETURNING_CASES = [
         _same(3, 6),
     ),
     OpCase(
-        "rwkv7_fast_ops_fp16::tmix_kk_a_gate",
+        "vllm_rwkv7_fast_ops_fp16::tmix_kk_a_gate",
         lambda d: (
             2,
             3,
@@ -382,7 +382,7 @@ FAST_RETURNING_CASES = [
         _same(4, 3),
     ),
     OpCase(
-        "rwkv7_fast_ops_fp16::tmix_kk_a_gate_2d",
+        "vllm_rwkv7_fast_ops_fp16::tmix_kk_a_gate_2d",
         lambda d: (
             2,
             1,
@@ -397,7 +397,7 @@ FAST_RETURNING_CASES = [
         _same(4, 3),
     ),
     OpCase(
-        "rwkv7_fast_ops_fp16::tmix_lnx_rkvres_xg",
+        "vllm_rwkv7_fast_ops_fp16::tmix_lnx_rkvres_xg",
         lambda d: (
             2,
             3,
@@ -412,7 +412,7 @@ FAST_RETURNING_CASES = [
         _same(4),
     ),
     OpCase(
-        "rwkv7_fast_ops_fp16::tmix_lnx_rkvres_xg_warp",
+        "vllm_rwkv7_fast_ops_fp16::tmix_lnx_rkvres_xg_warp",
         lambda d: (
             64,
             1,
@@ -427,7 +427,7 @@ FAST_RETURNING_CASES = [
         _same(4),
     ),
     OpCase(
-        "rwkv7_fast_ops_fp16::tmix_vres_gate",
+        "vllm_rwkv7_fast_ops_fp16::tmix_vres_gate",
         lambda d: (
             320,
             1,
@@ -440,32 +440,32 @@ FAST_RETURNING_CASES = [
         _same(3),
     ),
     OpCase(
-        "rwkv7_fast_ops_fp16::cmix_sparse_down_relu_one",
+        "vllm_rwkv7_fast_ops_fp16::cmix_sparse_down_relu_one",
         lambda d: (256, 128, _h(d, (128,)), _h(d, (128, 256))),
         _shape_expected((1, 1, 256), 2),
     ),
     OpCase(
-        "rwkv7_fast_ops_fp16::cmix_sparse_down_relu_rows",
+        "vllm_rwkv7_fast_ops_fp16::cmix_sparse_down_relu_rows",
         lambda d: (2, 3, 128, 128, _h(d, (2, 3, 128)), _h(d, (128, 128))),
         _shape_expected((2, 3, 128), 4),
     ),
     OpCase(
-        "rwkv7_fast_ops_fp16::cmix_sparse_down_relu_rows_t512",
+        "vllm_rwkv7_fast_ops_fp16::cmix_sparse_down_relu_rows_t512",
         lambda d: (2, 3, 512, 512, _h(d, (2, 3, 512)), _h(d, (512, 512))),
         _shape_expected((2, 3, 512), 4),
     ),
     OpCase(
-        "rwkv7_fast_ops_fp16::cmix_mix",
+        "vllm_rwkv7_fast_ops_fp16::cmix_mix",
         lambda d: (2, 3, 8, _h(d, (2, 3, 8)), _h(d, (2, 8)), _h(d, (8,))),
         _same(3),
     ),
     OpCase(
-        "rwkv7_fast_ops_fp16::cmix_mix_3d",
+        "vllm_rwkv7_fast_ops_fp16::cmix_mix_3d",
         lambda d: (2, 3, 8, _h(d, (2, 3, 8)), _h(d, (2, 8)), _h(d, (8,))),
         _same(3),
     ),
     OpCase(
-        "rwkv7_fast_ops_fp16::cmix_mix_slot",
+        "vllm_rwkv7_fast_ops_fp16::cmix_mix_slot",
         lambda d: (
             2,
             3,
@@ -478,7 +478,7 @@ FAST_RETURNING_CASES = [
         _same(3),
     ),
     OpCase(
-        "rwkv7_fast_ops_fp16::cmix_mix_varlen",
+        "vllm_rwkv7_fast_ops_fp16::cmix_mix_varlen",
         lambda d: (
             2,
             5,
@@ -492,16 +492,22 @@ FAST_RETURNING_CASES = [
         ),
         _same(3),
     ),
-    OpCase("rwkv7_fast_ops_fp16::relu_square", lambda d: (_h(d, (2, 3, 8)),), _same(0)),
-    OpCase("rwkv7_fast_ops_fp16::act_tanh", lambda d: (_h(d, (2, 3, 8)),), _same(0)),
-    OpCase("rwkv7_fast_ops_fp16::act_sigmoid", lambda d: (_h(d, (2, 3, 8)),), _same(0)),
     OpCase(
-        "rwkv7_fast_ops_fp16::add_vec",
+        "vllm_rwkv7_fast_ops_fp16::relu_square", lambda d: (_h(d, (2, 3, 8)),), _same(0)
+    ),
+    OpCase(
+        "vllm_rwkv7_fast_ops_fp16::act_tanh", lambda d: (_h(d, (2, 3, 8)),), _same(0)
+    ),
+    OpCase(
+        "vllm_rwkv7_fast_ops_fp16::act_sigmoid", lambda d: (_h(d, (2, 3, 8)),), _same(0)
+    ),
+    OpCase(
+        "vllm_rwkv7_fast_ops_fp16::add_vec",
         lambda d: (8, _h(d, (2, 3, 8)), _h(d, (8,))),
         _same(1),
     ),
     OpCase(
-        "rwkv7_fast_ops_fp16::add_vec_2d",
+        "vllm_rwkv7_fast_ops_fp16::add_vec_2d",
         lambda d: (8, _h(d, (2, 3, 8)), _h(d, (8,))),
         _same(1),
     ),
@@ -777,9 +783,9 @@ def test_rwkv7_tmix_kk_a_gate_2d_matches_flat_grid() -> None:
     k_a = torch.randn((hidden_size,), device="cuda", dtype=torch.float16)
     args = (batch_size, token_count, hidden_size, num_heads, k, k_k, a0, a12, k_a)
 
-    flat = torch.ops.rwkv7_fast_ops_fp16.tmix_kk_a_gate(*args)
-    grid_2d = torch.ops.rwkv7_fast_ops_fp16.tmix_kk_a_gate_2d(*args)
-    repeated = torch.ops.rwkv7_fast_ops_fp16.tmix_kk_a_gate_2d(*args)
+    flat = torch.ops.vllm_rwkv7_fast_ops_fp16.tmix_kk_a_gate(*args)
+    grid_2d = torch.ops.vllm_rwkv7_fast_ops_fp16.tmix_kk_a_gate_2d(*args)
+    repeated = torch.ops.vllm_rwkv7_fast_ops_fp16.tmix_kk_a_gate_2d(*args)
     torch.accelerator.synchronize()
 
     for expected, actual, again in zip(flat, grid_2d, repeated, strict=True):
@@ -813,9 +819,9 @@ def test_rwkv7_tmix_lnx_warp_matches_two_warp_kernel() -> None:
         g,
     )
 
-    two_warp = torch.ops.rwkv7_fast_ops_fp16.tmix_lnx_rkvres_xg(*args)
-    one_warp = torch.ops.rwkv7_fast_ops_fp16.tmix_lnx_rkvres_xg_warp(*args)
-    repeated = torch.ops.rwkv7_fast_ops_fp16.tmix_lnx_rkvres_xg_warp(*args)
+    two_warp = torch.ops.vllm_rwkv7_fast_ops_fp16.tmix_lnx_rkvres_xg(*args)
+    one_warp = torch.ops.vllm_rwkv7_fast_ops_fp16.tmix_lnx_rkvres_xg_warp(*args)
+    repeated = torch.ops.vllm_rwkv7_fast_ops_fp16.tmix_lnx_rkvres_xg_warp(*args)
     torch.accelerator.synchronize()
 
     assert torch.equal(repeated, one_warp)
@@ -843,7 +849,7 @@ def test_rwkv7_tmix_vres_gate_tuned_vec2_matches_scalar_and_reference(
     v_first = torch.randn_like(v)
     v0 = torch.randn((hidden_size,), device="cuda", dtype=torch.float16)
     v12 = torch.randn_like(v)
-    op = torch.ops.rwkv7_fast_ops_fp16.tmix_vres_gate
+    op = torch.ops.vllm_rwkv7_fast_ops_fp16.tmix_vres_gate
 
     output = op(batch_size, token_count, hidden_size, v, v_first, v0, v12)
     scalar_chunks = []
@@ -888,7 +894,7 @@ def test_rwkv7_tmix_vres_gate_fallback_matches_reference(
     v_first = torch.randn_like(v)
     v0 = torch.randn((hidden_size,), device="cuda", dtype=torch.float16)
     v12 = torch.randn_like(v)
-    op = torch.ops.rwkv7_fast_ops_fp16.tmix_vres_gate
+    op = torch.ops.vllm_rwkv7_fast_ops_fp16.tmix_vres_gate
     args = (batch_size, token_count, hidden_size, v, v_first, v0, v12)
 
     output = op(*args)
@@ -1062,7 +1068,7 @@ def test_rwkv7_cmix_sparse_down_relu_one_out_matches_allocating_op(
     C = 256
     preact = torch.randn((F,), device="cuda", dtype=torch.float16) * 0.25
     value_fc = torch.randn((F, C), device="cuda", dtype=torch.float16) * 0.05
-    expected = torch.ops.rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one(
+    expected = torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one(
         C,
         F,
         preact,
@@ -1070,7 +1076,7 @@ def test_rwkv7_cmix_sparse_down_relu_one_out_matches_allocating_op(
     )
     actual = torch.zeros((1, 1, C), device="cuda", dtype=torch.float16)
 
-    result = torch.ops.rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one_out(
+    result = torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one_out(
         C,
         F,
         preact,
@@ -1105,12 +1111,12 @@ def test_rwkv7_cmix_m1_prepare_zero_full_graph_replays_consecutively() -> None:
     key_weight = torch.randn((C, F), device="cuda", dtype=torch.float16)
     value_weight = torch.randn((F, C), device="cuda", dtype=torch.float16) * 0.05
     prepare = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk_prepare_zero
-    sparse_out = torch.ops.rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one_out
+    sparse_out = torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one_out
     baseline_preact = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(
         x,
         key_weight,
     )
-    baseline = torch.ops.rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one(
+    baseline = torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one(
         C,
         F,
         baseline_preact.view(-1),
@@ -1140,7 +1146,7 @@ def test_rwkv7_cmix_m1_prepare_zero_full_graph_replays_consecutively() -> None:
 
 
 def test_rwkv7_cmix_sparse_down_relu_one_out_fake_meta_and_schema() -> None:
-    op = torch.ops.rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one_out
+    op = torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one_out
     args = (
         256,
         128,
@@ -1164,7 +1170,7 @@ def test_rwkv7_cmix_sparse_down_relu_one_out_fake_meta_and_schema() -> None:
 
 
 def test_rwkv7_cmix_sparse_down_relu_one_out_bad_output_fails_closed() -> None:
-    op = torch.ops.rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one_out
+    op = torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one_out
     preact = _h("cuda", (128,))
     value_fc = _h("cuda", (128, 256))
 
@@ -1185,7 +1191,7 @@ def test_rwkv7_cmix_sparse_down_relu_one_out_bad_output_fails_closed() -> None:
             _h("cuda", (1, 1, 256)),
         )
     with pytest.raises(RuntimeError, match="C must be divisible by 256"):
-        torch.ops.rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one(
+        torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one(
             128,
             128,
             preact,
@@ -1635,7 +1641,7 @@ def test_rwkv7_cmix_sparse_down_out_uses_cuda1_non_default_stream() -> None:
 
     with torch.accelerator.device_index(0), torch.cuda.stream(stream):
         assert torch.cuda.current_stream(1).cuda_stream == stream.cuda_stream
-        torch.ops.rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one_out(
+        torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one_out(
             C,
             F,
             preact,
@@ -1643,7 +1649,7 @@ def test_rwkv7_cmix_sparse_down_out_uses_cuda1_non_default_stream() -> None:
             out,
         )
     stream.synchronize()
-    expected = torch.ops.rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one(
+    expected = torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one(
         C,
         F,
         preact,
@@ -1653,7 +1659,7 @@ def test_rwkv7_cmix_sparse_down_out_uses_cuda1_non_default_stream() -> None:
 
     assert torch.equal(out, expected)
     with pytest.raises(RuntimeError, match="same CUDA device"):
-        torch.ops.rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one_out(
+        torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one_out(
             C,
             F,
             preact,
@@ -2230,7 +2236,7 @@ def test_rwkv7_tmix_mix6_batched_shift_state_matches_reference(hidden: int) -> N
     )
     initial_shift_state = shift_state.clone()
 
-    op = torch.ops.rwkv7_fast_ops_fp16.tmix_mix6
+    op = torch.ops.vllm_rwkv7_fast_ops_fp16.tmix_mix6
     args = (batch, seq_len, hidden, x, shift_state, x_r, x_w, x_k, x_v, x_a, x_g)
     outputs = op(*args)
 
@@ -2263,10 +2269,10 @@ def test_rwkv7_tmix_mix6_3d_matches_dense_state_contract(
     reference_state = initial_shift_state.clone()
     grid_state = initial_shift_state.clone()
 
-    reference = torch.ops.rwkv7_fast_ops_fp16.tmix_mix6(
+    reference = torch.ops.vllm_rwkv7_fast_ops_fp16.tmix_mix6(
         batch, seq_len, hidden, x, reference_state, *mix_weights
     )
-    actual = torch.ops.rwkv7_fast_ops_fp16.tmix_mix6_3d(
+    actual = torch.ops.vllm_rwkv7_fast_ops_fp16.tmix_mix6_3d(
         batch, seq_len, hidden, x, grid_state, *mix_weights
     )
     torch.accelerator.synchronize()
@@ -2290,7 +2296,7 @@ def test_rwkv7_tmix_mix6_slot_matches_scattered_reference(hidden: int) -> None:
     )
     initial_shift_state = shift_state.clone()
 
-    op = torch.ops.rwkv7_fast_ops_fp16.tmix_mix6_slot
+    op = torch.ops.vllm_rwkv7_fast_ops_fp16.tmix_mix6_slot
     args = (
         batch,
         seq_len,
@@ -2338,7 +2344,7 @@ def test_rwkv7_tmix_mix6_varlen_matches_scattered_reference() -> None:
     )
     initial_shift_state = shift_state.clone()
 
-    outputs = torch.ops.rwkv7_fast_ops_fp16.tmix_mix6_varlen(
+    outputs = torch.ops.vllm_rwkv7_fast_ops_fp16.tmix_mix6_varlen(
         batch,
         total_tokens,
         hidden,
@@ -2390,7 +2396,7 @@ def test_rwkv7_cmix_mix_batched_shift_state_matches_reference(hidden: int) -> No
     x_k = torch.randn((hidden,), device=device, dtype=torch.float16)
     initial_shift_state = shift_state.clone()
 
-    op = torch.ops.rwkv7_fast_ops_fp16.cmix_mix
+    op = torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_mix
     args = (batch, seq_len, hidden, x, shift_state, x_k)
     output = op(*args)
 
@@ -2415,10 +2421,10 @@ def test_rwkv7_cmix_mix_3d_matches_dense_state_contract(
     reference_state = initial_shift_state.clone()
     grid_state = initial_shift_state.clone()
 
-    reference = torch.ops.rwkv7_fast_ops_fp16.cmix_mix(
+    reference = torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_mix(
         batch, seq_len, hidden, x, reference_state, x_k
     )
-    actual = torch.ops.rwkv7_fast_ops_fp16.cmix_mix_3d(
+    actual = torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_mix_3d(
         batch, seq_len, hidden, x, grid_state, x_k
     )
     torch.accelerator.synchronize()
@@ -2439,7 +2445,7 @@ def test_rwkv7_cmix_mix_slot_matches_scattered_reference(hidden: int) -> None:
     x_k = torch.randn((hidden,), device=device, dtype=torch.float16)
     initial_shift_state = shift_state.clone()
 
-    op = torch.ops.rwkv7_fast_ops_fp16.cmix_mix_slot
+    op = torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_mix_slot
     args = (batch, seq_len, hidden, x, shift_state, slot_indices, x_k)
     output = op(*args)
 
@@ -2466,7 +2472,7 @@ def test_rwkv7_cmix_mix_varlen_matches_scattered_reference() -> None:
     x_k = torch.randn((hidden,), device=device, dtype=torch.float16)
     initial_shift_state = shift_state.clone()
 
-    output = torch.ops.rwkv7_fast_ops_fp16.cmix_mix_varlen(
+    output = torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_mix_varlen(
         batch,
         total_tokens,
         hidden,
@@ -2504,9 +2510,9 @@ def test_rwkv7_add_vec_2d_matches_flat_kernel(rows: int) -> None:
     x = torch.randn((rows, hidden), device="cuda", dtype=torch.float16)
     vec = torch.randn((hidden,), device="cuda", dtype=torch.float16)
 
-    expected = torch.ops.rwkv7_fast_ops_fp16.add_vec(hidden, x, vec)
-    actual = torch.ops.rwkv7_fast_ops_fp16.add_vec_2d(hidden, x, vec)
-    repeated = torch.ops.rwkv7_fast_ops_fp16.add_vec_2d(hidden, x, vec)
+    expected = torch.ops.vllm_rwkv7_fast_ops_fp16.add_vec(hidden, x, vec)
+    actual = torch.ops.vllm_rwkv7_fast_ops_fp16.add_vec_2d(hidden, x, vec)
+    repeated = torch.ops.vllm_rwkv7_fast_ops_fp16.add_vec_2d(hidden, x, vec)
     torch.accelerator.synchronize()
 
     assert torch.equal(actual, expected)
@@ -2519,7 +2525,7 @@ def test_rwkv7_add_vec_2d_rejects_grid_y_overflow() -> None:
     vec = torch.empty((hidden,), device="cuda", dtype=torch.float16)
 
     with pytest.raises(RuntimeError, match="rows <= 65535"):
-        torch.ops.rwkv7_fast_ops_fp16.add_vec_2d(hidden, x, vec)
+        torch.ops.vllm_rwkv7_fast_ops_fp16.add_vec_2d(hidden, x, vec)
 
 
 def test_rwkv7_add_vec_2d_rejects_misaligned_half2_vector() -> None:
@@ -2530,4 +2536,4 @@ def test_rwkv7_add_vec_2d_rejects_misaligned_half2_vector() -> None:
     assert vec.is_contiguous()
 
     with pytest.raises(RuntimeError, match="aligned for fp16x2"):
-        torch.ops.rwkv7_fast_ops_fp16.add_vec_2d(hidden, x, vec)
+        torch.ops.vllm_rwkv7_fast_ops_fp16.add_vec_2d(hidden, x, vec)

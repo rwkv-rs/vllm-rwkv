@@ -68,7 +68,7 @@ def test_rwkv7_cuda_ops_match_torch_reference():
     ).contiguous()
 
     y = torch.ops.rwkv7_v3a_ops.layer_norm_f16(x, weight, bias, eps)
-    z = torch.ops.rwkv7_fast_ops_fp16.relu_square(x)
+    z = torch.ops.vllm_rwkv7_fast_ops_fp16.relu_square(x)
     torch.accelerator.synchronize()
 
     expected_y = F.layer_norm(
@@ -1364,13 +1364,13 @@ def test_rwkv7_cmix_m1_prepares_sparse_accumulator_during_splitk(
         raising=False,
     )
     monkeypatch.setattr(
-        torch.ops.rwkv7_fast_ops_fp16,
+        torch.ops.vllm_rwkv7_fast_ops_fp16,
         "cmix_sparse_down_relu_one_out",
         sparse_down_out,
         raising=False,
     )
     monkeypatch.setattr(
-        torch.ops.rwkv7_fast_ops_fp16,
+        torch.ops.vllm_rwkv7_fast_ops_fp16,
         "cmix_sparse_down_relu_one",
         lambda *_args: pytest.fail("prezero route must skip the zeroing op"),
         raising=False,
@@ -1442,13 +1442,13 @@ def test_rwkv7_cmix_m1_falls_back_to_independent_zero_path(
         raising=False,
     )
     monkeypatch.setattr(
-        torch.ops.rwkv7_fast_ops_fp16,
+        torch.ops.vllm_rwkv7_fast_ops_fp16,
         "cmix_sparse_down_relu_one_out",
         lambda *_args: pytest.fail("fallback must use independent zero path"),
         raising=False,
     )
     monkeypatch.setattr(
-        torch.ops.rwkv7_fast_ops_fp16,
+        torch.ops.vllm_rwkv7_fast_ops_fp16,
         "cmix_sparse_down_relu_one",
         sparse_down,
         raising=False,
@@ -1577,7 +1577,7 @@ def test_rwkv7_lowrank_out_activation_delegates_to_tuned_helper(
         return expected
 
     monkeypatch.setattr(
-        torch.ops.rwkv7_fast_ops_fp16,
+        torch.ops.vllm_rwkv7_fast_ops_fp16,
         op_name,
         activate,
         raising=False,

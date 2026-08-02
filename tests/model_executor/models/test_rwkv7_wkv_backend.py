@@ -15,12 +15,28 @@ from packaging.requirements import Requirement
 from vllm.model_executor.models import rwkv7_wkv_backend
 
 
+def test_vllm_fused_ops_use_a_provider_distinct_namespace() -> None:
+    source_path = (
+        Path(__file__).parents[3]
+        / "csrc"
+        / "libtorch_stable"
+        / "rwkv7"
+        / "rwkv7_fast_ops_fp16.cpp"
+    )
+    source = source_path.read_text(encoding="utf-8")
+
+    assert "TORCH_LIBRARY(vllm_rwkv7_fast_ops_fp16, m)" in source
+    assert "TORCH_LIBRARY_IMPL(vllm_rwkv7_fast_ops_fp16, CUDA, m)" in source
+    assert "TORCH_LIBRARY(rwkv7_fast_ops_fp16, m)" not in source
+    assert "TORCH_LIBRARY_IMPL(rwkv7_fast_ops_fp16, CUDA, m)" not in source
+
+
 def test_rwkv_requirements_pin_fla_and_flashrwkv_source_revisions() -> None:
     requirements_path = Path(__file__).parents[3] / "requirements" / "rwkv.txt"
     requirement_lines = [
         line
         for line in requirements_path.read_text().splitlines()
-        if line.strip() and not line.startswith("#")
+        if line.strip() and not line.startswith("#") and not line.startswith("-r ")
     ]
     requirements = {
         requirement.name: requirement

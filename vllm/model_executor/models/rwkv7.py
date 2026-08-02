@@ -2042,7 +2042,7 @@ class RWKV7ForCausalLM(nn.Module):
     ]:
         """Share the layout-independent time-mix projection pipeline."""
         z = self.z
-        ops = torch.ops.rwkv7_fast_ops_fp16
+        ops = torch.ops.vllm_rwkv7_fast_ops_fp16
         r, k, v = self.project_att_rkv(xr, xk, xv, p, path.rows)
         local_c = r.shape[-1]
         local_h = local_c // self.head_size
@@ -2238,7 +2238,7 @@ class RWKV7ForCausalLM(nn.Module):
         req_id: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         z = self.z
-        ops = torch.ops.rwkv7_fast_ops_fp16
+        ops = torch.ops.vllm_rwkv7_fast_ops_fp16
         B = int(slot_indices.numel())
         total_tokens = int(x.shape[0])
         xr, xw, xk, xv, xa, xg = ops.tmix_mix6_varlen(
@@ -2320,7 +2320,7 @@ class RWKV7ForCausalLM(nn.Module):
         slot_indices: torch.Tensor,
         req_id: torch.Tensor,
     ) -> torch.Tensor:
-        ops = torch.ops.rwkv7_fast_ops_fp16
+        ops = torch.ops.vllm_rwkv7_fast_ops_fp16
         total_tokens = int(x.shape[0])
         B = int(slot_indices.numel())
         mixed = ops.cmix_mix_varlen(
@@ -2398,7 +2398,7 @@ class RWKV7ForCausalLM(nn.Module):
         wkv_slot_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         z = self.z
-        ops = torch.ops.rwkv7_fast_ops_fp16
+        ops = torch.ops.vllm_rwkv7_fast_ops_fp16
         B, T, _ = x.shape
         if pre_mix is not None:
             xr, xw, xk, xv, xa, xg = pre_mix
@@ -2504,7 +2504,7 @@ class RWKV7ForCausalLM(nn.Module):
         slot_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         z = self.z
-        ops = torch.ops.rwkv7_fast_ops_fp16
+        ops = torch.ops.vllm_rwkv7_fast_ops_fp16
         B, T, _ = x.shape
 
         if slot_indices is not None:
@@ -2531,7 +2531,7 @@ class RWKV7ForCausalLM(nn.Module):
         self, mixed: torch.Tensor, p: str, path: PathConfig
     ) -> torch.Tensor:
         z = self.z
-        ops = torch.ops.rwkv7_fast_ops_fp16
+        ops = torch.ops.vllm_rwkv7_fast_ops_fp16
         B, T, _ = mixed.shape
         quantized_key = self._apply_quantized_linear(p + "key", mixed)
         quantized_value = self._quantized_linear_for_runtime_name(p + "value")
@@ -2828,7 +2828,7 @@ class RWKV7ForCausalLM(nn.Module):
             return torch.ops.rwkv7_v3a_ops.linear_t_act_f16(
                 x.contiguous(), weight_t, act
             )
-        ops = torch.ops.rwkv7_fast_ops_fp16
+        ops = torch.ops.vllm_rwkv7_fast_ops_fp16
         x = (
             ops.act_tanh(x.contiguous())
             if act == 1
