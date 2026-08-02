@@ -244,53 +244,30 @@ def test_rwkv7_auxiliary_tuned_shape_guards() -> None:
 
 
 @pytest.mark.parametrize("wkv_mode", ["fp16", "fp32io16"])
-def test_rwkv7_run_wkv_uses_canonical_packed_op(monkeypatch, wkv_mode) -> None:
-    calls: list[tuple[str, tuple[Any, ...]]] = []
-
-    def record(name):
-        def op(*args):
-            calls.append((name, args))
-
-        return op
-
-    monkeypatch.setattr(
-        torch.ops.rwkv7_wkv_fp32_v2,
-        "wkv",
-        record("fp32"),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        torch.ops.rwkv7_wkv_fp16_v2,
-        "wkv",
-        record("fp16"),
-        raising=False,
-    )
-
+def test_rwkv7_run_wkv_passes_packed_state_pool_to_fla(monkeypatch, wkv_mode) -> None:
     query_start_loc = torch.tensor([0, 2, 3], dtype=torch.int32)
     slot_indices = torch.tensor([3, 1], dtype=torch.int32)
     state_dtype = torch.float32 if wkv_mode == "fp32io16" else torch.float16
-    state = torch.empty((4, 2, 64, 64), dtype=state_dtype)
-    tensors = [torch.empty((1, 3, 128), dtype=torch.float16) for _ in range(6)]
+    state = torch.zeros((4, 2, 64, 64), dtype=state_dtype)
+    tensors = [torch.randn((1, 3, 128), dtype=torch.float16) for _ in range(6)]
     r, w, k, v, neg_kk, kka = tensors
-    w0 = torch.empty((128,), dtype=torch.float16)
+    w0 = torch.randn((128,), dtype=torch.float16)
     y = torch.empty_like(r)
-    elapsed = torch.empty((4,), dtype=torch.int32)
-    w_raw = torch.empty_like(w.reshape(3, 128))
+    elapsed = torch.tensor([2, 0, 7, 11], dtype=torch.int32)
+    expected_output = torch.randn((1, 3, 2, 64), dtype=torch.float16)
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
 
-    def add_vec(channels, rows, bias):
-        assert channels == 128
-        assert rows.shape == (3, 128)
-        assert bias is w0
-        calls.append(("add_vec", (channels, rows, bias)))
-        return w_raw
+    def run_fla(*args, **kwargs):
+        calls.append((args, kwargs))
+        return expected_output
 
-    monkeypatch.setattr(
-        torch.ops.rwkv7_fast_ops_fp16,
-        "add_vec",
-        add_vec,
-        raising=False,
+    monkeypatch.setattr(rwkv7, "run_fla_rwkv7_stateful", run_fla)
+    model = _new_rwkv7_forward_test_model(
+        wkv_mode=wkv_mode,
+        hidden_size=128,
+        head_size=64,
+        num_attention_heads=2,
     )
-    model = _new_rwkv7_forward_test_model(wkv_mode=wkv_mode)
 
     RWKV7ForCausalLM._run_wkv(
         model,
@@ -308,24 +285,20 @@ def test_rwkv7_run_wkv_uses_canonical_packed_op(monkeypatch, wkv_mode) -> None:
         elapsed,
     )
 
-    expected_call_names = ["fp16"] if wkv_mode == "fp16" else ["add_vec", "fp32"]
-    assert [name for name, _args in calls] == expected_call_names
-    args = calls[-1][1]
-    assert args[:3] == (query_start_loc, slot_indices, state)
-    if wkv_mode == "fp16":
-        assert args[5] is w0
-        assert args[-1] is elapsed
-        row_args = (args[3], args[4], args[6], args[7], args[8], args[9], args[10])
-        row_inputs = (r, w, k, v, neg_kk, kka, y)
-    else:
-        assert args[4] is w_raw
-        row_args = args[3:]
-        row_inputs = (r, w_raw, k, v, neg_kk, kka, y)
-    for actual, expected in zip(row_args, row_inputs):
-        assert actual.shape == (3, 128)
-        assert (
-            actual.untyped_storage().data_ptr() == expected.untyped_storage().data_ptr()
-        )
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert all(tensor.shape == (1, 3, 2, 64) for tensor in args)
+    torch.testing.assert_close(
+        args[1],
+        (-np.exp(-0.5) * torch.sigmoid((w + w0).float()))
+        .to(torch.float16)
+        .view(1, 3, 2, 64),
+    )
+    assert kwargs["state_pool"] is state
+    assert kwargs["cu_seqlens"] is query_start_loc
+    assert kwargs["state_indices"] is slot_indices
+    assert kwargs["mode"] == wkv_mode
+    torch.testing.assert_close(y, expected_output.view_as(y))
 
 
 def test_rwkv7_forward_layer_range_uses_slot_fused_tmix_for_batched_decode(
