@@ -1,5 +1,6 @@
 #include <torch/csrc/stable/library.h>
 
+#include "core/registration.h"
 #include "libtorch_stable/ops.h"
 
 // The rwkv-nvfp4 profile publishes exactly the Marlin W4A16 and CUTLASS W4A4
@@ -40,3 +41,5 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CompositeExplicitAutograd, rwkv_nvfp4_ops) {
   rwkv_nvfp4_ops.impl("cutlass_scaled_mm_supports_fp4",
                       TORCH_BOX(&cutlass_scaled_mm_supports_fp4));
 }
+
+REGISTER_EXTENSION(_C_stable_libtorch)
