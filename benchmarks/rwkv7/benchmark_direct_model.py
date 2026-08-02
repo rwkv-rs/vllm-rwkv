@@ -2,13 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Measure RWKV model and lm_head at the Albatross CUDA-graph boundary."""
+"""Measure RWKV7 with the canonical Transformers-comparable workload."""
 
 from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
+import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -39,6 +42,89 @@ FP16_LT_FAMILIES = (
     "lowrank-in",
     "lowrank-out",
 )
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _artifact_provenance(reference: str, config: Any) -> dict[str, Any]:
+    source_sha256 = getattr(config, "rwkv_source_sha256", None)
+    if source_sha256 is not None and (
+        not isinstance(source_sha256, str)
+        or len(source_sha256) != 64
+        or any(ch not in "0123456789abcdef" for ch in source_sha256.lower())
+    ):
+        raise ValueError("RWKV7 artifact rwkv_source_sha256 is not a SHA-256 digest")
+
+    local_path = Path(reference).expanduser()
+    if not local_path.exists():
+        return {
+            "kind": "hub_repo_id",
+            "input_reference": reference,
+            "resolved_reference": reference,
+            "hub_commit": getattr(config, "_commit_hash", None),
+            "source_checkpoint_sha256": source_sha256,
+        }
+    resolved = local_path.resolve()
+    if not resolved.is_dir():
+        raise ValueError(
+            "RWKV7 canonical benchmark requires an HF artifact directory, "
+            f"not a checkpoint file: {resolved}"
+        )
+    config_path = resolved / "config.json"
+    if not config_path.is_file():
+        raise ValueError(f"Local RWKV7 artifact has no config.json: {resolved}")
+    weight_files = sorted(resolved.glob("*.safetensors"))
+    if not weight_files:
+        raise ValueError(f"Local RWKV7 artifact has no safetensors: {resolved}")
+    weights = [
+        {
+            "name": path.name,
+            "size_bytes": path.stat().st_size,
+            "sha256": _sha256(path),
+        }
+        for path in weight_files
+    ]
+    aggregate = hashlib.sha256()
+    for weight in weights:
+        aggregate.update(weight["name"].encode())
+        aggregate.update(weight["sha256"].encode())
+    return {
+        "kind": "local_path",
+        "input_reference": reference,
+        "resolved_reference": str(resolved),
+        "config_sha256": _sha256(config_path),
+        "weights_sha256": aggregate.hexdigest(),
+        "weight_files": weights,
+        "hub_commit": getattr(config, "_commit_hash", None),
+        "source_checkpoint_sha256": source_sha256,
+    }
+
+
+def _source_provenance(repo_root: Path) -> dict[str, Any]:
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    return {
+        "revision": git("rev-parse", "HEAD"),
+        "dirty": bool(git("status", "--short")),
+    }
+
+
+def _input_digest(input_ids: Any) -> str:
+    contiguous = input_ids.detach().to(device="cpu").contiguous()
+    return hashlib.sha256(contiguous.numpy().tobytes()).hexdigest()
 
 
 def _parse_cases(value: str) -> tuple[tuple[int, int], ...]:
@@ -88,6 +174,266 @@ def _percentile(values: list[float], quantile: float) -> float:
             quantile,
         ).item()
     )
+
+
+def _clone_state(state: list[Any]) -> list[Any]:
+    return [component.clone() for component in state]
+
+
+def _direct_forward(
+    model: Any,
+    input_ids: Any,
+    state: list[Any] | None = None,
+) -> tuple[Any, list[Any]]:
+    """Run the complete direct-model boundary, including token embedding."""
+    import torch
+
+    from vllm.model_executor.models.rwkv7 import select_path
+
+    if input_ids.ndim != 2:
+        raise ValueError("RWKV7 direct benchmark input_ids must have shape [B, T]")
+    batch_size, token_count = input_ids.shape
+    if token_count <= 0:
+        raise ValueError("RWKV7 direct benchmark requires at least one token")
+    if state is None:
+        state = model.zero_state(batch_size)
+    embedded = model.embed(input_ids).contiguous()
+    query_start_loc = torch.arange(
+        0,
+        (batch_size + 1) * token_count,
+        token_count,
+        dtype=torch.int32,
+        device=input_ids.device,
+    )
+    wkv_slot_indices = torch.arange(
+        batch_size,
+        dtype=torch.int32,
+        device=input_ids.device,
+    )
+    hidden = model.forward_from_x(
+        embedded,
+        state,
+        select_path(batch_size, token_count),
+        query_start_loc=query_start_loc,
+        wkv_slot_indices=wkv_slot_indices,
+    )
+    return model.project_logits_fp32(hidden), state
+
+
+def _correctness_gate(
+    model: Any,
+    input_ids: Any,
+    prompt_tokens: int,
+) -> tuple[dict[str, Any], list[Any]]:
+    import torch
+
+    one_shot_logits, one_shot_state = _direct_forward(model, input_ids)
+    _, prefix_state = _direct_forward(model, input_ids[:, :prompt_tokens])
+    stable_prefix_state = _clone_state(prefix_state)
+    decode_state = _clone_state(prefix_state)
+    staged_logits = []
+    for token_index in range(prompt_tokens, input_ids.shape[1]):
+        logits, decode_state = _direct_forward(
+            model,
+            input_ids[:, token_index : token_index + 1],
+            decode_state,
+        )
+        staged_logits.append(logits)
+
+    staged = torch.cat(staged_logits, dim=1)
+    expected = one_shot_logits[:, prompt_tokens:]
+    rtol = atol = 5e-3
+    torch.testing.assert_close(staged, expected, rtol=rtol, atol=atol)
+    state_errors = []
+    for staged_component, expected_component in zip(
+        decode_state, one_shot_state, strict=True
+    ):
+        if staged_component.is_floating_point():
+            torch.testing.assert_close(
+                staged_component,
+                expected_component,
+                rtol=rtol,
+                atol=atol,
+            )
+            state_errors.append(
+                float(
+                    (staged_component.float() - expected_component.float())
+                    .abs()
+                    .max()
+                    .item()
+                )
+            )
+        else:
+            torch.testing.assert_close(staged_component, expected_component)
+            state_errors.append(0.0)
+    difference = (staged.float() - expected.float()).abs()
+    return (
+        {
+            "passed": True,
+            "comparison": (
+                "staged recurrent decode logits/final state vs matching one-shot"
+            ),
+            "compared_tokens": input_ids.shape[1] - prompt_tokens,
+            "max_abs_logit_error": float(difference.max().item()),
+            "mean_abs_logit_error": float(difference.mean().item()),
+            "max_abs_state_error": max(state_errors),
+            "rtol": rtol,
+            "atol": atol,
+        },
+        stable_prefix_state,
+    )
+
+
+def _latency_summary(
+    samples_ms: list[float],
+    tokens_per_iteration: int,
+) -> dict[str, Any]:
+    p50_ms = _percentile(samples_ms, 0.50)
+    return {
+        "samples_ms": samples_ms,
+        "p10_ms": _percentile(samples_ms, 0.10),
+        "p50_ms": p50_ms,
+        "p90_ms": _percentile(samples_ms, 0.90),
+        "tokens_per_iteration": tokens_per_iteration,
+        "tokens_per_second_at_p50": tokens_per_iteration * 1000.0 / p50_ms,
+    }
+
+
+def _measure_cuda(
+    operation: Callable[[Any], Any],
+    setup: Callable[[], Any],
+    *,
+    warmup: int,
+    iterations: int,
+    tokens_per_iteration: int,
+) -> dict[str, Any]:
+    """Mirror the Transformers CUDA-event and synchronization boundary."""
+    import torch
+
+    for _ in range(warmup):
+        payload = setup()
+        torch.accelerator.synchronize()
+        result = operation(payload)
+        torch.accelerator.synchronize()
+        del result, payload
+
+    events = [
+        (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        for _ in range(iterations)
+    ]
+    torch.accelerator.empty_cache()
+    samples_ms = []
+    for start, end in events:
+        payload = setup()
+        torch.accelerator.synchronize()
+        start.record()
+        result = operation(payload)
+        end.record()
+        torch.accelerator.synchronize()
+        samples_ms.append(float(start.elapsed_time(end)))
+        del result, payload
+    summary = _latency_summary(samples_ms, tokens_per_iteration)
+    summary.update(
+        {
+            "warmup_iterations": warmup,
+            "timed_iterations": iterations,
+        }
+    )
+    return summary
+
+
+def _runtime_provenance(model: Any) -> dict[str, Any]:
+    from vllm.model_executor.models import rwkv7
+
+    profile = model.execution_profile
+    wkv_operator = (
+        "torch.ops.rwkv7_wkv_fp32_v2.wkv"
+        if profile.wkv_mode == "fp32io16"
+        else "torch.ops.rwkv7_wkv_fp16_v2.wkv"
+    )
+    return {
+        "precision": {
+            "activation_dtype": "torch.float16",
+            "logits_dtype": "torch.float32",
+            "wkv_state_dtype": str(profile.wkv_state_dtype),
+        },
+        "wkv": {
+            "mode": profile.wkv_mode,
+            "provider": "vllm RWKV7 native CUDA ops",
+            "operator": wkv_operator,
+            "metadata_contract": "packed-varlen slot-mapped recurrent state",
+        },
+        "gemm": {
+            "provider": "torch.ops.rwkv7_v3a_ops",
+            "accumulation_policy": profile.gemm_accumulation_policy,
+            "allow_fp16_accumulation": profile.allow_fp16_accumulation,
+            "attention_c2c_fp16_lt": dict(rwkv7.ATT_C2C_FP16_LT_4096),
+            "ffn_down_fp16_lt": dict(rwkv7.FFN_DOWN_FP16_LT_4096),
+            "lowrank_in_fp16_lt": {
+                f"{rows}x{rank}": cfg
+                for (rows, rank), cfg in rwkv7.LOWRANK_IN_FP16_LT_4096.items()
+            },
+            "lowrank_out_fp16_lt": {
+                f"{rows}x{rank}": cfg
+                for (rows, rank), cfg in rwkv7.LOWRANK_OUT_FP16_LT_4096.items()
+            },
+            "m1_rkv_grouped_rows": sorted(rwkv7.M1_RKV_GROUPED_ROWS),
+            "m1_cmix_prezero_rows": sorted(rwkv7.M1_CMIX_PREZERO_ROWS),
+        },
+    }
+
+
+def _stage_kernel_provenance(
+    model: Any,
+    batch_size: int,
+    token_count: int,
+) -> dict[str, Any]:
+    from vllm.model_executor.models import rwkv7
+
+    rows = batch_size * token_count
+    path = rwkv7.select_path(batch_size, token_count)
+    allow_lt = model.execution_profile.allow_fp16_accumulation
+    hidden_size = model.hidden_size
+    return {
+        "batch_size": batch_size,
+        "token_count": token_count,
+        "rows": rows,
+        "cmix_mode": path.cmix_mode,
+        "wkv_operator": (
+            "torch.ops.rwkv7_wkv_fp32_v2.wkv"
+            if model.execution_profile.wkv_mode == "fp32io16"
+            else "torch.ops.rwkv7_wkv_fp16_v2.wkv"
+        ),
+        "resolved_fp16_lt": {
+            "attention_c2c": (
+                rwkv7.ATT_C2C_FP16_LT_4096.get(rows)
+                if allow_lt and hidden_size == 4096
+                else None
+            ),
+            "ffn_down": (
+                rwkv7.FFN_DOWN_FP16_LT_4096.get(rows)
+                if allow_lt and hidden_size == 4096
+                else None
+            ),
+            "lowrank_in": {
+                str(rank): rwkv7.LOWRANK_IN_FP16_LT_4096.get((rows, rank))
+                for rank in sorted({rank for _, rank in rwkv7.LOWRANK_IN_FP16_LT_4096})
+            }
+            if allow_lt and hidden_size == 4096 and rows > rwkv7.LOWRANK_IN_ROWS_T
+            else {},
+            "lowrank_out": {
+                str(rank): rwkv7.LOWRANK_OUT_FP16_LT_4096.get((rows, rank))
+                for rank in sorted({rank for _, rank in rwkv7.LOWRANK_OUT_FP16_LT_4096})
+            }
+            if (allow_lt and hidden_size == 4096 and rows > rwkv7.LOWRANK_OUT_ROWS_T)
+            else {},
+        },
+        "m1_rkv_grouped": rows in rwkv7.M1_RKV_GROUPED_ROWS,
+        "m1_cmix_prezero": rows in rwkv7.M1_CMIX_PREZERO_ROWS,
+    }
 
 
 def _capture_graph(
@@ -247,6 +593,156 @@ def _profile_graph_kernels(graph: Any, replays: int = 3) -> list[dict[str, Any]]
         reverse=True,
     )
     return events
+
+
+def _run_worker_canonical_benchmark(
+    worker: Any,
+    batch_size: int,
+    prompt_tokens: int,
+    decode_tokens: int,
+    seed: int,
+    warmup: int,
+    iterations: int,
+    expected_wkv_mode: str | None,
+    expected_gemm_accumulation: str | None,
+) -> dict[str, Any]:
+    import torch
+
+    model_runner = getattr(worker, "model_runner", None)
+    model = getattr(model_runner, "model", None)
+    if model is None:
+        raise RuntimeError("worker.model_runner.model is unavailable")
+    required = ("embed", "zero_state", "forward_from_x", "project_logits_fp32")
+    missing = [name for name in required if not callable(getattr(model, name, None))]
+    if missing:
+        raise RuntimeError(f"loaded model lacks RWKV direct APIs: {missing}")
+
+    runtime = _runtime_provenance(model)
+    runtime["kernels_by_stage"] = {
+        "prefill": _stage_kernel_provenance(model, batch_size, prompt_tokens),
+        "decode": _stage_kernel_provenance(model, batch_size, 1),
+    }
+    actual_wkv_mode = runtime["wkv"]["mode"]
+    actual_gemm = runtime["gemm"]["accumulation_policy"]
+    if expected_wkv_mode is not None and actual_wkv_mode != expected_wkv_mode:
+        raise RuntimeError(
+            "RWKV7 benchmark WKV mode mismatch: "
+            f"expected={expected_wkv_mode} actual={actual_wkv_mode}"
+        )
+    if (
+        expected_gemm_accumulation is not None
+        and actual_gemm != expected_gemm_accumulation
+    ):
+        raise RuntimeError(
+            "RWKV7 benchmark GEMM accumulation mismatch: "
+            f"expected={expected_gemm_accumulation} actual={actual_gemm}"
+        )
+
+    generator = torch.Generator().manual_seed(seed)
+    input_ids_cpu = torch.randint(
+        low=0,
+        high=model.vocab_size,
+        size=(batch_size, prompt_tokens + decode_tokens),
+        generator=generator,
+    )
+    input_sha256 = _input_digest(input_ids_cpu)
+    prompt_sha256 = _input_digest(input_ids_cpu[:, :prompt_tokens])
+    decode_sha256 = _input_digest(input_ids_cpu[:, prompt_tokens:])
+    input_ids = input_ids_cpu.to(device="cuda")
+    prompt_input_ids = input_ids[:, :prompt_tokens]
+    decode_input_ids = input_ids[:, prompt_tokens : prompt_tokens + 1]
+
+    with torch.inference_mode():
+        correctness, prefix_state = _correctness_gate(
+            model,
+            input_ids,
+            prompt_tokens,
+        )
+        torch.accelerator.synchronize()
+        prefill = _measure_cuda(
+            lambda _: _direct_forward(model, prompt_input_ids),
+            lambda: None,
+            warmup=warmup,
+            iterations=iterations,
+            tokens_per_iteration=batch_size * prompt_tokens,
+        )
+        decode = _measure_cuda(
+            lambda state: _direct_forward(model, decode_input_ids, state),
+            lambda: _clone_state(prefix_state),
+            warmup=warmup,
+            iterations=iterations,
+            tokens_per_iteration=batch_size,
+        )
+
+    return {
+        "device": torch.cuda.get_device_name(),
+        "hardware": {
+            "device_index": torch.cuda.current_device(),
+            "device_name": torch.cuda.get_device_name(),
+            "compute_capability": ".".join(
+                str(part) for part in torch.cuda.get_device_capability()
+            ),
+            "total_memory_bytes": torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).total_memory,
+            "torch_version": torch.__version__,
+            "cuda_version": torch.version.cuda,
+        },
+        "runtime": runtime,
+        "shape": {
+            "batch_size": batch_size,
+            "prompt_tokens": prompt_tokens,
+            "correctness_decode_tokens": decode_tokens,
+            "timed_decode_tokens_per_iteration": 1,
+            "vocab_size": model.vocab_size,
+            "hidden_size": model.hidden_size,
+            "num_hidden_layers": model.total_num_layers,
+            "head_size": model.head_size,
+        },
+        "input": {
+            "generator": "torch.Generator(device=cpu).manual_seed",
+            "seed": seed,
+            "dtype": str(input_ids_cpu.dtype),
+            "shape": list(input_ids_cpu.shape),
+            "sha256": input_sha256,
+            "prompt_sha256": prompt_sha256,
+            "decode_sha256": decode_sha256,
+        },
+        "correctness_gate": correctness,
+        "measurements": {"prefill": prefill, "decode": decode},
+        "measurement_boundary": {
+            "clock": "CUDA events with explicit device synchronization",
+            "prefill_included": [
+                "token embedding",
+                "zero recurrent-state construction",
+                "packed recurrent metadata construction",
+                "RWKV7 model forward",
+                "FP32 lm_head projection",
+            ],
+            "decode_included": [
+                "token embedding",
+                "packed recurrent metadata construction",
+                "RWKV7 model forward",
+                "FP32 lm_head projection",
+            ],
+            "excluded": [
+                "model/config loading",
+                "input construction",
+                "correctness gate",
+                "decode state cloning",
+                "CUDA event construction",
+                "JSON serialization and disk write",
+            ],
+            "decode_state": (
+                "each timed one-token decode starts from a clone of the same "
+                "real prompt prefill state"
+            ),
+            "warmup_and_sync": (
+                "setup, synchronize, operation, synchronize for each warmup; "
+                "setup and synchronize before each timed CUDA event pair"
+            ),
+        },
+    }
 
 
 def _run_worker_direct_model_benchmark(
@@ -725,14 +1221,37 @@ def _run_worker_variant_comparison(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--prompt-tokens", type=int, default=128)
+    parser.add_argument("--decode-tokens", type=int, default=32)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--cases",
         type=_parse_cases,
         default=DEFAULT_CASES,
-        help="comma- or space-separated BxT cases",
+        help="comma- or space-separated BxT cases for explicit diagnostics",
     )
     parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--iters", type=int, default=10)
+    parser.add_argument(
+        "--iterations", "--iters", dest="iterations", type=int, default=20
+    )
+    parser.add_argument(
+        "--expected-wkv-mode",
+        choices=("fp16", "fp32io16"),
+        default="fp16",
+        help="Fail if the loaded runtime uses a different WKV precision mode.",
+    )
+    parser.add_argument(
+        "--expected-gemm-accumulation",
+        choices=("fp16", "fp32"),
+        default="fp16",
+        help="Fail if the loaded runtime uses a different GEMM accumulation policy.",
+    )
+    parser.add_argument(
+        "--diagnostic-cases",
+        action="store_true",
+        help="Run the legacy CUDA-graph BxT microbench instead of canonical timing.",
+    )
     parser.add_argument(
         "--profile-range",
         action="store_true",
@@ -804,13 +1323,50 @@ def main() -> None:
     args = _build_parser().parse_args()
     if args.warmup < 0:
         raise ValueError("warmup must be non-negative")
-    if args.iters <= 0:
-        raise ValueError("iters must be positive")
+    for name in ("batch_size", "prompt_tokens", "decode_tokens", "iterations"):
+        if getattr(args, name) <= 0:
+            raise ValueError(f"{name.replace('_', '-')} must be positive")
 
     cases = tuple(args.cases)
-    max_batch_size = max(batch_size for batch_size, _ in cases)
-    max_token_count = max(token_count for _, token_count in cases)
+    comparison_requested = (
+        args.compare_fp16_lt_tuning
+        or args.compare_m1_rkv
+        or args.compare_m1_cmix_prezero
+        or args.compare_gemm_accumulation
+        or args.compare_ln1_tmix_fusion
+    )
+    diagnostic_requested = args.diagnostic_cases or comparison_requested
+    if (
+        args.profile_range or args.profile_kernels or args.joint_only
+    ) and not diagnostic_requested:
+        raise ValueError(
+            "--profile-range, --profile-kernels, and --joint-only require "
+            "--diagnostic-cases"
+        )
+    max_batch_size = (
+        max(batch_size for batch_size, _ in cases)
+        if diagnostic_requested
+        else args.batch_size
+    )
+    max_token_count = (
+        max(token_count for _, token_count in cases)
+        if diagnostic_requested
+        else args.prompt_tokens + args.decode_tokens
+    )
     repo_root = Path(__file__).resolve().parents[2]
+    from vllm.transformers_utils.config import get_config
+
+    hf_config = get_config(args.model, trust_remote_code=False)
+    context_length = int(hf_config.max_position_embeddings)
+    if (
+        not diagnostic_requested
+        and args.prompt_tokens + args.decode_tokens > context_length
+    ):
+        raise ValueError(
+            "The correctness workload exceeds model context: "
+            f"{args.prompt_tokens} + {args.decode_tokens} > {context_length}"
+        )
+    artifact = _artifact_provenance(args.model, hf_config)
     config = BenchmarkConfig(
         repo_root=repo_root,
         model=args.model,
@@ -822,13 +1378,7 @@ def main() -> None:
     )
     llm = _create_vllm_runner_llm(config)
     try:
-        if (
-            args.compare_fp16_lt_tuning
-            or args.compare_m1_rkv
-            or args.compare_m1_cmix_prezero
-            or args.compare_gemm_accumulation
-            or args.compare_ln1_tmix_fusion
-        ):
+        if comparison_requested:
             comparison_kind = (
                 "m1-rkv"
                 if args.compare_m1_rkv
@@ -851,22 +1401,36 @@ def main() -> None:
                 args=(
                     cases,
                     args.warmup,
-                    args.iters,
+                    args.iterations,
                     args.tuning_capture_order,
                     comparison_kind,
                     args.fp16_lt_family,
                 ),
             )
-        else:
+        elif args.diagnostic_cases:
             worker_results = llm.collective_rpc(
                 _run_worker_direct_model_benchmark,
                 args=(
                     cases,
                     args.warmup,
-                    args.iters,
+                    args.iterations,
                     args.profile_range,
                     args.profile_kernels,
                     args.joint_only,
+                ),
+            )
+        else:
+            worker_results = llm.collective_rpc(
+                _run_worker_canonical_benchmark,
+                args=(
+                    args.batch_size,
+                    args.prompt_tokens,
+                    args.decode_tokens,
+                    args.seed,
+                    args.warmup,
+                    args.iterations,
+                    args.expected_wkv_mode,
+                    args.expected_gemm_accumulation,
                 ),
             )
     finally:
@@ -875,8 +1439,16 @@ def main() -> None:
     if len(worker_results) != 1:
         raise RuntimeError(f"expected one worker result, got {len(worker_results)}")
     payload = {
+        "schema_version": 1,
         "benchmark": "rwkv7_direct_model",
-        "model": args.model,
+        "scope": (
+            "canonical Transformers-comparable eager model boundary"
+            if not diagnostic_requested
+            else "explicit CUDA-graph kernel diagnostic; not like-for-like"
+        ),
+        "source": _source_provenance(repo_root),
+        "artifact": artifact,
+        "command": [sys.executable, *sys.argv],
         **worker_results[0],
     }
     rendered = json.dumps(payload, indent=2, sort_keys=True)
