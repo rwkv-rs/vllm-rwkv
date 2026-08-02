@@ -21,6 +21,9 @@ from vllm.transformers_utils.rwkv7_provenance import (
     TRANSFORMERS_RWKV_REQUIREMENT,
     TRANSFORMERS_RWKV_REVISION,
 )
+from vllm.transformers_utils.rwkv7_runtime_contract import (
+    canonicalize_github_repository_url,
+)
 
 
 def _rwkv_requirements() -> dict[str, Requirement]:
@@ -47,6 +50,19 @@ def test_rwkv_profile_pins_transformers_and_operator_forks() -> None:
     assert requirements["flash-rwkv"].url == (
         f"git+{FLASH_RWKV_REPOSITORY}@{FLASH_RWKV_REVISION}"
     )
+
+
+@pytest.mark.parametrize("codepoint", (*range(0x21), 0x7F))
+def test_github_repository_canonicalizer_rejects_forbidden_ascii_anywhere(
+    codepoint: int,
+) -> None:
+    repository = TRANSFORMERS_RWKV_REPOSITORY
+    character = chr(codepoint)
+
+    for index in (0, len(repository) // 2, len(repository)):
+        hostile = repository[:index] + character + repository[index:]
+        with pytest.raises(ValueError, match="ASCII controls, spaces, or DEL"):
+            canonicalize_github_repository_url(hostile)
 
 
 def _write_fake_transformers_distribution(
@@ -190,6 +206,12 @@ def test_fresh_process_accepts_canonical_pinned_rwkv7_provenance(
 @pytest.mark.parametrize(
     "repository_url",
     [
+        " https://github.com/rwkv-rs/transformers-rwkv.git",
+        "\thttps://github.com/rwkv-rs/transformers-rwkv.git",
+        "\x00https://github.com/rwkv-rs/transformers-rwkv.git",
+        "https://github.com/rwkv-rs/transformers-\nrwkv.git",
+        "https://github.com/rwkv-rs/transformers-rwkv.git\n",
+        "\x7fhttps://github.com/rwkv-rs/transformers-rwkv.git",
         "https://user@github.com/rwkv-rs/transformers-rwkv.git",
         "https://github.com:443/rwkv-rs/transformers-rwkv.git",
         "https://github.com/rwkv-rs/transformers-rwkv.git?ref=main",
