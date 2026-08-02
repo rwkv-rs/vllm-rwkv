@@ -19,7 +19,12 @@ from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.engine.core import _supports_no_kv_cache_chunked_prefill
-from vllm.v1.worker.gpu.model_states.rwkv import RWKV7ModelState
+from vllm.v1.worker.gpu.model_states.rwkv import (
+    RWKV7ModelState,
+    RWKV7PrefixStateCache,
+    RWKV7PrefixStateIdentity,
+    RWKV7PrefixStateSnapshot,
+)
 from vllm.v1.worker.gpu_input_batch import (
     CachedRequestState,
 )
@@ -480,6 +485,102 @@ def _new_rwkv7_model_state(
         encoder_cache=None,
         device=torch.device("cpu"),
     )
+
+
+def _prefix_identity(
+    token_ids: tuple[int, ...], **changes: str
+) -> RWKV7PrefixStateIdentity:
+    values = {
+        "model_artifact": "org/rwkv7-1.5b",
+        "model_revision": "model-commit",
+        "backend_provider": "vllm-rwkv",
+        "backend_revision": "backend-commit",
+        "wkv_mode": "fp32io16",
+        "gemm_policy": "fp16-accumulation",
+    }
+    values.update(changes)
+    return RWKV7PrefixStateIdentity(token_ids=token_ids, **values)
+
+
+def _prefix_snapshot(value: float, elapsed: int = 2) -> RWKV7PrefixStateSnapshot:
+    return RWKV7PrefixStateSnapshot(
+        shift_state=torch.full((2, 3), value),
+        wkv_state=torch.full((2, 2), value),
+        elapsed=elapsed,
+    )
+
+
+def test_rwkv7_prefix_state_cache_is_copy_on_write_and_lru():
+    cache = RWKV7PrefixStateCache(capacity=2)
+    first = _prefix_identity((1, 2))
+    second = _prefix_identity((3, 4))
+    third = _prefix_identity((5, 6))
+    cache.put(first, _prefix_snapshot(1.0))
+    cache.put(second, _prefix_snapshot(2.0))
+
+    hit = cache.get(first)
+    assert hit is not None
+    hit.shift_state.zero_()
+    cache.put(first, _prefix_snapshot(1.0))
+    cache.put(third, _prefix_snapshot(3.0))
+
+    assert cache.get(second) is None
+    preserved = cache.get(first)
+    assert preserved is not None
+    assert torch.equal(preserved.shift_state, torch.ones((2, 3)))
+
+
+def test_rwkv7_prefix_state_cache_fails_closed_on_conflict_and_stale_identity():
+    cache = RWKV7PrefixStateCache(capacity=2)
+    identity = _prefix_identity((1, 2))
+    cache.put(identity, _prefix_snapshot(1.0))
+    cache.put(identity, _prefix_snapshot(1.0))
+    assert len(cache) == 1
+
+    with pytest.raises(ValueError, match="conflicting state"):
+        cache.put(identity, _prefix_snapshot(2.0))
+    with pytest.raises(ValueError, match="stale model revision"):
+        cache.get(_prefix_identity((1, 2), model_revision="new-model"))
+    with pytest.raises(ValueError, match="stale backend configuration"):
+        cache.get(_prefix_identity((1, 2), backend_revision="new-backend"))
+
+
+def test_rwkv7_cached_recurrence_matches_full_prefill_continuation():
+    embeddings = torch.tensor([[0.1, 0.2], [0.3, -0.2], [-0.1, 0.4], [0.2, 0.5]])
+
+    def run(
+        token_ids: tuple[int, ...], snapshot: RWKV7PrefixStateSnapshot | None = None
+    ) -> tuple[list[torch.Tensor], RWKV7PrefixStateSnapshot]:
+        shift = torch.zeros(2) if snapshot is None else snapshot.shift_state.clone()
+        wkv = torch.zeros((2, 2)) if snapshot is None else snapshot.wkv_state.clone()
+        elapsed = 0 if snapshot is None else snapshot.elapsed
+        outputs = []
+        for token_id in token_ids:
+            value = embeddings[token_id]
+            mixed = value + 0.25 * shift
+            wkv = 0.75 * wkv + torch.outer(mixed, value)
+            outputs.append(wkv @ mixed)
+            shift = value
+            elapsed += 1
+        return outputs, RWKV7PrefixStateSnapshot(shift, wkv, elapsed)
+
+    prefix = (0, 1)
+    continuation = (2, 3)
+    full_outputs, full_state = run(prefix + continuation)
+    _, prefix_state = run(prefix)
+    cache = RWKV7PrefixStateCache(capacity=1)
+    identity = _prefix_identity(prefix)
+    cache.put(identity, prefix_state)
+    cached_state = cache.get(identity)
+    assert cached_state is not None
+    cached_outputs, final_state = run(continuation, cached_state)
+
+    torch.testing.assert_close(
+        torch.stack(cached_outputs), torch.stack(full_outputs[2:])
+    )
+    torch.testing.assert_close(final_state.shift_state, full_state.shift_state)
+    torch.testing.assert_close(final_state.wkv_state, full_state.wkv_state)
+    assert final_state.elapsed == full_state.elapsed
 
 
 def _rwkv7_input_batch(

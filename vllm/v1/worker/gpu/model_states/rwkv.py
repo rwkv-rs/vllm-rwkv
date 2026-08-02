@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -18,6 +20,120 @@ from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class RWKV7PrefixStateIdentity:
+    """Compatibility identity for one recurrent prefix state."""
+
+    token_ids: tuple[int, ...]
+    model_artifact: str
+    model_revision: str
+    backend_provider: str
+    backend_revision: str
+    wkv_mode: str
+    gemm_policy: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "token_ids", tuple(self.token_ids))
+        if not self.token_ids:
+            raise ValueError("RWKV7 prefix identity requires at least one token")
+        if any(token_id < 0 for token_id in self.token_ids):
+            raise ValueError("RWKV7 prefix token ids must be non-negative")
+        for field_name in (
+            "model_artifact",
+            "model_revision",
+            "backend_provider",
+            "backend_revision",
+            "wkv_mode",
+            "gemm_policy",
+        ):
+            if not getattr(self, field_name):
+                raise ValueError(f"RWKV7 prefix identity requires {field_name}")
+
+
+@dataclass(frozen=True)
+class RWKV7PrefixStateSnapshot:
+    """A request-independent copy of all state needed to resume a prefix."""
+
+    shift_state: torch.Tensor
+    wkv_state: torch.Tensor
+    elapsed: int
+
+    def clone(self) -> "RWKV7PrefixStateSnapshot":
+        return RWKV7PrefixStateSnapshot(
+            shift_state=self.shift_state.clone(),
+            wkv_state=self.wkv_state.clone(),
+            elapsed=self.elapsed,
+        )
+
+    def is_identical(self, other: "RWKV7PrefixStateSnapshot") -> bool:
+        return (
+            self.elapsed == other.elapsed
+            and self.shift_state.dtype == other.shift_state.dtype
+            and self.shift_state.device == other.shift_state.device
+            and torch.equal(self.shift_state, other.shift_state)
+            and self.wkv_state.dtype == other.wkv_state.dtype
+            and self.wkv_state.device == other.wkv_state.device
+            and torch.equal(self.wkv_state, other.wkv_state)
+        )
+
+
+class RWKV7PrefixStateCache:
+    """Bounded LRU cache for recurrent state owned by the RWKV model state.
+
+    Capacity is measured in snapshots. Stored values and cache hits are cloned,
+    so a resumed request cannot mutate the cached state. This is intentionally a
+    state-only seam; it is not connected to vLLM's KV block manager.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        if capacity <= 0:
+            raise ValueError("RWKV7 prefix cache capacity must be positive")
+        self.capacity = capacity
+        self._entries: OrderedDict[
+            RWKV7PrefixStateIdentity, RWKV7PrefixStateSnapshot
+        ] = OrderedDict()
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def get(
+        self, identity: RWKV7PrefixStateIdentity
+    ) -> RWKV7PrefixStateSnapshot | None:
+        snapshot = self._entries.get(identity)
+        if snapshot is not None:
+            self._entries.move_to_end(identity)
+            return snapshot.clone()
+        self._reject_stale_identity(identity)
+        return None
+
+    def put(
+        self,
+        identity: RWKV7PrefixStateIdentity,
+        snapshot: RWKV7PrefixStateSnapshot,
+    ) -> None:
+        existing = self._entries.get(identity)
+        if existing is not None:
+            if not existing.is_identical(snapshot):
+                raise ValueError("RWKV7 prefix identity maps to conflicting state")
+            self._entries.move_to_end(identity)
+            return
+        self._reject_stale_identity(identity)
+        self._entries[identity] = snapshot.clone()
+        if len(self._entries) > self.capacity:
+            self._entries.popitem(last=False)
+
+    def _reject_stale_identity(self, identity: RWKV7PrefixStateIdentity) -> None:
+        for cached in self._entries:
+            if (
+                cached.token_ids != identity.token_ids
+                or cached.model_artifact != identity.model_artifact
+            ):
+                continue
+            if cached.model_revision != identity.model_revision:
+                raise ValueError("RWKV7 prefix state has a stale model revision")
+            raise ValueError("RWKV7 prefix state has a stale backend configuration")
 
 
 class RWKV7ModelState(ModelState):
