@@ -689,6 +689,9 @@ class RWKV7ForCausalLMConfig(VerifyAndUpdateConfig):
 
         cache_config = getattr(vllm_config, "cache_config", None)
         if cache_config is not None:
+            cache_config.rwkv_recurrent_prefix_caching = (
+                cache_config.enable_prefix_caching
+            )
             cache_config.enable_prefix_caching = False
 
         scheduler_config = getattr(vllm_config, "scheduler_config", None)

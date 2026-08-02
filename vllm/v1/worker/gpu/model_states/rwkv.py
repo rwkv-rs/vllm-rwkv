@@ -21,6 +21,8 @@ from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
 
+DEFAULT_RWKV7_PREFIX_CACHE_CAPACITY = 8
+
 
 @dataclass(frozen=True)
 class RWKV7PrefixStateIdentity:
@@ -83,8 +85,7 @@ class RWKV7PrefixStateCache:
     """Bounded LRU cache for recurrent state owned by the RWKV model state.
 
     Capacity is measured in snapshots. Stored values and cache hits are cloned,
-    so a resumed request cannot mutate the cached state. This is intentionally a
-    state-only seam; it is not connected to vLLM's KV block manager.
+    so a resumed request cannot mutate the cached state.
     """
 
     def __init__(self, capacity: int) -> None:
@@ -98,6 +99,9 @@ class RWKV7PrefixStateCache:
     def __len__(self) -> int:
         return len(self._entries)
 
+    def clear(self) -> None:
+        self._entries.clear()
+
     def get(
         self, identity: RWKV7PrefixStateIdentity
     ) -> RWKV7PrefixStateSnapshot | None:
@@ -107,6 +111,43 @@ class RWKV7PrefixStateCache:
             return snapshot.clone()
         self._reject_stale_identity(identity)
         return None
+
+    def get_longest_prefix(
+        self,
+        identity: RWKV7PrefixStateIdentity,
+        *,
+        max_prefix_length: int,
+    ) -> tuple[int, RWKV7PrefixStateSnapshot] | None:
+        if max_prefix_length <= 0:
+            return None
+
+        best: RWKV7PrefixStateIdentity | None = None
+        for cached in self._entries:
+            prefix_length = len(cached.token_ids)
+            if (
+                prefix_length > max_prefix_length
+                or identity.token_ids[:prefix_length] != cached.token_ids
+            ):
+                continue
+            if cached.model_artifact != identity.model_artifact:
+                continue
+            if cached.model_revision != identity.model_revision:
+                raise ValueError("RWKV7 prefix state has a stale model revision")
+            if (
+                cached.backend_provider != identity.backend_provider
+                or cached.backend_revision != identity.backend_revision
+                or cached.wkv_mode != identity.wkv_mode
+                or cached.gemm_policy != identity.gemm_policy
+            ):
+                raise ValueError("RWKV7 prefix state has a stale backend configuration")
+            if best is None or prefix_length > len(best.token_ids):
+                best = cached
+
+        if best is None:
+            return None
+        snapshot = self._entries[best]
+        self._entries.move_to_end(best)
+        return len(best.token_ids), snapshot.clone()
 
     def put(
         self,
@@ -220,6 +261,22 @@ class RWKV7ModelState(ModelState):
         self.decode_req_slots: set[int] = set()
         self._prefill_req_slots: list[int] = []
         self._prefill_becomes_decode: list[bool] = []
+        self._prefill_cache_targets: list[int] = []
+        self.req_prompt_token_ids: dict[str, tuple[int, ...]] = {}
+        self.req_prefix_cache_hit_lengths: dict[str, int] = {}
+        self.prefix_cache_eligible_req_ids: set[str] = set()
+
+        cache_config = getattr(vllm_config, "cache_config", None)
+        prefix_cache_enabled = bool(
+            cache_config is not None
+            and getattr(cache_config, "rwkv_recurrent_prefix_caching", False)
+        )
+        self.prefix_state_cache = (
+            RWKV7PrefixStateCache(capacity=DEFAULT_RWKV7_PREFIX_CACHE_CAPACITY)
+            if prefix_cache_enabled
+            else None
+        )
+        self._prefix_identity_fields = self._build_prefix_identity_fields()
 
     def _reset_mappings(self) -> None:
         self.req_slot_owners = [None] * self.max_num_reqs
@@ -229,6 +286,103 @@ class RWKV7ModelState(ModelState):
         self.decode_req_slots = set()
         self._prefill_req_slots = []
         self._prefill_becomes_decode = []
+        self._prefill_cache_targets = []
+        self.req_prompt_token_ids.clear()
+        self.req_prefix_cache_hit_lengths.clear()
+        self.prefix_cache_eligible_req_ids.clear()
+
+    def _build_prefix_identity_fields(self) -> dict[str, str]:
+        cfg = self.model_config.hf_config
+        model_artifact = str(
+            getattr(self.model_config, "model", None)
+            or getattr(cfg, "name_or_path", None)
+            or getattr(cfg, "_name_or_path", None)
+            or type(self.model).__qualname__
+        )
+        model_revision = str(
+            getattr(self.model_config, "revision", None)
+            or getattr(cfg, "_commit_hash", None)
+            or getattr(cfg, "rwkv_model_revision", None)
+            or "runtime"
+        )
+        backend_provider = str(
+            getattr(self.model, "rwkv_backend_provider", None) or "vllm-rwkv-native"
+        )
+        backend_revision = str(
+            getattr(self.model, "rwkv_backend_revision", None)
+            or getattr(cfg, "rwkv_backend_revision", None)
+            or f"{type(self.model).__module__}.{type(self.model).__qualname__}"
+        )
+        wkv_mode = str(getattr(self.model, "wkv_mode", "fp16"))
+        execution_profile = getattr(self.model, "execution_profile", None)
+        gemm_policy = str(
+            getattr(execution_profile, "gemm_accumulation_policy", None)
+            or (
+                "fp16"
+                if getattr(self.model, "allow_fp16_accumulation", False)
+                else "fp32"
+            )
+        )
+        return {
+            "model_artifact": model_artifact,
+            "model_revision": model_revision,
+            "backend_provider": backend_provider,
+            "backend_revision": backend_revision,
+            "wkv_mode": wkv_mode,
+            "gemm_policy": gemm_policy,
+        }
+
+    def _prefix_identity(self, token_ids: tuple[int, ...]) -> RWKV7PrefixStateIdentity:
+        return RWKV7PrefixStateIdentity(
+            token_ids=token_ids,
+            **self._prefix_identity_fields,
+        )
+
+    def _restore_row(
+        self,
+        row: int,
+        snapshot: RWKV7PrefixStateSnapshot,
+    ) -> None:
+        shift_row = self.shift_state[:, :, row]
+        wkv_row = self.wkv_state[:, row]
+        if (
+            snapshot.shift_state.shape != shift_row.shape
+            or snapshot.shift_state.dtype != shift_row.dtype
+            or snapshot.shift_state.device != shift_row.device
+            or snapshot.wkv_state.shape != wkv_row.shape
+            or snapshot.wkv_state.dtype != wkv_row.dtype
+            or snapshot.wkv_state.device != wkv_row.device
+            or snapshot.elapsed < 0
+        ):
+            raise ValueError("RWKV7 cached prefix state is incompatible with runtime")
+        shift_row.copy_(snapshot.shift_state)
+        wkv_row.copy_(snapshot.wkv_state)
+        self.elapsed[row].fill_(snapshot.elapsed)
+
+    def _cache_row(self, req_slot: int, prefix_length: int) -> None:
+        cache = self.prefix_state_cache
+        req_id = self.req_slot_owners[req_slot]
+        if (
+            cache is None
+            or req_id is None
+            or req_id not in self.prefix_cache_eligible_req_ids
+            or prefix_length <= 0
+        ):
+            return
+        token_ids = self.req_prompt_token_ids[req_id]
+        if prefix_length > len(token_ids):
+            raise RuntimeError("RWKV7 prefix cache target exceeds prompt length")
+        row = self.req_slot_to_row[req_slot]
+        if row < 0:
+            raise RuntimeError("RWKV7 prefix cache target has no resident state row")
+        cache.put(
+            self._prefix_identity(token_ids[:prefix_length]),
+            RWKV7PrefixStateSnapshot(
+                shift_state=self.shift_state[:, :, row].clone(),
+                wkv_state=self.wkv_state[:, row].clone(),
+                elapsed=prefix_length,
+            ),
+        )
 
     def _state_slot_for_batch_entry(
         self,
@@ -386,11 +540,37 @@ class RWKV7ModelState(ModelState):
         current_owner = self.req_slot_owners[req_index]
         if current_owner is not None:
             raise RuntimeError(
-                f"RWKV7 request slot {req_index} is already owned by "
-                f"{current_owner!r}"
+                f"RWKV7 request slot {req_index} is already owned by {current_owner!r}"
             )
         if not self.free_rows:
             raise RuntimeError("RWKV7 state pool is full")
+
+        prompt_token_ids = tuple(new_req_data.prompt_token_ids or ())
+        sampling_params = new_req_data.sampling_params
+        cache_eligible = bool(
+            self.prefix_state_cache is not None
+            and prompt_token_ids
+            and (
+                sampling_params is None
+                or getattr(sampling_params, "prompt_logprobs", None) is None
+            )
+        )
+        cache_hit_length = 0
+        cached_snapshot = None
+        if cache_eligible:
+            hit = self.prefix_state_cache.get_longest_prefix(
+                self._prefix_identity(prompt_token_ids),
+                max_prefix_length=len(prompt_token_ids) - 1,
+            )
+            if hit is not None:
+                cache_hit_length, cached_snapshot = hit
+        if new_req_data.num_computed_tokens > cache_hit_length:
+            raise RuntimeError(
+                "RWKV7 cannot restore scheduler-computed prefix state: "
+                f"request has {new_req_data.num_computed_tokens} computed tokens "
+                f"but recurrent cache restored {cache_hit_length}."
+            )
+
         row = min(self.free_rows)
         if self.row_to_req_slot[row] != -1:
             raise RuntimeError(f"RWKV7 free state row {row} still has an owner")
@@ -400,6 +580,21 @@ class RWKV7ModelState(ModelState):
         self.req_slot_to_row[req_index] = row
         self.row_to_req_slot[row] = req_index
         self._zero_row(row)
+        try:
+            if cached_snapshot is not None:
+                self._restore_row(row, cached_snapshot)
+        except Exception:
+            self.req_id_to_index.pop(req_id)
+            self.req_slot_owners[req_index] = None
+            self.req_slot_to_row[req_index] = -1
+            self.row_to_req_slot[row] = -1
+            self.free_rows.add(row)
+            self._zero_row(row)
+            raise
+        self.req_prompt_token_ids[req_id] = prompt_token_ids
+        self.req_prefix_cache_hit_lengths[req_id] = cache_hit_length
+        if cache_eligible:
+            self.prefix_cache_eligible_req_ids.add(req_id)
 
     def remove_request(self, req_id: str) -> None:
         req_index = self.req_id_to_index.get(req_id)
@@ -422,6 +617,9 @@ class RWKV7ModelState(ModelState):
             self.row_to_req_slot[row] = -1
             self.req_slot_owners[req_index] = None
             self.free_rows.add(row)
+        self.req_prompt_token_ids.pop(req_id, None)
+        self.req_prefix_cache_hit_lengths.pop(req_id, None)
+        self.prefix_cache_eligible_req_ids.discard(req_id)
 
     def _remove_decode_row(self, req_index: int, row: int) -> None:
         self._zero_row(row)
@@ -465,6 +663,11 @@ class RWKV7ModelState(ModelState):
         self.shift_state.zero_()
         self.wkv_state.zero_()
         self.elapsed.zero_()
+        if self.prefix_state_cache is not None:
+            self.prefix_state_cache.clear()
+        self.req_prefix_cache_hit_lengths = {
+            req_id: 0 for req_id in self.req_id_to_index
+        }
         # Level-2 sleep discards allocator-backed tensors. Rebuild the static
         # decode metadata that is not restored by checkpoint weight streaming.
         torch.arange(self.max_num_reqs, out=self.execution_idx_mapping)
@@ -487,6 +690,7 @@ class RWKV7ModelState(ModelState):
         self._set_sampling_logits_fast_path(input_batch, False)
         self._prefill_req_slots = []
         self._prefill_becomes_decode = []
+        self._prefill_cache_targets = []
         req_ids = getattr(input_batch, "req_ids", None)
         is_dummy_batch = (
             req_ids is not None
@@ -547,12 +751,16 @@ class RWKV7ModelState(ModelState):
         decode_entries: list[tuple[int, int, int, int]] = []
         live_decode_req_slots = set(self.decode_req_slots)
         scheduled_decode_req_slots: set[int] = set()
-        prefill_entries: list[tuple[int, int, int, bool]] = []
+        prefill_entries: list[tuple[int, int, int, bool, int, int, int]] = []
         for batch_idx, req_slot, is_prefill, start, end in batch_entries:
             current_row = self.req_slot_to_row[req_slot]
             if current_row == -1:
                 raise RuntimeError(f"RWKV state for request slot {req_slot} missing")
             if is_prefill:
+                if start >= end:
+                    raise RuntimeError(
+                        "RWKV7 fast prefill requires positive request lengths."
+                    )
                 num_computed_prefill = getattr(
                     input_batch, "num_computed_prefill_tokens_np", None
                 )
@@ -567,9 +775,41 @@ class RWKV7ModelState(ModelState):
                     becomes_decode = int(num_computed_prefill[batch_idx]) + int(
                         scheduled_tokens[batch_idx]
                     ) >= int(prefill_len[batch_idx])
-                prefill_entries.append(
-                    (batch_idx, req_slot, current_row, becomes_decode)
+                effective_start = start
+                cache_target = 0
+                req_id = self.req_slot_owners[req_slot]
+                cache_hit_length = (
+                    self.req_prefix_cache_hit_lengths.get(req_id, 0)
+                    if req_id is not None
+                    else 0
                 )
+                if cache_hit_length:
+                    if num_computed_prefill is None:
+                        raise RuntimeError(
+                            "RWKV7 prefix cache requires computed-token metadata"
+                        )
+                    computed = int(num_computed_prefill[batch_idx])
+                    effective_start += min(
+                        max(cache_hit_length - computed, 0), end - start
+                    )
+                if req_id in self.prefix_cache_eligible_req_ids:
+                    if num_computed_prefill is None:
+                        raise RuntimeError(
+                            "RWKV7 prefix cache requires computed-token metadata"
+                        )
+                    cache_target = int(num_computed_prefill[batch_idx]) + (end - start)
+                if effective_start < end:
+                    prefill_entries.append(
+                        (
+                            batch_idx,
+                            req_slot,
+                            current_row,
+                            becomes_decode,
+                            effective_start,
+                            end,
+                            cache_target,
+                        )
+                    )
             else:
                 decode_row = self._mark_resident_row_decode(req_slot)
                 scheduled_decode_req_slots.add(req_slot)
@@ -661,18 +901,26 @@ class RWKV7ModelState(ModelState):
             req_slot,
             _decode_row,
             becomes_decode,
+            _start,
+            _end,
+            cache_target,
         ) in prefill_entries:
             prefill_rows.append(self.req_slot_to_row[req_slot])
             self._prefill_req_slots.append(req_slot)
             self._prefill_becomes_decode.append(becomes_decode)
+            self._prefill_cache_targets.append(cache_target)
 
         prefill_ranges = [
-            (
+            (batch_idx, start, end)
+            for (
                 batch_idx,
-                int(query_start_loc_np[batch_idx]),
-                int(query_start_loc_np[batch_idx + 1]),
-            )
-            for batch_idx, _req_slot, _row, _becomes_decode in prefill_entries
+                _req_slot,
+                _row,
+                _becomes_decode,
+                start,
+                end,
+                _cache_target,
+            ) in prefill_entries
         ]
         prefill_lengths = [end - start for _batch_idx, start, end in prefill_ranges]
         has_positive_prefill_lengths = all(length > 0 for length in prefill_lengths)
@@ -727,11 +975,13 @@ class RWKV7ModelState(ModelState):
         if not self._prefill_req_slots:
             return
         for scratch_row, req_slot in enumerate(self._prefill_req_slots):
+            self._cache_row(req_slot, self._prefill_cache_targets[scratch_row])
             if self._prefill_becomes_decode[scratch_row]:
                 self._mark_resident_row_decode(req_slot)
         self._validate_decode_membership()
         self._prefill_req_slots = []
         self._prefill_becomes_decode = []
+        self._prefill_cache_targets = []
 
     def has_pending_postprocess_state(self) -> bool:
         return bool(self._prefill_req_slots)
