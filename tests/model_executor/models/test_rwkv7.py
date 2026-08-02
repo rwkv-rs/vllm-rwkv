@@ -894,6 +894,23 @@ def test_rwkv7_checkpoint_preprocess_validates_config_shape():
         RWKV7ForCausalLM._validate_checkpoint_weight_shapes(model, weights)
 
 
+def test_rwkv7_checkpoint_shape_validation_preserves_single_attention_head():
+    model = _new_rwkv7_for_weight_tests()
+    model.config = SimpleNamespace(
+        hidden_size=64,
+        vocab_size=32,
+        head_size=64,
+        num_hidden_layers=2,
+    )
+    weights = {
+        "emb.weight": torch.empty(32, 64),
+        "blocks.0.att.r_k": torch.empty(1, 64),
+        "blocks.1.att.r_k": torch.empty(1, 64),
+    }
+
+    RWKV7ForCausalLM._validate_checkpoint_weight_shapes(model, weights)
+
+
 @pytest.mark.parametrize(
     "compilation_mode",
     [
