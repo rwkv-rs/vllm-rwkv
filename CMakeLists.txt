@@ -82,7 +82,7 @@ function(vllm_write_build_profile_manifest)
       "  \"supported_weight_suffixes\": [\".pth\"],\n"
       "  \"supported_device_types\": [\"cuda\"],\n"
       "  \"supported_runner_types\": [\"generate\"],\n"
-      "  \"supported_serving_features\": [\"text_generation\", \"openai_chat\", \"openai_completions\", \"streaming\", \"stop\", \"prometheus_metrics\", \"rapid_sampling\", \"sleep_mode\", \"cumem_allocator\"],\n"
+      "  \"supported_serving_features\": [\"text_generation\", \"openai_chat\", \"openai_completions\", \"streaming\", \"structured_outputs\", \"stop\", \"prometheus_metrics\", \"rapid_sampling\", \"sleep_mode\", \"cumem_allocator\"],\n"
       "  \"supported_tensor_parallel_sizes\": [1],\n"
       "  \"supported_pipeline_parallel_sizes\": [1],\n"
       "  \"supported_data_parallel_sizes\": [1]\n")
