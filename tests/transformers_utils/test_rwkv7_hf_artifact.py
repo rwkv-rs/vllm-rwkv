@@ -28,6 +28,7 @@ from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.configs.rwkv7 import (
     RWKV7_COMPRESSED_TENSORS_VERSION,
     RWKV7_NVFP4_CONSUMER_SEMANTIC_REVISION,
+    RWKV7_NVFP4_W4A16_CONSUMER,
     RWKV7_SUPPORTED_PACKED_FORMATS,
     RWKV7Config,
     rwkv7_checkpoint_weight_shapes,
@@ -59,7 +60,7 @@ def _standard_rwkv7_hf_config(**overrides: object) -> SimpleNamespace:
 
 
 def _nvfp4_targets(candidate: str, num_hidden_layers: int = 2) -> list[str]:
-    if candidate == "nvfp4-w4a4":
+    if candidate in {"nvfp4-w4a4", "nvfp4-w4a16"}:
         return [
             f"model.blocks.{layer_id}.ffn.{name}"
             for layer_id in range(num_hidden_layers)
@@ -156,7 +157,7 @@ def _nvfp4_consumer_config(
     )
     target_schema = (
         "rwkv7-nvfp4-critical-high-v1"
-        if candidate == "nvfp4-w4a4"
+        if candidate in {"nvfp4-w4a4", "nvfp4-w4a16"}
         else "rwkv7-nvfp4-protection-ablation-no-ffn-v1"
     )
     metadata = {
@@ -314,6 +315,45 @@ def test_rwkv7_nvfp4_consumer_revision_is_immutable_semantic_parent() -> None:
     )
 
 
+def test_rwkv7_w4a16_baseline_is_distinct_weight_only_candidate() -> None:
+    baseline = _nvfp4_consumer_config("nvfp4-w4a16")
+    ablation = _nvfp4_consumer_config("nvfp4-w4a16-protection-ablation")
+
+    assert validate_rwkv7_quantization_artifact_metadata(baseline) == (
+        "nvfp4-pack-quantized"
+    )
+    baseline_metadata = baseline.rwkv7_quantization_metadata["vllm"]
+    ablation_metadata = ablation.rwkv7_quantization_metadata["vllm"]
+    assert baseline.rwkv7_quantization_metadata["candidate"] == "nvfp4-w4a16"
+    assert baseline_metadata["target_schema"] == "rwkv7-nvfp4-critical-high-v1"
+    assert baseline_metadata["vllm_consumer_requirement"] == (
+        RWKV7_NVFP4_W4A16_CONSUMER
+    )
+    assert (
+        baseline.quantization_config["config_groups"]["group_0"]["input_activations"]
+        is None
+    )
+    assert all(".ffn." in target for target in baseline_metadata["quantized_modules"])
+    assert not any(
+        ".ffn." in target for target in ablation_metadata["quantized_modules"]
+    )
+    assert (
+        baseline_metadata["quantized_modules"] != ablation_metadata["quantized_modules"]
+    )
+
+
+def test_rwkv7_w4a16_baseline_rejects_activation_quantization() -> None:
+    config = _nvfp4_consumer_config("nvfp4-w4a16")
+    group = config.quantization_config["config_groups"]["group_0"]
+    group["input_activations"] = {
+        **group["weights"],
+        "dynamic": "local",
+    }
+
+    with pytest.raises(ValueError, match="W4A16 requires input_activations=None"):
+        validate_rwkv7_quantization_artifact_metadata(config)
+
+
 @pytest.mark.parametrize(
     ("case", "match"),
     [
@@ -367,7 +407,7 @@ def test_invalid_rwkv7_quantization_metadata_fails_closed(
         assert isinstance(selection, dict)
         selection["names"] = list(selection["names"])[1:]
     elif case == "candidate":
-        metadata["candidate"] = "nvfp4-w4a16"
+        metadata["candidate"] = "nvfp4-w4a16-unknown"
     elif case == "consumer":
         vllm_metadata["vllm_consumer_revision"] = "1" * 40
     elif case == "consumer_capability":
@@ -597,9 +637,9 @@ def _exercise_nvfp4_consumer_candidate(
 
     targets = config.rwkv7_quantization_metadata["vllm"]["quantized_modules"]
     expected_target_count = (
-        2 * config.num_hidden_layers
-        if candidate == "nvfp4-w4a4"
-        else 9 + 12 * (config.num_hidden_layers - 1)
+        9 + 12 * (config.num_hidden_layers - 1)
+        if candidate == "nvfp4-w4a16-protection-ablation"
+        else 2 * config.num_hidden_layers
     )
     assert len(targets) == expected_target_count
     assert set(model._quantized_linears) == set(targets)
@@ -618,7 +658,7 @@ def _exercise_nvfp4_consumer_candidate(
             expected_parameter_names
         )
         assert linear.params_dtype == torch.float16
-        assert linear.scheme.use_a16 == (candidate == "nvfp4-w4a16-protection-ablation")
+        assert linear.scheme.use_a16 == (candidate != "nvfp4-w4a4")
         assert not hasattr(linear, "weight")
         for parameter_name, parameter in linear.named_parameters(recurse=False):
             full_name = f"{target}.{parameter_name}"
@@ -709,7 +749,7 @@ def _exercise_nvfp4_consumer_candidate(
                 torch.tensor(2, dtype=torch.float32),
             )
 
-    if candidate == "nvfp4-w4a4":
+    if candidate in {"nvfp4-w4a4", "nvfp4-w4a16"}:
         key = model._apply_quantized_linear(
             "blocks.0.ffn.key",
             torch.ones((2, 64), dtype=torch.float16),
@@ -754,7 +794,14 @@ def test_default_loader_w4a4_ffn_candidate_uses_real_ct_process_and_runtime(
     _exercise_nvfp4_consumer_candidate("nvfp4-w4a4", tmp_path, monkeypatch)
 
 
-def test_default_loader_w4a16_attention_candidate_uses_real_ct_process_and_runtime(
+def test_default_loader_w4a16_ffn_candidate_uses_real_ct_process_and_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _exercise_nvfp4_consumer_candidate("nvfp4-w4a16", tmp_path, monkeypatch)
+
+
+def test_default_loader_w4a16_ablation_uses_real_ct_process_and_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -774,7 +821,7 @@ def _unpack_nvfp4_for_reference(packed: torch.Tensor) -> torch.Tensor:
 
 @pytest.mark.parametrize(
     "candidate",
-    ("nvfp4-w4a4", "nvfp4-w4a16-protection-ablation"),
+    ("nvfp4-w4a4", "nvfp4-w4a16", "nvfp4-w4a16-protection-ablation"),
 )
 def test_default_loader_nvfp4_candidate_reaches_native_gpu_kernel(
     candidate: str,
@@ -804,7 +851,7 @@ def test_default_loader_nvfp4_candidate_reaches_native_gpu_kernel(
         compressed_tensors_w4a4_nvfp4,
     )
 
-    use_a16 = candidate == "nvfp4-w4a16-protection-ablation"
+    use_a16 = candidate != "nvfp4-w4a4"
     kernel_type = MarlinNvFp4LinearKernel if use_a16 else CutlassNvFp4LinearKernel
 
     def native_kernel(**_kwargs: object) -> object:
@@ -894,7 +941,11 @@ def test_default_loader_nvfp4_candidate_reaches_native_gpu_kernel(
     )
     loader.load_weights(model, model_config)
 
-    runtime_target = "model.blocks.1.att.key" if use_a16 else "model.blocks.0.ffn.key"
+    runtime_target = (
+        "model.blocks.1.att.key"
+        if candidate == "nvfp4-w4a16-protection-ablation"
+        else "model.blocks.0.ffn.key"
+    )
     linear = model.get_submodule(runtime_target)
     packed_before = linear.weight_packed.detach().clone()
     scales_before = linear.weight_scale.detach().clone()

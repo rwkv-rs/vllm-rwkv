@@ -20,8 +20,9 @@ RWKV7_SUPPORTED_PACKED_FORMATS = frozenset(("nvfp4-pack-quantized",))
 RWKV7_NVFP4_W4A4_CONSUMER = "vllm-rwkv-nvfp4-w4a4"
 RWKV7_NVFP4_W4A16_CONSUMER = "vllm-rwkv-nvfp4-w4a16"
 RWKV7_COMPRESSED_TENSORS_VERSION = "0.17.2.a20260731"
-# This immutable parent introduced the W4A4/W4A16 consumer semantics. Requiring
-# the validating child itself would make every follow-up artifact self-referential.
+# This immutable parent introduced W4A4 and W4A16 protection-ablation. The
+# follow-up provenance child advances this after the ordinary W4A16 semantic
+# commit has an OID; requiring the validating child here would be self-referential.
 RWKV7_NVFP4_CONSUMER_SEMANTIC_REVISION = "6df9bfb41d7ec091fc9e13210ca4249389518114"
 _RWKV7_TRANSFORMERS_CONSUMER = "transformers-rwkv-compressed-tensors"
 _RWKV7_TARGET_SCHEMA_VERSION = 1
@@ -117,7 +118,7 @@ def _rwkv7_nvfp4_candidate_targets(
     candidate: str,
     num_hidden_layers: int,
 ) -> list[str]:
-    if candidate == "nvfp4-w4a4":
+    if candidate in {"nvfp4-w4a4", "nvfp4-w4a16"}:
         return [
             f"model.blocks.{layer_id}.ffn.{name}"
             for layer_id in range(num_hidden_layers)
@@ -235,11 +236,12 @@ def validate_rwkv7_quantization_artifact_metadata(config: object) -> str | None:
     candidate = contract.get("candidate")
     if candidate not in {
         "nvfp4-w4a4",
+        "nvfp4-w4a16",
         "nvfp4-w4a16-protection-ablation",
     }:
         raise ValueError(
             "RWKV7 quantization metadata candidate must be the canonical W4A4 "
-            "or W4A16 protection-ablation consumer artifact"
+            "or W4A16 baseline/protection-ablation consumer artifact"
         )
 
     target_policy = _rwkv7_metadata_mapping(
@@ -328,12 +330,14 @@ def validate_rwkv7_quantization_artifact_metadata(config: object) -> str | None:
     expected_targets = _rwkv7_nvfp4_candidate_targets(str(candidate), num_hidden_layers)
     expected_schema = {
         "nvfp4-w4a4": "rwkv7-nvfp4-critical-high-v1",
+        "nvfp4-w4a16": "rwkv7-nvfp4-critical-high-v1",
         "nvfp4-w4a16-protection-ablation": (
             "rwkv7-nvfp4-protection-ablation-no-ffn-v1"
         ),
     }[str(candidate)]
     expected_consumer = {
         "nvfp4-w4a4": RWKV7_NVFP4_W4A4_CONSUMER,
+        "nvfp4-w4a16": RWKV7_NVFP4_W4A16_CONSUMER,
         "nvfp4-w4a16-protection-ablation": RWKV7_NVFP4_W4A16_CONSUMER,
     }[str(candidate)]
     consumer_revision = vllm.get("vllm_consumer_revision")
