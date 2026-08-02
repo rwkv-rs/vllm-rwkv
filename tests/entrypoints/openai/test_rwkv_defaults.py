@@ -11,6 +11,7 @@ from vllm.tokenizers.rwkv_defaults import (
     RWKV_PROMPT_TEMPLATE_BOT,
     resolve_rwkv_prompt_template,
     resolve_rwkv_sampling_params,
+    resolve_rwkv_tool_parser,
 )
 
 
@@ -64,3 +65,24 @@ def test_rwkv_native_chat_rejects_beam_search_without_text_stops() -> None:
             _ModelConfig(),
             prompt_template=resolve_rwkv_prompt_template(),
         )
+
+
+def test_raw_pth_filename_is_not_rwkv_serving_identity() -> None:
+    assert (
+        resolve_rwkv_tool_parser(
+            tool_parser=None,
+            enable_auto_tools=True,
+            model="rwkv7-g1g-7.2b-20260523-ctx8192.pth",
+        )
+        is None
+    )
+
+    assert (
+        resolve_rwkv_tool_parser(
+            tool_parser=None,
+            enable_auto_tools=True,
+            tokenizer_mode="rwkv",
+            model="weights.pth",
+        )
+        == "rwkv"
+    )
