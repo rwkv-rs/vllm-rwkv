@@ -569,7 +569,7 @@ torch::Tensor add_vec_2d(int64_t C, torch::Tensor x, torch::Tensor vec) {
   return add_vec_2d_cuda(c, x, vec);
 }
 
-TORCH_LIBRARY(rwkv7_fast_ops_fp16, m) {
+TORCH_LIBRARY(vllm_rwkv7_fast_ops_fp16, m) {
   m.def(
       "tmix_mix6(int B, int T, int C, Tensor x, Tensor(a!) shift_state, "
       "Tensor x_r, Tensor x_w, Tensor x_k, Tensor x_v, Tensor x_a, Tensor x_g) "
@@ -636,7 +636,7 @@ TORCH_LIBRARY(rwkv7_fast_ops_fp16, m) {
   m.def("add_vec_2d(int C, Tensor x, Tensor vec) -> Tensor");
 }
 
-TORCH_LIBRARY_IMPL(rwkv7_fast_ops_fp16, CUDA, m) {
+TORCH_LIBRARY_IMPL(vllm_rwkv7_fast_ops_fp16, CUDA, m) {
   m.impl("tmix_mix6", &tmix_mix6);
   m.impl("tmix_mix6_3d", &tmix_mix6_3d);
   m.impl("tmix_mix6_slot", &tmix_mix6_slot);
