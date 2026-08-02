@@ -17,6 +17,12 @@ def canonicalize_github_repository_url(repository: object) -> str:
     """Return a strict ASCII canonical URL for a public GitHub repository."""
     if not isinstance(repository, str) or not repository.isascii():
         raise ValueError("GitHub repository URL must be an ASCII string")
+    if any(
+        ord(character) <= 0x20 or ord(character) == 0x7F for character in repository
+    ):
+        raise ValueError(
+            "GitHub repository URL must not contain ASCII controls, spaces, or DEL"
+        )
 
     value = repository.removeprefix("git+")
     parsed = urlsplit(value)
