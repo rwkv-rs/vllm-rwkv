@@ -1,14 +1,35 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
+
 from vllm.build_profile import BuildProfileMetadata
 from vllm.model_executor.layers.quantization.utils import w8a8_utils
 
 
-def test_reduced_profile_skips_unbuilt_stable_cutlass_probes(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("profile", "configured_targets"),
+    [
+        ("rwkv", ("_rapid_sampling", "cumem_allocator", "rwkv7_ops")),
+        (
+            "rwkv-nvfp4",
+            (
+                "_C_stable_libtorch",
+                "_rapid_sampling",
+                "cumem_allocator",
+                "rwkv7_ops",
+            ),
+        ),
+    ],
+)
+def test_reduced_profile_skips_unbuilt_stable_cutlass_probes(
+    monkeypatch,
+    profile: str,
+    configured_targets: tuple[str, ...],
+) -> None:
     metadata = BuildProfileMetadata(
-        profile="full",
-        configured_targets=("_rapid_sampling", "cumem_allocator", "rwkv7_ops"),
+        profile=profile,
+        configured_targets=configured_targets,
         external_projects=(),
         unrestricted=False,
     )

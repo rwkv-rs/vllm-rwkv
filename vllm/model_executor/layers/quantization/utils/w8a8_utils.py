@@ -9,13 +9,15 @@ from vllm.build_profile import get_build_profile_metadata
 from vllm.platforms import current_platform
 
 
-def _stable_cutlass_ops_available() -> bool:
+def _full_stable_cutlass_ops_available() -> bool:
     metadata = get_build_profile_metadata()
-    return metadata.unrestricted or metadata.has_target("_C_stable_libtorch")
+    # The restricted NVFP4 target exposes only its FP4 subset under the same
+    # extension name, so target presence does not imply the FP8 probes exist.
+    return metadata.unrestricted
 
 
 def cutlass_fp8_supported() -> bool:
-    if not current_platform.is_cuda() or not _stable_cutlass_ops_available():
+    if not current_platform.is_cuda() or not _full_stable_cutlass_ops_available():
         return False
 
     capability_tuple = current_platform.get_device_capability()
@@ -25,7 +27,7 @@ def cutlass_fp8_supported() -> bool:
 
 
 def cutlass_block_fp8_supported() -> bool:
-    if not current_platform.is_cuda() or not _stable_cutlass_ops_available():
+    if not current_platform.is_cuda() or not _full_stable_cutlass_ops_available():
         return False
 
     capability_tuple = current_platform.get_device_capability()
@@ -35,7 +37,7 @@ def cutlass_block_fp8_supported() -> bool:
 
 
 def cutlass_group_gemm_supported() -> bool:
-    if not current_platform.is_cuda() or not _stable_cutlass_ops_available():
+    if not current_platform.is_cuda() or not _full_stable_cutlass_ops_available():
         return False
 
     capability_tuple = current_platform.get_device_capability()
