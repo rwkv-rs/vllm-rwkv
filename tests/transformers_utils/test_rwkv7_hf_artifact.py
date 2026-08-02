@@ -241,19 +241,29 @@ def _nvfp4_consumer_config(
         else None
     )
     config.rwkv7_quantization_metadata = metadata
-    config.quantization_config = {
-        "quant_method": "compressed-tensors",
-        "quantization_status": "compressed",
-        "format": "nvfp4-pack-quantized",
-        "config_groups": {
-            "group_0": {
-                "targets": targets,
-                "weights": weights,
-                "input_activations": input_activations,
-            }
+    from compressed_tensors.quantization import (
+        QuantizationArgs,
+        QuantizationConfig,
+        QuantizationScheme,
+    )
+
+    serialized_weights = QuantizationArgs(**weights)
+    serialized_input_activations = (
+        QuantizationArgs(**input_activations) if input_activations is not None else None
+    )
+    config.quantization_config = QuantizationConfig(
+        config_groups={
+            "group_0": QuantizationScheme(
+                targets=["Linear"],
+                weights=serialized_weights,
+                input_activations=serialized_input_activations,
+                format="nvfp4-pack-quantized",
+            )
         },
-        "ignore": protected_modules,
-    }
+        ignore=protected_linear,
+        format="nvfp4-pack-quantized",
+        quantization_status="compressed",
+    ).model_dump(mode="json")
     return config
 
 
@@ -342,6 +352,34 @@ def test_rwkv7_w4a16_baseline_is_distinct_weight_only_candidate() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "candidate",
+    ("nvfp4-w4a16", "nvfp4-w4a16-protection-ablation"),
+)
+def test_rwkv7_w4a16_accepts_standard_compressed_tensors_serialization(
+    candidate: str,
+) -> None:
+    config = _nvfp4_consumer_config(candidate)
+    vllm_metadata = config.rwkv7_quantization_metadata["vllm"]
+    group = config.quantization_config["config_groups"]["group_0"]
+
+    assert group["targets"] == ["Linear"]
+    assert set(config.quantization_config["ignore"]) == set(
+        vllm_metadata["protected_linear_modules"]
+    )
+    assert set(config.quantization_config["ignore"]).isdisjoint(
+        vllm_metadata["protected_embedding_modules"]
+    )
+    assert set(config.quantization_config["ignore"]).isdisjoint(
+        vllm_metadata["protected_normalization_modules"]
+    )
+    config.quantization_config["ignore"].reverse()
+
+    assert validate_rwkv7_quantization_artifact_metadata(config) == (
+        "nvfp4-pack-quantized"
+    )
+
+
 def test_rwkv7_w4a16_baseline_rejects_activation_quantization() -> None:
     config = _nvfp4_consumer_config("nvfp4-w4a16")
     group = config.quantization_config["config_groups"]["group_0"]
@@ -367,7 +405,9 @@ def test_rwkv7_w4a16_baseline_rejects_activation_quantization() -> None:
         ("consumer", "exact candidate consumer"),
         ("consumer_capability", "exact candidate consumer"),
         ("framework_version", "compressed-tensors version"),
-        ("scheme_targets", "exact candidate inventory"),
+        ("scheme_targets", r"exactly \['Linear'\]"),
+        ("ignore_missing", "protected Linear inventory"),
+        ("ignore_extra", "protected Linear inventory"),
         ("weight_scheme", "weight quantization arguments"),
         ("scheme", "dynamic-local"),
         ("digest", "FQN digest"),
@@ -423,7 +463,16 @@ def test_invalid_rwkv7_quantization_metadata_fails_closed(
     elif case == "scheme_targets":
         config.quantization_config["config_groups"]["group_0"]["targets"] = list(
             vllm_metadata["quantized_modules"]
+        )
+    elif case == "ignore_missing":
+        config.quantization_config["ignore"] = list(
+            config.quantization_config["ignore"]
         )[1:]
+    elif case == "ignore_extra":
+        config.quantization_config["ignore"] = [
+            *config.quantization_config["ignore"],
+            vllm_metadata["protected_embedding_modules"][0],
+        ]
     elif case == "weight_scheme":
         config.quantization_config["config_groups"]["group_0"]["weights"][
             "group_size"

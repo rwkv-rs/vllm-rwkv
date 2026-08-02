@@ -183,7 +183,6 @@ def _validate_rwkv7_nvfp4_scheme(
     quantization: Mapping[str, object],
     *,
     candidate: str,
-    expected_targets: list[str],
 ) -> None:
     groups = quantization.get("config_groups")
     if not isinstance(groups, Mapping) or len(groups) != 1:
@@ -191,9 +190,10 @@ def _validate_rwkv7_nvfp4_scheme(
             "RWKV7 NVFP4 quantization_config must contain exactly one config_group"
         )
     group = next(iter(groups.values()))
-    if not isinstance(group, Mapping) or group.get("targets") != expected_targets:
+    if not isinstance(group, Mapping) or group.get("targets") != ["Linear"]:
         raise ValueError(
-            "RWKV7 NVFP4 config_group targets must match the exact candidate inventory"
+            "RWKV7 NVFP4 config_group targets must be exactly ['Linear']; "
+            "expanded candidate FQNs are owned by rwkv7_quantization_metadata"
         )
     if not _rwkv7_quantization_args_match(group.get("weights"), activation=False):
         raise ValueError("RWKV7 NVFP4 weight quantization arguments are invalid")
@@ -354,7 +354,6 @@ def validate_rwkv7_quantization_artifact_metadata(config: object) -> str | None:
     _validate_rwkv7_nvfp4_scheme(
         quantization,
         candidate=str(candidate),
-        expected_targets=expected_targets,
     )
 
     inventory_names = (
@@ -485,11 +484,28 @@ def validate_rwkv7_quantization_artifact_metadata(config: object) -> str | None:
     if (
         policy_protected_modules != inventories["protected_modules"]
         or policy_protected_tensors != inventories["protected_tensors"]
-        or quantization.get("ignore") != inventories["protected_modules"]
+    ):
+        raise ValueError("RWKV7 protection policy and loader ownership disagree")
+    compressed_tensors_ignore = quantization.get("ignore")
+    if (
+        not isinstance(compressed_tensors_ignore, list)
+        or any(
+            not isinstance(name, str) or not name for name in compressed_tensors_ignore
+        )
+        or len(compressed_tensors_ignore) != len(set(compressed_tensors_ignore))
     ):
         raise ValueError(
-            "RWKV7 protection policy, compressed-tensors ignore list, and loader "
-            "ownership disagree"
+            "RWKV7 compressed-tensors ignore must be a unique Linear FQN list"
+        )
+    expected_ignore = set(inventories["protected_linear_modules"])
+    actual_ignore = set(compressed_tensors_ignore)
+    missing_ignore = sorted(expected_ignore - actual_ignore)
+    unexpected_ignore = sorted(actual_ignore - expected_ignore)
+    if missing_ignore or unexpected_ignore:
+        raise ValueError(
+            "RWKV7 compressed-tensors ignore must match the exact protected "
+            "Linear inventory: "
+            f"missing={missing_ignore} unexpected={unexpected_ignore}"
         )
     return str(packed_format)
 
