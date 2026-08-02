@@ -309,9 +309,9 @@ def test_rwkv7_schema_v3_quantization_metadata_is_validated() -> None:
     validate_rwkv7_hf_artifact_config(config)
 
 
-def test_rwkv7_nvfp4_consumer_revision_is_immutable_semantic_parent() -> None:
+def test_rwkv7_nvfp4_consumer_revision_pins_all_three_candidates() -> None:
     assert RWKV7_NVFP4_CONSUMER_SEMANTIC_REVISION == (
-        "6df9bfb41d7ec091fc9e13210ca4249389518114"
+        "72ad9109e63e00b67f8707c791a9f43783eff4b1"
     )
 
 
@@ -409,7 +409,9 @@ def test_invalid_rwkv7_quantization_metadata_fails_closed(
     elif case == "candidate":
         metadata["candidate"] = "nvfp4-w4a16-unknown"
     elif case == "consumer":
-        vllm_metadata["vllm_consumer_revision"] = "1" * 40
+        vllm_metadata["vllm_consumer_revision"] = (
+            "6df9bfb41d7ec091fc9e13210ca4249389518114"
+        )
     elif case == "consumer_capability":
         vllm_metadata["consumer_capabilities"] = [
             "transformers-rwkv-compressed-tensors"

@@ -20,10 +20,9 @@ RWKV7_SUPPORTED_PACKED_FORMATS = frozenset(("nvfp4-pack-quantized",))
 RWKV7_NVFP4_W4A4_CONSUMER = "vllm-rwkv-nvfp4-w4a4"
 RWKV7_NVFP4_W4A16_CONSUMER = "vllm-rwkv-nvfp4-w4a16"
 RWKV7_COMPRESSED_TENSORS_VERSION = "0.17.2.a20260731"
-# This immutable parent introduced W4A4 and W4A16 protection-ablation. The
-# follow-up provenance child advances this after the ordinary W4A16 semantic
-# commit has an OID; requiring the validating child here would be self-referential.
-RWKV7_NVFP4_CONSUMER_SEMANTIC_REVISION = "6df9bfb41d7ec091fc9e13210ca4249389518114"
+# This immutable semantic commit owns W4A4, ordinary W4A16, and the W4A16
+# protection-ablation consumer contract.
+RWKV7_NVFP4_CONSUMER_SEMANTIC_REVISION = "72ad9109e63e00b67f8707c791a9f43783eff4b1"
 _RWKV7_TRANSFORMERS_CONSUMER = "transformers-rwkv-compressed-tensors"
 _RWKV7_TARGET_SCHEMA_VERSION = 1
 _RWKV7_LOW_RANK_MODULE_RE = re.compile(
