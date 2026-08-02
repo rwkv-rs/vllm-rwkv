@@ -19,9 +19,12 @@ RWKV7_KNOWN_PACKED_FORMATS = frozenset(("nvfp4-pack-quantized", "pack-quantized"
 RWKV7_SUPPORTED_PACKED_FORMATS = frozenset(("nvfp4-pack-quantized",))
 RWKV7_NVFP4_W4A4_CONSUMER = "vllm-rwkv-nvfp4-w4a4"
 RWKV7_NVFP4_W4A16_CONSUMER = "vllm-rwkv-nvfp4-w4a16"
+RWKV7_COMPRESSED_TENSORS_VERSION = "0.17.2.a20260731"
+# This immutable parent introduced the W4A4/W4A16 consumer semantics. Requiring
+# the validating child itself would make every follow-up artifact self-referential.
+RWKV7_NVFP4_CONSUMER_SEMANTIC_REVISION = "6df9bfb41d7ec091fc9e13210ca4249389518114"
 _RWKV7_TRANSFORMERS_CONSUMER = "transformers-rwkv-compressed-tensors"
 _RWKV7_TARGET_SCHEMA_VERSION = 1
-_RWKV7_COMPRESSED_TENSORS_VERSION = "0.17.2.a20260731"
 _RWKV7_LOW_RANK_MODULE_RE = re.compile(
     r"^model\.blocks\.\d+\.att\."
     r"(?:w1|w2|a1|a2|v1|v2|g1|g2)$"
@@ -260,7 +263,7 @@ def validate_rwkv7_quantization_artifact_metadata(config: object) -> str | None:
         recipe.get("schema_version") != 1
         or recipe.get("candidate") != candidate
         or framework_versions.get("compressed_tensors")
-        != _RWKV7_COMPRESSED_TENSORS_VERSION
+        != RWKV7_COMPRESSED_TENSORS_VERSION
     ):
         raise ValueError(
             "RWKV7 quantization recipe candidate or compressed-tensors version "
@@ -339,8 +342,7 @@ def validate_rwkv7_quantization_artifact_metadata(config: object) -> str | None:
         or vllm.get("vllm_consumer_requirement") != expected_consumer
         or vllm.get("consumer_capabilities")
         != [_RWKV7_TRANSFORMERS_CONSUMER, expected_consumer]
-        or not isinstance(consumer_revision, str)
-        or re.fullmatch(r"[0-9a-f]{40}", consumer_revision) is None
+        or consumer_revision != RWKV7_NVFP4_CONSUMER_SEMANTIC_REVISION
     ):
         raise ValueError(
             "RWKV7 quantization metadata lacks the exact candidate consumer "
