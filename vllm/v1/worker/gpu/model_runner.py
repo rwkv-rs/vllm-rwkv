@@ -845,6 +845,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert new_req_data.prompt_token_ids is not None
             assert new_req_data.prefill_token_ids is not None
             req_id = new_req_data.req_id
+            sampling_params = new_req_data.sampling_params
+
+            # Validate sampler compatibility before removing a streaming
+            # request or mutating request/model state. Sampler.add_request()
+            # validates again to keep its direct request boundary fail-closed.
+            if self.is_last_pp_rank and sampling_params is not None:
+                assert self.sampler is not None
+                self.sampler.validate_sampling_params(sampling_params)
 
             # Streaming input update: request already exists from a prior
             # chunk. Remove old state so it can be cleanly re-added below
@@ -852,7 +860,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._remove_request(req_id)
 
             prompt_len = len(new_req_data.prompt_token_ids)
-            sampling_params = new_req_data.sampling_params
             self.req_states.add_request(
                 req_id=req_id,
                 prompt_len=prompt_len,
