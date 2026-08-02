@@ -12,6 +12,8 @@ from transformers import PretrainedConfig
 from vllm.transformers_utils.repo_utils import hf_api
 
 BLINKDL_RWKV7_G1_REPO = "BlinkDL/rwkv7-g1"
+STANDARD_RWKV7_ARCHITECTURE = "Rwkv7ForCausalLM"
+LEGACY_PTH_RWKV7_ARCHITECTURE = "RWKV7ForCausalLM"
 
 _RWKV7_G1_SPECS = {
     "0.1b": (12, 768),
@@ -67,7 +69,9 @@ def _rwkv7_config_value(config: object, name: str) -> object:
     return getattr(config, name, None)
 
 
-def validate_rwkv7_hf_artifact_config(config: object) -> None:
+def validate_rwkv7_hf_artifact_config(
+    config: object, *, allow_legacy_pth: bool = False
+) -> None:
     required_values = (
         "vocab_size",
         "hidden_size",
@@ -76,6 +80,9 @@ def validate_rwkv7_hf_artifact_config(config: object) -> None:
         "max_position_embeddings",
     )
     architectures = _rwkv7_config_value(config, "architectures")
+    allowed_architectures = [[STANDARD_RWKV7_ARCHITECTURE]]
+    if allow_legacy_pth:
+        allowed_architectures.append([LEGACY_PTH_RWKV7_ARCHITECTURE])
     values = {name: _rwkv7_config_value(config, name) for name in required_values}
     valid_values = all(
         not isinstance(value, bool) and isinstance(value, int) and value > 0
@@ -86,13 +93,13 @@ def validate_rwkv7_hf_artifact_config(config: object) -> None:
     )
     if (
         _rwkv7_config_value(config, "model_type") != "rwkv7"
-        or architectures != ["RWKV7ForCausalLM"]
+        or architectures not in allowed_architectures
         or not valid_values
         or not divisible_head_size
     ):
         raise ValueError(
             "Invalid RWKV7 Hugging Face artifact config: expected model_type="
-            "'rwkv7', architectures=['RWKV7ForCausalLM'], positive integer "
+            f"'rwkv7', architectures={allowed_architectures}, positive integer "
             "vocab_size/hidden_size/head_size/num_hidden_layers/"
             "max_position_embeddings, and hidden_size divisible by head_size."
         )
@@ -149,7 +156,7 @@ def build_rwkv7_config_from_pth(model: str | Path) -> RWKV7Config | None:
             if not isinstance(raw_config, dict):
                 raise ValueError(f"Invalid RWKV7 checkpoint config: {config_path}")
             try:
-                validate_rwkv7_hf_artifact_config(raw_config)
+                validate_rwkv7_hf_artifact_config(raw_config, allow_legacy_pth=True)
             except ValueError as error:
                 raise ValueError(
                     f"Invalid RWKV7 checkpoint config: {config_path}"

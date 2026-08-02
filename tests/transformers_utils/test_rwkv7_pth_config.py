@@ -17,7 +17,7 @@ from vllm.transformers_utils.configs.rwkv7 import (
 
 def _standard_rwkv7_hf_config(**overrides: object) -> SimpleNamespace:
     values = {
-        "architectures": ["RWKV7ForCausalLM"],
+        "architectures": ["Rwkv7ForCausalLM"],
         "model_type": "rwkv7",
         "vocab_size": 65536,
         "hidden_size": 2048,
@@ -38,6 +38,7 @@ def test_standard_rwkv7_hf_artifact_config_is_accepted() -> None:
     [
         {"model_type": "rwkv"},
         {"architectures": None},
+        {"architectures": ["RWKV7ForCausalLM"]},
         {"architectures": ["AutoModelForCausalLM"]},
         {"hidden_size": 0},
         {"head_size": 96},
