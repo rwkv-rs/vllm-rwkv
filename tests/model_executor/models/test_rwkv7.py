@@ -2518,6 +2518,75 @@ def test_rwkv7_model_state_reset_after_weight_update_restores_runtime_metadata()
     assert state.req_slot_to_row[1] != -1
 
 
+def test_rwkv7_state_pool_recycles_waiting_request_waves_after_zeroing():
+    state = _new_rwkv7_model_state(max_num_reqs=2, hidden_size=4, head_size=2)
+    completed = []
+
+    for wave in (("req-0", "req-1"), ("req-2", "req-3"), ("req-4",)):
+        for req_slot, req_id in enumerate(wave):
+            state.add_request(req_slot, _new_request(req_id))
+            row = state.req_slot_to_row[req_slot]
+            assert torch.count_nonzero(state.shift_state[:, :, row]) == 0
+            assert torch.count_nonzero(state.wkv_state[:, row]) == 0
+            assert state.elapsed[row].item() == 0
+            state.shift_state[:, :, row].fill_(req_slot + 1)
+            state.wkv_state[:, row].fill_(req_slot + 2)
+            state.elapsed[row].fill_(req_slot + 3)
+
+        for req_id in wave:
+            state.remove_request(req_id)
+            completed.append(req_id)
+
+        assert state.free_rows == {0, 1}
+        assert torch.count_nonzero(state.shift_state) == 0
+        assert torch.count_nonzero(state.wkv_state) == 0
+        assert torch.count_nonzero(state.elapsed) == 0
+
+    assert completed == ["req-0", "req-1", "req-2", "req-3", "req-4"]
+
+
+def test_rwkv7_state_pool_fails_closed_on_duplicate_out_of_range_and_stale_owner():
+    state = _new_rwkv7_model_state(max_num_reqs=2)
+    state.add_request(0, _new_request("req-0"))
+
+    with pytest.raises(RuntimeError, match="already owns state"):
+        state.add_request(1, _new_request("req-0"))
+    with pytest.raises(RuntimeError, match="already owned"):
+        state.add_request(0, _new_request("req-1"))
+    with pytest.raises(RuntimeError, match="out of range"):
+        state.add_request(2, _new_request("req-2"))
+
+    state.req_slot_owners[0] = "stale-owner"
+    with pytest.raises(RuntimeError, match="stale owner"):
+        state.remove_request("req-0")
+    assert state.req_id_to_index["req-0"] == 0
+
+
+def test_rwkv7_request_reordering_preserves_each_owner_state():
+    state = _new_rwkv7_model_state(max_num_reqs=3, hidden_size=4, head_size=2)
+    for req_slot, req_id in enumerate(("req-a", "req-b", "req-c")):
+        state.add_request(req_slot, _new_request(req_id))
+        row = state.req_slot_to_row[req_slot]
+        state.shift_state[:, :, row].fill_(10 + req_slot)
+        state.wkv_state[:, row].fill_(20 + req_slot)
+        state.elapsed[row].fill_(30 + req_slot)
+
+    reordered = _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([2, 0, 1], dtype=np.int32),
+        query_start_loc=torch.tensor([0, 1, 2, 3]),
+        is_prefilling_np=np.array([True, True, True]),
+    )
+    inputs = state.prepare_inputs(reordered, req_states=None)
+
+    assert inputs["idx_mapping"].tolist() == [2, 0, 1]
+    for req_slot in range(3):
+        row = state.req_slot_to_row[req_slot]
+        assert torch.all(state.shift_state[:, :, row] == 10 + req_slot)
+        assert torch.all(state.wkv_state[:, row] == 20 + req_slot)
+        assert state.elapsed[row].item() == 30 + req_slot
+
+
 def test_rwkv7_model_state_allocates_only_local_pp_layers():
     hf_config = SimpleNamespace(
         num_hidden_layers=4,

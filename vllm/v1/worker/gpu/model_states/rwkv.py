@@ -213,6 +213,7 @@ class RWKV7ModelState(ModelState):
         # Maps request ids to stable RWKV state slots. A vLLM request index can
         # change after request metadata is condensed, but this slot must not.
         self.req_id_to_index: dict[str, int] = {}
+        self.req_slot_owners: list[str | None] = [None] * self.max_num_reqs
         self.req_slot_to_row = [-1] * self.max_num_reqs
         self.row_to_req_slot = [-1] * self.max_num_reqs
         self.free_rows = set(range(self.max_num_reqs))
@@ -221,6 +222,7 @@ class RWKV7ModelState(ModelState):
         self._prefill_becomes_decode: list[bool] = []
 
     def _reset_mappings(self) -> None:
+        self.req_slot_owners = [None] * self.max_num_reqs
         self.req_slot_to_row = [-1] * self.max_num_reqs
         self.row_to_req_slot = [-1] * self.max_num_reqs
         self.free_rows = set(range(self.max_num_reqs))
@@ -376,36 +378,58 @@ class RWKV7ModelState(ModelState):
         return [req_id for _order, req_id in sorted(enumerate(req_ids), key=key)]
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
-        self.req_id_to_index[new_req_data.req_id] = req_index
+        if req_index < 0 or req_index >= self.max_num_reqs:
+            raise RuntimeError(f"RWKV7 request slot {req_index} is out of range")
+        req_id = new_req_data.req_id
+        if req_id in self.req_id_to_index:
+            raise RuntimeError(f"RWKV7 request id {req_id!r} already owns state")
+        current_owner = self.req_slot_owners[req_index]
+        if current_owner is not None:
+            raise RuntimeError(
+                f"RWKV7 request slot {req_index} is already owned by "
+                f"{current_owner!r}"
+            )
         if not self.free_rows:
             raise RuntimeError("RWKV7 state pool is full")
         row = min(self.free_rows)
+        if self.row_to_req_slot[row] != -1:
+            raise RuntimeError(f"RWKV7 free state row {row} still has an owner")
         self.free_rows.remove(row)
+        self.req_id_to_index[req_id] = req_index
+        self.req_slot_owners[req_index] = req_id
         self.req_slot_to_row[req_index] = row
         self.row_to_req_slot[row] = req_index
         self._zero_row(row)
 
     def remove_request(self, req_id: str) -> None:
-        req_index = self.req_id_to_index.pop(req_id, None)
+        req_index = self.req_id_to_index.get(req_id)
         if req_index is None:
             return
+        if self.req_slot_owners[req_index] != req_id:
+            raise RuntimeError(
+                f"RWKV7 request slot {req_index} has stale owner "
+                f"{self.req_slot_owners[req_index]!r}, expected {req_id!r}"
+            )
         row = self.req_slot_to_row[req_index]
         if row == -1:
-            return
+            raise RuntimeError(f"RWKV state for request id {req_id!r} missing")
+        self.req_id_to_index.pop(req_id)
         if req_index in self.decode_req_slots:
             self._remove_decode_row(req_index, row)
         else:
+            self._zero_row(row)
             self.req_slot_to_row[req_index] = -1
             self.row_to_req_slot[row] = -1
+            self.req_slot_owners[req_index] = None
             self.free_rows.add(row)
-            self._zero_row(row)
 
     def _remove_decode_row(self, req_index: int, row: int) -> None:
+        self._zero_row(row)
         self.decode_req_slots.remove(req_index)
         self.req_slot_to_row[req_index] = -1
         self.row_to_req_slot[row] = -1
+        self.req_slot_owners[req_index] = None
         self.free_rows.add(row)
-        self._zero_row(row)
 
     def _mark_resident_row_decode(self, req_slot: int) -> int:
         current_row = self.req_slot_to_row[req_slot]
@@ -416,6 +440,9 @@ class RWKV7ModelState(ModelState):
 
     def _validate_decode_membership(self) -> None:
         for req_slot in self.decode_req_slots:
+            owner = self.req_slot_owners[req_slot]
+            if owner is None or self.req_id_to_index.get(owner) != req_slot:
+                raise RuntimeError("RWKV7 decode request slot has a stale owner")
             row = self.req_slot_to_row[req_slot]
             if row < 0 or row >= self.max_num_reqs:
                 raise RuntimeError("RWKV7 live decode resident row is out of range")
