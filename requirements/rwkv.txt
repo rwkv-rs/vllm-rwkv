@@ -28,6 +28,7 @@ pyyaml
 cloudpickle
 packaging>=24.2
 jinja2>=3.1.6
+einops>=0.8.0
 # The OpenAI entrypoint eagerly imports multimodal serialization/registry
 # modules even for text-only models. Keep only Pillow from that stack.
 pillow
@@ -51,6 +52,8 @@ python-json-logger
 setproctitle
 pybase64
 cbor2
+# Imported by the shared model-hosting API routes at server startup.
+model-hosting-container-standards>=0.1.14,<1.0.0
 
 # Source build and first-use rapid-sampler JIT.
 cmake>=3.26.1
