@@ -24,7 +24,7 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.models.rwkv7_wkv_backend import run_fla_rwkv7_stateful
+from vllm.model_executor.models.rwkv7_wkv_backend import run_fla_rwkv7_recurrent
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.rwkv7 import (
@@ -2354,7 +2354,7 @@ class RWKV7ForCausalLM(nn.Module):
         y: torch.Tensor,
         elapsed_t: torch.Tensor,
     ) -> None:
-        """Run the FLA-owned packed-varlen WKV operator."""
+        """Run fla-rwkv's public packed recurrent WKV operator."""
         del elapsed_t
         hidden_size = r.shape[-1]
         if hidden_size % self.head_size != 0:
@@ -2368,7 +2368,7 @@ class RWKV7ForCausalLM(nn.Module):
         log_decay = (-math.exp(-0.5) * torch.sigmoid(decay_logits.float())).to(
             dtype=w.dtype
         )
-        output = run_fla_rwkv7_stateful(
+        output = run_fla_rwkv7_recurrent(
             r.view(packed_shape).contiguous(),
             log_decay.view(packed_shape).contiguous(),
             k.view(packed_shape).contiguous(),
