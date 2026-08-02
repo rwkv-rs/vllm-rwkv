@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 
-FLA_RWKV_REVISION = "1bc262c8c81241e1d339419a31f0aadffa20c210"
+FLA_RWKV_REVISION = "a4a8aa98df6ec5322f194a80ec57363dd045adfc"
 FLASH_RWKV_REVISION = "866aafd2eed146b0eda1ce03444009ae030f89e3"
 _REQUIRED_PARAMETERS = frozenset(
     {

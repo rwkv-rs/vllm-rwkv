@@ -678,6 +678,11 @@ class RWKV7ForCausalLMConfig(VerifyAndUpdateConfig):
         model_config = getattr(vllm_config, "model_config", None)
         hf_config = getattr(model_config, "hf_config", None)
         if hf_config is not None:
+            from vllm.transformers_utils.rwkv7_provenance import (
+                validate_transformers_rwkv7_runtime_provenance,
+            )
+
+            validate_transformers_rwkv7_runtime_provenance()
             validate_rwkv7_hf_artifact_config(hf_config)
 
         wkv_mode = envs.VLLM_RWKV7_WKV_MODE
