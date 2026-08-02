@@ -406,6 +406,8 @@ def test_rwkv7_w4a16_baseline_rejects_activation_quantization() -> None:
         ("consumer_capability", "exact candidate consumer"),
         ("framework_version", "compressed-tensors version"),
         ("scheme_targets", r"exactly \['Linear'\]"),
+        ("group_format", "config_group format"),
+        ("output_activations", "output_activations=None"),
         ("ignore_missing", "protected Linear inventory"),
         ("ignore_extra", "protected Linear inventory"),
         ("weight_scheme", "weight quantization arguments"),
@@ -464,6 +466,13 @@ def test_invalid_rwkv7_quantization_metadata_fails_closed(
         config.quantization_config["config_groups"]["group_0"]["targets"] = list(
             vllm_metadata["quantized_modules"]
         )
+    elif case == "group_format":
+        config.quantization_config["config_groups"]["group_0"]["format"] = (
+            "pack-quantized"
+        )
+    elif case == "output_activations":
+        group = config.quantization_config["config_groups"]["group_0"]
+        group["output_activations"] = deepcopy(group["weights"])
     elif case == "ignore_missing":
         config.quantization_config["ignore"] = list(
             config.quantization_config["ignore"]
