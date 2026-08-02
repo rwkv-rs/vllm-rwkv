@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 import torch
+from safetensors import safe_open
 
 FLASH_RWKV_TEST_REVISION = "94cf28084a899f7157fb987a178ad02205966706"
 FLA_RWKV_TEST_REVISION = "02093e6be24e07f285d466ab7fb62ce0597891dc"
@@ -127,13 +128,20 @@ def _write_tiny_standard_hf_artifact(artifact: Path) -> None:
         bos_token_id=0,
         eos_token_id=0,
     )
-    model = Rwkv7ForCausalLM(config).eval()
+    model = Rwkv7ForCausalLM(config).eval().to(dtype=torch.bfloat16)
     model.save_pretrained(artifact, safe_serialization=True)
 
     saved_config = json.loads((artifact / "config.json").read_text(encoding="utf-8"))
     assert saved_config["model_type"] == "rwkv7"
     assert saved_config["architectures"] == ["Rwkv7ForCausalLM"]
-    assert (artifact / "model.safetensors").is_file()
+    assert saved_config["dtype"] == "bfloat16"
+    safetensors_path = artifact / "model.safetensors"
+    assert safetensors_path.is_file()
+    with safe_open(safetensors_path, framework="pt") as weights:
+        weight_names = weights.keys()
+        assert {weights.get_tensor(key).dtype for key in weight_names} == {
+            torch.bfloat16
+        }
     assert not list(artifact.glob("*.pth"))
 
 
@@ -261,7 +269,6 @@ def test_tiny_hf_artifact_generates_through_public_recurrent_flash_chain(
             SamplingParams(
                 temperature=1.0,
                 top_k=1,
-                seed=17,
                 max_tokens=DECODE_TOKENS,
                 ignore_eos=True,
             ),
