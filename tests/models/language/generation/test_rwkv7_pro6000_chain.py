@@ -24,7 +24,8 @@ EXPECTED_GPU_NAME = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
 BOS_TOKEN_ID = 0
 PROMPT_TOKEN_IDS = [1, 7, 11, 3]
 NORMALIZED_PROMPT_TOKEN_IDS = [BOS_TOKEN_ID, *PROMPT_TOKEN_IDS]
-DECODE_TOKENS = 2
+RECURRENT_DECODE_STEPS = 2
+GENERATED_TOKENS = RECURRENT_DECODE_STEPS + 1
 
 pytestmark = pytest.mark.skipif(
     os.getenv("RWKV7_RUN_PRO6000_CHAIN") != "1",
@@ -271,7 +272,7 @@ def test_tiny_hf_artifact_generates_through_public_recurrent_flash_chain(
             SamplingParams(
                 temperature=1.0,
                 top_k=1,
-                max_tokens=DECODE_TOKENS,
+                max_tokens=GENERATED_TOKENS,
                 ignore_eos=True,
             ),
             use_tqdm=False,
@@ -285,7 +286,7 @@ def test_tiny_hf_artifact_generates_through_public_recurrent_flash_chain(
     assert outputs[0].prompt_token_ids == NORMALIZED_PROMPT_TOKEN_IDS
     assert len(outputs[0].outputs) == 1
     generated_token_ids = list(outputs[0].outputs[0].token_ids)
-    assert len(generated_token_ids) == DECODE_TOKENS
+    assert len(generated_token_ids) == GENERATED_TOKENS
     assert get_last_rwkv7_provider() == "flash_rwkv"
     assert forbidden_calls == []
 
@@ -297,8 +298,7 @@ def test_tiny_hf_artifact_generates_through_public_recurrent_flash_chain(
     for layer_calls in calls_by_state.values():
         assert [call["offsets"] for call in layer_calls] == [
             [0, len(NORMALIZED_PROMPT_TOKEN_IDS)],
-            [0, 1],
-            [0, 1],
+            *([[0, 1]] * RECURRENT_DECODE_STEPS),
         ]
         assert len({tuple(call["slots"]) for call in layer_calls}) == 1
         assert layer_calls[0]["before"] == 0.0
