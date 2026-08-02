@@ -23,6 +23,11 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.sequence import IntermediateTensors
+from vllm.transformers_utils.configs.rwkv7 import (
+    rwkv7_checkpoint_weight_shapes,
+    rwkv7_hf_to_internal_weight_name,
+    rwkv7_is_legacy_low_rank_weight_name,
+)
 
 logger = init_logger(__name__)
 
@@ -85,7 +90,6 @@ M1_RKV_GROUPED_ROWS = {1}
 # The M=1 no-fc path prepares the sparse-down accumulator while reducing the
 # FFN key split-K result, eliminating one zeroing launch per layer.
 M1_CMIX_PREZERO_ROWS = {1}
-STANDARD_HF_WEIGHT_PREFIX = "model."
 
 
 @dataclass(frozen=True)
@@ -173,14 +177,6 @@ def is_lowrank_weight(key: str) -> bool:
     return key.endswith(LOWRANK_SUFFIXES)
 
 
-def _projection_ranks(hidden_size: int) -> tuple[int, int, int]:
-    return (
-        max(32, round(2.5 * hidden_size**0.5 / 32) * 32),
-        max(32, round(1.7 * hidden_size**0.5 / 32) * 32),
-        max(32, round(5.0 * hidden_size**0.5 / 32) * 32),
-    )
-
-
 def can_use_lowrank_fused(hidden_size: int, rows: int) -> bool:
     return hidden_size >= LOWRANK_FUSED_MIN_C and rows <= LOWRANK_IN_ROWS_T
 
@@ -228,8 +224,8 @@ class RWKV7ForCausalLM(nn.Module):
         self.num_attention_heads = num_attention_heads
         self.vocab_size = vocab_size
         self.z: dict[str, torch.Tensor] = {}
-        self.raw_weight_names: set[str] | None = None
-        self.raw_weight_shapes: dict[str, tuple[int, ...]] | None = None
+        self.checkpoint_weight_names: set[str] | None = None
+        self.checkpoint_weight_shapes: dict[str, tuple[int, ...]] | None = None
         self.total_num_layers = num_hidden_layers
         self.start_layer, self.end_layer = self._get_layer_range()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -411,191 +407,106 @@ class RWKV7ForCausalLM(nn.Module):
             for name, weight in weights:
                 loaded_names.add(name)
                 try:
-                    raw_name = self._checkpoint_name_to_raw(name)
                     if self._weight_update_error is not None:
-                        pending.setdefault(raw_name, None)
+                        pending.setdefault(name, None)
                         continue
                     if (
-                        self.raw_weight_names is None
-                        or raw_name not in self.raw_weight_names
+                        self.checkpoint_weight_names is None
+                        or name not in self.checkpoint_weight_names
                     ):
                         raise ValueError(
                             f"RWKV7 weight update received unexpected key {name!r}"
                         )
-                    if raw_name in pending:
+                    if name in pending:
                         raise ValueError(
                             f"RWKV7 weight update received duplicate key {name!r}"
                         )
 
                     detached = weight.detach()
                     expected_shape = (
-                        getattr(self, "raw_weight_shapes", None) or {}
-                    ).get(raw_name)
+                        getattr(self, "checkpoint_weight_shapes", None) or {}
+                    ).get(name)
                     if self._streaming_weight_update and expected_shape is None:
                         raise RuntimeError(
-                            f"RWKV7 streaming update has no raw shape for {raw_name!r}"
+                            "RWKV7 streaming update has no checkpoint shape for "
+                            f"{name!r}"
                         )
                     actual_shape = tuple(detached.shape)
                     if expected_shape is not None and actual_shape != expected_shape:
                         raise ValueError(
-                            "RWKV7 raw weight shape mismatch for "
-                            f"{raw_name}: expected {expected_shape}, got {actual_shape}"
+                            "RWKV7 checkpoint weight shape mismatch for "
+                            f"{name}: expected {expected_shape}, "
+                            f"got {actual_shape}"
                         )
 
                     if self._streaming_weight_update:
                         if (
-                            raw_name in self._embedding_update_keys()
-                            and self._is_weight_needed_on_rank(raw_name)
+                            name in self._embedding_update_keys()
+                            and self._checkpoint_weight_is_needed_on_rank(name)
                         ):
-                            pending[raw_name] = detached.to(device="cpu", copy=True)
+                            pending[name] = detached.to(device="cpu", copy=True)
                         else:
-                            self._copy_raw_weight_to_runtime(raw_name, detached)
-                            pending[raw_name] = None
+                            self._copy_checkpoint_weight_to_runtime(name, detached)
+                            pending[name] = None
                     else:
-                        pending[raw_name] = detached.to(device="cpu", copy=True)
+                        pending[name] = detached.to(device="cpu", copy=True)
                 except Exception as exc:
                     self._record_weight_update_error(exc)
                     pending.setdefault(name, None)
             return loaded_names
 
-        z, loaded_names, source_format = self._normalize_checkpoint_weights(weights)
-        raw_weight_names = set(z.keys())
-        self.weight_source_format = source_format
-        self.raw_weight_names = raw_weight_names
-        self.raw_weight_shapes = {
-            name: tuple(weight.shape) for name, weight in z.items()
+        checkpoint_weights, loaded_names = self._normalize_checkpoint_weights(weights)
+        self.checkpoint_weight_names = set(loaded_names)
+        self.checkpoint_weight_shapes = {
+            name: tuple(weight.shape) for name, weight in checkpoint_weights.items()
         }
+        z = self._checkpoint_weights_to_runtime_layout(checkpoint_weights)
         self._preprocess_weights(z)
         self._commit_preprocessed_weights(z)
         return loaded_names
 
     @staticmethod
-    def _standard_hf_name_to_raw(name: str) -> str | None:
-        if name == "model.embeddings.weight":
-            return "emb.weight"
-        if name == "head.weight":
-            return name
-        if name.startswith("model.blocks.") or name.startswith("model.ln_out."):
-            return name.removeprefix(STANDARD_HF_WEIGHT_PREFIX)
-        return None
-
-    def _checkpoint_name_to_raw(self, name: str) -> str:
-        if getattr(self, "weight_source_format", "legacy_pth") == "standard_hf":
-            raw_name = self._standard_hf_name_to_raw(name)
-            if raw_name is None:
-                raise ValueError(
-                    "RWKV7 standard Hugging Face weight update received "
-                    f"unexpected key {name!r}"
-                )
-            return raw_name
-        return name
+    def _checkpoint_name_to_internal(name: str) -> str:
+        internal_name = rwkv7_hf_to_internal_weight_name(name)
+        if internal_name is None:
+            raise ValueError(
+                "RWKV7 standard Hugging Face weight update received "
+                f"unexpected key {name!r}"
+            )
+        return internal_name
 
     def _normalize_checkpoint_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> tuple[dict[str, torch.Tensor], set[str], str]:
+    ) -> tuple[dict[str, torch.Tensor], set[str]]:
         source: dict[str, torch.Tensor] = {}
         for name, weight in weights:
             if name in source:
                 raise ValueError(f"RWKV7 checkpoint contains duplicate key {name!r}")
             source[name] = weight.detach().cpu()
         loaded_names = set(source)
-        source_format = (
-            "standard_hf"
-            if any(name.startswith(STANDARD_HF_WEIGHT_PREFIX) for name in source)
-            else "legacy_pth"
-        )
-        if source_format == "legacy_pth":
-            return source, loaded_names, source_format
 
-        mapped: dict[str, torch.Tensor] = {}
-        mapped_sources: dict[str, str] = {}
-        for name, weight in source.items():
-            raw_name = self._standard_hf_name_to_raw(name)
-            if raw_name is None:
-                raise ValueError(
-                    "RWKV7 standard Hugging Face artifact contains "
-                    f"unsupported key {name!r}"
-                )
-            if raw_name in mapped:
-                raise ValueError(
-                    "RWKV7 standard Hugging Face artifact has a mapping conflict: "
-                    f"{mapped_sources[raw_name]!r} and {name!r} both map to "
-                    f"{raw_name!r}"
-                )
-            mapped[raw_name] = weight
-            mapped_sources[raw_name] = name
-        self._validate_standard_hf_weights(mapped)
-        return mapped, loaded_names, source_format
+        self._validate_standard_hf_weights(source)
+        return source, loaded_names
 
-    def _expected_standard_raw_shapes(self) -> dict[str, tuple[int, ...]]:
-        if bool(getattr(self.config, "embedding_layer_norm_fused", False)):
-            raise ValueError(
-                "RWKV7 vLLM loading currently requires an unfused standard artifact; "
-                "convert without embedding_layer_norm_fused."
+    @staticmethod
+    def _checkpoint_weights_to_runtime_layout(
+        weights: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        runtime_weights = {}
+        for name, weight in weights.items():
+            internal_name = RWKV7ForCausalLM._checkpoint_name_to_internal(name)
+            runtime_weights[internal_name] = (
+                weight.transpose(0, 1).contiguous()
+                if rwkv7_is_legacy_low_rank_weight_name(internal_name)
+                else weight
             )
-        hidden_size = int(self.config.hidden_size)
-        vocab_size = int(self.config.vocab_size)
-        num_layers = int(self.config.num_hidden_layers)
-        head_size = int(self.config.head_size)
-        num_heads = hidden_size // head_size
-        intermediate_size = int(
-            getattr(self.config, "intermediate_size", None) or 4 * hidden_size
-        )
-        decay_rank, value_rank, gate_rank = _projection_ranks(hidden_size)
-        shapes = {
-            "emb.weight": (vocab_size, hidden_size),
-            "head.weight": (vocab_size, hidden_size),
-            "ln_out.weight": (hidden_size,),
-            "ln_out.bias": (hidden_size,),
-        }
-        vectors = ("x_r", "x_w", "x_k", "x_v", "x_a", "x_g", "w0", "a0", "k_k", "k_a")
-        for layer_id in range(num_layers):
-            block = f"blocks.{layer_id}"
-            if layer_id == 0:
-                shapes[f"{block}.ln0.weight"] = (hidden_size,)
-                shapes[f"{block}.ln0.bias"] = (hidden_size,)
-            for norm in ("ln1", "ln2"):
-                shapes[f"{block}.{norm}.weight"] = (hidden_size,)
-                shapes[f"{block}.{norm}.bias"] = (hidden_size,)
-            attention = f"{block}.att"
-            for name in vectors:
-                shapes[f"{attention}.{name}"] = (1, 1, hidden_size)
-            if layer_id > 0:
-                shapes[f"{attention}.v0"] = (1, 1, hidden_size)
-                shapes[f"{attention}.v1"] = (hidden_size, value_rank)
-                shapes[f"{attention}.v2"] = (value_rank, hidden_size)
-            shapes.update(
-                {
-                    f"{attention}.w1": (hidden_size, decay_rank),
-                    f"{attention}.w2": (decay_rank, hidden_size),
-                    f"{attention}.a1": (hidden_size, decay_rank),
-                    f"{attention}.a2": (decay_rank, hidden_size),
-                    f"{attention}.g1": (hidden_size, gate_rank),
-                    f"{attention}.g2": (gate_rank, hidden_size),
-                    f"{attention}.r_k": (num_heads, head_size),
-                    f"{attention}.ln_x.weight": (hidden_size,),
-                    f"{attention}.ln_x.bias": (hidden_size,),
-                }
-            )
-            for projection in ("receptance", "key", "value", "output"):
-                shapes[f"{attention}.{projection}.weight"] = (
-                    hidden_size,
-                    hidden_size,
-                )
-            feed_forward = f"{block}.ffn"
-            shapes[f"{feed_forward}.x_k"] = (1, 1, hidden_size)
-            shapes[f"{feed_forward}.key.weight"] = (
-                intermediate_size,
-                hidden_size,
-            )
-            shapes[f"{feed_forward}.value.weight"] = (
-                hidden_size,
-                intermediate_size,
-            )
-        return shapes
+        return runtime_weights
+
+    def _expected_checkpoint_weight_shapes(self) -> dict[str, tuple[int, ...]]:
+        return rwkv7_checkpoint_weight_shapes(self.config)
 
     def _validate_standard_hf_weights(self, weights: dict[str, torch.Tensor]) -> None:
-        expected = self._expected_standard_raw_shapes()
+        expected = self._expected_checkpoint_weight_shapes()
         missing = sorted(expected.keys() - weights.keys())
         unexpected = sorted(weights.keys() - expected.keys())
         if missing or unexpected:
@@ -634,16 +545,16 @@ class RWKV7ForCausalLM(nn.Module):
         if pending is None:
             raise RuntimeError("RWKV7 weight update is not active")
         try:
-            if self.raw_weight_names is None:
+            if self.checkpoint_weight_names is None:
                 raise RuntimeError(
                     "RWKV7 online weight update requires a previous full "
-                    "checkpoint load to establish raw weight names."
+                    "checkpoint load to establish the HF weight contract."
                 )
             if self._weight_update_error is not None:
                 raise self._weight_update_error
             received = set(pending.keys())
-            missing = self.raw_weight_names - received
-            unexpected = received - self.raw_weight_names
+            missing = self.checkpoint_weight_names - received
+            unexpected = received - self.checkpoint_weight_names
             if missing or unexpected:
                 raise ValueError(
                     "RWKV7 weight update key mismatch: "
@@ -659,6 +570,7 @@ class RWKV7ForCausalLM(nn.Module):
                 }
                 old_z = self.z
                 try:
+                    z = self._checkpoint_weights_to_runtime_layout(z)
                     self._preprocess_weights(z)
                     self._commit_preprocessed_weights(
                         z,
@@ -688,13 +600,17 @@ class RWKV7ForCausalLM(nn.Module):
     def _embedding_update_keys() -> frozenset[str]:
         return frozenset(
             {
-                "emb.weight",
-                "blocks.0.ln0.weight",
-                "blocks.0.ln0.bias",
+                "model.embeddings.weight",
+                "model.blocks.0.ln0.weight",
+                "model.blocks.0.ln0.bias",
             }
         )
 
-    def _runtime_keys_for_raw_weight(self, key: str) -> tuple[str, ...]:
+    def _checkpoint_weight_is_needed_on_rank(self, name: str) -> bool:
+        return self._is_weight_needed_on_rank(self._checkpoint_name_to_internal(name))
+
+    def _runtime_keys_for_checkpoint_weight(self, name: str) -> tuple[str, ...]:
+        key = self._checkpoint_name_to_internal(name)
         if not self._is_weight_needed_on_rank(key):
             return ()
         if is_lowrank_weight(key):
@@ -702,23 +618,29 @@ class RWKV7ForCausalLM(nn.Module):
         return (key,)
 
     def _can_stream_weight_update(self) -> bool:
-        """Return whether every local raw weight has a runtime destination."""
-        if self.raw_weight_names is None or not self.z:
+        """Return whether every local checkpoint weight has a destination."""
+        if self.checkpoint_weight_names is None or not self.z:
             return False
-        raw_shapes = getattr(self, "raw_weight_shapes", None)
-        if raw_shapes is None or set(raw_shapes) != self.raw_weight_names:
+        checkpoint_shapes = getattr(self, "checkpoint_weight_shapes", None)
+        if (
+            checkpoint_shapes is None
+            or set(checkpoint_shapes) != self.checkpoint_weight_names
+        ):
             return False
         return all(
             runtime_key in self.z
-            for raw_key in self.raw_weight_names
-            for runtime_key in self._runtime_keys_for_raw_weight(raw_key)
+            for checkpoint_key in self.checkpoint_weight_names
+            for runtime_key in self._runtime_keys_for_checkpoint_weight(checkpoint_key)
         )
 
-    def _runtime_views_for_raw_weight(
-        self, key: str, weight: torch.Tensor
+    def _runtime_views_for_checkpoint_weight(
+        self, name: str, weight: torch.Tensor
     ) -> tuple[tuple[str, torch.Tensor], ...]:
+        key = self._checkpoint_name_to_internal(name)
         if not self._is_weight_needed_on_rank(key):
             return ()
+        if rwkv7_is_legacy_low_rank_weight_name(key):
+            weight = weight.transpose(0, 1)
         value = self._shard_weight_for_tp(key, weight.squeeze())
         lowrank = is_lowrank_weight(key)
         if not lowrank and (
@@ -735,9 +657,13 @@ class RWKV7ForCausalLM(nn.Module):
             return ((key, value), (key + ".t", value.t()))
         return ((key, value),)
 
-    def _copy_raw_weight_to_runtime(self, key: str, weight: torch.Tensor) -> None:
+    def _copy_checkpoint_weight_to_runtime(
+        self, name: str, weight: torch.Tensor
+    ) -> None:
         with torch.no_grad():
-            for runtime_key, value in self._runtime_views_for_raw_weight(key, weight):
+            for runtime_key, value in self._runtime_views_for_checkpoint_weight(
+                name, weight
+            ):
                 destination = self.z.get(runtime_key)
                 if destination is None:
                     raise RuntimeError(
@@ -754,7 +680,7 @@ class RWKV7ForCausalLM(nn.Module):
     def _finish_streaming_weight_update(
         self, pending: dict[str, torch.Tensor | None]
     ) -> None:
-        if not self._is_weight_needed_on_rank("emb.weight"):
+        if not self._checkpoint_weight_is_needed_on_rank("model.embeddings.weight"):
             return
         embedding_inputs = self._embedding_update_keys()
         if not embedding_inputs.issubset(pending):
@@ -762,13 +688,13 @@ class RWKV7ForCausalLM(nn.Module):
             raise ValueError(
                 f"RWKV7 streaming embedding update is incomplete: missing={missing}"
             )
-        emb_src = pending["emb.weight"]
-        ln0_w_src = pending["blocks.0.ln0.weight"]
-        ln0_b_src = pending["blocks.0.ln0.bias"]
+        emb_src = pending["model.embeddings.weight"]
+        ln0_w_src = pending["model.blocks.0.ln0.weight"]
+        ln0_b_src = pending["model.blocks.0.ln0.bias"]
         assert emb_src is not None and ln0_w_src is not None and ln0_b_src is not None
 
-        self._copy_raw_weight_to_runtime("blocks.0.ln0.weight", ln0_w_src)
-        self._copy_raw_weight_to_runtime("blocks.0.ln0.bias", ln0_b_src)
+        self._copy_checkpoint_weight_to_runtime("model.blocks.0.ln0.weight", ln0_w_src)
+        self._copy_checkpoint_weight_to_runtime("model.blocks.0.ln0.bias", ln0_b_src)
 
         destination = self.z["emb.weight"]
         vocab_start, vocab_end, _ = self._tp_vocab_range(self.vocab_size)
@@ -848,7 +774,7 @@ class RWKV7ForCausalLM(nn.Module):
             self.vocab_size,
         )
 
-    def _validate_raw_weight_shapes(self, z: dict[str, torch.Tensor]) -> None:
+    def _validate_checkpoint_weight_shapes(self, z: dict[str, torch.Tensor]) -> None:
         r_k = z["blocks.0.att.r_k"].squeeze()
         emb = z["emb.weight"].squeeze()
         weight_heads, head_size = r_k.shape
@@ -867,13 +793,13 @@ class RWKV7ForCausalLM(nn.Module):
             expected = getattr(self.config, name, None)
             if expected is not None and int(expected) != actual:
                 raise ValueError(
-                    f"RWKV7 config {name}={expected} does not match raw "
+                    f"RWKV7 config {name}={expected} does not match "
                     f"checkpoint {name}={actual}."
                 )
 
     def _preprocess_weights(self, z: dict[str, torch.Tensor]) -> None:
         """Apply the albatross faster3a weight layout preprocessing."""
-        self._validate_raw_weight_shapes(z)
+        self._validate_checkpoint_weight_shapes(z)
         num_attention_heads, head_size = z["blocks.0.att.r_k"].shape
         hidden_size = num_attention_heads * head_size
         vocab_size = z["emb.weight"].shape[0]

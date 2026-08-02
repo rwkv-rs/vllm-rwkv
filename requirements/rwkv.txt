@@ -1,4 +1,4 @@
-# Dense RWKV7 raw .pth inference and OpenAI-compatible text serving on CUDA.
+# Dense RWKV7 Hugging Face artifact inference and OpenAI-compatible serving.
 # Install this file first, then build with:
 #   VLLM_BUILD_PROFILE=rwkv uv pip install --no-deps --no-build-isolation -e .
 #

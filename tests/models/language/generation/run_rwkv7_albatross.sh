@@ -32,7 +32,6 @@ export RWKV7_ALBATROSS_ENABLE_FLASHINFER_AUTOTUNE="${RWKV7_ALBATROSS_ENABLE_FLAS
 export RWKV7_ALBATROSS_EXECUTION_MODES="${RWKV7_ALBATROSS_EXECUTION_MODES:-eager,cudagraph}"
 export RWKV7_ALBATROSS_TENSOR_PARALLEL_SIZE="${RWKV7_ALBATROSS_TENSOR_PARALLEL_SIZE:-1}"
 export RWKV7_ALBATROSS_PIPELINE_PARALLEL_SIZE="${RWKV7_ALBATROSS_PIPELINE_PARALLEL_SIZE:-1}"
-export ALBATROSS_PTH="${ALBATROSS_PTH:-${VLLM_RWKV7_MODEL:-}}"
 albatross_impl_dir="${ALBATROSS_ROOT}/${ALBATROSS_IMPL}"
 
 missing=()
@@ -46,8 +45,8 @@ if (( ${#missing[@]} > 0 )); then
   printf 'Missing required RWKV7 Albatross test environment variables:\n' >&2
   printf '  %s\n' "${missing[@]}" >&2
   printf '\nCreate .env or set RWKV7_ALBATROSS_ENV_FILE to a file with:\n' >&2
-  printf '  VLLM_RWKV7_MODEL=/path/to/rwkv7-g1h-7.2b-20260710-ctx10240.pth\n' >&2
-  printf '  # Optional: ALBATROSS_PTH=/path/to/same-rwkv7.pth\n' >&2
+  printf '  ALBATROSS_PTH=/path/to/rwkv7-g1h-7.2b-20260710-ctx10240.pth\n' >&2
+  printf '  VLLM_RWKV7_MODEL=/path/to/matching-rwkv7-hf-artifact\n' >&2
   printf '  # Optional: RWKV7_ALBATROSS_TENSOR_PARALLEL_SIZE=2\n' >&2
   printf '  # Optional: RWKV7_ALBATROSS_PIPELINE_PARALLEL_SIZE=2\n' >&2
   printf '\nUse --server to include the OpenAI server alignment test.\n' >&2
@@ -60,7 +59,9 @@ for name in ALBATROSS_ROOT ALBATROSS_PTH; do
     missing_paths+=("${name}=${!name}")
   fi
 done
-if [[ ! "${VLLM_RWKV7_MODEL}" =~ ^https?:// && ! -e "${VLLM_RWKV7_MODEL}" ]]; then
+if [[ "${VLLM_RWKV7_MODEL}" == *.pth ]]; then
+  missing_paths+=("VLLM_RWKV7_MODEL must be a Hugging Face artifact, not .pth")
+elif [[ "${VLLM_RWKV7_MODEL}" == /* && ! -d "${VLLM_RWKV7_MODEL}" ]]; then
   missing_paths+=("VLLM_RWKV7_MODEL=${VLLM_RWKV7_MODEL}")
 fi
 if [[ ! -d "${albatross_impl_dir}" ]]; then

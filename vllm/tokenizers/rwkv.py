@@ -5,12 +5,16 @@
 # Adapted from BlinkDL/ChatRWKV tokenizer/rwkv_tokenizer.py.
 
 import ast
+import json
+import shutil
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, overload
 
 from transformers import BatchEncoding
 from transformers.utils import chat_template_utils as hf_chat_utils
+
+from vllm.transformers_utils.repo_utils import hf_api
 
 from .protocol import TokenizerLike
 from .rwkv_defaults import (
@@ -22,6 +26,7 @@ from .rwkv_defaults import (
 )
 
 _VOCAB_FILE = Path(__file__).parent / "assets" / "rwkv_vocab_v20230424.txt"
+_VOCAB_FILENAME = _VOCAB_FILE.name
 _RWKV7_VOCAB_SIZE = 65536
 _UNKNOWN_TOKEN_BYTES = "\ufffd".encode()
 
@@ -98,7 +103,79 @@ class RWKVTokenizer(TokenizerLike):
         **kwargs,
     ) -> "RWKVTokenizer":
         vocab_file = kwargs.pop("vocab_file", None)
-        return cls(vocab_file or _VOCAB_FILE, name_or_path=path_or_repo_id)
+        artifact_path = Path(path_or_repo_id)
+        if vocab_file is None:
+            if artifact_path.is_file():
+                vocab_file = artifact_path
+            elif artifact_path.is_dir():
+                vocab_file = artifact_path / _VOCAB_FILENAME
+                if not vocab_file.is_file():
+                    raise ValueError(
+                        "RWKV Hugging Face artifact is missing tokenizer vocabulary: "
+                        f"{vocab_file}"
+                    )
+            else:
+                try:
+                    vocab_file = hf_api().hf_hub_download(
+                        repo_id=str(path_or_repo_id),
+                        filename=_VOCAB_FILENAME,
+                        revision=revision,
+                        cache_dir=download_dir,
+                        token=kwargs.get("token"),
+                    )
+                except Exception as error:
+                    raise ValueError(
+                        "RWKV Hugging Face artifact is missing tokenizer vocabulary "
+                        f"{_VOCAB_FILENAME!r}: {path_or_repo_id}"
+                    ) from error
+        return cls(vocab_file, name_or_path=path_or_repo_id)
+
+    def save_pretrained(self, save_directory: str | Path) -> tuple[str, ...]:
+        save_directory = Path(save_directory)
+        save_directory.mkdir(parents=True, exist_ok=True)
+        vocab_path = save_directory / _VOCAB_FILENAME
+        source_vocab = (
+            Path(self.name_or_path)
+            if Path(self.name_or_path).is_file()
+            else _VOCAB_FILE
+        )
+        if source_vocab.resolve() != vocab_path.resolve():
+            shutil.copyfile(source_vocab, vocab_path)
+        tokenizer_config_path = save_directory / "tokenizer_config.json"
+        tokenizer_config_path.write_text(
+            json.dumps(
+                {
+                    "tokenizer_class": type(self).__name__,
+                    "bos_token": self.bos_token,
+                    "eos_token": self.eos_token,
+                    "pad_token": self.pad_token,
+                    "chat_template": _RWKV_NATIVE_CHAT_TEMPLATE,
+                    "vocab_file": _VOCAB_FILENAME,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        special_tokens_path = save_directory / "special_tokens_map.json"
+        special_tokens_path.write_text(
+            json.dumps(
+                {
+                    "bos_token": self.bos_token,
+                    "eos_token": self.eos_token,
+                    "pad_token": self.pad_token,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return tuple(
+            str(path)
+            for path in (vocab_path, tokenizer_config_path, special_tokens_path)
+        )
 
     @property
     def bos_token_id(self) -> int:

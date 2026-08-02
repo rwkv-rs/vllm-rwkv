@@ -108,9 +108,6 @@ from vllm.platforms import CpuArchEnum, current_platform
 from vllm.plugins import load_general_plugins
 from vllm.ray.lazy_utils import is_in_ray_actor, is_ray_initialized
 from vllm.transformers_utils.config import maybe_override_with_speculators
-from vllm.transformers_utils.configs.rwkv7 import (
-    try_parse_rwkv7_pth_source,
-)
 from vllm.transformers_utils.repo_utils import get_model_path
 from vllm.transformers_utils.utils import is_cloud_storage
 from vllm.utils.argparse_utils import (
@@ -800,10 +797,7 @@ class EngineArgs:
             # Skip cloud storage URIs (s3://, gs://, az://) — they are not
             # HF repo IDs and will be resolved later by
             # ModelConfig.maybe_pull_model_tokenizer_for_runai().
-            if (
-                not is_cloud_storage(self.model)
-                and try_parse_rwkv7_pth_source(self.model) is None
-            ):  # noqa: E501
+            if not is_cloud_storage(self.model):
                 model_id = self.model
                 self.model = get_model_path(self.model, self.revision)
                 if model_id is not self.model:
@@ -813,11 +807,7 @@ class EngineArgs:
                         model_id,
                         self.model,
                     )
-            if (
-                self.tokenizer is not None
-                and not is_cloud_storage(self.tokenizer)
-                and try_parse_rwkv7_pth_source(self.tokenizer) is None
-            ):  # noqa: E501
+            if self.tokenizer is not None and not is_cloud_storage(self.tokenizer):
                 tokenizer_id = self.tokenizer
                 self.tokenizer = get_model_path(self.tokenizer, self.tokenizer_revision)
                 if tokenizer_id is not self.tokenizer:
@@ -1689,19 +1679,13 @@ class EngineArgs:
                 self.seed,
             )
 
-        rwkv7_source = try_parse_rwkv7_pth_source(self.model)
-        local_path = rwkv7_source.local_path if rwkv7_source else None
-        model = str(local_path) if local_path else self.model
-        hf_config_path = (
-            model if self.hf_config_path == self.model else self.hf_config_path
-        )
         return ModelConfig(
-            model=model,
+            model=self.model,
             model_weights=self.model_weights,
-            hf_config_path=hf_config_path,
+            hf_config_path=self.hf_config_path,
             runner=self.runner,
             convert=self.convert,
-            tokenizer=model if self.tokenizer == self.model else self.tokenizer,  # type: ignore[arg-type]
+            tokenizer=self.tokenizer,
             tokenizer_mode=self.tokenizer_mode,
             trust_remote_code=self.trust_remote_code,
             allowed_local_media_path=self.allowed_local_media_path,
@@ -1926,10 +1910,7 @@ class EngineArgs:
         # Skip speculator detection for cloud storage models (eg: S3, GCS) since
         # HuggingFace cannot load configs directly from S3 URLs. S3 models can still
         # use speculators with explicit --speculative-config.
-        if (
-            not is_cloud_storage(self.model)
-            and try_parse_rwkv7_pth_source(self.model) is None
-        ):
+        if not is_cloud_storage(self.model):
             (self.model, self.tokenizer, self.speculative_config) = (
                 maybe_override_with_speculators(
                     model=self.model,

@@ -32,20 +32,24 @@ def test_get_blip2_eos_token():
     assert generation_config.eos_token_id == 50118
 
 
-def test_rwkv7_raw_pth_generation_config_uses_model_config(tmp_path, monkeypatch):
+def test_rwkv7_hf_artifact_generation_config_is_loaded(tmp_path):
     from transformers import GenerationConfig
 
-    model_path = tmp_path / "rwkv7-g1g-1.5b-20260526-ctx8192.pth"
-    model_path.write_bytes(b"")
+    from vllm.transformers_utils.configs.rwkv7 import RWKV7Config
 
-    def fail_from_pretrained(*args, **kwargs):
-        raise AssertionError("raw RWKV .pth should not be parsed as JSON")
-
-    monkeypatch.setattr(GenerationConfig, "from_pretrained", fail_from_pretrained)
+    RWKV7Config(
+        hidden_size=64,
+        head_size=64,
+        num_hidden_layers=1,
+        eos_token_id=0,
+    ).save_pretrained(tmp_path)
+    GenerationConfig(eos_token_id=0, max_new_tokens=23).save_pretrained(tmp_path)
 
     generation_config = try_get_generation_config(
-        str(model_path),
+        str(tmp_path),
         trust_remote_code=False,
     )
 
     assert generation_config is not None
+    assert generation_config.eos_token_id == 0
+    assert generation_config.max_new_tokens == 23
