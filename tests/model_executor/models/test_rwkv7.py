@@ -2263,10 +2263,18 @@ def test_rwkv7_streaming_update_stages_only_embedding_dependencies(monkeypatch):
     emb = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
     ln0_w = torch.tensor([2.0, 3.0])
     ln0_b = torch.tensor([5.0, 7.0])
+
+    def preprocess_embedding(value, weight, bias):
+        assert value.dtype == torch.bfloat16
+        assert weight.dtype == torch.bfloat16
+        assert bias.dtype == torch.bfloat16
+        return value * weight + bias
+
     monkeypatch.setattr(
         torch.ops.rwkv7_v3a_ops,
         "emb_ln0_bf16_to_f16",
-        lambda value, weight, bias: value * weight + bias,
+        preprocess_embedding,
+        raising=False,
     )
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
 
