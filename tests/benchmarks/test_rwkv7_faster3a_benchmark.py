@@ -11,7 +11,62 @@ from typing import Any
 
 import pytest
 
+from benchmarks.rwkv7 import benchmark_direct_model as direct_bench
 from benchmarks.rwkv7 import benchmark_faster3a as bench
+
+
+def _artifact_identity() -> dict[str, Any]:
+    return {
+        "kind": "hf_artifact",
+        "config_sha256": "a" * 64,
+        "weights_sha256": "b" * 64,
+        "source_checkpoint_sha256": "c" * 64,
+    }
+
+
+def _input_contract(batch_size: int = 16, prompt_len: int = 128) -> dict[str, Any]:
+    return {
+        "shape": [batch_size, prompt_len],
+        "prompt_sha256": "d" * 64,
+        "seed": bench.RUNNER_INPUT_SEED,
+    }
+
+
+def _runtime_contract() -> dict[str, Any]:
+    return {
+        "wkv": {"mode": "fp16", "operator": "rwkv7_wkv_fp16_v2.wkv"},
+        "gemm": {
+            "accumulation_policy": "fp16",
+            "allow_fp16_accumulation": True,
+            "provider": "torch.ops.rwkv7_v3a_ops",
+        },
+        "kernels_by_stage": {"prefill_chunk": {}, "decode": {}},
+    }
+
+
+def _prefill_state_contract(
+    batch_size: int = 16,
+    prompt_len: int = 128,
+) -> dict[str, Any]:
+    return {
+        "validated": True,
+        "request_count": batch_size,
+        "minimum_prefill_elapsed": prompt_len,
+        "maximum_prefill_elapsed": prompt_len,
+        "unique_slot_ownership": True,
+        "decode_state_origin": "same-request real chunked prefill",
+    }
+
+
+def _local_hf_artifact(tmp_path: Path) -> Path:
+    artifact = tmp_path / "model"
+    artifact.mkdir()
+    (artifact / "config.json").write_text(
+        json.dumps({"rwkv_source_sha256": "c" * 64}),
+        encoding="utf-8",
+    )
+    (artifact / "model.safetensors").write_bytes(b"safetensors-fixture")
+    return artifact
 
 
 def _config(
@@ -41,10 +96,26 @@ def _measurement(
         if fixed_model_contract is None
         else fixed_model_contract
     )
+    input_contract = _input_contract()
+    runtime_contract = _runtime_contract()
     return {
-        "runner_steady_decode": {"runner_tokens_per_s": tokens_per_s},
+        "runner_prefill": {
+            "input": input_contract,
+            "runtime": runtime_contract,
+            "measurement_boundary": {"included": ["prompt token embedding"]},
+        },
+        "runner_steady_decode": {
+            "runner_tokens_per_s": tokens_per_s,
+            "runner_batch_size": 16,
+            "runner_prompt_len": 128,
+            "input": input_contract,
+            "runtime": runtime_contract,
+            "prefill_state": _prefill_state_contract(),
+            "measurement_boundary": {"state_origin": "completed prefill"},
+        },
         "config": {
             "provenance": {
+                "artifact": _artifact_identity(),
                 "env": env,
                 "raw_env": env,
                 "fixed_model_contract": fixed_contract,
@@ -68,6 +139,24 @@ def test_runner_measurement_records_albatross_source(
 ) -> None:
     monkeypatch.setattr(bench, "_create_vllm_runner_llm", lambda _config: object())
     monkeypatch.setattr(bench, "_shutdown_vllm_runner_llm", lambda _llm: None)
+    input_contract = _input_contract(batch_size=2, prompt_len=4)
+    runtime_contract = _runtime_contract()
+    monkeypatch.setattr(
+        bench,
+        "_time_vllm_runner_prefill_phase",
+        lambda *_args, **_kwargs: {
+            "avg_tokens_per_s": 8_000.0,
+            "peak_iteration_tokens_per_s": 9_000.0,
+            "peak_unit_tokens_per_s": 10_000.0,
+            "p10_ms": 0.8,
+            "p50_ms": 0.9,
+            "p90_ms": 1.0,
+            "total_tokens": 8,
+            "worker_count": 1,
+            "input": input_contract,
+            "runtime": runtime_contract,
+        },
+    )
     monkeypatch.setattr(
         bench,
         "_time_vllm_runner_steady_decode",
@@ -78,6 +167,12 @@ def test_runner_measurement_records_albatross_source(
             "p90_ms": 1.2,
             "decode_steps": 4,
             "worker_count": 1,
+            "input": input_contract,
+            "runtime": runtime_contract,
+            "prefill_state": _prefill_state_contract(
+                batch_size=2,
+                prompt_len=4,
+            ),
         },
     )
 
@@ -92,6 +187,11 @@ def test_runner_measurement_records_albatross_source(
 
     assert measurement["source"]["albatross_commit"] == bench.ALBATROSS_COMMIT
     assert measurement["source"]["contracts"]
+    assert measurement["runner_prefill"]["input"] == input_contract
+    assert (
+        measurement["runner_steady_decode"]["prefill_state"]["minimum_prefill_elapsed"]
+        == 4
+    )
 
 
 def test_git_revision_reads_source_marker(tmp_path: Path) -> None:
@@ -258,6 +358,42 @@ def test_report_requires_fixed_model_contract_provenance() -> None:
     assert blocker["code"] == "missing_runner_throughput_provenance"
 
 
+def test_report_requires_hf_artifact_source_and_weight_digests() -> None:
+    measurement = _measurement()
+    measurement["config"]["provenance"]["artifact"] = {
+        "kind": "checkpoint_file",
+        "sha256": "a" * 64,
+    }
+
+    report = bench.build_report(
+        _config(Path.cwd()),
+        measurements=measurement,
+        cuda_available=True,
+    )
+
+    blocker = report["checks"]["runner_steady_decode"]["blockers"][0]
+    assert blocker["code"] == "missing_runner_hf_artifact_identity"
+
+
+def test_report_rejects_zero_state_decode_provenance() -> None:
+    measurement = _measurement()
+    measurement["runner_steady_decode"]["prefill_state"] = {
+        **_prefill_state_contract(),
+        "minimum_prefill_elapsed": 0,
+        "decode_state_origin": "zero_state",
+    }
+
+    report = bench.build_report(
+        _config(Path.cwd()),
+        measurements=measurement,
+        cuda_available=True,
+    )
+
+    blocker = report["checks"]["runner_steady_decode"]["blockers"][0]
+    assert blocker["code"] == "invalid_runner_canonical_workload"
+    assert "prefill_state" in blocker["violations"]
+
+
 def test_report_blocks_missing_runtime_paths() -> None:
     report = bench.build_report(
         _config(Path.cwd(), model=None),
@@ -272,15 +408,58 @@ def test_report_blocks_missing_runtime_paths() -> None:
     }
 
 
-def test_cli_writes_runner_measurement_json(tmp_path: Path, monkeypatch) -> None:
+def test_control_plane_runner_cli_enters_canonical_worker_phases(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     output = tmp_path / "runner.json"
-    calls: list[tuple[Any, ...]] = []
+    calls: list[tuple[str, dict[str, Any]]] = []
+    input_contract = _input_contract(batch_size=320, prompt_len=128)
+    runtime_contract = _runtime_contract()
 
-    def fake_generate(config, **kwargs):
-        calls.append((config, kwargs))
-        return {**_measurement(), "benchmark": bench.BENCHMARK_NAME}
+    monkeypatch.setattr(bench, "_create_vllm_runner_llm", lambda _config: object())
+    monkeypatch.setattr(bench, "_shutdown_vllm_runner_llm", lambda _llm: None)
+    monkeypatch.setattr(
+        bench, "_artifact_metadata", lambda _model: _artifact_identity()
+    )
+    monkeypatch.setattr(bench, "_cuda_device_metadata", lambda: {"available": True})
+    for name, value in bench.RUNNER_RUNTIME_ENV_REQUIREMENTS.items():
+        monkeypatch.setenv(name, value)
 
-    monkeypatch.setattr(bench, "generate_vllm_runner_measurement", fake_generate)
+    def fake_prefill(_llm, **kwargs):
+        calls.append(("prefill", kwargs))
+        return {
+            "avg_tokens_per_s": 20_000.0,
+            "peak_iteration_tokens_per_s": 21_000.0,
+            "peak_unit_tokens_per_s": 22_000.0,
+            "p10_ms": 1.0,
+            "p50_ms": 1.1,
+            "p90_ms": 1.2,
+            "total_tokens": 320 * 128 * 3,
+            "worker_count": 1,
+            "input": input_contract,
+            "runtime": runtime_contract,
+        }
+
+    def fake_decode(_llm, **kwargs):
+        calls.append(("decode", kwargs))
+        return {
+            "tokens_per_s": 10_000.0,
+            "p10_ms": 1.0,
+            "p50_ms": 1.1,
+            "p90_ms": 1.2,
+            "decode_steps": 1280 * 3,
+            "worker_count": 1,
+            "input": input_contract,
+            "runtime": runtime_contract,
+            "prefill_state": _prefill_state_contract(
+                batch_size=320,
+                prompt_len=128,
+            ),
+        }
+
+    monkeypatch.setattr(bench, "_time_vllm_runner_prefill_phase", fake_prefill)
+    monkeypatch.setattr(bench, "_time_vllm_runner_steady_decode", fake_decode)
     rc = bench.main(
         [
             "--repo-root",
@@ -289,9 +468,9 @@ def test_cli_writes_runner_measurement_json(tmp_path: Path, monkeypatch) -> None
             "https://example.test/model",
             "--measure-vllm-runner",
             "--runner-batch-size",
-            "32",
+            "320",
             "--runner-prompt-len",
-            "64",
+            "128",
             "--runner-prefill-chunk-tokens",
             "16",
             "--runner-decode-tokens",
@@ -306,14 +485,97 @@ def test_cli_writes_runner_measurement_json(tmp_path: Path, monkeypatch) -> None
     )
 
     assert rc == 0
-    assert json.loads(output.read_text())["benchmark"] == bench.BENCHMARK_NAME
-    assert calls[0][1] == {
-        "batch_size": 32,
-        "prompt_len": 64,
+    measurement = json.loads(output.read_text())
+    assert measurement["benchmark"] == bench.BENCHMARK_NAME
+    assert calls == [
+        (
+            "prefill",
+            {
+                "batch_size": 320,
+                "prompt_len": 128,
+                "prefill_chunk_tokens": 16,
+                "warmup": 1,
+                "iters": 3,
+            },
+        ),
+        (
+            "decode",
+            {
+                "batch_size": 320,
+                "prompt_len": 128,
+                "prefill_chunk_tokens": 16,
+                "decode_tokens": 1280,
+                "warmup": 1,
+                "iters": 3,
+            },
+        ),
+    ]
+    assert measurement["runner_prefill"]["input"]["prompt_sha256"] == "d" * 64
+    assert measurement["runner_prefill"]["runtime"] == runtime_contract
+    assert measurement["runner_steady_decode"]["input"] == input_contract
+    assert measurement["runner_steady_decode"]["prefill_state"] == (
+        _prefill_state_contract(batch_size=320, prompt_len=128)
+    )
+    assert measurement["config"]["provenance"]["artifact"] == _artifact_identity()
+    assert measurement["config"]["provenance"]["workload"] == {
+        "batch_size": 320,
+        "prompt_len": 128,
+        "warmup_tokens": 1,
         "decode_tokens": 1280,
-        "warmup": 1,
-        "iters": 3,
+        "runner_prefill_chunk_tokens": 16,
+        "runner_enforce_eager": False,
+        "runner_cudagraph_capture_sizes": None,
     }
+
+
+def test_runner_cli_rejects_raw_checkpoint_before_llm_construction(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    checkpoint = tmp_path / "rwkv7-7.2b.pth"
+    checkpoint.write_bytes(b"legacy-checkpoint")
+    output = tmp_path / "runner.json"
+    llm_constructions = 0
+
+    def fail_if_constructed(_config):
+        nonlocal llm_constructions
+        llm_constructions += 1
+        raise AssertionError("LLM construction must not run for a raw checkpoint")
+
+    monkeypatch.setattr(bench, "_create_vllm_runner_llm", fail_if_constructed)
+    monkeypatch.setattr(bench, "_cuda_device_metadata", lambda: {"available": False})
+
+    rc = bench.main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--model",
+            str(checkpoint),
+            "--measure-vllm-runner",
+            "--runner-batch-size",
+            "320",
+            "--runner-prompt-len",
+            "128",
+            "--runner-prefill-chunk-tokens",
+            "16",
+            "--runner-decode-tokens",
+            "1280",
+            "--runner-warmup",
+            "1",
+            "--runner-iters",
+            "3",
+            "--measurement-output",
+            str(output),
+        ]
+    )
+
+    measurement = json.loads(output.read_text())
+    blocker = measurement["runner_steady_decode"]["blockers"][0]
+    assert rc == 2
+    assert llm_constructions == 0
+    assert blocker["code"] == "unsupported_runner_checkpoint_file"
+    assert blocker["artifact"]["kind"] == "checkpoint_file"
+    assert "convert_rwkv7_pth_to_hf_artifact" in blocker["message"]
 
 
 @pytest.mark.parametrize(
@@ -382,8 +644,7 @@ def test_create_runner_llm_preserves_env_and_capture_contract(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    model_path = tmp_path / "model.pth"
-    model_path.write_bytes(b"")
+    model_path = _local_hf_artifact(tmp_path)
     captured: dict[str, Any] = {}
 
     class FakeLLM:
@@ -426,8 +687,7 @@ def test_create_runner_llm_omits_capture_for_eager_mode(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    model_path = tmp_path / "model.pth"
-    model_path.write_bytes(b"")
+    model_path = _local_hf_artifact(tmp_path)
     captured: dict[str, Any] = {}
 
     class FakeLLM:
@@ -497,7 +757,85 @@ def test_phase_summary_reports_average_and_peak() -> None:
     assert summary["p50_ms"] == pytest.approx(10.0)
 
 
+def test_steady_decode_reuses_nonzero_completed_prefill_state(monkeypatch) -> None:
+    import torch
+
+    batch_size = 2
+    prompt_len = 4
+    model_state = SimpleNamespace(
+        req_id_to_index={},
+        elapsed=torch.zeros(batch_size, dtype=torch.int32),
+    )
+    model_runner = SimpleNamespace(
+        model=SimpleNamespace(vocab_size=32),
+        model_state=model_state,
+    )
+    decode_start_elapsed: list[int] = []
+
+    class FakeWorker:
+        def __init__(self) -> None:
+            self.model_runner = model_runner
+
+        def execute_model(self, scheduler_output) -> None:
+            for request in scheduler_output.scheduled_new_reqs:
+                slot = len(model_state.req_id_to_index)
+                model_state.req_id_to_index[request.req_id] = slot
+                scheduled = scheduler_output.num_scheduled_tokens[request.req_id]
+                model_state.elapsed[slot] += scheduled
+            for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
+                slot = model_state.req_id_to_index[req_id]
+                scheduled = scheduler_output.num_scheduled_tokens[req_id]
+                if scheduled == 1:
+                    decode_start_elapsed.append(int(model_state.elapsed[slot].item()))
+                model_state.elapsed[slot] += scheduled
+            for req_id in scheduler_output.finished_req_ids:
+                model_state.req_id_to_index.pop(req_id, None)
+
+        def sample_tokens(self, _grammar_output) -> None:
+            return None
+
+    monkeypatch.setattr(bench, "_worker_cuda_event_pair", lambda: None)
+    monkeypatch.setattr(bench, "_worker_cuda_synchronize", lambda: None)
+    monkeypatch.setattr(
+        bench,
+        "_worker_runtime_provenance",
+        lambda *_args, **_kwargs: _runtime_contract(),
+    )
+
+    result = bench._run_vllm_worker_internal_steady_decode(
+        FakeWorker(),
+        batch_size=batch_size,
+        prompt_len=prompt_len,
+        prefill_chunk_tokens=2,
+        decode_tokens=2,
+        iters=1,
+        measure=True,
+        warmup_decode_tokens=1,
+    )
+
+    expected_ids = torch.randint(
+        0,
+        32,
+        (batch_size, prompt_len),
+        generator=torch.Generator().manual_seed(bench.RUNNER_INPUT_SEED),
+    )
+    assert result["input"]["prompt_sha256"] == direct_bench._input_digest(expected_ids)
+    assert decode_start_elapsed[0] == prompt_len
+    assert all(elapsed >= prompt_len for elapsed in decode_start_elapsed)
+    assert result["prefill_state"] == {
+        "validated": True,
+        "iterations": 1,
+        "request_count": batch_size,
+        "minimum_prefill_elapsed": prompt_len,
+        "maximum_prefill_elapsed": prompt_len,
+        "unique_slot_ownership": True,
+        "decode_state_origin": "same-request real chunked prefill",
+    }
+
+
 def test_internal_runner_merge_reports_component_timings() -> None:
+    input_contract = _input_contract(batch_size=2, prompt_len=4)
+    runtime_contract = _runtime_contract()
     result = bench._merge_worker_internal_runner_results(
         [
             {
@@ -507,6 +845,12 @@ def test_internal_runner_merge_reports_component_timings() -> None:
                 "decode_step_durations_s": [0.004, 0.006],
                 "decode_steps": 2,
                 "timing_clock": "cuda_event",
+                "input": input_contract,
+                "runtime": runtime_contract,
+                "prefill_state": _prefill_state_contract(
+                    batch_size=2,
+                    prompt_len=4,
+                ),
             }
         ],
         batch_size=2,
@@ -518,3 +862,29 @@ def test_internal_runner_merge_reports_component_timings() -> None:
     assert result["execute_model_p50_ms"] == pytest.approx(3.0)
     assert result["sample_tokens_p50_ms"] == pytest.approx(1.0)
     assert result["internal_timing_target"] == bench.VLLM_RUNNER_TIMING_TARGET
+    assert result["input"] == input_contract
+    assert result["runtime"] == runtime_contract
+    assert result["prefill_state"]["minimum_prefill_elapsed"] == 4
+
+
+def test_internal_prefill_merge_preserves_input_and_runtime_provenance() -> None:
+    input_contract = _input_contract(batch_size=2, prompt_len=4)
+    runtime_contract = _runtime_contract()
+
+    result = bench._merge_worker_internal_phase_results(
+        [
+            {
+                "iteration_durations_s": [0.01],
+                "unit_durations_s": [0.004, 0.006],
+                "unit_tokens": [4, 4],
+                "input": input_contract,
+                "runtime": runtime_contract,
+            }
+        ],
+        total_tokens=8,
+        expected_iterations=1,
+    )
+
+    assert result["avg_tokens_per_s"] == pytest.approx(800.0)
+    assert result["input"] == input_contract
+    assert result["runtime"] == runtime_contract

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import math
 import os
@@ -61,11 +62,13 @@ VLLM_RUNNER_MODE = "worker_execute_model"
 VLLM_RUNNER_TIMING_TARGET = "worker.execute_model + worker.sample_tokens"
 VLLM_RUNNER_TIMING_CLOCK = "cuda_event"
 DEFAULT_RUNNER_PREFILL_CHUNK_TOKENS = 16
+RUNNER_INPUT_SEED = 0
 VLLM_RUNNER_SAMPLING = {
     "temperature": 1.0,
     "top_p": 1.0,
     "ignore_eos": True,
     "detokenize": False,
+    "seed": RUNNER_INPUT_SEED,
 }
 # The outer benchmark launcher can still provide these historical variables,
 # but vLLM deliberately rejects them because their model behavior is fixed.
@@ -164,6 +167,21 @@ class BenchmarkConfig:
     runner_cudagraph_capture_sizes: tuple[int, ...] | None = None
 
 
+class RunnerModelContractError(ValueError):
+    """Raised before runner startup when ``--model`` is not an HF artifact."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        artifact: dict[str, Any],
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.artifact = artifact
+
+
 def _is_url(value: str) -> bool:
     parsed = urlparse(value)
     return parsed.scheme in ("http", "https")
@@ -205,6 +223,75 @@ def _source_metadata(config: BenchmarkConfig) -> dict[str, Any]:
             }
             for entry in SOURCE_PROVENANCE
         ],
+    }
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _artifact_metadata(model: str | None) -> dict[str, Any] | None:
+    if model is None:
+        return None
+    if _is_url(model):
+        return {"kind": "url", "input_reference": model}
+    path = Path(model).expanduser()
+    if not path.exists():
+        return {"kind": "hub_repo_id", "input_reference": model}
+    resolved = path.resolve()
+    if resolved.is_file():
+        return {
+            "kind": "checkpoint_file",
+            "input_reference": model,
+            "resolved_reference": str(resolved),
+            "size_bytes": resolved.stat().st_size,
+        }
+
+    config_path = resolved / "config.json"
+    if not config_path.is_file():
+        return {
+            "kind": "local_directory",
+            "input_reference": model,
+            "resolved_reference": str(resolved),
+            "config_sha256": None,
+            "weight_files": [],
+        }
+    try:
+        config_values = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Invalid model artifact config: {config_path}") from error
+    source_sha256 = config_values.get("rwkv_source_sha256")
+    if source_sha256 is not None and (
+        not isinstance(source_sha256, str)
+        or len(source_sha256) != 64
+        or any(ch not in "0123456789abcdef" for ch in source_sha256.lower())
+    ):
+        raise ValueError("RWKV7 artifact rwkv_source_sha256 is not a SHA-256 digest")
+    weight_paths = sorted(resolved.glob("*.safetensors"))
+    weights = [
+        {
+            "name": weight_path.name,
+            "size_bytes": weight_path.stat().st_size,
+            "sha256": _sha256(weight_path),
+        }
+        for weight_path in weight_paths
+    ]
+    aggregate = hashlib.sha256()
+    for weight in weights:
+        aggregate.update(weight["name"].encode())
+        aggregate.update(weight["sha256"].encode())
+    return {
+        "kind": "hf_artifact",
+        "input_reference": model,
+        "resolved_reference": str(resolved),
+        "config_sha256": _sha256(config_path),
+        "weights_sha256": aggregate.hexdigest() if weights else None,
+        "weight_files": weights,
+        "source_checkpoint_sha256": source_sha256,
     }
 
 
@@ -321,6 +408,7 @@ def _without_unregistered_benchmark_env_vars():
 def _benchmark_provenance(config: BenchmarkConfig) -> dict[str, Any]:
     return {
         "git_revision": _git_revision(config.repo_root),
+        "artifact": _artifact_metadata(config.model),
         "cuda": _cuda_device_metadata(),
         "env": _rwkv_environment_metadata(),
         "raw_env": _rwkv_environment_raw_metadata(),
@@ -377,7 +465,7 @@ def _runtime_blockers(
         blockers.append(
             _blocker(
                 "missing_vllm_model",
-                "Set --model or VLLM_RWKV7_MODEL to a vLLM-loadable RWKV7 model.",
+                "Set --model or VLLM_RWKV7_MODEL to a standard RWKV7 HF artifact.",
             )
         )
     elif not _is_url(config.model) and not Path(config.model).expanduser().exists():
@@ -459,8 +547,41 @@ def _phase_throughput_summary(
 def _required_vllm_runner_model(config: BenchmarkConfig) -> str:
     if not config.model:
         raise ValueError("Set --model or VLLM_RWKV7_MODEL.")
-    if not _is_url(config.model) and not Path(config.model).expanduser().exists():
+    if _is_url(config.model):
+        return config.model
+    model_path = Path(config.model).expanduser()
+    if not model_path.exists():
         raise FileNotFoundError(f"missing vLLM model path: {config.model}")
+    resolved = model_path.resolve()
+    if resolved.is_file():
+        raise RunnerModelContractError(
+            "unsupported_runner_checkpoint_file",
+            "RWKV7 runner benchmark requires a converted HF artifact directory; "
+            f"raw checkpoint files are not runtime-loadable: {resolved}. Convert "
+            "once with vllm.transformers_utils.rwkv7_artifact."
+            "convert_rwkv7_pth_to_hf_artifact().",
+            artifact={
+                "kind": "checkpoint_file",
+                "input_reference": config.model,
+                "resolved_reference": str(resolved),
+                "size_bytes": resolved.stat().st_size,
+            },
+        )
+    config_path = resolved / "config.json"
+    weight_paths = sorted(resolved.glob("*.safetensors"))
+    if not config_path.is_file() or not weight_paths:
+        raise RunnerModelContractError(
+            "invalid_runner_hf_artifact",
+            "RWKV7 runner benchmark requires a local HF artifact directory with "
+            f"config.json and safetensors weights: {resolved}",
+            artifact={
+                "kind": "local_directory",
+                "input_reference": config.model,
+                "resolved_reference": str(resolved),
+                "has_config_json": config_path.is_file(),
+                "safetensors_files": [path.name for path in weight_paths],
+            },
+        )
     return config.model
 
 
@@ -481,6 +602,7 @@ def _create_vllm_runner_llm(config: BenchmarkConfig) -> Any:
         config.batch_size * prefill_chunk_tokens,
         config.batch_size,
     )
+    model = _required_vllm_runner_model(config)
     llm_kwargs: dict[str, Any] = {}
     if (
         not config.runner_enforce_eager
@@ -498,7 +620,7 @@ def _create_vllm_runner_llm(config: BenchmarkConfig) -> Any:
         from vllm import LLM
 
         return LLM(
-            model=_required_vllm_runner_model(config),
+            model=model,
             skip_tokenizer_init=True,
             tensor_parallel_size=1,
             pipeline_parallel_size=1,
@@ -553,6 +675,7 @@ def _worker_time_call(
         return time.perf_counter() - start_s
 
     start_event, end_event = cuda_events
+    _worker_cuda_synchronize()
     start_event.record()
     fn()
     end_event.record()
@@ -736,11 +859,137 @@ def _worker_internal_runner_blocker(code: str, message: str) -> dict[str, Any]:
     }
 
 
-def _worker_prompt_token_ids(batch_size: int, prompt_len: int) -> list[list[int]]:
-    return [
-        [(idx + position) % 1024 for position in range(prompt_len)]
-        for idx in range(batch_size)
-    ]
+def _worker_prompt_inputs(
+    worker: Any,
+    batch_size: int,
+    prompt_len: int,
+) -> tuple[list[list[int]], dict[str, Any]]:
+    import torch
+
+    model_runner = getattr(worker, "model_runner", None)
+    model = getattr(model_runner, "model", None)
+    vocab_size = int(getattr(model, "vocab_size", 0))
+    if vocab_size <= 0:
+        raise RuntimeError("RWKV7 runner benchmark cannot determine model vocab_size")
+    generator = torch.Generator().manual_seed(RUNNER_INPUT_SEED)
+    input_ids = torch.randint(
+        low=0,
+        high=vocab_size,
+        size=(batch_size, prompt_len),
+        generator=generator,
+    )
+    return input_ids.tolist(), {
+        "generator": "torch.Generator(device=cpu).manual_seed",
+        "seed": RUNNER_INPUT_SEED,
+        "dtype": str(input_ids.dtype),
+        "shape": list(input_ids.shape),
+        "prompt_sha256": hashlib.sha256(input_ids.numpy().tobytes()).hexdigest(),
+        "vocab_size": vocab_size,
+    }
+
+
+def _worker_prefill_state_contract(
+    worker: Any,
+    req_ids: list[str],
+    prompt_len: int,
+) -> dict[str, Any]:
+    model_runner = getattr(worker, "model_runner", None)
+    model_state = getattr(model_runner, "model_state", None)
+    req_id_to_index = getattr(model_state, "req_id_to_index", None)
+    elapsed = getattr(model_state, "elapsed", None)
+    if not isinstance(req_id_to_index, dict) or elapsed is None:
+        raise RuntimeError(
+            "RWKV7 runner cannot prove recurrent state ownership after prefill"
+        )
+    missing = [req_id for req_id in req_ids if req_id not in req_id_to_index]
+    if missing:
+        raise RuntimeError(
+            "RWKV7 runner prefill did not allocate state for every request: "
+            f"missing={missing[:8]}"
+        )
+    state_indices = [int(req_id_to_index[req_id]) for req_id in req_ids]
+    if len(set(state_indices)) != len(state_indices):
+        raise RuntimeError("RWKV7 runner prefill state ownership is not unique")
+    processed_tokens = [int(elapsed[index].item()) for index in state_indices]
+    if any(tokens < prompt_len for tokens in processed_tokens):
+        raise RuntimeError(
+            "RWKV7 runner decode would start before prompt prefill completed: "
+            f"minimum_elapsed={min(processed_tokens)} prompt_len={prompt_len}"
+        )
+    return {
+        "validated": True,
+        "request_count": len(req_ids),
+        "unique_state_indices": len(set(state_indices)),
+        "minimum_prefill_elapsed": min(processed_tokens),
+        "maximum_prefill_elapsed": max(processed_tokens),
+        "decode_state_origin": "same-request real chunked prefill",
+    }
+
+
+def _worker_runtime_provenance(
+    worker: Any,
+    batch_size: int,
+    prompt_len: int,
+    prefill_chunk_tokens: int,
+) -> dict[str, Any]:
+    import torch
+
+    from vllm.model_executor.models import rwkv7
+
+    model_runner = getattr(worker, "model_runner", None)
+    model = getattr(model_runner, "model", None)
+    profile = getattr(model, "execution_profile", None)
+    if model is None or profile is None:
+        raise RuntimeError("RWKV7 runner cannot inspect loaded model runtime profile")
+
+    def stage(token_count: int) -> dict[str, Any]:
+        rows = batch_size * token_count
+        path = rwkv7.select_path(batch_size, token_count)
+        allow_lt = profile.allow_fp16_accumulation and model.hidden_size == 4096
+        return {
+            "batch_size": batch_size,
+            "token_count": token_count,
+            "rows": rows,
+            "cmix_mode": path.cmix_mode,
+            "resolved_fp16_lt": {
+                "attention_c2c": (
+                    rwkv7.ATT_C2C_FP16_LT_4096.get(rows) if allow_lt else None
+                ),
+                "ffn_down": (
+                    rwkv7.FFN_DOWN_FP16_LT_4096.get(rows) if allow_lt else None
+                ),
+            },
+            "m1_rkv_grouped": rows in rwkv7.M1_RKV_GROUPED_ROWS,
+            "m1_cmix_prezero": rows in rwkv7.M1_CMIX_PREZERO_ROWS,
+        }
+
+    wkv_operator = (
+        "torch.ops.rwkv7_wkv_fp32_v2.wkv"
+        if profile.wkv_mode == "fp32io16"
+        else "torch.ops.rwkv7_wkv_fp16_v2.wkv"
+    )
+    return {
+        "precision": {
+            "activation_dtype": str(next(iter(model.z.values())).dtype),
+            "logits_dtype": str(torch.float32),
+            "wkv_state_dtype": str(profile.wkv_state_dtype),
+        },
+        "wkv": {
+            "mode": profile.wkv_mode,
+            "provider": "vllm RWKV7 native CUDA ops",
+            "operator": wkv_operator,
+            "metadata_contract": "packed-varlen slot-mapped recurrent state",
+        },
+        "gemm": {
+            "provider": "torch.ops.rwkv7_v3a_ops",
+            "accumulation_policy": profile.gemm_accumulation_policy,
+            "allow_fp16_accumulation": profile.allow_fp16_accumulation,
+        },
+        "kernels_by_stage": {
+            "prefill_chunk": stage(min(prompt_len, prefill_chunk_tokens)),
+            "decode": stage(1),
+        },
+    }
 
 
 def _worker_execute_prefill_chunks(
@@ -837,7 +1086,23 @@ def _run_vllm_worker_internal_prefill(
         top_p=VLLM_RUNNER_SAMPLING["top_p"],
         ignore_eos=VLLM_RUNNER_SAMPLING["ignore_eos"],
         detokenize=VLLM_RUNNER_SAMPLING["detokenize"],
+        seed=VLLM_RUNNER_SAMPLING["seed"],
     )
+    prompt_token_ids, input_provenance = _worker_prompt_inputs(
+        worker, batch_size, prompt_len
+    )
+    try:
+        runtime_provenance = _worker_runtime_provenance(
+            worker,
+            batch_size,
+            prompt_len,
+            prefill_chunk_tokens,
+        )
+    except RuntimeError as error:
+        return _worker_internal_runner_blocker(
+            "missing_runner_runtime_provenance",
+            str(error),
+        )
     prefix = f"rwkv7-prefill-{id(worker)}-{time.perf_counter_ns()}"
     cuda_events = _worker_cuda_event_pair()
     timing_clock = "cuda_event" if cuda_events is not None else "wall_clock"
@@ -852,7 +1117,7 @@ def _run_vllm_worker_internal_prefill(
         _worker_execute_prefill_chunks(
             worker,
             req_ids=req_ids,
-            prompt_token_ids=_worker_prompt_token_ids(batch_size, prompt_len),
+            prompt_token_ids=prompt_token_ids,
             sampling_params=sampling_params,
             prompt_len=prompt_len,
             prefill_chunk_tokens=prefill_chunk_tokens,
@@ -869,7 +1134,7 @@ def _run_vllm_worker_internal_prefill(
         chunk_durations_s, chunk_token_counts = _worker_execute_prefill_chunks(
             worker,
             req_ids=req_ids,
-            prompt_token_ids=_worker_prompt_token_ids(batch_size, prompt_len),
+            prompt_token_ids=prompt_token_ids,
             sampling_params=sampling_params,
             prompt_len=prompt_len,
             prefill_chunk_tokens=prefill_chunk_tokens,
@@ -892,6 +1157,8 @@ def _run_vllm_worker_internal_prefill(
         "tokens": batch_size * prompt_len * iters,
         "warmup_iterations": warmup,
         "worker_count": 1,
+        "input": input_provenance,
+        "runtime": runtime_provenance,
     }
 
 
@@ -933,6 +1200,10 @@ def _run_vllm_worker_internal_decode_only(
         top_p=VLLM_RUNNER_SAMPLING["top_p"],
         ignore_eos=VLLM_RUNNER_SAMPLING["ignore_eos"],
         detokenize=VLLM_RUNNER_SAMPLING["detokenize"],
+        seed=VLLM_RUNNER_SAMPLING["seed"],
+    )
+    prompt_token_ids, input_provenance = _worker_prompt_inputs(
+        worker, batch_size, prompt_len
     )
     prefix = f"rwkv7-decode-{id(worker)}-{time.perf_counter_ns()}"
     cuda_events = _worker_cuda_event_pair()
@@ -947,7 +1218,7 @@ def _run_vllm_worker_internal_decode_only(
         worker.execute_model(
             _worker_add_decode_requests_scheduler_output(
                 req_ids=req_ids,
-                prompt_token_ids=_worker_prompt_token_ids(batch_size, prompt_len),
+                prompt_token_ids=prompt_token_ids,
                 sampling_params=sampling_params,
                 prompt_len=prompt_len,
             )
@@ -1009,6 +1280,7 @@ def _run_vllm_worker_internal_decode_only(
         "sample_durations_s": sample_durations_s,
         "tokens": batch_size * decode_tokens * iters,
         "worker_count": 1,
+        "input": input_provenance,
     }
 
 
@@ -1045,6 +1317,10 @@ def _run_vllm_worker_internal_steady_decode(
         top_p=VLLM_RUNNER_SAMPLING["top_p"],
         ignore_eos=VLLM_RUNNER_SAMPLING["ignore_eos"],
         detokenize=VLLM_RUNNER_SAMPLING["detokenize"],
+        seed=VLLM_RUNNER_SAMPLING["seed"],
+    )
+    prompt_token_ids, input_provenance = _worker_prompt_inputs(
+        worker, batch_size, prompt_len
     )
     iteration_durations_s: list[float] = []
     execute_durations_s: list[float] = []
@@ -1057,13 +1333,26 @@ def _run_vllm_worker_internal_steady_decode(
     if prefill_chunk_tokens <= 0:
         raise ValueError("runner prefill chunk tokens must be positive")
     prefill_chunk_tokens = min(prefill_chunk_tokens, prompt_len)
+    try:
+        runtime_provenance = _worker_runtime_provenance(
+            worker,
+            batch_size,
+            prompt_len,
+            prefill_chunk_tokens,
+        )
+    except RuntimeError as error:
+        return _worker_internal_runner_blocker(
+            "missing_runner_runtime_provenance",
+            str(error),
+        )
+    prefill_state_contracts: list[dict[str, Any]] = []
 
     for iteration in range(iters):
         req_ids = [f"{prefix}-{iteration}-{idx}" for idx in range(batch_size)]
         _worker_execute_prefill_chunks(
             worker,
             req_ids=req_ids,
-            prompt_token_ids=_worker_prompt_token_ids(batch_size, prompt_len),
+            prompt_token_ids=prompt_token_ids,
             sampling_params=sampling_params,
             prompt_len=prompt_len,
             prefill_chunk_tokens=prefill_chunk_tokens,
@@ -1071,6 +1360,15 @@ def _run_vllm_worker_internal_steady_decode(
         )
         worker.sample_tokens(None)
         _worker_cuda_synchronize()
+        try:
+            prefill_state_contracts.append(
+                _worker_prefill_state_contract(worker, req_ids, prompt_len)
+            )
+        except RuntimeError as error:
+            return _worker_internal_runner_blocker(
+                "invalid_runner_prefill_state",
+                str(error),
+            )
 
         for step in range(warmup_decode_tokens):
             worker.execute_model(
@@ -1130,6 +1428,26 @@ def _run_vllm_worker_internal_steady_decode(
         "warmup_decode_steps": warmup_decode_tokens * iters,
         "tokens": batch_size * decode_tokens * iters if measure else 0,
         "timing_clock": timing_clock,
+        "input": input_provenance,
+        "runtime": runtime_provenance,
+        "prefill_state": {
+            "validated": True,
+            "iterations": len(prefill_state_contracts),
+            "request_count": batch_size,
+            "minimum_prefill_elapsed": min(
+                contract["minimum_prefill_elapsed"]
+                for contract in prefill_state_contracts
+            ),
+            "maximum_prefill_elapsed": max(
+                contract["maximum_prefill_elapsed"]
+                for contract in prefill_state_contracts
+            ),
+            "unique_slot_ownership": all(
+                contract["unique_state_indices"] == batch_size
+                for contract in prefill_state_contracts
+            ),
+            "decode_state_origin": "same-request real chunked prefill",
+        },
     }
 
 
@@ -1166,6 +1484,41 @@ def _merge_worker_internal_runner_results(
             "invalid_internal_runner_worker_result",
             "A vLLM worker returned a non-dict internal runner timing result.",
         )
+
+    shared_metadata: dict[str, Any] = {}
+    for key in ("input", "runtime"):
+        values = [result.get(key) for result in normalized_results]
+        if any(not isinstance(value, dict) for value in values) or any(
+            value != values[0] for value in values[1:]
+        ):
+            return _worker_internal_runner_blocker(
+                "inconsistent_internal_runner_provenance",
+                f"Workers did not return one consistent {key} contract.",
+            )
+        shared_metadata[key] = values[0]
+    state_contracts = [result.get("prefill_state") for result in normalized_results]
+    if any(not isinstance(contract, dict) for contract in state_contracts):
+        return _worker_internal_runner_blocker(
+            "missing_runner_prefill_state_contract",
+            "Workers did not prove decode state came from completed prefill.",
+        )
+    shared_metadata["prefill_state"] = {
+        "validated": all(contract.get("validated") for contract in state_contracts),
+        "iterations": min(
+            int(contract.get("iterations", 0)) for contract in state_contracts
+        ),
+        "request_count": batch_size,
+        "minimum_prefill_elapsed": min(
+            int(contract["minimum_prefill_elapsed"]) for contract in state_contracts
+        ),
+        "maximum_prefill_elapsed": max(
+            int(contract["maximum_prefill_elapsed"]) for contract in state_contracts
+        ),
+        "unique_slot_ownership": all(
+            contract.get("unique_slot_ownership") for contract in state_contracts
+        ),
+        "decode_state_origin": "same-request real chunked prefill",
+    }
 
     expected_decode_steps = decode_tokens * iters
     duration_specs = (
@@ -1231,6 +1584,7 @@ def _merge_worker_internal_runner_results(
         "internal_timing_target": VLLM_RUNNER_TIMING_TARGET,
         "decode_steps": decode_steps,
         "worker_count": len(normalized_results),
+        **shared_metadata,
     }
 
 
@@ -1265,6 +1619,18 @@ def _merge_worker_internal_phase_results(
             "invalid_internal_runner_worker_result",
             "A vLLM worker returned a non-dict internal runner timing result.",
         )
+
+    shared_metadata: dict[str, Any] = {}
+    for key in ("input", "runtime"):
+        values = [result.get(key) for result in normalized_results]
+        if any(not isinstance(value, dict) for value in values) or any(
+            value != values[0] for value in values[1:]
+        ):
+            return _worker_internal_runner_blocker(
+                "inconsistent_internal_runner_provenance",
+                f"Workers did not return one consistent {key} contract.",
+            )
+        shared_metadata[key] = values[0]
 
     per_worker_iterations = [
         [float(value) for value in result.get("iteration_durations_s", [])]
@@ -1314,6 +1680,7 @@ def _merge_worker_internal_phase_results(
             ),
             "timing_clock": first_result.get("timing_clock", VLLM_RUNNER_TIMING_CLOCK),
             "worker_count": worker_count,
+            **shared_metadata,
         }
     )
     if "warmup_iterations" in first_result:
@@ -1484,8 +1851,10 @@ def generate_vllm_runner_measurement(
         config,
         batch_size=batch_size,
         prompt_len=prompt_len,
+        warmup_tokens=warmup,
         decode_tokens=decode_tokens,
     )
+    _required_vllm_runner_model(runner_config)
     prefill_chunk_tokens = _runner_prefill_chunk_tokens(runner_config)
     capacity_config = replace(
         runner_config,
@@ -1493,7 +1862,15 @@ def generate_vllm_runner_measurement(
     )
     llm = _create_vllm_runner_llm(capacity_config)
     try:
-        parsed = _time_vllm_runner_steady_decode(
+        parsed_prefill = _time_vllm_runner_prefill_phase(
+            llm,
+            batch_size=batch_size,
+            prompt_len=prompt_len,
+            prefill_chunk_tokens=prefill_chunk_tokens,
+            warmup=warmup,
+            iters=iters,
+        )
+        parsed_decode = _time_vllm_runner_steady_decode(
             llm,
             batch_size=batch_size,
             prompt_len=prompt_len,
@@ -1505,6 +1882,60 @@ def generate_vllm_runner_measurement(
     finally:
         _shutdown_vllm_runner_llm(llm)
 
+    prefill_metrics: dict[str, Any] = {
+        "runner_batch_size": batch_size,
+        "runner_prompt_len": prompt_len,
+        "runner_prefill_chunk_tokens": prefill_chunk_tokens,
+        "runner_warmup": warmup,
+        "runner_warmup_mode": "whole_prefill_iterations",
+        "runner_iters": iters,
+        "runner_measurement_mode": parsed_prefill.get(
+            "measurement_mode", VLLM_RUNNER_MODE
+        ),
+        "runner_internal_timing_target": parsed_prefill.get(
+            "internal_timing_target", "worker.execute_model.prefill"
+        ),
+        "runner_timing_clock": parsed_prefill.get(
+            "timing_clock", VLLM_RUNNER_TIMING_CLOCK
+        ),
+        "measurement_boundary": {
+            "included": [
+                "prompt token embedding",
+                "chunked RWKV recurrent model execution",
+                "recurrent state update",
+            ],
+            "excluded": [
+                "request construction",
+                "request cleanup",
+                "sampling",
+                "JSON serialization",
+            ],
+            "warmup": "whole prefill iterations on the same prompt workload",
+            "synchronization": "before each CUDA event and at event completion",
+        },
+    }
+    if "blockers" in parsed_prefill:
+        prefill_metrics["blockers"] = parsed_prefill["blockers"]
+    else:
+        prefill_metrics.update(
+            {
+                "runner_avg_tokens_per_s": parsed_prefill["avg_tokens_per_s"],
+                "runner_peak_iteration_tokens_per_s": parsed_prefill[
+                    "peak_iteration_tokens_per_s"
+                ],
+                "runner_peak_chunk_tokens_per_s": parsed_prefill[
+                    "peak_unit_tokens_per_s"
+                ],
+                "runner_p10_ms": parsed_prefill["p10_ms"],
+                "runner_p50_ms": parsed_prefill["p50_ms"],
+                "runner_p90_ms": parsed_prefill["p90_ms"],
+                "runner_total_tokens": parsed_prefill["total_tokens"],
+                "runner_worker_count": parsed_prefill["worker_count"],
+                "input": parsed_prefill["input"],
+                "runtime": parsed_prefill["runtime"],
+            }
+        )
+
     runner_metrics: dict[str, Any] = {
         "runner_batch_size": batch_size,
         "runner_prompt_len": prompt_len,
@@ -1514,12 +1945,14 @@ def generate_vllm_runner_measurement(
         "runner_warmup_mode": "same_request_decode_steps",
         "runner_warmup_decode_tokens": warmup,
         "runner_iters": iters,
-        "runner_measurement_mode": parsed.get("measurement_mode", VLLM_RUNNER_MODE),
-        "runner_internal_timing_target": parsed.get(
+        "runner_measurement_mode": parsed_decode.get(
+            "measurement_mode", VLLM_RUNNER_MODE
+        ),
+        "runner_internal_timing_target": parsed_decode.get(
             "internal_timing_target",
             VLLM_RUNNER_TIMING_TARGET,
         ),
-        "runner_timing_clock": parsed.get(
+        "runner_timing_clock": parsed_decode.get(
             "timing_clock",
             VLLM_RUNNER_TIMING_CLOCK,
         ),
@@ -1528,35 +1961,60 @@ def generate_vllm_runner_measurement(
             if os.environ.get("VLLM_ALLOW_INSECURE_SERIALIZATION") == "1"
             else "msgpack_only"
         ),
+        "measurement_boundary": {
+            "included": [
+                "decode token embedding",
+                "RWKV recurrent model execution from the completed prompt state",
+                "FP32 logits projection",
+                "rapid sampler token selection",
+            ],
+            "excluded": [
+                "prompt prefill",
+                "request construction",
+                "request cleanup",
+                "detokenization",
+                "JSON serialization",
+            ],
+            "state_origin": "same-request real chunked prefill",
+            "warmup": "same-request decode steps after completed prefill",
+            "synchronization": "before each CUDA event and at event completion",
+        },
     }
-    if "blockers" in parsed:
-        runner_metrics["blockers"] = parsed["blockers"]
+    if "blockers" in parsed_decode:
+        runner_metrics["blockers"] = parsed_decode["blockers"]
     else:
         runner_metrics.update(
             {
-                "runner_tokens_per_s": parsed["tokens_per_s"],
-                "runner_p10_ms": parsed["p10_ms"],
-                "runner_p50_ms": parsed["p50_ms"],
-                "runner_p90_ms": parsed["p90_ms"],
-                "runner_execute_model_p50_ms": parsed.get("execute_model_p50_ms"),
-                "runner_execute_model_p50_tokens_per_s": parsed.get(
+                "runner_tokens_per_s": parsed_decode["tokens_per_s"],
+                "runner_p10_ms": parsed_decode["p10_ms"],
+                "runner_p50_ms": parsed_decode["p50_ms"],
+                "runner_p90_ms": parsed_decode["p90_ms"],
+                "runner_execute_model_p50_ms": parsed_decode.get(
+                    "execute_model_p50_ms"
+                ),
+                "runner_execute_model_p50_tokens_per_s": parsed_decode.get(
                     "execute_model_p50_tokens_per_s"
                 ),
-                "runner_sample_tokens_p50_ms": parsed.get("sample_tokens_p50_ms"),
-                "runner_sample_tokens_p50_tokens_per_s": parsed.get(
+                "runner_sample_tokens_p50_ms": parsed_decode.get(
+                    "sample_tokens_p50_ms"
+                ),
+                "runner_sample_tokens_p50_tokens_per_s": parsed_decode.get(
                     "sample_tokens_p50_tokens_per_s"
                 ),
-                "runner_decode_step_p50_ms": parsed.get("decode_step_p50_ms"),
-                "runner_decode_step_p50_tokens_per_s": parsed.get(
+                "runner_decode_step_p50_ms": parsed_decode.get("decode_step_p50_ms"),
+                "runner_decode_step_p50_tokens_per_s": parsed_decode.get(
                     "decode_step_p50_tokens_per_s"
                 ),
-                "runner_postprocess_p50_ms": parsed.get("postprocess_p50_ms"),
-                "runner_postprocess_timing_available": parsed.get(
+                "runner_postprocess_p50_ms": parsed_decode.get("postprocess_p50_ms"),
+                "runner_postprocess_timing_available": parsed_decode.get(
                     "postprocess_timing_available",
                     False,
                 ),
-                "runner_decode_steps": parsed["decode_steps"],
-                "runner_worker_count": parsed["worker_count"],
+                "runner_decode_steps": parsed_decode["decode_steps"],
+                "runner_worker_count": parsed_decode["worker_count"],
+                "input": parsed_decode["input"],
+                "runtime": parsed_decode["runtime"],
+                "prefill_state": parsed_decode["prefill_state"],
             }
         )
 
@@ -1564,6 +2022,7 @@ def generate_vllm_runner_measurement(
         "schema_version": SCHEMA_VERSION,
         "benchmark": BENCHMARK_NAME,
         "source": _source_metadata(runner_config),
+        "runner_prefill": prefill_metrics,
         "runner_steady_decode": runner_metrics,
         "config": {
             "repo_root": str(config.repo_root),
@@ -1572,6 +2031,45 @@ def generate_vllm_runner_measurement(
             "provenance": _benchmark_provenance(runner_config),
         },
     }
+
+
+def _runner_model_contract_failure_measurement(
+    config: BenchmarkConfig,
+    error: RunnerModelContractError,
+) -> dict[str, Any]:
+    blocker = _blocker(error.code, str(error), artifact=error.artifact)
+    provenance_config = replace(config, model=None)
+    provenance = _benchmark_provenance(provenance_config)
+    provenance["artifact"] = error.artifact
+    phase = {
+        "runner_batch_size": config.batch_size,
+        "runner_prompt_len": config.prompt_len,
+        "runner_prefill_chunk_tokens": _runner_prefill_chunk_tokens(config),
+        "runner_decode_tokens": config.decode_tokens,
+        "runner_measurement_mode": VLLM_RUNNER_MODE,
+        "blockers": [blocker],
+    }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "benchmark": BENCHMARK_NAME,
+        "source": _source_metadata(config),
+        "runner_prefill": dict(phase),
+        "runner_steady_decode": dict(phase),
+        "config": {
+            "repo_root": str(config.repo_root),
+            "model": config.model,
+            "measurement_source": f"vllm_runner_{VLLM_RUNNER_MODE}",
+            "provenance": provenance,
+        },
+    }
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(ch in "0123456789abcdef" for ch in value.lower())
+    )
 
 
 def _runner_throughput_contract_blocker(
@@ -1618,6 +2116,83 @@ def _runner_throughput_contract_blocker(
             "invalid_runner_throughput_contract",
             "Runner performance acceptance requires the FP16 throughput contract.",
             violations=violations,
+        )
+
+    artifact = provenance.get("artifact")
+    if (
+        not isinstance(artifact, dict)
+        or artifact.get("kind") != "hf_artifact"
+        or not _is_sha256(artifact.get("config_sha256"))
+        or not _is_sha256(artifact.get("weights_sha256"))
+        or not _is_sha256(artifact.get("source_checkpoint_sha256"))
+    ):
+        return _blocker(
+            "missing_runner_hf_artifact_identity",
+            "Runner performance acceptance requires config, safetensors, and "
+            "source checkpoint SHA-256 provenance from a converted HF artifact.",
+        )
+
+    prefill = measurements.get("runner_prefill")
+    decode = measurements.get("runner_steady_decode")
+    required_prefill = ("input", "runtime", "measurement_boundary")
+    required_decode = ("input", "runtime", "prefill_state", "measurement_boundary")
+    if (
+        not isinstance(prefill, dict)
+        or not isinstance(decode, dict)
+        or any(not isinstance(prefill.get(name), dict) for name in required_prefill)
+        or any(not isinstance(decode.get(name), dict) for name in required_decode)
+    ):
+        return _blocker(
+            "missing_runner_canonical_workload_provenance",
+            "Runner acceptance requires measured prefill, input digest, actual "
+            "runtime provenance, and completed-prefill decode state provenance.",
+        )
+    if prefill["input"] != decode["input"] or prefill["runtime"] != decode["runtime"]:
+        return _blocker(
+            "inconsistent_runner_canonical_workload",
+            "Prefill and decode did not use one input and runtime contract.",
+        )
+
+    input_shape = decode["input"].get("shape")
+    state = decode["prefill_state"]
+    runtime = decode["runtime"]
+    wkv = runtime.get("wkv") if isinstance(runtime, dict) else None
+    gemm = runtime.get("gemm") if isinstance(runtime, dict) else None
+    expected_shape = [
+        int(decode.get("runner_batch_size", 0)),
+        int(decode.get("runner_prompt_len", 0)),
+    ]
+    canonical_violations: dict[str, Any] = {}
+    if input_shape != expected_shape or not _is_sha256(
+        decode["input"].get("prompt_sha256")
+    ):
+        canonical_violations["input"] = {
+            "required_shape": expected_shape,
+            "actual_shape": input_shape,
+            "has_sha256": _is_sha256(decode["input"].get("prompt_sha256")),
+        }
+    prompt_len = expected_shape[1]
+    if (
+        state.get("validated") is not True
+        or state.get("unique_slot_ownership") is not True
+        or state.get("decode_state_origin") != "same-request real chunked prefill"
+        or int(state.get("minimum_prefill_elapsed", -1)) < prompt_len
+    ):
+        canonical_violations["prefill_state"] = state
+    if (
+        not isinstance(wkv, dict)
+        or wkv.get("mode") != "fp16"
+        or not isinstance(gemm, dict)
+        or gemm.get("accumulation_policy") != "fp16"
+        or gemm.get("allow_fp16_accumulation") is not True
+    ):
+        canonical_violations["runtime"] = runtime
+    if canonical_violations:
+        return _blocker(
+            "invalid_runner_canonical_workload",
+            "Runner measurement did not execute the canonical input, recurrent "
+            "state, WKV, and GEMM contract.",
+            violations=canonical_violations,
         )
     return None
 
@@ -1777,7 +2352,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         description="RWKV7 faster3a performance acceptance harness."
     )
     parser.add_argument("--repo-root", type=Path, default=_default_repo_root())
-    parser.add_argument("--model", help="vLLM-loadable RWKV7 model path or URL.")
+    parser.add_argument(
+        "--model",
+        help="Standard RWKV7 HF artifact directory or supported remote reference.",
+    )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--prompt-len", type=int, default=128)
     parser.add_argument("--warmup-tokens", type=int, default=16)
@@ -1890,14 +2468,27 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     config = _config_from_args(args)
     if args.measure_vllm_runner:
-        measurement = generate_vllm_runner_measurement(
+        runner_config = replace(
             config,
             batch_size=args.runner_batch_size,
             prompt_len=args.runner_prompt_len,
+            warmup_tokens=args.runner_warmup,
             decode_tokens=args.runner_decode_tokens,
-            warmup=args.runner_warmup,
-            iters=args.runner_iters,
         )
+        try:
+            measurement = generate_vllm_runner_measurement(
+                config,
+                batch_size=args.runner_batch_size,
+                prompt_len=args.runner_prompt_len,
+                decode_tokens=args.runner_decode_tokens,
+                warmup=args.runner_warmup,
+                iters=args.runner_iters,
+            )
+        except RunnerModelContractError as error:
+            measurement = _runner_model_contract_failure_measurement(
+                runner_config,
+                error,
+            )
         _write_report(measurement, args.measurement_output)
         return _measurement_exit_code(measurement)
     report = build_report(
