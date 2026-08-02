@@ -62,9 +62,27 @@ jobs:
     - run: echo "::add-matcher::.github/workflows/matchers/actionlint.json"
     - run: echo "::add-matcher::.github/workflows/matchers/markdownlint.json"
     - run: echo "::add-matcher::.github/workflows/matchers/mypy.json"
+    - name: Run ShellCheck on changed PR files
+      if: github.event_name == 'pull_request'
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        mapfile -d '' changed_shell_files < <(
+          git diff --name-only --diff-filter=ACMR -z \
+            "$BASE_SHA" "$HEAD_SHA" -- '*.sh' \
+            ':(exclude).buildkite/scripts/hardware_ci/run-amd-test.sh'
+        )
+        if (( ${#changed_shell_files[@]} == 0 )); then
+          echo "No changed shell files to check."
+        else
+          shellcheck -s bash "${changed_shell_files[@]}"
+        fi
     - name: Run pre-commit on the PR diff
       if: github.event_name == 'pull_request'
       uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+      env:
+        SKIP: shellcheck
       with:
         extra_args: >-
           --from-ref ${{ github.event.pull_request.base.sha }}
