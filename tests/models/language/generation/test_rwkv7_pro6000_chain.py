@@ -259,7 +259,9 @@ def test_tiny_hf_artifact_generates_through_public_recurrent_flash_chain(
         outputs = llm.generate(
             [{"prompt_token_ids": PROMPT_TOKEN_IDS}],
             SamplingParams(
-                temperature=0.0,
+                temperature=1.0,
+                top_k=1,
+                seed=17,
                 max_tokens=DECODE_TOKENS,
                 ignore_eos=True,
             ),
