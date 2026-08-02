@@ -14,9 +14,14 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 _PROFILE_PATH = Path(__file__).with_name("_build_profile.json")
-_VALID_PROFILES = {"full", "rwkv"}
+_VALID_PROFILES = {"full", "rwkv", "rwkv-nvfp4"}
 _RWKV_LOAD_FORMATS = {"auto", "hf", "safetensors"}
 _LEGACY_RWKV_WEIGHT_SUFFIXES = (".pth",)
+_RWKV_TARGETS = ("_rapid_sampling", "cumem_allocator", "rwkv7_ops")
+_RWKV_NVFP4_TARGETS = (
+    "_C_stable_libtorch",
+    *_RWKV_TARGETS,
+)
 
 
 @dataclass(frozen=True)
@@ -91,13 +96,18 @@ def load_build_profile_metadata(path: Path = _PROFILE_PATH) -> BuildProfileMetad
         ),
         supported_data_parallel_sizes=int_tuple("supported_data_parallel_sizes"),
     )
-    if profile == "rwkv" and (
-        metadata.unrestricted
-        or metadata.configured_targets
-        != ("_rapid_sampling", "cumem_allocator", "rwkv7_ops")
-        or metadata.external_projects
-    ):
-        raise RuntimeError(f"Inconsistent RWKV build profile metadata in {path}")
+    if profile in {"rwkv", "rwkv-nvfp4"}:
+        expected_targets = (
+            _RWKV_NVFP4_TARGETS if profile == "rwkv-nvfp4" else _RWKV_TARGETS
+        )
+        if (
+            metadata.unrestricted
+            or metadata.configured_targets != expected_targets
+            or metadata.external_projects
+        ):
+            raise RuntimeError(
+                f"Inconsistent {profile} build profile metadata in {path}"
+            )
     return metadata
 
 
@@ -146,10 +156,27 @@ def validate_build_profile_capabilities(
             "not a legacy raw .pth checkpoint"
         )
 
-    if (
-        getattr(model_config, "quantization", None) is not None
-        or getattr(model_config, "quantization_config", None) is not None
-    ):
+    quantization = getattr(model_config, "quantization", None)
+    quantization_config = getattr(model_config, "quantization_config", None)
+    if metadata.profile == "rwkv-nvfp4":
+        quantization_names = {
+            name
+            for value in (quantization, quantization_config)
+            if value is not None
+            for name in (
+                value.get_name()
+                if callable(getattr(value, "get_name", None))
+                else (
+                    value.get("quant_method") if isinstance(value, dict) else str(value)
+                ),
+            )
+        }
+        if quantization_names != {"compressed-tensors"}:
+            reasons.append(
+                "requires compressed-tensors NVFP4 quantization and rejects "
+                f"quantization={sorted(quantization_names)!r}"
+            )
+    elif quantization is not None or quantization_config is not None:
         reasons.append("does not support quantization")
     if _is_multimodal(model_config):
         reasons.append("does not support multimodal models")

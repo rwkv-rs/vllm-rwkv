@@ -95,6 +95,17 @@ RWKV_METADATA = BuildProfileMetadata(
     supported_data_parallel_sizes=(1,),
 )
 
+RWKV_NVFP4_METADATA = replace(
+    RWKV_METADATA,
+    profile="rwkv-nvfp4",
+    configured_targets=(
+        "_C_stable_libtorch",
+        "_rapid_sampling",
+        "cumem_allocator",
+        "rwkv7_ops",
+    ),
+)
+
 
 def test_missing_metadata_defaults_to_full(tmp_path: Path) -> None:
     metadata = load_build_profile_metadata(tmp_path / "missing.json")
@@ -106,6 +117,24 @@ def test_rwkv_manifest_fixture_matches_runtime_contract() -> None:
     path = Path(__file__).with_name("fixtures") / "rwkv_build_profile.json"
 
     assert load_build_profile_metadata(path) == RWKV_METADATA
+
+
+def test_rwkv_nvfp4_manifest_fixture_matches_runtime_contract() -> None:
+    path = Path(__file__).with_name("fixtures") / "rwkv_nvfp4_build_profile.json"
+
+    assert load_build_profile_metadata(path) == RWKV_NVFP4_METADATA
+
+
+def test_rwkv_nvfp4_profile_accepts_only_compressed_tensors() -> None:
+    validate_build_profile_capabilities(
+        make_config(quantization="compressed-tensors"), RWKV_NVFP4_METADATA
+    )
+
+    for quantization in (None, "awq", "nvfp4"):
+        with pytest.raises(ValueError, match="requires compressed-tensors NVFP4"):
+            validate_build_profile_capabilities(
+                make_config(quantization=quantization), RWKV_NVFP4_METADATA
+            )
 
 
 @pytest.mark.parametrize(

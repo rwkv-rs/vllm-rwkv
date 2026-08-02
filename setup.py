@@ -57,11 +57,12 @@ USE_PRECOMPILED_EXTENSIONS = envs.VLLM_USE_PRECOMPILED
 USE_PRECOMPILED_RUST_FRONTEND = (
     envs.VLLM_USE_PRECOMPILED or envs.VLLM_USE_PRECOMPILED_RUST
 )
-if VLLM_BUILD_PROFILE == "rwkv" and (
+if VLLM_BUILD_PROFILE in ("rwkv", "rwkv-nvfp4") and (
     USE_PRECOMPILED_EXTENSIONS or USE_PRECOMPILED_RUST_FRONTEND
 ):
     raise ValueError(
-        "VLLM_BUILD_PROFILE='rwkv' requires a source build; precompiled full "
+        f"VLLM_BUILD_PROFILE={VLLM_BUILD_PROFILE!r} requires a source build; "
+        "precompiled full "
         "extensions cannot be relabeled as an RWKV artifact"
     )
 
@@ -196,7 +197,10 @@ def bundle_tcmalloc(build_lib: str) -> None:
 class CMakeExtension(Extension):
     def __init__(self, name: str, cmake_lists_dir: str = ".", **kwa) -> None:
         py_limited_api = not is_freethreaded()
-        if VLLM_BUILD_PROFILE == "rwkv" and name == "vllm._rapid_sampling":
+        if (
+            VLLM_BUILD_PROFILE in ("rwkv", "rwkv-nvfp4")
+            and name == "vllm._rapid_sampling"
+        ):
             # sampling.cpp includes torch/extension.h, which requires the full
             # Python C API and cannot be compiled with Py_LIMITED_API.
             py_limited_api = False
@@ -436,7 +440,7 @@ class cmake_build_ext(build_ext):
         if should_bundle_tcmalloc():
             bundle_tcmalloc(self.build_lib)
 
-        if VLLM_BUILD_PROFILE == "rwkv":
+        if VLLM_BUILD_PROFILE in ("rwkv", "rwkv-nvfp4"):
             return
 
         # copy vllm/vllm_flash_attn/**/*.py from self.build_lib to current
@@ -1114,9 +1118,10 @@ def get_vllm_version() -> str:
     else:
         raise RuntimeError("Unknown runtime environment")
 
-    if VLLM_BUILD_PROFILE == "rwkv":
+    if VLLM_BUILD_PROFILE in ("rwkv", "rwkv-nvfp4"):
         profile_separator = "+" if "+" not in version else "."
-        version += f"{profile_separator}rwkv"
+        profile_suffix = VLLM_BUILD_PROFILE.replace("-", ".")
+        version += f"{profile_separator}{profile_suffix}"
 
     return version
 
@@ -1142,6 +1147,8 @@ def get_requirements() -> list[str]:
 
     if VLLM_BUILD_PROFILE == "rwkv":
         requirements = _read_requirements("rwkv.txt")
+    elif VLLM_BUILD_PROFILE == "rwkv-nvfp4":
+        requirements = _read_requirements("rwkv-nvfp4.txt")
     elif _no_device():
         requirements = _read_requirements("common.txt")
     elif _is_cuda():
@@ -1251,9 +1258,12 @@ if _build_custom_ops():
         ext_modules.append(CMakeExtension(name="vllm._rapid_sampling"))
         ext_modules.append(CMakeExtension(name="vllm.rwkv7_ops"))
 
-if VLLM_BUILD_PROFILE == "rwkv":
+if VLLM_BUILD_PROFILE in ("rwkv", "rwkv-nvfp4"):
     if not _is_cuda():
-        raise ValueError("VLLM_BUILD_PROFILE='rwkv' requires VLLM_TARGET_DEVICE='cuda'")
+        raise ValueError(
+            f"VLLM_BUILD_PROFILE={VLLM_BUILD_PROFILE!r} requires "
+            "VLLM_TARGET_DEVICE='cuda'"
+        )
     selected_names = build_profiles.select_extension_names(
         (extension.name for extension in ext_modules), VLLM_BUILD_PROFILE
     )

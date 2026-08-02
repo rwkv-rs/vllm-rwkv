@@ -50,6 +50,10 @@ LOWRANK_SUFFIXES = (
     "att.v2",
 )
 RWKV7_QUANTIZED_LINEAR_SUFFIXES = (
+    ".att.receptance",
+    ".att.key",
+    ".att.value",
+    ".att.output",
     ".ffn.key",
     ".ffn.value",
     *(f".{suffix}" for suffix in LOWRANK_SUFFIXES),
@@ -2320,7 +2324,9 @@ class RWKV7ForCausalLM(nn.Module):
             z[p + "ln_x.bias"],
             g.view(total_tokens, 1, local_c).contiguous(),
         ).view(total_tokens, local_c)
-        out = self.linear_att_c2c(y, z[p + "output.weight"], path.rows)
+        out = self._apply_quantized_linear(p + "output", y)
+        if out is None:
+            out = self.linear_att_c2c(y, z[p + "output.weight"], path.rows)
         return self._tp_all_reduce(out), v_first
 
     def cmix_varlen(
@@ -2503,7 +2509,9 @@ class RWKV7ForCausalLM(nn.Module):
             z[p + "ln_x.bias"],
             g.contiguous(),
         )
-        out = self.linear_att_c2c(y, z[p + "output.weight"], path.rows)
+        out = self._apply_quantized_linear(p + "output", y)
+        if out is None:
+            out = self.linear_att_c2c(y, z[p + "output.weight"], path.rows)
         return self._tp_all_reduce(out), v_first
 
     def cmix(
@@ -2676,12 +2684,25 @@ class RWKV7ForCausalLM(nn.Module):
         rows: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project exact-M1 R/K/V with shared launches and separate weights."""
-        weights = (
-            self.z[p + "receptance.weight"],
-            self.z[p + "key.weight"],
-            self.z[p + "value.weight"],
-        )
+        names = ("receptance", "key", "value")
         inputs = (xr, xk, xv)
+        quantized = tuple(
+            self._apply_quantized_linear(p + name, value)
+            for name, value in zip(names, inputs)
+        )
+        if any(value is not None for value in quantized):
+            return tuple(
+                value
+                if value is not None
+                else self.linear_att_c2c(
+                    input_value,
+                    self.z[p + name + ".weight"],
+                    rows,
+                )
+                for name, input_value, value in zip(names, inputs, quantized)
+            )
+
+        weights = tuple(self.z[p + name + ".weight"] for name in names)
         weight_shape = tuple(weights[0].shape)
         if (
             rows in M1_RKV_GROUPED_ROWS

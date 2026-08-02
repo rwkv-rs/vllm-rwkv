@@ -32,19 +32,27 @@ endif()
 # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
 set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
 set(VLLM_BUILD_PROFILE "full" CACHE STRING "Native extension build profile")
-set_property(CACHE VLLM_BUILD_PROFILE PROPERTY STRINGS full rwkv)
+set_property(CACHE VLLM_BUILD_PROFILE PROPERTY STRINGS full rwkv rwkv-nvfp4)
 if(NOT VLLM_BUILD_PROFILE STREQUAL "full" AND
-   NOT VLLM_BUILD_PROFILE STREQUAL "rwkv")
+   NOT VLLM_BUILD_PROFILE STREQUAL "rwkv" AND
+   NOT VLLM_BUILD_PROFILE STREQUAL "rwkv-nvfp4")
   message(FATAL_ERROR
-    "VLLM_BUILD_PROFILE='${VLLM_BUILD_PROFILE}' must be 'full' or 'rwkv'")
+    "VLLM_BUILD_PROFILE='${VLLM_BUILD_PROFILE}' must be 'full', 'rwkv', or 'rwkv-nvfp4'")
 endif()
-if(VLLM_BUILD_PROFILE STREQUAL "rwkv" AND
+if((VLLM_BUILD_PROFILE STREQUAL "rwkv" OR
+    VLLM_BUILD_PROFILE STREQUAL "rwkv-nvfp4") AND
    NOT VLLM_TARGET_DEVICE STREQUAL "cuda")
-  message(FATAL_ERROR "VLLM_BUILD_PROFILE='rwkv' requires VLLM_TARGET_DEVICE='cuda'")
+  message(FATAL_ERROR
+    "VLLM_BUILD_PROFILE='${VLLM_BUILD_PROFILE}' requires VLLM_TARGET_DEVICE='cuda'")
 endif()
 set(VLLM_RWKV_ONLY_BUILD OFF)
-if(VLLM_BUILD_PROFILE STREQUAL "rwkv")
+set(VLLM_RWKV_NVFP4_BUILD OFF)
+if(VLLM_BUILD_PROFILE STREQUAL "rwkv" OR
+   VLLM_BUILD_PROFILE STREQUAL "rwkv-nvfp4")
   set(VLLM_RWKV_ONLY_BUILD ON)
+endif()
+if(VLLM_BUILD_PROFILE STREQUAL "rwkv-nvfp4")
+  set(VLLM_RWKV_NVFP4_BUILD ON)
 endif()
 set(VLLM_EXTERNAL_PROJECTS "")
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
@@ -537,6 +545,92 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   # Setting this variable sidesteps the issue by calling the driver directly.
   target_compile_definitions(_C PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
 endif() # _C HIP endif
+
+# The canonical RWKV+NVFP4 artifact needs only Marlin A16 weight repacking and
+# GEMM in addition to the self-owned RWKV kernels. Keep this target independent
+# from the unrestricted extension so the profile does not acquire unrelated
+# attention, MoE, speculative-decoding, or CUTLASS runtime ownership.
+if(VLLM_RWKV_NVFP4_BUILD)
+  set(RWKV_NVFP4_MARLIN_SRC
+    "csrc/libtorch_stable/rwkv_nvfp4_bindings.cpp"
+    "csrc/libtorch_stable/quantization/marlin/marlin.cu"
+    "csrc/libtorch_stable/quantization/marlin/gptq_marlin_repack.cu")
+
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+    cuda_archs_loose_intersection(RWKV_NVFP4_MARLIN_ARCHS
+      "8.0+PTX;12.0f" "${CUDA_ARCHS}")
+  else()
+    cuda_archs_loose_intersection(RWKV_NVFP4_MARLIN_ARCHS
+      "8.0+PTX;12.0a;12.1a" "${CUDA_ARCHS}")
+  endif()
+  cuda_archs_loose_intersection(RWKV_NVFP4_MARLIN_OTHER_ARCHS
+    "8.0+PTX" "${CUDA_ARCHS}")
+  if(NOT RWKV_NVFP4_MARLIN_ARCHS OR NOT RWKV_NVFP4_MARLIN_OTHER_ARCHS)
+    message(FATAL_ERROR
+      "VLLM_BUILD_PROFILE='rwkv-nvfp4' requires a Marlin-compatible CUDA architecture")
+  endif()
+
+  set(RWKV_NVFP4_MARLIN_GEN_SCRIPT
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/libtorch_stable/quantization/marlin/generate_kernels.py)
+  file(MD5 ${RWKV_NVFP4_MARLIN_GEN_SCRIPT} RWKV_NVFP4_MARLIN_GEN_SCRIPT_HASH)
+  list(JOIN CUDA_ARCHS "," RWKV_NVFP4_CUDA_ARCHS_STR)
+  set(RWKV_NVFP4_MARLIN_CACHE_KEY
+    "${RWKV_NVFP4_MARLIN_GEN_SCRIPT_HASH}(ARCH:${RWKV_NVFP4_CUDA_ARCHS_STR})")
+  if(NOT DEFINED CACHE{RWKV_NVFP4_MARLIN_CACHE_KEY} OR
+     NOT $CACHE{RWKV_NVFP4_MARLIN_CACHE_KEY} STREQUAL ${RWKV_NVFP4_MARLIN_CACHE_KEY})
+    execute_process(
+      COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=$ENV{PYTHONPATH}
+        ${Python_EXECUTABLE} ${RWKV_NVFP4_MARLIN_GEN_SCRIPT}
+        ${RWKV_NVFP4_CUDA_ARCHS_STR}
+      RESULT_VARIABLE rwkv_nvfp4_marlin_generation_result
+      OUTPUT_FILE ${CMAKE_CURRENT_BINARY_DIR}/rwkv_nvfp4_marlin_generation.log
+      ERROR_FILE ${CMAKE_CURRENT_BINARY_DIR}/rwkv_nvfp4_marlin_generation.log)
+    if(NOT rwkv_nvfp4_marlin_generation_result EQUAL 0)
+      message(FATAL_ERROR
+        "RWKV NVFP4 Marlin generation failed; see ${CMAKE_CURRENT_BINARY_DIR}/rwkv_nvfp4_marlin_generation.log")
+    endif()
+    set(RWKV_NVFP4_MARLIN_CACHE_KEY ${RWKV_NVFP4_MARLIN_CACHE_KEY}
+      CACHE STRING "Last RWKV NVFP4 Marlin generator hash and arch" FORCE)
+  endif()
+
+  # marlin.cu's generated selector names every specialization emitted for the
+  # requested architecture. Link all emitted SM80/SM89 translation units even
+  # though the public profile exposes only the A16 NVFP4 path; omitting an
+  # unselected specialization would still leave an unresolved function pointer.
+  file(GLOB RWKV_NVFP4_MARLIN_TEMPLATE_SRC
+    "csrc/libtorch_stable/quantization/marlin/sm80_kernel_*.cu"
+    "csrc/libtorch_stable/quantization/marlin/sm89_kernel_*.cu")
+  if(NOT RWKV_NVFP4_MARLIN_TEMPLATE_SRC)
+    message(FATAL_ERROR "RWKV NVFP4 Marlin generated no kernels")
+  endif()
+  set_gencode_flags_for_srcs(
+    SRCS "${RWKV_NVFP4_MARLIN_TEMPLATE_SRC}"
+    CUDA_ARCHS "${RWKV_NVFP4_MARLIN_ARCHS}")
+  set_gencode_flags_for_srcs(
+    SRCS "csrc/libtorch_stable/quantization/marlin/marlin.cu;csrc/libtorch_stable/quantization/marlin/gptq_marlin_repack.cu"
+    CUDA_ARCHS "${RWKV_NVFP4_MARLIN_OTHER_ARCHS}")
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
+    set_source_files_properties(
+      ${RWKV_NVFP4_MARLIN_TEMPLATE_SRC}
+      csrc/libtorch_stable/quantization/marlin/marlin.cu
+      csrc/libtorch_stable/quantization/marlin/gptq_marlin_repack.cu
+      PROPERTIES COMPILE_FLAGS "-static-global-template-stub=false")
+  endif()
+  list(APPEND RWKV_NVFP4_MARLIN_SRC ${RWKV_NVFP4_MARLIN_TEMPLATE_SRC})
+
+  define_extension_target(
+    _C_stable_libtorch
+    DESTINATION vllm
+    LANGUAGE CUDA
+    SOURCES ${RWKV_NVFP4_MARLIN_SRC}
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES ${VLLM_GPU_ARCHES}
+    USE_SABI 3
+    WITH_SOABI)
+  target_compile_definitions(_C_stable_libtorch PRIVATE
+    TORCH_TARGET_VERSION=0x020B000000000000ULL
+    USE_CUDA)
+endif()
 
 if((VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP") AND
    NOT VLLM_RWKV_ONLY_BUILD)

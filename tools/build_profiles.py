@@ -7,11 +7,15 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable
 
-BUILD_PROFILES = ("full", "rwkv")
+BUILD_PROFILES = ("full", "rwkv", "rwkv-nvfp4")
 RWKV_EXTENSION_NAMES = (
     "vllm._rapid_sampling",
     "vllm.cumem_allocator",
     "vllm.rwkv7_ops",
+)
+RWKV_NVFP4_EXTENSION_NAMES = (
+    *RWKV_EXTENSION_NAMES,
+    "vllm._C_stable_libtorch",
 )
 
 
@@ -36,7 +40,7 @@ def resolve_build_profile() -> str:
 def profile_build_temp(build_temp: str, profile: str) -> str:
     """Return a profile-specific CMake reuse directory."""
     _validate_profile(profile)
-    return f"{build_temp}-rwkv" if profile == "rwkv" else build_temp
+    return f"{build_temp}-{profile}" if profile != "full" else build_temp
 
 
 def select_extension_names(names: Iterable[str], profile: str) -> list[str]:
@@ -44,10 +48,13 @@ def select_extension_names(names: Iterable[str], profile: str) -> list[str]:
     names = list(names)
     if profile == "full":
         return names
+    required = (
+        RWKV_NVFP4_EXTENSION_NAMES if profile == "rwkv-nvfp4" else RWKV_EXTENSION_NAMES
+    )
     available = set(names)
-    missing = [name for name in RWKV_EXTENSION_NAMES if name not in available]
+    missing = [name for name in required if name not in available]
     if missing:
         raise RuntimeError(
             "RWKV build profile is missing required extension(s): " + ", ".join(missing)
         )
-    return [name for name in RWKV_EXTENSION_NAMES if name in available]
+    return [name for name in required if name in available]
