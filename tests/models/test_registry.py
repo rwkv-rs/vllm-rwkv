@@ -181,19 +181,21 @@ def test_hf_registry_coverage():
     )
 
 
-def test_rwkv7_hf_registry_uses_blinkdl_raw_pth(tmp_path):
+def test_rwkv7_hf_registry_uses_standard_artifact(tmp_path):
+    from vllm.transformers_utils.configs.rwkv7 import RWKV7Config
+
     model_info = HF_EXAMPLE_MODELS.get_hf_info("RWKV7ForCausalLM")
 
-    assert model_info.default == (
-        "https://huggingface.co/BlinkDL/rwkv7-g1/blob/main/"
-        "rwkv7-g1g-1.5b-20260526-ctx8192.pth"
-    )
+    assert model_info.default == "rwkv-rs/rwkv7-g1g-1.5b-20260526-ctx8192"
     assert model_info.tokenizer_mode == "rwkv"
     assert model_info.is_available_online is False
 
-    checkpoint = tmp_path / "rwkv7-g1g-1.5b-20260526-ctx8192.pth"
-    checkpoint.touch()
-    hf_config = get_config(checkpoint, trust_remote_code=False)
+    RWKV7Config(
+        hidden_size=64,
+        head_size=64,
+        num_hidden_layers=1,
+    ).save_pretrained(tmp_path)
+    hf_config = get_config(tmp_path, trust_remote_code=False)
     model_cls, arch = ModelRegistry.resolve_model_cls(
         hf_config.architectures,
         SimpleNamespace(
@@ -203,7 +205,7 @@ def test_rwkv7_hf_registry_uses_blinkdl_raw_pth(tmp_path):
         ),
     )
 
-    assert arch == "RWKV7ForCausalLM"
+    assert arch == "Rwkv7ForCausalLM"
     assert model_cls.__name__ == "RWKV7ForCausalLM"
     assert is_text_generation_model(model_cls)
 

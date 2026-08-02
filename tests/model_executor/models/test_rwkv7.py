@@ -18,6 +18,10 @@ from vllm.model_executor.models.interfaces import requires_uniform_decode_wave
 from vllm.model_executor.models.rwkv7 import RWKV7ForCausalLM
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
+from vllm.transformers_utils.configs.rwkv7 import (
+    rwkv7_internal_to_hf_weight_name,
+    rwkv7_is_legacy_low_rank_weight_name,
+)
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.engine.core import _supports_no_kv_cache_chunked_prefill
 from vllm.v1.worker.gpu.model_states.rwkv import (
@@ -131,22 +135,39 @@ def _new_rwkv7_for_weight_tests() -> RWKV7ForCausalLM:
     return model
 
 
-def _new_default_loader_for_weight_tests(
-    load_format: str = "auto",
-) -> DefaultModelLoader:
-    return DefaultModelLoader(
-        SimpleNamespace(
-            load_format=load_format,
-            model_loader_extra_config={},
-            download_dir=None,
-            ignore_patterns=None,
-            use_tqdm_on_load=False,
-            safetensors_load_strategy="lazy",
-            safetensors_prefetch_num_threads=1,
-            safetensors_prefetch_block_size=1024,
-            pt_load_map_location="cpu",
+def _standard_weight_update(
+    weights: list[tuple[str, torch.Tensor]],
+) -> list[tuple[str, torch.Tensor]]:
+    updates = []
+    for internal_name, weight in weights:
+        checkpoint_name = rwkv7_internal_to_hf_weight_name(internal_name)
+        assert checkpoint_name is not None
+        updates.append(
+            (
+                checkpoint_name,
+                weight.transpose(0, 1)
+                if rwkv7_is_legacy_low_rank_weight_name(internal_name)
+                else weight,
+            )
         )
-    )
+    return updates
+
+
+def _set_checkpoint_contract(
+    model: RWKV7ForCausalLM,
+    internal_shapes: dict[str, tuple[int, ...]],
+) -> None:
+    checkpoint_shapes = {}
+    for internal_name, shape in internal_shapes.items():
+        checkpoint_name = rwkv7_internal_to_hf_weight_name(internal_name)
+        assert checkpoint_name is not None
+        checkpoint_shapes[checkpoint_name] = (
+            tuple(reversed(shape))
+            if rwkv7_is_legacy_low_rank_weight_name(internal_name)
+            else shape
+        )
+    model.checkpoint_weight_names = set(checkpoint_shapes)
+    model.checkpoint_weight_shapes = checkpoint_shapes
 
 
 def test_rwkv7_forward_tokens_propagates_canonical_wkv_metadata(monkeypatch):
@@ -878,61 +899,7 @@ def test_rwkv7_init_preserves_process_wide_torch_state(
         torch.set_float32_matmul_precision(old_matmul_precision)
 
 
-@pytest.mark.parametrize("load_format", ["auto", "hf"])
-def test_rwkv7_raw_pth_file_uses_single_weight_file(tmp_path, load_format):
-    checkpoint = tmp_path / "rwkv7-g1g-1.5b-20260526-ctx8192.pth"
-    checkpoint.touch()
-    loader = _new_default_loader_for_weight_tests(load_format=load_format)
-
-    _, weight_files, use_safetensors = loader._prepare_weights(
-        str(checkpoint),
-        subfolder=None,
-        revision=None,
-        fall_back_to_pt=True,
-        allow_patterns_overrides=None,
-    )
-
-    assert weight_files == [str(checkpoint)]
-    assert use_safetensors is False
-
-
-def test_rwkv7_raw_pth_url_downloads_single_weight_file(tmp_path, monkeypatch):
-    downloaded = tmp_path / "rwkv7-g1g-1.5b-20260526-ctx8192.pth"
-    downloaded.touch()
-    calls: list[Any] = []
-
-    def fake_hf_hub_download(**kwargs):
-        calls.append(kwargs)
-        return str(downloaded)
-
-    monkeypatch.setattr(
-        "vllm.transformers_utils.configs.rwkv7.hf_hub_download",
-        fake_hf_hub_download,
-    )
-    loader = _new_default_loader_for_weight_tests()
-
-    _, weight_files, use_safetensors = loader._prepare_weights(
-        "https://huggingface.co/BlinkDL/rwkv7-g1/blob/main/"
-        "rwkv7-g1g-1.5b-20260526-ctx8192.pth",
-        subfolder=None,
-        revision=None,
-        fall_back_to_pt=True,
-        allow_patterns_overrides=None,
-    )
-
-    assert calls == [
-        {
-            "repo_id": "BlinkDL/rwkv7-g1",
-            "filename": "rwkv7-g1g-1.5b-20260526-ctx8192.pth",
-            "revision": "main",
-            "cache_dir": None,
-        }
-    ]
-    assert weight_files == [str(downloaded)]
-    assert use_safetensors is False
-
-
-def test_rwkv7_raw_pth_preprocess_validates_config_shape():
+def test_rwkv7_checkpoint_preprocess_validates_config_shape():
     model = _new_rwkv7_for_weight_tests()
     model.tp_size = 1
     model.tp_rank = 0
@@ -949,7 +916,7 @@ def test_rwkv7_raw_pth_preprocess_validates_config_shape():
     }
 
     with pytest.raises(ValueError, match="RWKV7 config hidden_size"):
-        RWKV7ForCausalLM._validate_raw_weight_shapes(model, weights)
+        RWKV7ForCausalLM._validate_checkpoint_weight_shapes(model, weights)
 
 
 @pytest.mark.parametrize(
@@ -1820,55 +1787,26 @@ def test_rwkv7_full_cudagraph_replay_requires_exact_contiguous_decode(
     assert RWKV7ModelState.can_replay_full_cudagraph(model_inputs) is expected
 
 
-def test_rwkv7_load_weights_preprocesses_full_raw_weights(monkeypatch):
-    model = _new_rwkv7_for_weight_tests()
-    raw_weights = {
-        "emb.weight": torch.tensor([1.0]),
-        "head.weight": torch.tensor([2.0]),
-    }
-    calls: list[set[str]] = []
-
-    def fake_preprocess(self, z):
-        calls.append(set(z))
-        z["processed"] = torch.tensor([3.0])
-        self.z = z
-
-    monkeypatch.setattr(RWKV7ForCausalLM, "_preprocess_weights", fake_preprocess)
-
-    loaded = model.load_weights(raw_weights.items())
-
-    assert loaded == {"emb.weight", "head.weight"}
-    assert model.raw_weight_names == {"emb.weight", "head.weight"}
-    assert calls == [{"emb.weight", "head.weight"}]
-    assert set(model.z) == {"emb.weight", "head.weight", "processed"}
-    torch.testing.assert_close(model.z["emb.weight"], raw_weights["emb.weight"])
-    torch.testing.assert_close(model.z["head.weight"], raw_weights["head.weight"])
-    torch.testing.assert_close(model.z["processed"], torch.tensor([3.0]))
-
-
 def _standard_hf_weights_for_test(
     model: RWKV7ForCausalLM,
 ) -> dict[str, torch.Tensor]:
-    weights = {}
-    for raw_name, shape in model._expected_standard_raw_shapes().items():
-        if raw_name == "emb.weight":
-            name = "model.embeddings.weight"
-        elif raw_name == "head.weight":
-            name = raw_name
-        else:
-            name = f"model.{raw_name}"
-        weights[name] = torch.zeros(shape)
-    return weights
+    return {
+        name: torch.zeros(shape)
+        for name, shape in model._expected_checkpoint_weight_shapes().items()
+    }
 
 
 def test_rwkv7_load_weights_maps_complete_standard_hf_artifact(monkeypatch):
     model = _new_rwkv7_for_weight_tests()
     model.config = SimpleNamespace(
+        model_type="rwkv7",
+        architectures=["Rwkv7ForCausalLM"],
         vocab_size=17,
         hidden_size=64,
         intermediate_size=128,
         num_hidden_layers=2,
         head_size=64,
+        max_position_embeddings=321,
         embedding_layer_norm_fused=False,
     )
     standard = _standard_hf_weights_for_test(model)
@@ -1877,7 +1815,7 @@ def test_rwkv7_load_weights_maps_complete_standard_hf_artifact(monkeypatch):
         "model.embeddings.weight",
         "model.blocks.0.ln0.weight",
         "model.blocks.0.att.r_k",
-        "model.blocks.1.att.v2",
+        "model.blocks.1.att.v2.weight",
         "model.ln_out.weight",
         "head.weight",
     }.issubset(standard)
@@ -1900,27 +1838,37 @@ def test_rwkv7_load_weights_maps_complete_standard_hf_artifact(monkeypatch):
     loaded = model.load_weights(standard.items())
 
     assert loaded == set(standard)
-    assert model.weight_source_format == "standard_hf"
-    assert model.raw_weight_names == set(model._expected_standard_raw_shapes())
-    assert set(captured) == model.raw_weight_names
+    assert model.checkpoint_weight_names == set(standard)
+    assert model.checkpoint_weight_shapes == {
+        name: tuple(weight.shape) for name, weight in standard.items()
+    }
+    assert set(captured) == {
+        model._checkpoint_name_to_internal(name) for name in standard
+    }
     torch.testing.assert_close(
         captured["emb.weight"], standard["model.embeddings.weight"]
     )
     torch.testing.assert_close(
-        captured["blocks.1.att.v2"], standard["model.blocks.1.att.v2"]
+        captured["blocks.1.att.v2"],
+        standard["model.blocks.1.att.v2.weight"].transpose(0, 1),
     )
     torch.testing.assert_close(captured["head.weight"], standard["head.weight"])
 
 
-@pytest.mark.parametrize("failure", ["missing", "unknown", "shape", "mixed"])
+@pytest.mark.parametrize(
+    "failure", ["missing", "unknown", "shape", "mixed", "legacy_low_rank"]
+)
 def test_rwkv7_standard_hf_weights_fail_closed(failure):
     model = _new_rwkv7_for_weight_tests()
     model.config = SimpleNamespace(
+        model_type="rwkv7",
+        architectures=["Rwkv7ForCausalLM"],
         vocab_size=17,
         hidden_size=64,
         intermediate_size=128,
         num_hidden_layers=2,
         head_size=64,
+        max_position_embeddings=321,
         embedding_layer_norm_fused=False,
     )
     weights = _standard_hf_weights_for_test(model)
@@ -1929,13 +1877,18 @@ def test_rwkv7_standard_hf_weights_fail_closed(failure):
         match = "key mismatch.*head.weight"
     elif failure == "unknown":
         weights["model.unexpected.weight"] = torch.zeros(1)
-        match = "unsupported key"
+        match = "key mismatch.*model.unexpected.weight"
     elif failure == "shape":
         weights["model.blocks.0.att.r_k"] = torch.zeros(2, 64)
         match = "shape mismatch.*blocks.0.att.r_k"
-    else:
+    elif failure == "mixed":
         weights["emb.weight"] = weights["model.embeddings.weight"]
-        match = "unsupported key.*emb.weight"
+        match = "key mismatch.*emb.weight"
+    else:
+        weights["model.blocks.0.att.w1"] = weights.pop(
+            "model.blocks.0.att.w1.weight"
+        ).transpose(0, 1)
+        match = "key mismatch.*model.blocks.0.att.w1.weight"
 
     with pytest.raises(ValueError, match=match):
         model.load_weights(weights.items())
@@ -2012,43 +1965,32 @@ def test_rwkv7_tp_shards_reconstruct_dense_vocab_head_and_attention_weights():
     assert single._shard_weight_for_tp("head.weight", dense_vocab) is dense_vocab
 
 
-@pytest.mark.parametrize(
-    ("source_format", "update_key"),
-    [
-        ("standard_hf", "emb.weight"),
-        ("legacy_pth", "model.embeddings.weight"),
-    ],
-)
-def test_rwkv7_online_update_cannot_mix_standard_and_legacy_rank_formats(
-    source_format, update_key
-):
+def test_rwkv7_online_update_rejects_legacy_internal_key():
     model = _new_rwkv7_for_weight_tests()
-    model.weight_source_format = source_format
-    model.raw_weight_names = {"emb.weight"}
-    model.raw_weight_shapes = {"emb.weight": (1,)}
+    _set_checkpoint_contract(model, {"emb.weight": (1,)})
     model.z = {"emb.weight": torch.zeros(1)}
     model.start_weight_update()
 
-    model.load_weights([(update_key, torch.ones(1))])
+    model.load_weights([("emb.weight", torch.ones(1))])
 
     with pytest.raises(ValueError, match="unexpected key"):
         model.finish_weight_update()
 
 
-def test_rwkv7_default_loader_validation_uses_raw_weight_names():
+def test_rwkv7_default_loader_validation_uses_checkpoint_weight_names():
     model = _new_rwkv7_for_weight_tests()
-    model.raw_weight_names = {"emb.weight", "head.weight"}
+    model.checkpoint_weight_names = {"model.embeddings.weight", "head.weight"}
 
     DefaultModelLoader.track_weights_loading(
         object.__new__(DefaultModelLoader),
         model,
-        {"emb.weight", "head.weight"},
+        {"model.embeddings.weight", "head.weight"},
     )
 
 
 def test_rwkv7_online_weight_update_preprocesses_only_on_finish(monkeypatch):
     model = _new_rwkv7_for_weight_tests()
-    model.raw_weight_names = {"emb.weight", "head.weight"}
+    _set_checkpoint_contract(model, {"emb.weight": (1,), "head.weight": (1,)})
     old_z = model.z
     calls: list[Any] = []
 
@@ -2060,8 +2002,8 @@ def test_rwkv7_online_weight_update_preprocesses_only_on_finish(monkeypatch):
     monkeypatch.setattr(RWKV7ForCausalLM, "_preprocess_weights", fake_preprocess)
 
     assert model.start_weight_update() is True
-    model.load_weights([("emb.weight", torch.tensor([10.0]))])
-    model.load_weights([("head.weight", torch.tensor([20.0]))])
+    model.load_weights(_standard_weight_update([("emb.weight", torch.tensor([10.0]))]))
+    model.load_weights(_standard_weight_update([("head.weight", torch.tensor([20.0]))]))
 
     assert model.z is old_z
     assert calls == []
@@ -2076,10 +2018,10 @@ def test_rwkv7_online_weight_update_preprocesses_only_on_finish(monkeypatch):
 
 def test_rwkv7_abort_weight_update_allows_retry():
     model = _new_rwkv7_for_weight_tests()
-    model.raw_weight_names = {"emb.weight"}
+    _set_checkpoint_contract(model, {"emb.weight": (1,)})
 
     assert model.start_weight_update() is True
-    model.load_weights([("emb.weight", torch.tensor([10.0]))])
+    model.load_weights(_standard_weight_update([("emb.weight", torch.tensor([10.0]))]))
     model.abort_weight_update()
 
     assert not hasattr(model, "_pending_weight_update")
@@ -2093,7 +2035,8 @@ def test_rwkv7_online_weight_update_reuses_existing_tensor_storage(monkeypatch):
         "head.weight": torch.tensor([2.0]),
         "stale.weight": torch.tensor([99.0]),
     }
-    model.raw_weight_names = {"emb.weight", "head.weight"}
+    _set_checkpoint_contract(model, {"emb.weight": (1,), "head.weight": (1,)})
+    model.checkpoint_weight_shapes = None
     old_z = model.z
     old_emb = model.z["emb.weight"]
     old_head = model.z["head.weight"]
@@ -2106,8 +2049,8 @@ def test_rwkv7_online_weight_update_reuses_existing_tensor_storage(monkeypatch):
     monkeypatch.setattr(RWKV7ForCausalLM, "_preprocess_weights", fake_preprocess)
 
     model.start_weight_update()
-    model.load_weights([("emb.weight", torch.tensor([10.0]))])
-    model.load_weights([("head.weight", torch.tensor([20.0]))])
+    model.load_weights(_standard_weight_update([("emb.weight", torch.tensor([10.0]))]))
+    model.load_weights(_standard_weight_update([("head.weight", torch.tensor([20.0]))]))
     model.finish_weight_update()
 
     assert model.z is old_z
@@ -2123,7 +2066,7 @@ def test_rwkv7_online_weight_update_rejects_missing_and_unexpected_keys(
     monkeypatch,
 ):
     model = _new_rwkv7_for_weight_tests()
-    model.raw_weight_names = {"emb.weight", "head.weight"}
+    _set_checkpoint_contract(model, {"emb.weight": (1,), "head.weight": (1,)})
     old_z = model.z
     monkeypatch.setattr(
         RWKV7ForCausalLM,
@@ -2132,7 +2075,7 @@ def test_rwkv7_online_weight_update_rejects_missing_and_unexpected_keys(
     )
 
     model.start_weight_update()
-    model.load_weights([("emb.weight", torch.tensor([1.0]))])
+    model.load_weights(_standard_weight_update([("emb.weight", torch.tensor([1.0]))]))
 
     with pytest.raises(ValueError, match="missing.*head.weight"):
         model.finish_weight_update()
@@ -2141,13 +2084,14 @@ def test_rwkv7_online_weight_update_rejects_missing_and_unexpected_keys(
     assert not hasattr(model, "_pending_weight_update")
 
     model.start_weight_update()
-    model.load_weights(
+    updates = _standard_weight_update(
         [
             ("emb.weight", torch.tensor([1.0])),
             ("head.weight", torch.tensor([2.0])),
-            ("extra.weight", torch.tensor([3.0])),
         ]
     )
+    updates.append(("model.extra.weight", torch.tensor([3.0])))
+    model.load_weights(updates)
 
     with pytest.raises(ValueError, match="unexpected.*extra.weight"):
         model.finish_weight_update()
@@ -2160,7 +2104,7 @@ def test_rwkv7_online_weight_update_keeps_old_weights_on_preprocess_error(
     monkeypatch,
 ):
     model = _new_rwkv7_for_weight_tests()
-    model.raw_weight_names = {"emb.weight"}
+    _set_checkpoint_contract(model, {"emb.weight": (1,)})
     old_z = model.z
 
     def fail_preprocess(self, z):
@@ -2169,7 +2113,7 @@ def test_rwkv7_online_weight_update_keeps_old_weights_on_preprocess_error(
     monkeypatch.setattr(RWKV7ForCausalLM, "_preprocess_weights", fail_preprocess)
 
     model.start_weight_update()
-    model.load_weights([("emb.weight", torch.tensor([1.0]))])
+    model.load_weights(_standard_weight_update([("emb.weight", torch.tensor([1.0]))]))
 
     with pytest.raises(RuntimeError, match="bad preprocess"):
         model.finish_weight_update()
@@ -2182,7 +2126,7 @@ def test_rwkv7_online_weight_update_restores_old_weights_after_partial_preproces
     monkeypatch,
 ):
     model = _new_rwkv7_for_weight_tests()
-    model.raw_weight_names = {"emb.weight"}
+    _set_checkpoint_contract(model, {"emb.weight": (1,)})
     old_z = model.z
 
     def fail_after_partial_preprocess(self, z):
@@ -2194,7 +2138,7 @@ def test_rwkv7_online_weight_update_restores_old_weights_after_partial_preproces
     )
 
     model.start_weight_update()
-    model.load_weights([("emb.weight", torch.tensor([1.0]))])
+    model.load_weights(_standard_weight_update([("emb.weight", torch.tensor([1.0]))]))
 
     with pytest.raises(RuntimeError, match="post preprocess failure"):
         model.finish_weight_update()
@@ -2208,7 +2152,7 @@ def test_rwkv7_online_weight_update_cuda_snapshots_pending_tensors_on_cpu(monkey
         pytest.skip("CUDA is required for CUDA staging")
 
     model = _new_rwkv7_for_weight_tests()
-    model.raw_weight_names = {"emb.weight"}
+    _set_checkpoint_contract(model, {"emb.weight": (1,)})
     source = torch.tensor([1.0], device="cuda")
     captured = {}
 
@@ -2219,8 +2163,8 @@ def test_rwkv7_online_weight_update_cuda_snapshots_pending_tensors_on_cpu(monkey
     monkeypatch.setattr(RWKV7ForCausalLM, "_preprocess_weights", fake_preprocess)
 
     model.start_weight_update()
-    model.load_weights([("emb.weight", source)])
-    pending = model._pending_weight_update["emb.weight"]
+    model.load_weights(_standard_weight_update([("emb.weight", source)]))
+    pending = model._pending_weight_update["model.embeddings.weight"]
     source.fill_(99.0)
 
     assert pending.device.type == "cpu"
@@ -2238,20 +2182,16 @@ def test_rwkv7_streaming_update_copies_regular_and_derived_weights_in_place():
     model.end_layer = 1
     model.tp_size = 1
     model.tp_rank = 0
-    model.raw_weight_names = {
-        "emb.weight",
-        "blocks.0.ln0.weight",
-        "blocks.0.ln0.bias",
-        "head.weight",
-        "blocks.0.att.w1",
-    }
-    model.raw_weight_shapes = {
-        "emb.weight": (2, 2),
-        "blocks.0.ln0.weight": (2,),
-        "blocks.0.ln0.bias": (2,),
-        "head.weight": (2, 2),
-        "blocks.0.att.w1": (2, 3),
-    }
+    _set_checkpoint_contract(
+        model,
+        {
+            "emb.weight": (2, 2),
+            "blocks.0.ln0.weight": (2,),
+            "blocks.0.ln0.bias": (2,),
+            "head.weight": (2, 2),
+            "blocks.0.att.w1": (2, 3),
+        },
+    )
     model.z = {
         "emb.weight": torch.zeros((2, 2)),
         "blocks.0.ln0.weight": torch.zeros(2),
@@ -2268,7 +2208,9 @@ def test_rwkv7_streaming_update_copies_regular_and_derived_weights_in_place():
 
     assert model.start_weight_update() is True
     assert model._streaming_weight_update is True
-    model.load_weights([("head.weight", head), ("blocks.0.att.w1", lowrank)])
+    model.load_weights(
+        _standard_weight_update([("head.weight", head), ("blocks.0.att.w1", lowrank)])
+    )
 
     assert model.z["head.weight"] is head_destination
     assert model.z["blocks.0.att.w1"] is lowrank_destination
@@ -2277,7 +2219,7 @@ def test_rwkv7_streaming_update_copies_regular_and_derived_weights_in_place():
     torch.testing.assert_close(lowrank_destination, lowrank)
     torch.testing.assert_close(lowrank_t_destination, lowrank.t())
     assert model._pending_weight_update["head.weight"] is None
-    assert model._pending_weight_update["blocks.0.att.w1"] is None
+    assert model._pending_weight_update["model.blocks.0.att.w1.weight"] is None
     model.abort_weight_update()
 
 
@@ -2290,16 +2232,14 @@ def test_rwkv7_streaming_update_stages_only_embedding_dependencies(monkeypatch):
     model.tp_size = 1
     model.tp_rank = 0
     model.vocab_size = 2
-    model.raw_weight_names = {
-        "emb.weight",
-        "blocks.0.ln0.weight",
-        "blocks.0.ln0.bias",
-    }
-    model.raw_weight_shapes = {
-        "emb.weight": (2, 2),
-        "blocks.0.ln0.weight": (2,),
-        "blocks.0.ln0.bias": (2,),
-    }
+    _set_checkpoint_contract(
+        model,
+        {
+            "emb.weight": (2, 2),
+            "blocks.0.ln0.weight": (2,),
+            "blocks.0.ln0.bias": (2,),
+        },
+    )
     model.z = {
         "emb.weight": torch.zeros((2, 2)),
         "blocks.0.ln0.weight": torch.zeros(2),
@@ -2317,11 +2257,13 @@ def test_rwkv7_streaming_update_stages_only_embedding_dependencies(monkeypatch):
 
     model.start_weight_update()
     model.load_weights(
-        [
-            ("emb.weight", emb),
-            ("blocks.0.ln0.weight", ln0_w),
-            ("blocks.0.ln0.bias", ln0_b),
-        ]
+        _standard_weight_update(
+            [
+                ("emb.weight", emb),
+                ("blocks.0.ln0.weight", ln0_w),
+                ("blocks.0.ln0.bias", ln0_b),
+            ]
+        )
     )
 
     assert all(value is not None for value in model._pending_weight_update.values())
@@ -2345,18 +2287,15 @@ def test_rwkv7_streaming_validation_error_is_delayed_until_finish(monkeypatch):
     model.end_layer = 1
     model.tp_size = 1
     model.tp_rank = 0
-    model.raw_weight_names = {
-        "emb.weight",
-        "blocks.0.ln0.weight",
-        "blocks.0.ln0.bias",
-        "head.weight",
-    }
-    model.raw_weight_shapes = {
-        "emb.weight": (2, 2),
-        "blocks.0.ln0.weight": (2,),
-        "blocks.0.ln0.bias": (2,),
-        "head.weight": (2, 2),
-    }
+    _set_checkpoint_contract(
+        model,
+        {
+            "emb.weight": (2, 2),
+            "blocks.0.ln0.weight": (2,),
+            "blocks.0.ln0.bias": (2,),
+            "head.weight": (2, 2),
+        },
+    )
     model.z = {
         "emb.weight": torch.zeros((2, 2)),
         "blocks.0.ln0.weight": torch.zeros(2),
@@ -2373,12 +2312,12 @@ def test_rwkv7_streaming_validation_error_is_delayed_until_finish(monkeypatch):
         [("blocks.0.ln0.weight", torch.zeros(2))],
         [("blocks.0.ln0.bias", torch.zeros(2))],
     ):
-        loaded.update(model.load_weights(bucket))
+        loaded.update(model.load_weights(_standard_weight_update(bucket)))
 
-    assert loaded == model.raw_weight_names
-    assert set(model._pending_weight_update) == model.raw_weight_names
+    assert loaded == model.checkpoint_weight_names
+    assert set(model._pending_weight_update) == model.checkpoint_weight_names
     torch.testing.assert_close(model.z["head.weight"], old_head)
-    with pytest.raises(ValueError, match="raw weight shape mismatch"):
+    with pytest.raises(ValueError, match="checkpoint weight shape mismatch"):
         model.finish_weight_update()
     assert not hasattr(model, "_pending_weight_update")
 
@@ -2393,24 +2332,18 @@ def test_rwkv7_streaming_update_matches_tp2_runtime_layouts():
     model.tp_rank = 1
     model.tp_hidden_size = 2
     model.vocab_size = 3
-    model.raw_weight_names = {
-        "emb.weight",
-        "blocks.0.ln0.weight",
-        "blocks.0.ln0.bias",
-        "head.weight",
-        "blocks.0.att.r_k",
-        "blocks.0.att.output.weight",
-        "blocks.0.ffn.key.weight",
-    }
-    model.raw_weight_shapes = {
-        "emb.weight": (3, 4),
-        "blocks.0.ln0.weight": (4,),
-        "blocks.0.ln0.bias": (4,),
-        "head.weight": (3, 4),
-        "blocks.0.att.r_k": (4, 2),
-        "blocks.0.att.output.weight": (4, 4),
-        "blocks.0.ffn.key.weight": (4, 6),
-    }
+    _set_checkpoint_contract(
+        model,
+        {
+            "emb.weight": (3, 4),
+            "blocks.0.ln0.weight": (4,),
+            "blocks.0.ln0.bias": (4,),
+            "head.weight": (3, 4),
+            "blocks.0.att.r_k": (4, 2),
+            "blocks.0.att.output.weight": (4, 4),
+            "blocks.0.ffn.key.weight": (4, 6),
+        },
+    )
     model.z = {
         "emb.weight": torch.zeros((2, 4)),
         "blocks.0.ln0.weight": torch.zeros(4),
@@ -2428,12 +2361,14 @@ def test_rwkv7_streaming_update_matches_tp2_runtime_layouts():
     model.start_weight_update()
     assert model._streaming_weight_update is True
     model.load_weights(
-        [
-            ("head.weight", head),
-            ("blocks.0.att.r_k", r_k),
-            ("blocks.0.att.output.weight", output),
-            ("blocks.0.ffn.key.weight", ffn_key),
-        ]
+        _standard_weight_update(
+            [
+                ("head.weight", head),
+                ("blocks.0.att.r_k", r_k),
+                ("blocks.0.att.output.weight", output),
+                ("blocks.0.ffn.key.weight", ffn_key),
+            ]
+        )
     )
 
     expected_head_shard = torch.zeros((2, 4))
@@ -2453,8 +2388,8 @@ def test_rwkv7_streaming_update_matches_tp2_runtime_layouts():
 
 def test_rwkv7_strict_online_update_forbids_full_model_staging(monkeypatch):
     model = _new_rwkv7_for_weight_tests()
-    model.raw_weight_names = {"emb.weight"}
-    model.raw_weight_shapes = None
+    model.checkpoint_weight_names = {"model.embeddings.weight"}
+    model.checkpoint_weight_shapes = None
     monkeypatch.setenv("VLLM_RWKV7_STRICT_STREAMING_WEIGHT_UPDATE", "1")
 
     with pytest.raises(RuntimeError, match="streaming weight update capability"):
@@ -2473,30 +2408,29 @@ def test_rwkv7_streaming_update_skips_off_rank_embedding_on_pp_last(monkeypatch)
     model.end_layer = 2
     model.tp_size = 1
     model.tp_rank = 0
-    model.raw_weight_names = {
-        "emb.weight",
-        "blocks.0.ln0.weight",
-        "blocks.0.ln0.bias",
-        "head.weight",
-    }
-    model.raw_weight_shapes = {
-        "emb.weight": (2, 2),
-        "blocks.0.ln0.weight": (2,),
-        "blocks.0.ln0.bias": (2,),
-        "head.weight": (2, 2),
-    }
+    _set_checkpoint_contract(
+        model,
+        {
+            "emb.weight": (2, 2),
+            "blocks.0.ln0.weight": (2,),
+            "blocks.0.ln0.bias": (2,),
+            "head.weight": (2, 2),
+        },
+    )
     model.z = {"head.weight": torch.zeros((2, 2))}
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
 
     model.start_weight_update()
     assert model._streaming_weight_update is True
     model.load_weights(
-        [
-            ("emb.weight", torch.ones((2, 2))),
-            ("blocks.0.ln0.weight", torch.ones(2)),
-            ("blocks.0.ln0.bias", torch.ones(2)),
-            ("head.weight", torch.tensor([[1.0, 2.0], [3.0, 4.0]])),
-        ]
+        _standard_weight_update(
+            [
+                ("emb.weight", torch.ones((2, 2))),
+                ("blocks.0.ln0.weight", torch.ones(2)),
+                ("blocks.0.ln0.bias", torch.ones(2)),
+                ("head.weight", torch.tensor([[1.0, 2.0], [3.0, 4.0]])),
+            ]
+        )
     )
 
     assert all(value is None for value in model._pending_weight_update.values())
@@ -2514,18 +2448,15 @@ def test_rwkv7_streaming_update_drains_after_non_validation_error(monkeypatch):
     model.end_layer = 1
     model.tp_size = 1
     model.tp_rank = 0
-    model.raw_weight_names = {
-        "emb.weight",
-        "blocks.0.ln0.weight",
-        "blocks.0.ln0.bias",
-        "head.weight",
-    }
-    model.raw_weight_shapes = {
-        "emb.weight": (2, 2),
-        "blocks.0.ln0.weight": (2,),
-        "blocks.0.ln0.bias": (2,),
-        "head.weight": (2, 2),
-    }
+    _set_checkpoint_contract(
+        model,
+        {
+            "emb.weight": (2, 2),
+            "blocks.0.ln0.weight": (2,),
+            "blocks.0.ln0.bias": (2,),
+            "head.weight": (2, 2),
+        },
+    )
     model.z = {
         "emb.weight": torch.zeros((2, 2)),
         "blocks.0.ln0.weight": torch.zeros(2),
@@ -2534,7 +2465,7 @@ def test_rwkv7_streaming_update_drains_after_non_validation_error(monkeypatch):
     }
     monkeypatch.setattr(
         model,
-        "_copy_raw_weight_to_runtime",
+        "_copy_checkpoint_weight_to_runtime",
         lambda name, weight: (_ for _ in ()).throw(OSError("copy failed")),
     )
 
@@ -2545,9 +2476,9 @@ def test_rwkv7_streaming_update_drains_after_non_validation_error(monkeypatch):
         [("blocks.0.ln0.weight", torch.zeros(2))],
         [("blocks.0.ln0.bias", torch.zeros(2))],
     ):
-        model.load_weights(bucket)
+        model.load_weights(_standard_weight_update(bucket))
 
-    assert set(model._pending_weight_update) == model.raw_weight_names
+    assert set(model._pending_weight_update) == model.checkpoint_weight_names
     with pytest.raises(OSError, match="copy failed"):
         model.finish_weight_update()
 
@@ -2585,7 +2516,7 @@ def test_rwkv7_streaming_update_matches_fresh_preprocess_for_all_runtime_keys(
         model._get_layer_range = lambda: (0, 1)
         return model
 
-    old_raw = {
+    old_internal = {
         "emb.weight": torch.arange(256, dtype=torch.float32).view(2, 128),
         "blocks.0.ln0.weight": torch.ones(128),
         "blocks.0.ln0.bias": torch.zeros(128),
@@ -2599,26 +2530,26 @@ def test_rwkv7_streaming_update_matches_fresh_preprocess_for_all_runtime_keys(
         ),
         "head.weight": torch.arange(256, dtype=torch.float32).view(2, 128),
     }
-    new_raw = {name: value + 1 for name, value in old_raw.items()}
+    new_internal = {name: value + 1 for name, value in old_internal.items()}
 
     model = new_model()
-    old_runtime = {name: value.clone() for name, value in old_raw.items()}
+    old_runtime = {name: value.clone() for name, value in old_internal.items()}
     model._preprocess_weights(old_runtime)
     model.z = old_runtime
-    model.raw_weight_names = set(old_raw)
-    model.raw_weight_shapes = {
-        name: tuple(value.shape) for name, value in old_raw.items()
-    }
+    _set_checkpoint_contract(
+        model,
+        {name: tuple(value.shape) for name, value in old_internal.items()},
+    )
     old_storage = {name: value.data_ptr() for name, value in model.z.items()}
 
     expected_model = new_model()
-    expected_runtime = {name: value.clone() for name, value in new_raw.items()}
+    expected_runtime = {name: value.clone() for name, value in new_internal.items()}
     expected_model._preprocess_weights(expected_runtime)
 
     model.start_weight_update()
     assert model._streaming_weight_update is True
-    for item in new_raw.items():
-        model.load_weights([item])
+    for item in new_internal.items():
+        model.load_weights(_standard_weight_update([item]))
     model.finish_weight_update()
 
     assert set(model.z) == set(expected_runtime)
@@ -2634,20 +2565,16 @@ def test_rwkv7_streaming_update_skips_off_rank_weights_on_pp_middle(monkeypatch)
     model.end_layer = 2
     model.tp_size = 1
     model.tp_rank = 0
-    model.raw_weight_names = {
-        "emb.weight",
-        "blocks.0.ln0.weight",
-        "blocks.0.ln0.bias",
-        "blocks.1.ffn.key.weight",
-        "head.weight",
-    }
-    model.raw_weight_shapes = {
-        "emb.weight": (2, 2),
-        "blocks.0.ln0.weight": (2,),
-        "blocks.0.ln0.bias": (2,),
-        "blocks.1.ffn.key.weight": (2, 2),
-        "head.weight": (2, 2),
-    }
+    _set_checkpoint_contract(
+        model,
+        {
+            "emb.weight": (2, 2),
+            "blocks.0.ln0.weight": (2,),
+            "blocks.0.ln0.bias": (2,),
+            "blocks.1.ffn.key.weight": (2, 2),
+            "head.weight": (2, 2),
+        },
+    )
     model.z = {"blocks.1.ffn.key.weight": torch.zeros((2, 2))}
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
 
@@ -2660,7 +2587,7 @@ def test_rwkv7_streaming_update_skips_off_rank_weights_on_pp_middle(monkeypatch)
         ("blocks.1.ffn.key.weight", torch.tensor([[1.0, 2.0], [3.0, 4.0]])),
         ("head.weight", torch.ones((2, 2))),
     ):
-        model.load_weights([item])
+        model.load_weights(_standard_weight_update([item]))
 
     assert all(value is None for value in model._pending_weight_update.values())
     model.finish_weight_update()

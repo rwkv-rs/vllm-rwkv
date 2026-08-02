@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """RWKV7 dynamic correctness checks against the Albatross reference path.
 
-These tests are opt-in because they require an Albatross checkout, a matching
-Albatross `.pth` checkpoint, CUDA, and a vLLM-loadable checkpoint with the same
-weights. Use `tests/models/language/generation/run_rwkv7_albatross.sh` to load
+These tests are opt-in because they require an Albatross checkout, its legacy
+`.pth` checkpoint, CUDA, and the matching standard Hugging Face vLLM artifact.
+Use `tests/models/language/generation/run_rwkv7_albatross.sh` to load
 the local environment and fail fast when required model paths are missing. They
 default to eager and decode CUDAGraph vLLM execution. RWKV7 does not support
 torch.compile. The CUDAGraph mode is limited to the Albatross-style fixed-buffer
@@ -13,6 +13,7 @@ decode path. These tests intentionally do not test registry/import presence.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -35,6 +36,9 @@ import torch
 
 from vllm import SamplingParams
 from vllm.config.compilation import CUDAGraphMode
+from vllm.tokenizers.registry import get_tokenizer
+from vllm.tokenizers.rwkv import RWKVTokenizer
+from vllm.transformers_utils.config import get_config
 
 TOP_K = int(os.environ.get("RWKV7_ALBATROSS_TOP_K", "20"))
 LOGPROB_ATOL = float(os.environ.get("RWKV7_ALBATROSS_LOGPROB_ATOL", "0.20"))
@@ -394,7 +398,7 @@ def rwkv7_albatross_settings() -> AlbatrossSettings:
     vllm_model_env = os.environ.get("VLLM_RWKV7_MODEL", "")
     parsed_vllm_model = urlparse(vllm_model_env)
     is_vllm_model_url = parsed_vllm_model.scheme in ("http", "https")
-    vllm_model = None if is_vllm_model_url else Path(vllm_model_env).expanduser()
+    vllm_model = Path(vllm_model_env).expanduser()
 
     if not impl_dir.is_dir():
         pytest.skip(f"Albatross implementation directory not found: {impl_dir}")
@@ -402,8 +406,42 @@ def rwkv7_albatross_settings() -> AlbatrossSettings:
         pytest.skip("Set ALBATROSS_PTH to a matching RWKV7 .pth checkpoint")
     if not vllm_model_env:
         pytest.skip("Set VLLM_RWKV7_MODEL to the matching vLLM checkpoint")
-    if not is_vllm_model_url and vllm_model is not None and not vllm_model.exists():
-        pytest.skip(f"vLLM checkpoint path not found: {vllm_model}")
+    if is_vllm_model_url or parsed_vllm_model.path.endswith(".pth"):
+        pytest.fail(
+            "VLLM_RWKV7_MODEL must be a local HF artifact directory or HF repo ID, "
+            "not a raw checkpoint or direct file URL"
+        )
+    is_hf_repo_id = (
+        not vllm_model.exists()
+        and not vllm_model.is_absolute()
+        and len(vllm_model_env.split("/")) == 2
+    )
+    if not is_hf_repo_id and not vllm_model.is_dir():
+        pytest.skip(f"vLLM Hugging Face artifact not found: {vllm_model}")
+
+    hf_config = get_config(vllm_model_env, trust_remote_code=False)
+    source_sha256 = getattr(hf_config, "rwkv_source_sha256", None)
+    with checkpoint.open("rb") as source:
+        checkpoint_sha256 = hashlib.file_digest(source, "sha256").hexdigest()
+    if source_sha256 != checkpoint_sha256:
+        pytest.fail(
+            "RWKV7 HF artifact source digest does not match the Albatross "
+            f"checkpoint: artifact={source_sha256} checkpoint={checkpoint_sha256}"
+        )
+    artifact_context = int(getattr(hf_config, "max_position_embeddings", 0))
+    if artifact_context < MAX_MODEL_LEN:
+        pytest.fail(
+            "RWKV7 HF artifact context is smaller than the requested alignment "
+            f"window: artifact={artifact_context} requested={MAX_MODEL_LEN}"
+        )
+    artifact_tokenizer = get_tokenizer(vllm_model_env, tokenizer_mode="rwkv")
+    reference_tokenizer = RWKVTokenizer()
+    for prompt in PROMPTS:
+        text = prompt["text"]
+        if artifact_tokenizer.encode(
+            text, add_special_tokens=False
+        ) != reference_tokenizer.encode(text, add_special_tokens=False):
+            pytest.fail(f"RWKV7 HF tokenizer mismatch for prompt {prompt['name']!r}")
 
     if impl != ALBATROSS_REFERENCE_IMPL:
         pytest.fail(
@@ -444,7 +482,7 @@ def rwkv7_albatross_settings() -> AlbatrossSettings:
         root=root,
         impl_dir=impl_dir,
         checkpoint=checkpoint,
-        vllm_model=vllm_model_env if is_vllm_model_url else str(vllm_model),
+        vllm_model=vllm_model_env if is_hf_repo_id else str(vllm_model),
         max_model_len=MAX_MODEL_LEN,
         revision=reference.revision,
         tree=reference.tree,
@@ -1040,7 +1078,7 @@ def test_rwkv7_vllm_outputs_passes_parallel_settings_to_runner(monkeypatch) -> N
         root=Path("/unused"),
         impl_dir=Path("/unused/impl"),
         checkpoint=Path("/unused/model.pth"),
-        vllm_model="/unused/model.pth",
+        vllm_model="/unused/model-hf",
         max_model_len=128,
     )
     execution_mode = ExecutionMode(
@@ -1055,7 +1093,7 @@ def test_rwkv7_vllm_outputs_passes_parallel_settings_to_runner(monkeypatch) -> N
     monkeypatch.setattr(sys.modules[__name__], "PARALLEL_SETTINGS", parallel_settings)
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
     monkeypatch.setenv("VLLM_USE_RAPID_SAMPLER", "0")
-    monkeypatch.setenv("VLLM_RWKV7_MODEL", "/test-only/model.pth")
+    monkeypatch.setenv("VLLM_RWKV7_MODEL", "/test-only/model-hf")
     runner_calls: list[dict[str, Any]] = []
     sampling_calls: list[Any] = []
 
@@ -1105,7 +1143,7 @@ def test_rwkv7_vllm_outputs_passes_parallel_settings_to_runner(monkeypatch) -> N
     assert sampling_calls[0].ignore_eos is True
     assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "0"
     assert os.environ["VLLM_USE_RAPID_SAMPLER"] == "0"
-    assert os.environ["VLLM_RWKV7_MODEL"] == "/test-only/model.pth"
+    assert os.environ["VLLM_RWKV7_MODEL"] == "/test-only/model-hf"
 
 
 def test_rwkv7_vllm_outputs_disables_cudagraph_for_pipeline_parallel(
@@ -1115,7 +1153,7 @@ def test_rwkv7_vllm_outputs_disables_cudagraph_for_pipeline_parallel(
         root=Path("/unused"),
         impl_dir=Path("/unused/impl"),
         checkpoint=Path("/unused/model.pth"),
-        vllm_model="/unused/model.pth",
+        vllm_model="/unused/model-hf",
         max_model_len=128,
     )
     execution_mode = ExecutionMode(
@@ -1171,7 +1209,7 @@ def test_rwkv7_vllm_outputs_captures_requested_decode_batch(
         root=Path("/unused"),
         impl_dir=Path("/unused/impl"),
         checkpoint=Path("/unused/model.pth"),
-        vllm_model="/unused/model.pth",
+        vllm_model="/unused/model-hf",
         max_model_len=128,
     )
     execution_mode = ExecutionMode(
@@ -1222,7 +1260,7 @@ def test_rwkv7_server_args_include_parallel_settings() -> None:
         root=Path("/unused"),
         impl_dir=Path("/unused/impl"),
         checkpoint=Path("/unused/model.pth"),
-        vllm_model="/unused/model.pth",
+        vllm_model="/unused/model-hf",
         max_model_len=128,
     )
     execution_mode = ExecutionMode(name="cudagraph", enforce_eager=False, env={})

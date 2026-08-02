@@ -511,14 +511,12 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
     ),
     "RWForCausalLM": _HfExamplesInfo("tiiuae/falcon-40b"),
     "RWKV7ForCausalLM": _HfExamplesInfo(
-        "https://huggingface.co/BlinkDL/rwkv7-g1/blob/main/"
-        "rwkv7-g1g-1.5b-20260526-ctx8192.pth",
+        "rwkv-rs/rwkv7-g1g-1.5b-20260526-ctx8192",
         tokenizer_mode="rwkv",
         is_available_online=False,
     ),
     "Rwkv7ForCausalLM": _HfExamplesInfo(
-        "https://huggingface.co/BlinkDL/rwkv7-g1/blob/main/"
-        "rwkv7-g1g-1.5b-20260526-ctx8192.pth",
+        "rwkv-rs/rwkv7-g1g-1.5b-20260526-ctx8192",
         tokenizer_mode="rwkv",
         is_available_online=False,
     ),

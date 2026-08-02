@@ -136,8 +136,10 @@ def gptoss_speculative_server(default_server_args: list[str]):
     )
     server_args = default_server_args + [
         "--speculative-config",
-        f'{{"model": "{GPT_OSS_SPECULATOR_NAME}", '
-        f'"method": "eagle3", "num_speculative_tokens": 3}}',
+        (
+            f'{{"model": "{GPT_OSS_SPECULATOR_NAME}", '
+            f'"method": "eagle3", "num_speculative_tokens": 3}}'
+        ),
         f"--attention-backend={attention_backend}",
     ]
     # gpt-oss requires AITER unified attention on ROCm
@@ -783,7 +785,7 @@ async def test_chat_streaming_metrics_ride_on_usage_chunk():
 
 def test_rwkv_serving_chat_defaults_tool_parser_when_auto_tools_enabled():
     model_config = MockModelConfig()
-    model_config.model = "/models/rwkv7-g1g-7.2b-20260523-ctx8192.pth"
+    model_config.model = "/models/rwkv7-g1g-7.2b-hf"
     model_config.tokenizer = model_config.model
     model_config.tokenizer_mode = "rwkv"
     model_config.hf_config = MockHFConfig(model_type="rwkv7")

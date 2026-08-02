@@ -4,6 +4,7 @@
 import pytest
 
 from vllm.tokenizers.registry import TokenizerRegistry, get_tokenizer
+from vllm.tokenizers.rwkv import RWKVTokenizer
 from vllm.tokenizers.rwkv_defaults import (
     RWKV_PROMPT_TEMPLATE_ASSISTANT,
     RWKV_PROMPT_TEMPLATE_BOT,
@@ -14,7 +15,7 @@ from vllm.tokenizers.rwkv_defaults import (
 
 
 def test_rwkv_tokenizer_matches_world_vocab_golden_ids():
-    tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
+    tokenizer = RWKVTokenizer()
 
     assert tokenizer.encode("Hello world", add_special_tokens=False) == [33155, 40213]
     assert tokenizer.encode("你好", add_special_tokens=False) == [10464, 11685]
@@ -27,7 +28,7 @@ def test_rwkv_tokenizer_matches_world_vocab_golden_ids():
 
 
 def test_rwkv_tokenizer_left_truncation_can_drop_bos_when_budget_is_too_small():
-    tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
+    tokenizer = RWKVTokenizer()
 
     assert tokenizer.encode("Hello world", truncation=True, max_length=2) == [
         33155,
@@ -39,7 +40,7 @@ def test_rwkv_tokenizer_left_truncation_can_drop_bos_when_budget_is_too_small():
 
 
 def test_rwkv_tokenizer_decode_replaces_invalid_utf8_tokens():
-    tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
+    tokenizer = RWKVTokenizer()
 
     assert tokenizer.decode([129]) == "\ufffd"
     assert tokenizer.decode([196]) == "\ufffd"
@@ -48,7 +49,7 @@ def test_rwkv_tokenizer_decode_replaces_invalid_utf8_tokens():
 
 
 def test_rwkv_tokenizer_pads_unused_logits_ids():
-    tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
+    tokenizer = RWKVTokenizer()
 
     assert tokenizer.vocab_size == 65536
     assert tokenizer.max_token_id == 65535
@@ -56,7 +57,7 @@ def test_rwkv_tokenizer_pads_unused_logits_ids():
 
 
 def test_rwkv_tokenizer_exposes_lossless_byte_vocab_tokens():
-    tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
+    tokenizer = RWKVTokenizer()
 
     raw_byte_token = tokenizer.convert_ids_to_tokens([129])[0]
     assert raw_byte_token == "\x80"
@@ -66,23 +67,72 @@ def test_rwkv_tokenizer_exposes_lossless_byte_vocab_tokens():
 
 
 def test_rwkv_tokenizer_reports_slow_until_offsets_are_supported():
-    tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
+    tokenizer = RWKVTokenizer()
 
     assert tokenizer.is_fast is False
 
 
-def test_rwkv_tokenizer_exposes_cached_metadata():
+def test_rwkv_tokenizer_exposes_cached_metadata(tmp_path):
     tokenizer_cls = TokenizerRegistry.load_tokenizer_cls("rwkv")
-    tokenizer = tokenizer_cls.from_pretrained("BlinkDL/rwkv7-g1")
+    RWKVTokenizer().save_pretrained(tmp_path)
+    tokenizer = tokenizer_cls.from_pretrained(tmp_path)
 
-    assert tokenizer.name_or_path == "BlinkDL/rwkv7-g1"
+    assert tokenizer.name_or_path == str(tmp_path)
     cached_max_chars = tokenizer.max_chars_per_token
     tokenizer.idx2token.append(b"x" * (cached_max_chars + 1))
     assert tokenizer.max_chars_per_token == cached_max_chars
 
 
+def test_rwkv_tokenizer_save_pretrained_round_trip_uses_artifact_vocab(tmp_path):
+    source = RWKVTokenizer()
+
+    saved = source.save_pretrained(tmp_path)
+    reloaded = get_tokenizer(tmp_path, tokenizer_mode="rwkv")
+
+    assert {path.name for path in tmp_path.iterdir()} == {
+        "rwkv_vocab_v20230424.txt",
+        "special_tokens_map.json",
+        "tokenizer_config.json",
+    }
+    assert set(saved) == {str(path) for path in tmp_path.iterdir()}
+    assert reloaded.name_or_path == str(tmp_path)
+    assert reloaded.encode("Hello 你好") == source.encode("Hello 你好")
+
+
+def test_rwkv_tokenizer_downloads_vocab_from_remote_hf_artifact(
+    tmp_path,
+    monkeypatch,
+):
+    source = RWKVTokenizer()
+    calls = []
+
+    class FakeHfApi:
+        def hf_hub_download(self, **kwargs):
+            calls.append(kwargs)
+            return source.name_or_path
+
+    monkeypatch.setattr("vllm.tokenizers.rwkv.hf_api", lambda: FakeHfApi())
+
+    tokenizer = RWKVTokenizer.from_pretrained(
+        "rwkv-rs/model-hf",
+        revision="key-contract",
+        download_dir=str(tmp_path),
+    )
+
+    assert tokenizer.encode("Hello") == source.encode("Hello")
+    assert calls == [
+        {
+            "repo_id": "rwkv-rs/model-hf",
+            "filename": "rwkv_vocab_v20230424.txt",
+            "revision": "key-contract",
+            "cache_dir": str(tmp_path),
+            "token": None,
+        }
+    ]
+
+
 def test_rwkv_chat_template_renders_basic_dialogue_from_training_template():
-    tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
+    tokenizer = RWKVTokenizer()
 
     rendered = tokenizer.apply_chat_template(
         [
@@ -114,7 +164,7 @@ def test_rwkv_chat_template_and_stop_style_render_together(
     prompt_template: str,
     expected: str,
 ):
-    tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
+    tokenizer = RWKVTokenizer()
 
     rendered = tokenizer.apply_chat_template(
         [{"role": "user", "content": "Hi"}],
@@ -161,7 +211,7 @@ def test_rwkv_prompt_bos_normalization_preserves_a_truncated_length_budget():
 def test_rwkv_chat_template_tokenizes_with_exactly_one_leading_bos_eos(
     prompt_template: str,
 ):
-    tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
+    tokenizer = RWKVTokenizer()
 
     rendered = tokenizer.apply_chat_template(
         [{"role": "user", "content": "Question: Hi\nAnswer:"}],
@@ -192,7 +242,7 @@ def test_rwkv_chat_template_tokenizes_with_exactly_one_leading_bos_eos(
 
 
 def test_rwkv_native_chat_preserves_dataset_prompt_verbatim():
-    tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
+    tokenizer = RWKVTokenizer()
     dapo_prompt = (
         "Solve the following math problem step by step. The last line of your "
         "response should be of the form Answer: $Answer (without quotes) where "
@@ -211,7 +261,7 @@ def test_rwkv_native_chat_preserves_dataset_prompt_verbatim():
 
 
 def test_rwkv_chat_template_can_render_fake_think_generation_prompt():
-    tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
+    tokenizer = RWKVTokenizer()
 
     rendered = tokenizer.apply_chat_template(
         [{"role": "user", "content": "Hi"}],
@@ -224,7 +274,7 @@ def test_rwkv_chat_template_can_render_fake_think_generation_prompt():
 
 
 def test_rwkv_chat_template_preserves_raw_user_content():
-    tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
+    tokenizer = RWKVTokenizer()
     problem = "已知 x+y=3, 求 x。"
 
     rendered = tokenizer.apply_chat_template(
@@ -237,7 +287,7 @@ def test_rwkv_chat_template_preserves_raw_user_content():
 
 
 def test_rwkv_chat_template_renders_tools_and_tool_outputs_from_training_template():
-    tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
+    tokenizer = RWKVTokenizer()
     tools = [
         {
             "type": "function",
