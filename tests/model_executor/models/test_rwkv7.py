@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import vllm.model_executor.models.rwkv7 as rwkv7
+from vllm.config.cache import CacheConfig
 from vllm.config.compilation import CompilationConfig, CompilationMode, CUDAGraphMode
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.models.config import RWKV7ForCausalLMConfig
@@ -74,15 +75,21 @@ def test_rwkv7_cuda_ops_match_torch_reference():
     torch.testing.assert_close(z, expected_z, rtol=0, atol=0)
 
 
-def _new_request(req_id: str) -> NewRequestData:
+def _new_request(
+    req_id: str,
+    *,
+    prompt_token_ids: list[int] | None = None,
+    num_computed_tokens: int = 0,
+    sampling_params: SamplingParams | None = None,
+) -> NewRequestData:
     return NewRequestData(
         req_id=req_id,
-        prompt_token_ids=[1, 2, 3],
+        prompt_token_ids=prompt_token_ids or [1, 2, 3],
         mm_features=[],
-        sampling_params=None,
+        sampling_params=sampling_params,
         pooling_params=None,
         block_ids=(),
-        num_computed_tokens=0,
+        num_computed_tokens=num_computed_tokens,
         lora_request=None,
     )
 
@@ -468,6 +475,7 @@ def _new_rwkv7_model_state(
     hidden_size: int = 64,
     head_size: int = 64,
     num_attention_heads: int = 1,
+    enable_prefix_caching: bool = False,
 ) -> RWKV7ModelState:
     hf_config = SimpleNamespace(
         num_hidden_layers=num_hidden_layers,
@@ -476,8 +484,16 @@ def _new_rwkv7_model_state(
         num_attention_heads=num_attention_heads,
     )
     vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=hf_config),
+        model_config=SimpleNamespace(
+            hf_config=hf_config,
+            model="org/rwkv7-test",
+            revision="model-revision",
+        ),
         scheduler_config=SimpleNamespace(max_num_seqs=max_num_reqs),
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=False,
+            rwkv_recurrent_prefix_caching=enable_prefix_caching,
+        ),
     )
     return RWKV7ModelState(
         vllm_config=vllm_config,
@@ -642,6 +658,183 @@ def _assert_prefill_wkv_metadata(
     assert inputs["rwkv_prefill_req_id"].tolist() == req_id
 
 
+def _rwkv7_prefill_batch(
+    state: RWKV7ModelState,
+    *,
+    req_slot: int,
+    num_computed_tokens: int,
+    num_scheduled_tokens: int,
+    prefill_len: int,
+) -> SimpleNamespace:
+    return _rwkv7_input_batch(
+        state,
+        idx_mapping_np=np.array([req_slot], dtype=np.int32),
+        query_start_loc=torch.tensor([0, num_scheduled_tokens], dtype=torch.int32),
+        is_prefilling_np=np.array([True], dtype=np.bool_),
+        num_computed_prefill_tokens_np=np.array([num_computed_tokens], dtype=np.int32),
+        prefill_len_np=np.array([prefill_len], dtype=np.int32),
+        num_scheduled_tokens=np.array([num_scheduled_tokens], dtype=np.int32),
+    )
+
+
+def _run_rwkv7_prefill_chunk(
+    state: RWKV7ModelState,
+    *,
+    req_slot: int,
+    num_computed_tokens: int,
+    num_scheduled_tokens: int,
+    prefill_len: int,
+    shift_value: float,
+    wkv_value: float,
+) -> dict[str, Any]:
+    input_batch = _rwkv7_prefill_batch(
+        state,
+        req_slot=req_slot,
+        num_computed_tokens=num_computed_tokens,
+        num_scheduled_tokens=num_scheduled_tokens,
+        prefill_len=prefill_len,
+    )
+    inputs = state.prepare_inputs(input_batch, req_states=None)
+    row = state.req_slot_to_row[req_slot]
+    state.shift_state[:, :, row].fill_(shift_value)
+    state.wkv_state[:, row].fill_(wkv_value)
+    state.elapsed[row] = num_computed_tokens + num_scheduled_tokens
+    state.postprocess_state(inputs["idx_mapping"], 0)
+    return inputs
+
+
+def test_rwkv7_model_state_restores_prefix_before_packed_prefill_suffix():
+    prompt = [1, 2, 3, 4]
+    state = _new_rwkv7_model_state(
+        max_num_reqs=1,
+        hidden_size=4,
+        head_size=2,
+        num_attention_heads=2,
+        enable_prefix_caching=True,
+    )
+    state.add_request(0, _new_request("seed", prompt_token_ids=prompt))
+    seed_inputs = _run_rwkv7_prefill_chunk(
+        state,
+        req_slot=0,
+        num_computed_tokens=0,
+        num_scheduled_tokens=2,
+        prefill_len=len(prompt),
+        shift_value=11,
+        wkv_value=12,
+    )
+    assert seed_inputs["rwkv_prefill_token_positions"].tolist() == [0, 1]
+    state.remove_request("seed")
+
+    state.add_request(0, _new_request("hit", prompt_token_ids=prompt))
+    row = state.req_slot_to_row[0]
+    assert state.req_prefix_cache_hit_lengths["hit"] == 2
+    assert torch.all(state.shift_state[:, :, row] == 11)
+    assert torch.all(state.wkv_state[:, row] == 12)
+    assert state.elapsed[row].item() == 2
+
+    hit_batch = _rwkv7_prefill_batch(
+        state,
+        req_slot=0,
+        num_computed_tokens=0,
+        num_scheduled_tokens=len(prompt),
+        prefill_len=len(prompt),
+    )
+    hit_inputs = state.prepare_inputs(hit_batch, req_states=None)
+
+    assert hit_inputs["rwkv_prefill_token_ranges"] == [(0, 2, 4)]
+    assert hit_inputs["rwkv_prefill_query_start_loc"].tolist() == [0, 2]
+    assert hit_inputs["rwkv_prefill_token_positions"].tolist() == [2, 3]
+    assert hit_inputs["rwkv_prefill_req_id"].tolist() == [0, 0]
+
+
+def test_rwkv7_model_state_cancel_recycles_row_without_mutating_cached_prefix():
+    prompt = [4, 5, 6, 7]
+    state = _new_rwkv7_model_state(
+        max_num_reqs=1,
+        hidden_size=4,
+        head_size=2,
+        num_attention_heads=2,
+        enable_prefix_caching=True,
+    )
+    state.add_request(0, _new_request("seed", prompt_token_ids=prompt))
+    _run_rwkv7_prefill_chunk(
+        state,
+        req_slot=0,
+        num_computed_tokens=0,
+        num_scheduled_tokens=2,
+        prefill_len=len(prompt),
+        shift_value=21,
+        wkv_value=22,
+    )
+    state.remove_request("seed")
+
+    state.add_request(0, _new_request("cancelled", prompt_token_ids=prompt))
+    cancelled_row = state.req_slot_to_row[0]
+    state.shift_state[:, :, cancelled_row].fill_(99)
+    state.wkv_state[:, cancelled_row].fill_(99)
+    state.elapsed[cancelled_row] = 99
+    state.remove_request("cancelled")
+
+    assert state.req_id_to_index == {}
+    assert state.req_slot_owners == [None]
+    assert state.req_slot_to_row == [-1]
+    assert state.row_to_req_slot == [-1]
+    assert state.free_rows == {0}
+    assert torch.count_nonzero(state.shift_state[:, :, cancelled_row]) == 0
+    assert torch.count_nonzero(state.wkv_state[:, cancelled_row]) == 0
+    assert state.elapsed[cancelled_row].item() == 0
+
+    state.add_request(0, _new_request("after-cancel", prompt_token_ids=prompt))
+    restored_row = state.req_slot_to_row[0]
+    assert state.req_prefix_cache_hit_lengths["after-cancel"] == 2
+    assert torch.all(state.shift_state[:, :, restored_row] == 21)
+    assert torch.all(state.wkv_state[:, restored_row] == 22)
+    assert state.elapsed[restored_row].item() == 2
+
+
+def test_rwkv7_model_state_prefix_cache_survives_waiting_waves():
+    prompt = [8, 9, 10, 11]
+    state = _new_rwkv7_model_state(
+        max_num_reqs=1,
+        hidden_size=4,
+        head_size=2,
+        num_attention_heads=2,
+        enable_prefix_caching=True,
+    )
+    state.add_request(0, _new_request("wave-seed", prompt_token_ids=prompt))
+    _run_rwkv7_prefill_chunk(
+        state,
+        req_slot=0,
+        num_computed_tokens=0,
+        num_scheduled_tokens=2,
+        prefill_len=len(prompt),
+        shift_value=31,
+        wkv_value=32,
+    )
+    state.remove_request("wave-seed")
+
+    completed = []
+    for req_id in ("wave-1", "wave-2", "wave-3"):
+        state.add_request(0, _new_request(req_id, prompt_token_ids=prompt))
+        assert state.req_prefix_cache_hit_lengths[req_id] == 2
+        inputs = _run_rwkv7_prefill_chunk(
+            state,
+            req_slot=0,
+            num_computed_tokens=0,
+            num_scheduled_tokens=len(prompt),
+            prefill_len=len(prompt),
+            shift_value=41,
+            wkv_value=42,
+        )
+        assert inputs["rwkv_prefill_token_positions"].tolist() == [2, 3]
+        assert state.decode_req_slots == {0}
+        state.remove_request(req_id)
+        completed.append(req_id)
+        assert state.free_rows == {0}
+
+    assert completed == ["wave-1", "wave-2", "wave-3"]
+
+
 def test_rwkv7_rejects_torch_compile():
     with pytest.raises(ValueError, match="RWKV7 does not support torch.compile"):
         RWKV7ForCausalLM(
@@ -790,10 +983,10 @@ def test_rwkv7_config_defaults_to_no_compile():
     )
 
 
-def test_rwkv7_config_disables_prefix_caching():
+def test_rwkv7_config_routes_prefix_caching_to_recurrent_state():
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=False),
-        cache_config=SimpleNamespace(enable_prefix_caching=True),
+        cache_config=CacheConfig(enable_prefix_caching=True),
         scheduler_config=SimpleNamespace(
             max_num_seqs=4,
             max_num_batched_tokens=8,
@@ -805,6 +998,7 @@ def test_rwkv7_config_disables_prefix_caching():
     RWKV7ForCausalLMConfig.verify_and_update_config(vllm_config)
 
     assert vllm_config.cache_config.enable_prefix_caching is False
+    assert vllm_config.cache_config.rwkv_recurrent_prefix_caching is True
 
 
 def test_rwkv7_config_captures_full_decode_capacity():
