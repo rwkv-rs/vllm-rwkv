@@ -929,8 +929,8 @@ class RWKV7ForCausalLM(nn.Module):
         )
 
     def _validate_checkpoint_weight_shapes(self, z: dict[str, torch.Tensor]) -> None:
-        r_k = z["blocks.0.att.r_k"].squeeze()
-        emb = z["emb.weight"].squeeze()
+        r_k = z["blocks.0.att.r_k"]
+        emb = z["emb.weight"]
         weight_heads, head_size = r_k.shape
         hidden_size = weight_heads * head_size
         vocab_size = emb.shape[0]
