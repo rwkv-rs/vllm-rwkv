@@ -4,7 +4,6 @@
   "external_projects": [],
   "unrestricted": false,
   "supported_architectures": ["RWKV7ForCausalLM"],
-  "supported_weight_suffixes": [".pth"],
   "supported_device_types": ["cuda"],
   "supported_runner_types": ["generate"],
   "supported_serving_features": [

@@ -15,7 +15,8 @@ if TYPE_CHECKING:
 
 _PROFILE_PATH = Path(__file__).with_name("_build_profile.json")
 _VALID_PROFILES = {"full", "rwkv"}
-_RWKV_LOAD_FORMATS = {"auto", "hf", "pt"}
+_RWKV_LOAD_FORMATS = {"auto", "hf", "safetensors"}
+_LEGACY_RWKV_WEIGHT_SUFFIXES = (".pth",)
 
 
 @dataclass(frozen=True)
@@ -25,7 +26,6 @@ class BuildProfileMetadata:
     external_projects: tuple[str, ...]
     unrestricted: bool = True
     supported_architectures: tuple[str, ...] = ()
-    supported_weight_suffixes: tuple[str, ...] = ()
     supported_device_types: tuple[str, ...] = ()
     supported_runner_types: tuple[str, ...] = ()
     supported_serving_features: tuple[str, ...] = ()
@@ -82,7 +82,6 @@ def load_build_profile_metadata(path: Path = _PROFILE_PATH) -> BuildProfileMetad
         external_projects=tuple(projects),
         unrestricted=unrestricted,
         supported_architectures=string_tuple("supported_architectures"),
-        supported_weight_suffixes=string_tuple("supported_weight_suffixes"),
         supported_device_types=string_tuple("supported_device_types"),
         supported_runner_types=string_tuple("supported_runner_types"),
         supported_serving_features=string_tuple("supported_serving_features"),
@@ -141,11 +140,10 @@ def validate_build_profile_capabilities(
         )
 
     model = str(getattr(model_config, "model", ""))
-    if not model.endswith(metadata.supported_weight_suffixes):
+    if model.endswith(_LEGACY_RWKV_WEIGHT_SUFFIXES):
         reasons.append(
-            "requires an RWKV7 raw "
-            + "/".join(metadata.supported_weight_suffixes)
-            + " checkpoint"
+            "requires a standard Transformers/Hugging Face artifact, "
+            "not a legacy raw .pth checkpoint"
         )
 
     if (
@@ -205,7 +203,8 @@ def validate_build_profile_capabilities(
     load_format = str(_value(getattr(load_config, "load_format", "auto"))).lower()
     if load_format not in _RWKV_LOAD_FORMATS:
         reasons.append(
-            "requires load format 'auto', 'hf', or 'pt' for a raw .pth checkpoint"
+            "requires load format 'auto', 'hf', or 'safetensors' for a standard "
+            "Transformers/Hugging Face artifact"
         )
 
     device_type = getattr(
