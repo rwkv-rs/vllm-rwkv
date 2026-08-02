@@ -1,0 +1,63 @@
+name: RWKV7 PRO6000 recurrent chain
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: rwkv7-pro6000-chain-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  recurrent-chain:
+    runs-on: [self-hosted, linux, x64, rwkv-pro6000]
+    timeout-minutes: 60
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+      CUDA_HOME: /usr/local/cuda
+      CUDA_PATH: /usr/local/cuda
+      LD_LIBRARY_PATH: /usr/local/cuda/lib64
+      HTTP_PROXY: http://127.0.0.1:58011
+      HTTPS_PROXY: http://127.0.0.1:58011
+      http_proxy: http://127.0.0.1:58011
+      https_proxy: http://127.0.0.1:58011
+      NO_PROXY: 127.0.0.1,localhost
+      no_proxy: 127.0.0.1,localhost
+      UV_LINK_MODE: copy
+      VLLM_BUILD_PROFILE: rwkv
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Expose and verify the controlled CUDA toolchain
+        run: |
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+          /usr/local/cuda/bin/nvcc --version
+          test "$(nvidia-smi --id=0 --query-gpu=name --format=csv,noheader)" = \
+            "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: |
+            requirements/rwkv*.txt
+            requirements/test/rwkv7-pro6000-chain.txt
+      - name: Create isolated RWKV test environment
+        run: uv venv --clear --python 3.12 .venv
+      - name: Install product dependencies with controlled test revisions
+        run: >-
+          uv pip install --python .venv/bin/python
+          --requirements requirements/rwkv-nvfp4.txt
+          --overrides requirements/test/rwkv7-pro6000-chain.txt
+          pytest==9.1.0 tblib==3.2.2
+      - name: Build the RWKV vLLM profile
+        run: >-
+          uv pip install --python .venv/bin/python
+          --no-deps --no-build-isolation --editable .
+      - name: Run the focused recurrent provider and metadata contract
+        env:
+          RWKV7_RUN_PRO6000_CHAIN: "1"
+        run: |
+          .venv/bin/python -m pytest -q -s \
+            tests/models/language/generation/test_rwkv7_pro6000_chain.py \
+            tests/transformers_utils/test_rwkv7_hf_artifact.py::test_rwkv7_w4a16_accepts_standard_compressed_tensors_serialization
