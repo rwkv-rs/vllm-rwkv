@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from transformers import OPTConfig
 
 import vllm.envs as envs
 from vllm.config import (
@@ -120,8 +121,19 @@ def test_add_requests():
         assert len(scheduler.waiting) == i + 1
 
 
-def test_rwkv_sized_request_pool_drains_more_requests_in_waiting_waves():
-    scheduler = create_scheduler(max_num_seqs=2)
+def test_rwkv_sized_request_pool_drains_more_requests_in_waiting_waves(tmp_path):
+    model_dir = tmp_path / "synthetic-opt"
+    OPTConfig(
+        architectures=["OPTForCausalLM"],
+        hidden_size=64,
+        num_attention_heads=1,
+        num_hidden_layers=1,
+        ffn_dim=256,
+        word_embed_proj_dim=64,
+        max_position_embeddings=8192,
+        vocab_size=128,
+    ).save_pretrained(model_dir)
+    scheduler = create_scheduler(model=str(model_dir), max_num_seqs=2)
     requests = create_requests(
         num_requests=5,
         req_ids=[f"rwkv-{i}" for i in range(5)],
