@@ -268,7 +268,7 @@ MarlinFuncPtr get_marlin_kernel(
   int num_bits = b_type.size_bits();
   auto kernel = MarlinDefault;
 
-  #include "kernel_selector.h"
+  #include <kernel_selector.h>
 
   return kernel;
 }

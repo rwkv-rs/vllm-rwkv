@@ -2,4 +2,4 @@
 # dependency boundary unchanged and add only the canonical packed loader.
 -r rwkv.txt
 
-compressed-tensors==0.17.0
+compressed-tensors==0.17.2a20260731
