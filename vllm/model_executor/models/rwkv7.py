@@ -865,19 +865,11 @@ class RWKV7ForCausalLM(nn.Module):
         device = destination.device
         emb_input = (
             emb_src.squeeze()[vocab_start:vocab_end]
-            .to(device=device, dtype=torch.bfloat16, non_blocking=False)
+            .to(device=device, non_blocking=False)
             .contiguous()
         )
-        ln0_w = (
-            ln0_w_src.squeeze()
-            .to(device=device, dtype=torch.bfloat16, non_blocking=False)
-            .contiguous()
-        )
-        ln0_b = (
-            ln0_b_src.squeeze()
-            .to(device=device, dtype=torch.bfloat16, non_blocking=False)
-            .contiguous()
-        )
+        ln0_w = ln0_w_src.squeeze().to(device=device, non_blocking=False).contiguous()
+        ln0_b = ln0_b_src.squeeze().to(device=device, non_blocking=False).contiguous()
         transformed = torch.ops.rwkv7_v3a_ops.emb_ln0_bf16_to_f16(
             emb_input, ln0_w, ln0_b
         )
@@ -1029,17 +1021,15 @@ class RWKV7ForCausalLM(nn.Module):
                 z[key] = value
         if self._is_weight_needed_on_rank("emb.weight"):
             emb_dev = CUDA_DEVICE
-            ln0_w_bf16 = ln0_w_src.to(device=emb_dev, dtype=torch.bfloat16).contiguous()
-            ln0_b_bf16 = ln0_b_src.to(device=emb_dev, dtype=torch.bfloat16).contiguous()
+            ln0_w_bf16 = ln0_w_src.to(device=emb_dev).contiguous()
+            ln0_b_bf16 = ln0_b_src.to(device=emb_dev).contiguous()
             vocab_start, vocab_end, vocab_per_rank = self._tp_vocab_range(vocab_size)
             emb = torch.zeros(
                 (vocab_per_rank, hidden_size), dtype=DTYPE, device=emb_dev
             )
             if vocab_end > vocab_start:
                 local = torch.ops.rwkv7_v3a_ops.emb_ln0_bf16_to_f16(
-                    emb_src[vocab_start:vocab_end]
-                    .to(device=emb_dev, dtype=torch.bfloat16)
-                    .contiguous(),
+                    emb_src[vocab_start:vocab_end].to(device=emb_dev).contiguous(),
                     ln0_w_bf16,
                     ln0_b_bf16,
                 )
