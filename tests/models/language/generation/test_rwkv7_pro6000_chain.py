@@ -120,8 +120,8 @@ def _write_tiny_standard_hf_artifact(artifact: Path) -> None:
     torch.manual_seed(17)
     config = Rwkv7Config(
         vocab_size=32,
-        hidden_size=64,
-        intermediate_size=128,
+        hidden_size=256,
+        intermediate_size=512,
         num_hidden_layers=2,
         head_size=64,
         context_length=16,
