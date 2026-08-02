@@ -208,6 +208,21 @@ def test_rwkv7_hf_registry_uses_blinkdl_raw_pth(tmp_path):
     assert is_text_generation_model(model_cls)
 
 
+def test_rwkv7_registry_resolves_standard_transformers_architecture():
+    model_cls, arch = ModelRegistry.resolve_model_cls(
+        ["Rwkv7ForCausalLM"],
+        SimpleNamespace(
+            model_impl="auto",
+            convert_type="none",
+            runner_type="generate",
+        ),
+    )
+
+    assert arch == "Rwkv7ForCausalLM"
+    assert model_cls.__name__ == "RWKV7ForCausalLM"
+    assert is_text_generation_model(model_cls)
+
+
 def test_rwkv7_registry_load_does_not_import_ops_with_unspecified_platform():
     code = """
 import sys
