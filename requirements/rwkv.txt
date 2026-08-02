@@ -9,6 +9,11 @@
 
 torch==2.11.0
 
+# Stateful packed-varlen RWKV7 provider. Keep both source revisions exact:
+# FLA owns dispatch and FlashRWKV owns the recurrent CUDA implementation.
+flash-linear-attention @ git+https://github.com/rwkv-rs/fla-rwkv.git@1bc262c8c81241e1d339419a31f0aadffa20c210
+flash-rwkv @ git+https://github.com/rwkv-rs/FlashRWKV.git@866aafd2eed146b0eda1ce03444009ae030f89e3
+
 # Core configuration, model loading, tokenizer, and process runtime.
 regex
 cachetools
