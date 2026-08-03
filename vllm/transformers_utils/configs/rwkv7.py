@@ -628,11 +628,27 @@ def rwkv7_is_legacy_low_rank_weight_name(name: str) -> bool:
     )
 
 
-def _projection_ranks(hidden_size: int) -> tuple[int, int, int]:
-    return (
+def _projection_ranks(config: object) -> tuple[int, int, int, int]:
+    hidden_size = cast(int, _rwkv7_config_value(config, "hidden_size"))
+    derived = (
         max(32, round(2.5 * hidden_size**0.5 / 32) * 32),
         max(32, round(1.7 * hidden_size**0.5 / 32) * 32),
         max(32, round(5.0 * hidden_size**0.5 / 32) * 32),
+    )
+
+    def rank(name: str, fallback: int) -> int:
+        value = _rwkv7_config_value(config, name)
+        if value is None:
+            return fallback
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"RWKV7 config {name} must be a positive integer")
+        return value
+
+    return (
+        rank("decay_low_rank_dim", derived[0]),
+        rank("a_low_rank_dim", derived[0]),
+        rank("v_low_rank_dim", derived[1]),
+        rank("gate_low_rank_dim", derived[2]),
     )
 
 
@@ -651,7 +667,7 @@ def _rwkv7_legacy_checkpoint_weight_shapes_unvalidated(
     num_heads = hidden_size // head_size
     intermediate_size_value = _rwkv7_config_value(config, "intermediate_size")
     intermediate_size = cast(int, intermediate_size_value or 4 * hidden_size)
-    decay_rank, value_rank, gate_rank = _projection_ranks(hidden_size)
+    decay_rank, a_rank, value_rank, gate_rank = _projection_ranks(config)
     shapes = {
         "emb.weight": (vocab_size, hidden_size),
         "head.weight": (vocab_size, hidden_size),
@@ -678,8 +694,8 @@ def _rwkv7_legacy_checkpoint_weight_shapes_unvalidated(
             {
                 f"{attention}.w1": (hidden_size, decay_rank),
                 f"{attention}.w2": (decay_rank, hidden_size),
-                f"{attention}.a1": (hidden_size, decay_rank),
-                f"{attention}.a2": (decay_rank, hidden_size),
+                f"{attention}.a1": (hidden_size, a_rank),
+                f"{attention}.a2": (a_rank, hidden_size),
                 f"{attention}.g1": (hidden_size, gate_rank),
                 f"{attention}.g2": (gate_rank, hidden_size),
                 f"{attention}.r_k": (num_heads, head_size),
