@@ -10,6 +10,7 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 import torch
@@ -99,7 +100,7 @@ def _nvfp4_consumer_config(
     target_set = set(targets)
     linear_modules = ["head"]
     normalization_modules = ["model.ln_out", "model.blocks.0.ln0"]
-    low_rank_modules = []
+    low_rank_modules: list[str] = []
     for layer_id in range(config.num_hidden_layers):
         attention = f"model.blocks.{layer_id}.att"
         linear_modules.extend(
@@ -562,10 +563,14 @@ def test_invalid_rwkv7_hf_artifact_config_fails_closed(
 def test_runtime_loader_rejects_raw_pth_directory(tmp_path: Path) -> None:
     (tmp_path / "model.pth").touch()
     loader = object.__new__(DefaultModelLoader)
-    loader.load_config = SimpleNamespace(
-        load_format="auto",
-        download_dir=None,
-        ignore_patterns=None,
+    setattr(
+        loader,
+        "load_config",
+        SimpleNamespace(
+            load_format="auto",
+            download_dir=None,
+            ignore_patterns=None,
+        ),
     )
 
     with pytest.raises(RuntimeError, match="Cannot find any model weights"):
@@ -776,11 +781,15 @@ def _exercise_nvfp4_consumer_candidate(
     )
     save_file(artifact_tensors, artifact / "model.safetensors")
 
-    model._preprocess_weights = lambda _weights: None
-    model._commit_preprocessed_weights = lambda weights: setattr(model, "z", weights)
+    setattr(model, "_preprocess_weights", lambda _weights: None)
+    setattr(
+        model,
+        "_commit_preprocessed_weights",
+        lambda weights: setattr(model, "z", weights),
+    )
     loader = DefaultModelLoader(LoadConfig(load_format="safetensors"))
     monkeypatch.setattr(loader, "_init_ep_weight_filter", lambda _config: None)
-    model_config = SimpleNamespace(
+    model_config: Any = SimpleNamespace(
         hf_config=config,
         quantization="compressed-tensors",
         model=str(artifact),
@@ -798,7 +807,8 @@ def _exercise_nvfp4_consumer_candidate(
         assert id(parameter) == identity
         torch.testing.assert_close(parameter, artifact_tensors[full_name])
         assert not hasattr(model.get_submodule(target), "weight")
-    assert quantized_dense_names.isdisjoint(model.checkpoint_weight_names)
+    checkpoint_weight_names: set[str] = model.checkpoint_weight_names or set()
+    assert quantized_dense_names.isdisjoint(checkpoint_weight_names)
     for target in targets:
         internal_name = model._checkpoint_name_to_internal(f"{target}.weight")
         assert internal_name not in model.z
@@ -847,7 +857,7 @@ def _exercise_nvfp4_consumer_candidate(
             torch.ones((2, 64), dtype=torch.float16),
         )
         assert output is not None and output.shape == (2, 32)
-        r, k, v = model.project_att_rkv(
+        r, k, v = cast(Any, model).project_att_rkv(
             *(torch.ones((2, 64), dtype=torch.float16) for _ in range(3)),
             "blocks.1.att.",
             2,
@@ -1008,11 +1018,15 @@ def test_default_loader_nvfp4_candidate_reaches_native_gpu_kernel(
         encoding="utf-8",
     )
     save_file(artifact_tensors, artifact / "model.safetensors")
-    model._preprocess_weights = lambda _weights: None
-    model._commit_preprocessed_weights = lambda weights: setattr(model, "z", weights)
+    setattr(model, "_preprocess_weights", lambda _weights: None)
+    setattr(
+        model,
+        "_commit_preprocessed_weights",
+        lambda weights: setattr(model, "z", weights),
+    )
     loader = DefaultModelLoader(LoadConfig(load_format="safetensors"))
     monkeypatch.setattr(loader, "_init_ep_weight_filter", lambda _config: None)
-    model_config = SimpleNamespace(
+    model_config: Any = SimpleNamespace(
         hf_config=config,
         quantization="compressed-tensors",
         model=str(artifact),
@@ -1042,7 +1056,7 @@ def test_default_loader_nvfp4_candidate_reaches_native_gpu_kernel(
         reference = input_value @ (reference_weight / 64).t()
 
     quant_calls: list[dict[str, object]] = []
-    real_scaled_fp4_quant = cutlass_module.scaled_fp4_quant
+    real_scaled_fp4_quant = cast(Any, cutlass_module.scaled_fp4_quant)
 
     def record_real_scaled_fp4_quant(
         input_tensor: torch.Tensor,

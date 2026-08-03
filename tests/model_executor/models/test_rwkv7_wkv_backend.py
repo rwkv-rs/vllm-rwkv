@@ -7,6 +7,7 @@ import sys
 import textwrap
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -58,6 +59,7 @@ def test_real_local_fla_rwkv_source_exposes_recurrent_contract() -> None:
     checkout_value = os.environ.get("VLLM_TEST_FLA_RWKV_CHECKOUT")
     if checkout_value is None:
         pytest.skip("VLLM_TEST_FLA_RWKV_CHECKOUT is not set")
+    assert checkout_value is not None
     checkout = Path(checkout_value).resolve()
     revision = subprocess.run(
         ["git", "-C", str(checkout), "rev-parse", "HEAD"],
@@ -201,7 +203,7 @@ def test_fused_contract_forwards_raw_decay_metadata_and_state_identity(
 ) -> None:
     tensors, state_pool, cu_seqlens, state_indices = _inputs(packed=packed)
     output = torch.full_like(tensors[3], 2)
-    calls = []
+    calls: list[Any] = []
     prepare_calls = []
     ticket = object()
 

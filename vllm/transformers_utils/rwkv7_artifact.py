@@ -174,7 +174,10 @@ def convert_rwkv7_pth_to_hf_artifact(
         config,
     )
     with checkpoint.open("rb") as source:
-        config.rwkv_source_sha256 = hashlib.file_digest(source, "sha256").hexdigest()
+        digest = hashlib.sha256()
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+        config.rwkv_source_sha256 = digest.hexdigest()
     config.rwkv_artifact_format_version = 1
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)

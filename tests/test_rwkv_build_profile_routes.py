@@ -191,7 +191,7 @@ def test_rwkv_profile_accepts_upstream_structured_output_constraints(
 def test_rwkv_profile_reuses_xgrammar_streaming_state_progression() -> None:
     class Matcher:
         def __init__(self) -> None:
-            self.accepted = []
+            self.accepted: list[int] = []
 
         def accept_token(self, token_id: int) -> bool:
             self.accepted.append(token_id)
