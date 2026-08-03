@@ -126,10 +126,30 @@ def _inputs(*, packed: bool = True):
     return tensors, state_pool, cu_seqlens, state_indices
 
 
-def _module(recurrent_rwkv7, *, provider="flash_rwkv", kernel=None):
+def _default_prepare_metadata(
+    cu_seqlens,
+    state_indices,
+    *,
+    total_tokens,
+    state_pool_size,
+):
+    return object()
+
+
+def _module(
+    recurrent_rwkv7,
+    *,
+    prepare_metadata=None,
+    provider="flash_rwkv",
+    kernel=None,
+):
     if kernel is None:
         kernel = rwkv7_wkv_backend._EXPECTED_KERNEL
+    if prepare_metadata is None:
+        prepare_metadata = _default_prepare_metadata
+
     return SimpleNamespace(
+        prepare_rwkv7_recurrent_metadata=prepare_metadata,
         recurrent_rwkv7=recurrent_rwkv7,
         get_last_rwkv7_provider=lambda: provider,
         get_last_rwkv7_kernel=lambda: kernel,
@@ -147,6 +167,7 @@ def _recurrent(output, calls):
         *,
         decay_bias,
         elapsed_t,
+        validated_metadata,
         initial_state,
         output_final_state,
         cu_seqlens,
@@ -160,6 +181,7 @@ def _recurrent(output, calls):
                     "initial_state": initial_state,
                     "decay_bias": decay_bias,
                     "elapsed_t": elapsed_t,
+                    "validated_metadata": validated_metadata,
                     "output_final_state": output_final_state,
                     "cu_seqlens": cu_seqlens,
                     "state_indices": state_indices,
@@ -180,7 +202,30 @@ def test_fused_contract_forwards_raw_decay_metadata_and_state_identity(
     tensors, state_pool, cu_seqlens, state_indices = _inputs(packed=packed)
     output = torch.full_like(tensors[3], 2)
     calls = []
-    module = _module(_recurrent(output, calls))
+    prepare_calls = []
+    ticket = object()
+
+    def prepare_metadata(
+        actual_cu_seqlens,
+        actual_state_indices,
+        *,
+        total_tokens,
+        state_pool_size,
+    ):
+        prepare_calls.append(
+            (
+                actual_cu_seqlens,
+                actual_state_indices,
+                total_tokens,
+                state_pool_size,
+            )
+        )
+        return ticket
+
+    module = _module(
+        _recurrent(output, calls),
+        prepare_metadata=prepare_metadata,
+    )
     decay_bias = torch.empty((128,))
     elapsed_t = torch.empty((4,), dtype=torch.int32)
     monkeypatch.setattr(
@@ -189,10 +234,17 @@ def test_fused_contract_forwards_raw_decay_metadata_and_state_identity(
         lambda name: module,
     )
 
+    validated_metadata = rwkv7_wkv_backend.prepare_fla_rwkv7_recurrent_metadata(
+        cu_seqlens,
+        state_indices,
+        total_tokens=3,
+        state_pool_size=4,
+    )
     actual = rwkv7_wkv_backend.run_fla_rwkv7_recurrent_from_decay_logits(
         *tensors,
         decay_bias=decay_bias,
         elapsed_t=elapsed_t,
+        validated_metadata=validated_metadata,
         state_pool=state_pool,
         cu_seqlens=cu_seqlens,
         state_indices=state_indices,
@@ -200,12 +252,15 @@ def test_fused_contract_forwards_raw_decay_metadata_and_state_identity(
     )
 
     assert actual is output
+    assert validated_metadata is ticket
+    assert prepare_calls == [(cu_seqlens, state_indices, 3, 4)]
     assert len(calls) == 1
     args, kwargs = calls[0]
     assert all(actual is expected for actual, expected in zip(args, tensors))
     assert args[1] is tensors[1]
     assert kwargs["decay_bias"] is decay_bias
     assert kwargs["elapsed_t"] is elapsed_t
+    assert kwargs["validated_metadata"] is ticket
     assert kwargs["initial_state"] is state_pool
     assert kwargs["output_final_state"] is True
     assert kwargs["cu_seqlens"] is cu_seqlens
@@ -216,7 +271,18 @@ def test_fused_contract_forwards_raw_decay_metadata_and_state_identity(
 def test_fused_contract_is_resolved_and_inspected_once(monkeypatch) -> None:
     tensors, state_pool, cu_seqlens, state_indices = _inputs()
     output = torch.empty_like(tensors[3])
-    module = _module(_recurrent(output, []))
+    ticket = object()
+
+    def prepare_metadata(
+        cu_seqlens,
+        state_indices,
+        *,
+        total_tokens,
+        state_pool_size,
+    ):
+        return ticket
+
+    module = _module(_recurrent(output, []), prepare_metadata=prepare_metadata)
     decay_bias = torch.empty((128,))
     elapsed_t = None
     imports = []
@@ -235,11 +301,18 @@ def test_fused_contract_is_resolved_and_inspected_once(monkeypatch) -> None:
     monkeypatch.setattr(rwkv7_wkv_backend.importlib, "import_module", import_module)
     monkeypatch.setattr(rwkv7_wkv_backend.inspect, "signature", signature)
 
+    validated_metadata = rwkv7_wkv_backend.prepare_fla_rwkv7_recurrent_metadata(
+        cu_seqlens,
+        state_indices,
+        total_tokens=3,
+        state_pool_size=4,
+    )
     for _ in range(2):
         rwkv7_wkv_backend.run_fla_rwkv7_recurrent_from_decay_logits(
             *tensors,
             decay_bias=decay_bias,
             elapsed_t=elapsed_t,
+            validated_metadata=validated_metadata,
             state_pool=state_pool,
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
@@ -247,7 +320,10 @@ def test_fused_contract_is_resolved_and_inspected_once(monkeypatch) -> None:
         )
 
     assert imports == ["fla.ops.rwkv7"]
-    assert inspections == [module.recurrent_rwkv7]
+    assert inspections == [
+        module.prepare_rwkv7_recurrent_metadata,
+        module.recurrent_rwkv7,
+    ]
 
 
 @pytest.mark.parametrize(
@@ -272,6 +348,7 @@ def test_fused_contract_rejects_other_provider_or_kernel(
     )
     decay_bias = torch.empty((128,))
     elapsed_t = torch.empty((4,), dtype=torch.int32)
+    ticket = object()
     monkeypatch.setattr(
         rwkv7_wkv_backend.importlib,
         "import_module",
@@ -283,6 +360,7 @@ def test_fused_contract_rejects_other_provider_or_kernel(
             *tensors,
             decay_bias=decay_bias,
             elapsed_t=elapsed_t,
+            validated_metadata=ticket,
             state_pool=state_pool,
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
@@ -303,6 +381,7 @@ def test_fused_contract_rejects_copied_state(monkeypatch) -> None:
         *,
         decay_bias,
         elapsed_t,
+        validated_metadata,
         initial_state,
         output_final_state,
         cu_seqlens,
@@ -314,6 +393,7 @@ def test_fused_contract_rejects_copied_state(monkeypatch) -> None:
     module = _module(recurrent_rwkv7)
     decay_bias = torch.empty((128,))
     elapsed_t = None
+    ticket = object()
     monkeypatch.setattr(
         rwkv7_wkv_backend.importlib,
         "import_module",
@@ -325,6 +405,7 @@ def test_fused_contract_rejects_copied_state(monkeypatch) -> None:
             *tensors,
             decay_bias=decay_bias,
             elapsed_t=elapsed_t,
+            validated_metadata=ticket,
             state_pool=state_pool,
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
@@ -337,29 +418,23 @@ def test_noncontiguous_scheduler_metadata_is_not_silently_copied(monkeypatch) ->
     cu_seqlens = torch.arange(6, dtype=torch.int32)[::2]
     state_indices = torch.arange(4, dtype=torch.int32)[::2]
 
-    def recurrent_rwkv7(
-        r,
-        decay_logits,
-        k,
-        v,
-        a,
-        b,
+    def prepare_metadata(
+        actual_cu_seqlens,
+        actual_state_indices,
         *,
-        decay_bias,
-        elapsed_t,
-        initial_state,
-        output_final_state,
-        cu_seqlens: torch.Tensor,
-        state_indices: torch.Tensor,
-        mode,
+        total_tokens,
+        state_pool_size,
     ):
-        assert not cu_seqlens.is_contiguous()
-        assert not state_indices.is_contiguous()
+        assert actual_cu_seqlens is cu_seqlens
+        assert actual_state_indices is state_indices
+        assert not actual_cu_seqlens.is_contiguous()
+        assert not actual_state_indices.is_contiguous()
         raise ValueError("packed metadata must be contiguous")
 
-    module = _module(recurrent_rwkv7)
-    decay_bias = torch.empty((128,))
-    elapsed_t = torch.empty((4,), dtype=torch.int32)
+    module = _module(
+        _recurrent(torch.empty_like(tensors[3]), []),
+        prepare_metadata=prepare_metadata,
+    )
     monkeypatch.setattr(
         rwkv7_wkv_backend.importlib,
         "import_module",
@@ -367,14 +442,11 @@ def test_noncontiguous_scheduler_metadata_is_not_silently_copied(monkeypatch) ->
     )
 
     with pytest.raises(RuntimeError, match="packed metadata must be contiguous"):
-        rwkv7_wkv_backend.run_fla_rwkv7_recurrent_from_decay_logits(
-            *tensors,
-            decay_bias=decay_bias,
-            elapsed_t=elapsed_t,
-            state_pool=state_pool,
-            cu_seqlens=cu_seqlens,
-            state_indices=state_indices,
-            mode="fp16",
+        rwkv7_wkv_backend.prepare_fla_rwkv7_recurrent_metadata(
+            cu_seqlens,
+            state_indices,
+            total_tokens=3,
+            state_pool_size=state_pool.shape[0],
         )
 
 
@@ -389,7 +461,7 @@ def test_missing_fused_api_fails_before_execution(monkeypatch) -> None:
         lambda name: module,
     )
 
-    with pytest.raises(RuntimeError, match="get_last_rwkv7_kernel"):
+    with pytest.raises(RuntimeError, match="prepare_rwkv7_recurrent_metadata"):
         rwkv7_wkv_backend._load_fla_rwkv7_recurrent_contract()
 
 
@@ -419,7 +491,31 @@ def test_fused_api_requires_bias_and_elapsed_parameters(monkeypatch) -> None:
 
     with pytest.raises(
         RuntimeError,
-        match=r"missing parameters \['decay_bias', 'elapsed_t'\]",
+        match=(
+            r"missing parameters \['decay_bias', 'elapsed_t', "
+            r"'validated_metadata'\]"
+        ),
+    ):
+        rwkv7_wkv_backend._load_fla_rwkv7_recurrent_contract()
+
+
+def test_prepare_api_requires_token_and_state_pool_sizes(monkeypatch) -> None:
+    def prepare_metadata(cu_seqlens, state_indices):
+        raise AssertionError("incomplete prepare API must not execute")
+
+    module = _module(
+        _recurrent(torch.empty((1, 3, 2, 64)), []),
+        prepare_metadata=prepare_metadata,
+    )
+    monkeypatch.setattr(
+        rwkv7_wkv_backend.importlib,
+        "import_module",
+        lambda name: module,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"missing parameters \['state_pool_size', 'total_tokens'\]",
     ):
         rwkv7_wkv_backend._load_fla_rwkv7_recurrent_contract()
 
@@ -436,6 +532,7 @@ def test_standard_fused_api_rejects_legacy_log_decay_parameter(monkeypatch) -> N
         *,
         decay_bias,
         elapsed_t,
+        validated_metadata,
         initial_state,
         output_final_state,
         cu_seqlens,
@@ -456,3 +553,80 @@ def test_standard_fused_api_rejects_legacy_log_decay_parameter(monkeypatch) -> N
         match="standard recurrent_rwkv7 API still exposes log_decay",
     ):
         rwkv7_wkv_backend._load_fla_rwkv7_recurrent_contract()
+
+
+@pytest.mark.parametrize("symbol", sorted(rwkv7_wkv_backend._FORBIDDEN_PUBLIC_SYMBOLS))
+def test_fused_api_rejects_public_log_decay_symbols(monkeypatch, symbol) -> None:
+    module = _module(_recurrent(torch.empty((1, 3, 2, 64)), []))
+    setattr(module, symbol, lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        rwkv7_wkv_backend.importlib,
+        "import_module",
+        lambda name: module,
+    )
+
+    with pytest.raises(RuntimeError, match="forbidden canonical log-decay symbols"):
+        rwkv7_wkv_backend._load_fla_rwkv7_recurrent_contract()
+
+
+def test_fused_api_rejects_future_exported_log_decay_symbol(monkeypatch) -> None:
+    module = _module(_recurrent(torch.empty((1, 3, 2, 64)), []))
+    module.__all__ = ["future_log_decay_conversion"]
+    monkeypatch.setattr(
+        rwkv7_wkv_backend.importlib,
+        "import_module",
+        lambda name: module,
+    )
+
+    with pytest.raises(RuntimeError, match="future_log_decay_conversion"):
+        rwkv7_wkv_backend._load_fla_rwkv7_recurrent_contract()
+
+
+def test_prepare_fused_api_rejects_missing_ticket(monkeypatch) -> None:
+    def prepare_metadata(
+        cu_seqlens,
+        state_indices,
+        *,
+        total_tokens,
+        state_pool_size,
+    ):
+        return None
+
+    module = _module(
+        _recurrent(torch.empty((1, 3, 2, 64)), []),
+        prepare_metadata=prepare_metadata,
+    )
+    monkeypatch.setattr(
+        rwkv7_wkv_backend.importlib,
+        "import_module",
+        lambda name: module,
+    )
+
+    with pytest.raises(RuntimeError, match="returned no validation ticket"):
+        rwkv7_wkv_backend.prepare_fla_rwkv7_recurrent_metadata(
+            torch.tensor([0, 3], dtype=torch.int32),
+            torch.tensor([0], dtype=torch.int32),
+            total_tokens=3,
+            state_pool_size=1,
+        )
+
+
+def test_fused_execution_rejects_missing_prevalidated_ticket(monkeypatch) -> None:
+    tensors, state_pool, cu_seqlens, state_indices = _inputs()
+    monkeypatch.setattr(
+        rwkv7_wkv_backend.importlib,
+        "import_module",
+        lambda name: pytest.fail(f"unexpected backend import: {name}"),
+    )
+
+    with pytest.raises(RuntimeError, match="requires a prevalidated metadata ticket"):
+        rwkv7_wkv_backend.run_fla_rwkv7_recurrent_from_decay_logits(
+            *tensors,
+            decay_bias=torch.empty((128,)),
+            elapsed_t=None,
+            validated_metadata=None,
+            state_pool=state_pool,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            mode="fp32io16",
+        )
