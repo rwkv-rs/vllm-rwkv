@@ -64,6 +64,7 @@ def test_real_rwkv7_artifact_uses_packed_recurrent_serving_boundary(
     assert current_platform.get_device_name() == EXPECTED_GPU_NAME
 
     from fla.ops.rwkv7 import get_last_rwkv7_provider
+
     from vllm.model_executor.models import rwkv7 as vllm_rwkv7
     from vllm.transformers_utils.rwkv7_provenance import (
         validate_transformers_rwkv7_runtime_provenance,
