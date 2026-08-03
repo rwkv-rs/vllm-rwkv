@@ -422,3 +422,37 @@ def test_fused_api_requires_bias_and_elapsed_parameters(monkeypatch) -> None:
         match=r"missing parameters \['decay_bias', 'elapsed_t'\]",
     ):
         rwkv7_wkv_backend._load_fla_rwkv7_recurrent_contract()
+
+
+def test_standard_fused_api_rejects_legacy_log_decay_parameter(monkeypatch) -> None:
+    def recurrent_rwkv7(
+        r,
+        log_decay,
+        decay_logits,
+        k,
+        v,
+        a,
+        b,
+        *,
+        decay_bias,
+        elapsed_t,
+        initial_state,
+        output_final_state,
+        cu_seqlens,
+        state_indices,
+        mode,
+    ):
+        raise AssertionError("legacy log_decay API must not execute")
+
+    module = _module(recurrent_rwkv7)
+    monkeypatch.setattr(
+        rwkv7_wkv_backend.importlib,
+        "import_module",
+        lambda name: module,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="standard recurrent_rwkv7 API still exposes log_decay",
+    ):
+        rwkv7_wkv_backend._load_fla_rwkv7_recurrent_contract()
