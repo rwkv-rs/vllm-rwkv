@@ -26,6 +26,7 @@ _REQUIRED_RECURRENT_PARAMETERS = frozenset(
         "initial_state",
         "output_final_state",
         "cu_seqlens",
+        "decay_logits",
         "decay_bias",
         "elapsed_t",
         "state_indices",
@@ -85,6 +86,12 @@ def _load_fla_rwkv7_recurrent_contract() -> tuple[
                 "the installed fla-rwkv recurrent_rwkv7 API lacks the required "
                 f"packed stateful contract: missing parameters {missing}"
             )
+        )
+    if "log_decay" in parameters:
+        raise RuntimeError(
+            "the installed fla-rwkv standard recurrent_rwkv7 API still exposes "
+            "log_decay; canonical log-decay is allowed only through the explicit "
+            "recurrent_rwkv7_from_log_decay compatibility API"
         )
     return recurrent_rwkv7, get_last_provider, get_last_kernel
 
