@@ -244,9 +244,7 @@ def test_rwkv7_auxiliary_tuned_shape_guards() -> None:
 
 
 @pytest.mark.parametrize("wkv_mode", ["fp16", "fp32io16"])
-def test_rwkv7_run_wkv_passes_packed_state_pool_to_recurrent_backend(
-    monkeypatch, wkv_mode
-) -> None:
+def test_rwkv7_run_wkv_passes_raw_decay_to_fused_backend(monkeypatch, wkv_mode) -> None:
     query_start_loc = torch.tensor([0, 2, 3], dtype=torch.int32)
     slot_indices = torch.tensor([3, 1], dtype=torch.int32)
     state_dtype = torch.float32 if wkv_mode == "fp32io16" else torch.float16
@@ -254,7 +252,6 @@ def test_rwkv7_run_wkv_passes_packed_state_pool_to_recurrent_backend(
     tensors = [torch.randn((1, 3, 128), dtype=torch.float16) for _ in range(6)]
     r, w, k, v, neg_kk, kka = tensors
     w0 = torch.randn((128,), dtype=torch.float16)
-    y = torch.empty_like(r)
     elapsed = torch.tensor([2, 0, 7, 11], dtype=torch.int32)
     expected_output = torch.randn((1, 3, 2, 64), dtype=torch.float16)
     calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
@@ -263,7 +260,11 @@ def test_rwkv7_run_wkv_passes_packed_state_pool_to_recurrent_backend(
         calls.append((args, kwargs))
         return expected_output
 
-    monkeypatch.setattr(rwkv7, "run_fla_rwkv7_recurrent", run_fla)
+    monkeypatch.setattr(
+        rwkv7,
+        "run_fla_rwkv7_recurrent_from_decay_logits",
+        run_fla,
+    )
     model = _new_rwkv7_forward_test_model(
         wkv_mode=wkv_mode,
         hidden_size=128,
@@ -271,7 +272,7 @@ def test_rwkv7_run_wkv_passes_packed_state_pool_to_recurrent_backend(
         num_attention_heads=2,
     )
 
-    RWKV7ForCausalLM._run_wkv(
+    output = RWKV7ForCausalLM._run_wkv(
         model,
         query_start_loc,
         slot_indices,
@@ -283,24 +284,27 @@ def test_rwkv7_run_wkv_passes_packed_state_pool_to_recurrent_backend(
         v,
         neg_kk,
         kka,
-        y,
         elapsed,
     )
 
     assert len(calls) == 1
     args, kwargs = calls[0]
     assert all(tensor.shape == (1, 3, 2, 64) for tensor in args)
-    torch.testing.assert_close(
-        args[1],
-        (-np.exp(-0.5) * torch.sigmoid((w + w0).float()))
-        .to(torch.float16)
-        .view(1, 3, 2, 64),
+    assert args[1].untyped_storage().data_ptr() == w.untyped_storage().data_ptr()
+    assert kwargs["decay_bias"].shape == (2, 64)
+    assert kwargs["decay_bias"].untyped_storage().data_ptr() == (
+        w0.untyped_storage().data_ptr()
     )
+    expected_elapsed = elapsed if wkv_mode == "fp16" else None
+    assert kwargs["elapsed_t"] is expected_elapsed
     assert kwargs["state_pool"] is state
     assert kwargs["cu_seqlens"] is query_start_loc
     assert kwargs["state_indices"] is slot_indices
     assert kwargs["mode"] == wkv_mode
-    torch.testing.assert_close(y, expected_output.view_as(y))
+    assert output.shape == r.shape
+    assert output.untyped_storage().data_ptr() == (
+        expected_output.untyped_storage().data_ptr()
+    )
 
 
 def test_rwkv7_forward_layer_range_uses_slot_fused_tmix_for_batched_decode(

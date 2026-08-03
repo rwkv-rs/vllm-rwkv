@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import inspect
+
+from types import SimpleNamespace
 import os
 import subprocess
 import sys
 import textwrap
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -77,7 +77,7 @@ def test_real_local_fla_rwkv_source_exposes_recurrent_contract() -> None:
             _load_fla_rwkv7_recurrent_contract,
         )
 
-        recurrent_rwkv7, _ = _load_fla_rwkv7_recurrent_contract()
+        recurrent_rwkv7 = _load_fla_rwkv7_recurrent_contract()[0]
         parameters = inspect.signature(recurrent_rwkv7).parameters
         assert {"state_indices", "mode"} <= parameters.keys()
         """
@@ -107,33 +107,11 @@ def test_fla_rwkv_import_error_reports_required_source_revisions(monkeypatch) ->
     assert f"FlashRWKV@{rwkv7_wkv_backend.FLASH_RWKV_REVISION}" in message
 
 
-def test_missing_recurrent_api_fails_before_execution(monkeypatch) -> None:
-    called = False
-
-    def incompatible_public_api(*_args, **_kwargs):
-        nonlocal called
-        called = True
-
-    module = SimpleNamespace(
-        incompatible_public_api=incompatible_public_api,
-        get_last_rwkv7_provider=lambda: "flash_rwkv",
-    )
-    monkeypatch.setattr(
-        rwkv7_wkv_backend.importlib,
-        "import_module",
-        lambda name: module,
-    )
-    tensors, state_pool, cu_seqlens, state_indices = _inputs()
-
-    with pytest.raises(RuntimeError, match="does not expose recurrent_rwkv7"):
-        rwkv7_wkv_backend.run_fla_rwkv7_recurrent(
-            *tensors,
-            state_pool=state_pool,
-            cu_seqlens=cu_seqlens,
-            state_indices=state_indices,
-            mode="fp16",
-        )
-    assert not called
+@pytest.fixture(autouse=True)
+def clear_fla_contract_cache():
+    rwkv7_wkv_backend._load_fla_rwkv7_recurrent_contract.cache_clear()
+    yield
+    rwkv7_wkv_backend._load_fla_rwkv7_recurrent_contract.cache_clear()
 
 
 def _inputs(*, packed: bool = True):
@@ -148,29 +126,261 @@ def _inputs(*, packed: bool = True):
     return tensors, state_pool, cu_seqlens, state_indices
 
 
-def test_recurrent_contract_missing_state_indices_fails_before_execution(
-    monkeypatch,
-) -> None:
-    called = False
+def _module(recurrent_rwkv7, *, provider="flash_rwkv", kernel=None):
+    if kernel is None:
+        kernel = rwkv7_wkv_backend._EXPECTED_KERNEL
+    return SimpleNamespace(
+        recurrent_rwkv7=recurrent_rwkv7,
+        get_last_rwkv7_provider=lambda: provider,
+        get_last_rwkv7_kernel=lambda: kernel,
+    )
 
-    def incomplete_recurrent_rwkv7(
+
+def _recurrent(output, calls):
+    def recurrent_rwkv7(
         r,
-        w,
+        decay_logits,
         k,
         v,
         a,
         b,
         *,
-        initial_state=None,
-        output_final_state=False,
-        cu_seqlens=None,
-        mode="fp32io16",
+        decay_bias,
+        elapsed_t,
+        initial_state,
+        output_final_state,
+        cu_seqlens,
+        state_indices,
+        mode,
     ):
-        nonlocal called
-        called = True
+        calls.append(
+            (
+                (r, decay_logits, k, v, a, b),
+                {
+                    "initial_state": initial_state,
+                    "decay_bias": decay_bias,
+                    "elapsed_t": elapsed_t,
+                    "output_final_state": output_final_state,
+                    "cu_seqlens": cu_seqlens,
+                    "state_indices": state_indices,
+                    "mode": mode,
+                },
+            )
+        )
+        return output, initial_state
 
+    return recurrent_rwkv7
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=("ordinary", "packed"))
+def test_fused_contract_forwards_raw_decay_metadata_and_state_identity(
+    monkeypatch,
+    packed,
+) -> None:
+    tensors, state_pool, cu_seqlens, state_indices = _inputs(packed=packed)
+    output = torch.full_like(tensors[3], 2)
+    calls = []
+    module = _module(_recurrent(output, calls))
+    decay_bias = torch.empty((128,))
+    elapsed_t = torch.empty((4,), dtype=torch.int32)
+    monkeypatch.setattr(
+        rwkv7_wkv_backend.importlib,
+        "import_module",
+        lambda name: module,
+    )
+
+    actual = rwkv7_wkv_backend.run_fla_rwkv7_recurrent_from_decay_logits(
+        *tensors,
+        decay_bias=decay_bias,
+        elapsed_t=elapsed_t,
+        state_pool=state_pool,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        mode="fp16",
+    )
+
+    assert actual is output
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert all(actual is expected for actual, expected in zip(args, tensors))
+    assert args[1] is tensors[1]
+    assert kwargs["decay_bias"] is decay_bias
+    assert kwargs["elapsed_t"] is elapsed_t
+    assert kwargs["initial_state"] is state_pool
+    assert kwargs["output_final_state"] is True
+    assert kwargs["cu_seqlens"] is cu_seqlens
+    assert kwargs["state_indices"] is state_indices
+    assert kwargs["mode"] == "fp16"
+
+
+def test_fused_contract_is_resolved_and_inspected_once(monkeypatch) -> None:
+    tensors, state_pool, cu_seqlens, state_indices = _inputs()
+    output = torch.empty_like(tensors[3])
+    module = _module(_recurrent(output, []))
+    decay_bias = torch.empty((128,))
+    elapsed_t = None
+    imports = []
+    inspections = []
+
+    def import_module(name):
+        imports.append(name)
+        return module
+
+    original_signature = rwkv7_wkv_backend.inspect.signature
+
+    def signature(value):
+        inspections.append(value)
+        return original_signature(value)
+
+    monkeypatch.setattr(rwkv7_wkv_backend.importlib, "import_module", import_module)
+    monkeypatch.setattr(rwkv7_wkv_backend.inspect, "signature", signature)
+
+    for _ in range(2):
+        rwkv7_wkv_backend.run_fla_rwkv7_recurrent_from_decay_logits(
+            *tensors,
+            decay_bias=decay_bias,
+            elapsed_t=elapsed_t,
+            state_pool=state_pool,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            mode="fp32io16",
+        )
+
+    assert imports == ["fla.ops.rwkv7"]
+    assert inspections == [module.recurrent_rwkv7]
+
+
+@pytest.mark.parametrize(
+    ("provider", "kernel", "expected"),
+    [
+        ("triton", rwkv7_wkv_backend._EXPECTED_KERNEL, "fallback is disabled"),
+        ("flash_rwkv", "rwkv7_recurrent", "fallback is disabled"),
+    ],
+)
+def test_fused_contract_rejects_other_provider_or_kernel(
+    monkeypatch,
+    provider,
+    kernel,
+    expected,
+) -> None:
+    tensors, state_pool, cu_seqlens, state_indices = _inputs()
+    output = torch.empty_like(tensors[3])
+    module = _module(
+        _recurrent(output, []),
+        provider=provider,
+        kernel=kernel,
+    )
+    decay_bias = torch.empty((128,))
+    elapsed_t = torch.empty((4,), dtype=torch.int32)
+    monkeypatch.setattr(
+        rwkv7_wkv_backend.importlib,
+        "import_module",
+        lambda name: module,
+    )
+
+    with pytest.raises(RuntimeError, match=expected):
+        rwkv7_wkv_backend.run_fla_rwkv7_recurrent_from_decay_logits(
+            *tensors,
+            decay_bias=decay_bias,
+            elapsed_t=elapsed_t,
+            state_pool=state_pool,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            mode="fp16",
+        )
+
+
+def test_fused_contract_rejects_copied_state(monkeypatch) -> None:
+    tensors, state_pool, cu_seqlens, state_indices = _inputs()
+
+    def recurrent_rwkv7(
+        r,
+        decay_logits,
+        k,
+        v,
+        a,
+        b,
+        *,
+        decay_bias,
+        elapsed_t,
+        initial_state,
+        output_final_state,
+        cu_seqlens,
+        state_indices,
+        mode,
+    ):
+        return torch.empty_like(v), initial_state.clone()
+
+    module = _module(recurrent_rwkv7)
+    decay_bias = torch.empty((128,))
+    elapsed_t = None
+    monkeypatch.setattr(
+        rwkv7_wkv_backend.importlib,
+        "import_module",
+        lambda name: module,
+    )
+
+    with pytest.raises(RuntimeError, match="state pool in place"):
+        rwkv7_wkv_backend.run_fla_rwkv7_recurrent_from_decay_logits(
+            *tensors,
+            decay_bias=decay_bias,
+            elapsed_t=elapsed_t,
+            state_pool=state_pool,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            mode="fp32io16",
+        )
+
+
+def test_noncontiguous_scheduler_metadata_is_not_silently_copied(monkeypatch) -> None:
+    tensors, state_pool, _cu_seqlens, _state_indices = _inputs()
+    cu_seqlens = torch.arange(6, dtype=torch.int32)[::2]
+    state_indices = torch.arange(4, dtype=torch.int32)[::2]
+
+    def recurrent_rwkv7(
+        r,
+        decay_logits,
+        k,
+        v,
+        a,
+        b,
+        *,
+        decay_bias,
+        elapsed_t,
+        initial_state,
+        output_final_state,
+        cu_seqlens: torch.Tensor,
+        state_indices: torch.Tensor,
+        mode,
+    ):
+        assert not cu_seqlens.is_contiguous()
+        assert not state_indices.is_contiguous()
+        raise ValueError("packed metadata must be contiguous")
+
+    module = _module(recurrent_rwkv7)
+    decay_bias = torch.empty((128,))
+    elapsed_t = torch.empty((4,), dtype=torch.int32)
+    monkeypatch.setattr(
+        rwkv7_wkv_backend.importlib,
+        "import_module",
+        lambda name: module,
+    )
+
+    with pytest.raises(RuntimeError, match="packed metadata must be contiguous"):
+        rwkv7_wkv_backend.run_fla_rwkv7_recurrent_from_decay_logits(
+            *tensors,
+            decay_bias=decay_bias,
+            elapsed_t=elapsed_t,
+            state_pool=state_pool,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            mode="fp16",
+        )
+
+
+def test_missing_fused_api_fails_before_execution(monkeypatch) -> None:
     module = SimpleNamespace(
-        recurrent_rwkv7=incomplete_recurrent_rwkv7,
+        recurrent_rwkv7=lambda *args, **kwargs: None,
         get_last_rwkv7_provider=lambda: "flash_rwkv",
     )
     monkeypatch.setattr(
@@ -178,44 +388,15 @@ def test_recurrent_contract_missing_state_indices_fails_before_execution(
         "import_module",
         lambda name: module,
     )
-    tensors, state_pool, cu_seqlens, state_indices = _inputs()
 
-    with pytest.raises(
-        RuntimeError,
-        match=r"missing parameters \['state_indices'\]",
-    ):
-        rwkv7_wkv_backend.run_fla_rwkv7_recurrent(
-            *tensors,
-            state_pool=state_pool,
-            cu_seqlens=cu_seqlens,
-            state_indices=state_indices,
-            mode="fp32io16",
-        )
-    assert not called
+    with pytest.raises(RuntimeError, match="get_last_rwkv7_kernel"):
+        rwkv7_wkv_backend._load_fla_rwkv7_recurrent_contract()
 
 
-@pytest.mark.parametrize(
-    ("provider", "return_original_pool", "error"),
-    [
-        ("triton", True, "fallback is disabled"),
-        (
-            "flash_rwkv",
-            False,
-            "update the supplied request-indexed state pool in place",
-        ),
-    ],
-)
-def test_recurrent_contract_rejects_fallback_or_copied_state(
-    monkeypatch,
-    provider,
-    return_original_pool,
-    error,
-) -> None:
-    tensors, state_pool, cu_seqlens, state_indices = _inputs()
-
+def test_fused_api_requires_bias_and_elapsed_parameters(monkeypatch) -> None:
     def recurrent_rwkv7(
         r,
-        w,
+        decay_logits,
         k,
         v,
         a,
@@ -227,89 +408,17 @@ def test_recurrent_contract_rejects_fallback_or_copied_state(
         state_indices,
         mode,
     ):
-        final_state = initial_state if return_original_pool else initial_state.clone()
-        return torch.empty_like(v), final_state
+        raise AssertionError("incomplete API must not execute")
 
-    module = SimpleNamespace(
-        recurrent_rwkv7=recurrent_rwkv7,
-        get_last_rwkv7_provider=lambda: provider,
-    )
+    module = _module(recurrent_rwkv7)
     monkeypatch.setattr(
         rwkv7_wkv_backend.importlib,
         "import_module",
         lambda name: module,
     )
 
-    with pytest.raises(RuntimeError, match=error):
-        rwkv7_wkv_backend.run_fla_rwkv7_recurrent(
-            *tensors,
-            state_pool=state_pool,
-            cu_seqlens=cu_seqlens,
-            state_indices=state_indices,
-            mode="fp32io16",
-        )
-
-
-@pytest.mark.parametrize("packed", [False, True], ids=("ordinary", "packed"))
-def test_recurrent_contract_forwards_metadata_and_state_pool(
-    monkeypatch,
-    packed,
-) -> None:
-    tensors, state_pool, cu_seqlens, state_indices = _inputs(packed=packed)
-    calls = []
-
-    def recurrent_rwkv7(*args, **kwargs):
-        calls.append((args, kwargs))
-        return torch.full_like(args[3], 2), kwargs["initial_state"]
-
-    recurrent_rwkv7.__signature__ = inspect.Signature(
-        parameters=[
-            *(
-                inspect.Parameter(
-                    name,
-                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                )
-                for name in ("r", "w", "k", "v", "a", "b")
-            ),
-            *(
-                inspect.Parameter(
-                    name,
-                    inspect.Parameter.KEYWORD_ONLY,
-                )
-                for name in (
-                    "initial_state",
-                    "output_final_state",
-                    "cu_seqlens",
-                    "state_indices",
-                    "mode",
-                )
-            ),
-        ]
-    )
-    module = SimpleNamespace(
-        recurrent_rwkv7=recurrent_rwkv7,
-        get_last_rwkv7_provider=lambda: "flash_rwkv",
-    )
-    monkeypatch.setattr(
-        rwkv7_wkv_backend.importlib,
-        "import_module",
-        lambda name: module,
-    )
-
-    output = rwkv7_wkv_backend.run_fla_rwkv7_recurrent(
-        *tensors,
-        state_pool=state_pool,
-        cu_seqlens=cu_seqlens,
-        state_indices=state_indices,
-        mode="fp16",
-    )
-
-    assert torch.equal(output, torch.full_like(tensors[3], 2))
-    assert len(calls) == 1
-    assert all(actual is expected for actual, expected in zip(calls[0][0], tensors))
-    kwargs = calls[0][1]
-    assert kwargs["initial_state"] is state_pool
-    assert kwargs["output_final_state"] is True
-    assert kwargs["cu_seqlens"] is cu_seqlens
-    assert kwargs["state_indices"] is state_indices
-    assert kwargs["mode"] == "fp16"
+    with pytest.raises(
+        RuntimeError,
+        match=r"missing parameters \['decay_bias', 'elapsed_t'\]",
+    ):
+        rwkv7_wkv_backend._load_fla_rwkv7_recurrent_contract()

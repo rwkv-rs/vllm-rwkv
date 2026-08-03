@@ -6,6 +6,10 @@
 import pytest
 import torch
 
+from vllm.model_executor.models.rwkv7_wkv_backend import (
+    run_fla_rwkv7_recurrent_from_decay_logits,
+)
+
 HEAD_SIZE = 64
 TWO_NEG_41 = 4.547473508864641e-13
 NEXP_HALF_LOG2_E = -0.8750387749145276
@@ -304,6 +308,103 @@ def test_wkv_fp32_matches_float_reference() -> None:
 
     torch.testing.assert_close(output, expected_output, atol=2e-3, rtol=2e-3)
     torch.testing.assert_close(state, expected_state, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize("mode", ["fp16", "fp32io16"])
+@pytest.mark.parametrize("lengths", [(1,), (2, 3), (1, 4, 2)])
+def test_fla_fused_raw_decay_matches_legacy_varlen_state_semantics(
+    mode: str,
+    lengths: tuple[int, ...],
+) -> None:
+    pytest.importorskip("fla.ops.rwkv7")
+    state_dtype = torch.float16 if mode == "fp16" else torch.float32
+    (
+        query_start_loc,
+        slot_indices,
+        legacy_state,
+        r,
+        w,
+        k,
+        v,
+        a,
+        b,
+        w0,
+        elapsed,
+    ) = _case(lengths, state_dtype=state_dtype, seed=70 + sum(lengths))
+    initial_legacy_state = legacy_state.clone()
+    legacy_output = torch.empty_like(r)
+    if mode == "fp16":
+        torch.ops.rwkv7_wkv_fp16_v2.wkv(
+            query_start_loc,
+            slot_indices,
+            legacy_state,
+            r,
+            w,
+            w0,
+            k,
+            v,
+            a,
+            b,
+            legacy_output,
+            elapsed,
+        )
+    else:
+        combined_decay_logits = torch.ops.rwkv7_fast_ops_fp16.add_vec(
+            HEAD_SIZE,
+            w,
+            w0,
+        )
+        torch.ops.rwkv7_wkv_fp32_v2.wkv(
+            query_start_loc,
+            slot_indices,
+            legacy_state,
+            r,
+            combined_decay_logits,
+            k,
+            v,
+            a,
+            b,
+            legacy_output,
+        )
+
+    canonical_state = initial_legacy_state.transpose(-1, -2).contiguous()
+    fused_output = run_fla_rwkv7_recurrent_from_decay_logits(
+        r.view(1, -1, 1, HEAD_SIZE),
+        w.view(1, -1, 1, HEAD_SIZE),
+        k.view(1, -1, 1, HEAD_SIZE),
+        v.view(1, -1, 1, HEAD_SIZE),
+        a.view(1, -1, 1, HEAD_SIZE),
+        b.view(1, -1, 1, HEAD_SIZE),
+        decay_bias=w0.view(1, HEAD_SIZE),
+        elapsed_t=elapsed if mode == "fp16" else None,
+        state_pool=canonical_state,
+        cu_seqlens=query_start_loc,
+        state_indices=slot_indices,
+        mode=mode,
+    ).view_as(r)
+    torch.accelerator.synchronize()
+
+    expected_canonical_state = legacy_state.transpose(-1, -2).contiguous()
+    output_tolerance = 3e-3 if mode == "fp16" else 2e-3
+    state_tolerance = 3e-3 if mode == "fp16" else 2e-5
+    torch.testing.assert_close(
+        fused_output,
+        legacy_output,
+        atol=output_tolerance,
+        rtol=output_tolerance,
+    )
+    torch.testing.assert_close(
+        canonical_state,
+        expected_canonical_state,
+        atol=state_tolerance,
+        rtol=state_tolerance,
+    )
+    untouched = torch.ones(canonical_state.size(0), dtype=torch.bool, device="cuda")
+    untouched[slot_indices.long()] = False
+    assert torch.equal(
+        canonical_state[untouched],
+        initial_legacy_state.transpose(-1, -2)[untouched],
+    )
 
 
 def test_wkv_fp16_is_repeatable_and_graph_capturable() -> None:

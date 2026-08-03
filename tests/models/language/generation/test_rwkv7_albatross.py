@@ -47,6 +47,7 @@ LOSS_MAX_ATOL = float(os.environ.get("RWKV7_ALBATROSS_LOSS_MAX_ATOL", "0.25"))
 LOGIT_MAX_ABS = float(os.environ.get("RWKV7_ALBATROSS_LOGIT_MAX_ABS", "0.1"))
 LOGIT_REL_L2 = float(os.environ.get("RWKV7_ALBATROSS_LOGIT_REL_L2", "0.0025"))
 LOGIT_COSINE = float(os.environ.get("RWKV7_ALBATROSS_LOGIT_COSINE", "0.9999995"))
+STATE_REL_L2 = float(os.environ.get("RWKV7_ALBATROSS_STATE_REL_L2", "0.003"))
 ALBATROSS_REFERENCE_NAME = "albatross"
 ALBATROSS_REFERENCE_IMPL = "faster3a_2607"
 ALBATROSS_REFERENCE_REVISION = "ee3308f6922e59f2166c7fac3c5a192340a2b48e"
@@ -535,6 +536,14 @@ def albatross_oracle(
             f"stderr:\n{result.stderr}"
         )
     oracle = json.loads(response_path.read_text(encoding="utf-8"))
+    state_path = response_path.with_suffix(".state.pt")
+    if not state_path.is_file():
+        raise RuntimeError("Albatross oracle did not record canonical final state")
+    oracle["canonical_state"] = torch.load(
+        state_path,
+        map_location="cpu",
+        weights_only=True,
+    )
     oracle["reference"] = {
         "implementation": rwkv7_albatross_settings.impl_dir.name,
         "revision": rwkv7_albatross_settings.revision,
@@ -628,6 +637,7 @@ def _albatross_oracle_code() -> str:
             ]
 
         cases = []
+        state_path = response_path.rsplit(".", 1)[0] + ".state.pt"
         for item in request["prompts"]:
             ids = encode(item["text"])
             state = model.zero_state(1)
@@ -635,6 +645,20 @@ def _albatross_oracle_code() -> str:
                 ids, dtype=torch.long, device=token_device
             ).view(1, -1)
             logits = model.forward(tokens, state).view(-1)
+            if not cases:
+                torch.save(
+                    {
+                        "shift": state[0][:, :, 0].detach().float().cpu(),
+                        "wkv": state[1][:, 0]
+                        .transpose(-1, -2)
+                        .contiguous()
+                        .detach()
+                        .float()
+                        .cpu(),
+                        "elapsed": state[2].detach().cpu(),
+                    },
+                    state_path,
+                )
             losses = prompt_losses(ids)
             top2_logits = torch.topk(logits.float(), k=2).values
             greedy_token_ids, greedy_top1_gaps = greedy(
@@ -790,11 +814,18 @@ def _worker_direct_next_logits(
         raise RuntimeError("RWKV7 head weights must remain CUDA FP16")
 
     outputs: list[torch.Tensor] = []
+    canonical_state: dict[str, torch.Tensor] | None = None
     with torch.inference_mode():
         for ids in prompt_token_ids:
             tokens = torch.tensor(ids, dtype=torch.long, device="cuda").view(1, -1)
             state = model.zero_state(1)
             hidden = model.forward_tokens(tokens, state)
+            if canonical_state is None:
+                canonical_state = {
+                    "shift": state[0][:, :, 0].detach().float().cpu(),
+                    "wkv": state[1][:, 0].detach().float().cpu(),
+                    "elapsed": state[2].detach().cpu(),
+                }
             if hidden.dtype != torch.float16 or not hidden.is_cuda:
                 raise RuntimeError("RWKV7 hidden states must remain CUDA FP16")
             logits = model.compute_logits(hidden)
@@ -823,6 +854,7 @@ def _worker_direct_next_logits(
         "head_weight_dtype": str(head_weight.dtype),
         "logits_dtype": str(outputs[0].dtype) if outputs else "torch.float32",
         "logits": outputs,
+        "canonical_state": canonical_state,
     }
 
 
@@ -986,6 +1018,48 @@ def test_rwkv7_direct_fp32_logits_match_albatross(
             {
                 "albatross_reference": albatross_oracle["reference"],
                 "rwkv7_direct_fp32_logits_alignment": metrics,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+
+
+def test_rwkv7_direct_fp32_state_matches_albatross(
+    albatross_oracle: dict[str, Any],
+    vllm_direct_logits: dict[str, Any],
+) -> None:
+    expected_state = albatross_oracle["canonical_state"]
+    actual_state = vllm_direct_logits["canonical_state"]
+    assert actual_state is not None
+    assert torch.equal(actual_state["elapsed"], expected_state["elapsed"])
+
+    metrics = {}
+    for name in ("shift", "wkv"):
+        expected = cast(torch.Tensor, expected_state[name]).float()
+        actual = cast(torch.Tensor, actual_state[name]).float()
+        assert actual.shape == expected.shape
+        assert torch.isfinite(actual).all()
+        difference = actual - expected
+        relative_l2 = float(
+            torch.linalg.vector_norm(difference)
+            / torch.linalg.vector_norm(expected).clamp_min(
+                torch.finfo(torch.float32).tiny
+            )
+        )
+        metrics[name] = {
+            "max_abs": float(difference.abs().max()),
+            "relative_l2": relative_l2,
+        }
+        assert relative_l2 <= STATE_REL_L2, (
+            f"{name} state relative L2 {relative_l2:.6e} > {STATE_REL_L2:.6e}"
+        )
+
+    print(
+        json.dumps(
+            {
+                "albatross_reference": albatross_oracle["reference"],
+                "rwkv7_direct_fp32_state_alignment": metrics,
             },
             sort_keys=True,
         ),
