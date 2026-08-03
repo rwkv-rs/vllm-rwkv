@@ -4,4 +4,4 @@
 # explicit and reviewable.
 flash-linear-attention[flash-rwkv] @ git+https://github.com/rwkv-rs/fla-rwkv.git@606752b7dff79eb326eeebf2d046102027da5306
 flash-rwkv @ git+https://github.com/rwkv-rs/FlashRWKV.git@8b3d08a9a9430df23fb9da9b35fb0aa625faa1fb
-transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@a6c3aa33fe1f99d063acbbd7b4df469819613449
+transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@e1ae554b27f9b113c1549476bad5c54864ee6022
