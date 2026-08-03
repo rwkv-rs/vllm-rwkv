@@ -18,9 +18,7 @@ from vllm import LLM, SamplingParams
 from vllm.platforms import current_platform
 
 
-CHECKPOINT_SHA256 = (
-    "737079d81865801fd85e5459488d89a36d5304a524e890244eb83d44f531c89c"
-)
+CHECKPOINT_SHA256 = "737079d81865801fd85e5459488d89a36d5304a524e890244eb83d44f531c89c"
 FIXED_PROMPT_TOKEN_IDS = [1, 7, 11, 3]
 EXPECTED_GPU_NAME = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
 
@@ -152,15 +150,13 @@ def test_real_rwkv7_artifact_uses_packed_recurrent_serving_boundary(
         sampling = SamplingParams(
             temperature=1.0, top_k=1, max_tokens=4, ignore_eos=True
         )
-        request = [{"prompt_token_ids": FIXED_PROMPT_TOKEN_IDS}]
+        request: Any = [{"prompt_token_ids": FIXED_PROMPT_TOKEN_IDS}]
         for _ in range(2):
-            llm.generate(request, sampling, use_tqdm=False)  # type: ignore[arg-type]
+            llm.generate(request, sampling, use_tqdm=False)
         for _ in range(5):
             torch.accelerator.synchronize()
             started = time.perf_counter()
-            outputs = llm.generate(  # type: ignore[arg-type]
-                request, sampling, use_tqdm=False
-            )
+            outputs = llm.generate(request, sampling, use_tqdm=False)
             torch.accelerator.synchronize()
             timings_ms.append((time.perf_counter() - started) * 1000.0)
         assert len(outputs) == 1
@@ -171,7 +167,7 @@ def test_real_rwkv7_artifact_uses_packed_recurrent_serving_boundary(
     finally:
         if llm is not None:
             with contextlib.suppress(Exception):
-                getattr(llm, "shutdown")()
+                llm.shutdown()  # type: ignore[attr-defined]
 
     assert forbidden_calls == []
     assert recurrent_calls
