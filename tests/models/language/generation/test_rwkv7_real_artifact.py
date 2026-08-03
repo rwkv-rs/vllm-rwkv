@@ -8,6 +8,7 @@ import contextlib
 import json
 import os
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -179,10 +180,15 @@ def test_real_rwkv7_artifact_uses_packed_recurrent_serving_boundary(
     )
     assert recurrent_calls[0]["before_state_norm_squared"] == 0.0
     assert recurrent_calls[0]["after_state_norm_squared"] > 0.0
-    assert all(
-        call["state_pointer"] == recurrent_calls[0]["state_pointer"]
-        for call in recurrent_calls
-    )
+    calls_by_state = defaultdict(list)
+    for call in recurrent_calls:
+        calls_by_state[call["state_pointer"]].append(call)
+    expected_layer_count = int(metadata["config"]["num_hidden_layers"])
+    assert len(calls_by_state) == expected_layer_count
+    assert len({len(layer_calls) for layer_calls in calls_by_state.values()}) == 1
+    for layer_calls in calls_by_state.values():
+        assert layer_calls[0]["before_state_norm_squared"] == 0.0
+        assert layer_calls[0]["after_state_norm_squared"] > 0.0
 
     evidence = {
         "artifact": str(artifact),
