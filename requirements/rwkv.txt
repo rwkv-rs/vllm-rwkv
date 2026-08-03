@@ -23,7 +23,7 @@ requests>=2.26.0
 tqdm
 blake3
 py-cpuinfo
-transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@2fe087ee6379ac0b33e9e23b684478cbc51af070
+transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@a6c3aa33fe1f99d063acbbd7b4df469819613449
 tokenizers>=0.21.1
 safetensors>=0.6.2
 protobuf>=5.29.6,!=6.30.*,!=6.31.*,!=6.32.*,!=6.33.0.*,!=6.33.1.*,!=6.33.2.*,!=6.33.3.*,!=6.33.4.*
