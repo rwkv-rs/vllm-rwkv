@@ -24,6 +24,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models.rwkv7_wkv_backend import (
+    prepare_fla_rwkv7_recurrent_metadata,
     run_fla_rwkv7_recurrent_from_decay_logits,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -1774,6 +1775,12 @@ class RWKV7ForCausalLM(nn.Module):
             z[f"blocks.{start_layer}.ln1.bias"],
         )
         pre_mix = None
+        validated_wkv_metadata = prepare_fla_rwkv7_recurrent_metadata(
+            query_start_loc,
+            wkv_slot_indices,
+            total_tokens=B * T,
+            state_pool_size=int(state[1][0].shape[0]),
+        )
 
         for layer in range(start_layer, end_layer):
             local_layer = layer - start_layer
@@ -1790,6 +1797,7 @@ class RWKV7ForCausalLM(nn.Module):
                 p + "att.",
                 path,
                 pre_mix,
+                validated_wkv_metadata=validated_wkv_metadata,
                 slot_indices=slot_indices,
                 query_start_loc=query_start_loc,
                 wkv_slot_indices=wkv_slot_indices,
@@ -1961,6 +1969,12 @@ class RWKV7ForCausalLM(nn.Module):
             z[f"blocks.{start_layer}.ln1.weight"],
             z[f"blocks.{start_layer}.ln1.bias"],
         )
+        validated_wkv_metadata = prepare_fla_rwkv7_recurrent_metadata(
+            query_start_loc,
+            slot_indices,
+            total_tokens=total_tokens,
+            state_pool_size=int(state[1][0].shape[0]),
+        )
 
         for layer in range(start_layer, end_layer):
             local_layer = layer - start_layer
@@ -1976,6 +1990,7 @@ class RWKV7ForCausalLM(nn.Module):
                 layer_v_first,
                 p + "att.",
                 path,
+                validated_wkv_metadata=validated_wkv_metadata,
                 query_start_loc=query_start_loc,
                 slot_indices=slot_indices,
                 req_id=req_id,
@@ -2234,6 +2249,7 @@ class RWKV7ForCausalLM(nn.Module):
         p: str,
         path: PathConfig,
         *,
+        validated_wkv_metadata: object,
         query_start_loc: torch.Tensor,
         slot_indices: torch.Tensor,
         req_id: torch.Tensor,
@@ -2288,6 +2304,7 @@ class RWKV7ForCausalLM(nn.Module):
             neg_kk,
             kka,
             elapsed_t,
+            validated_metadata=validated_wkv_metadata,
         )
         y = ops.tmix_lnx_rkvres_xg(
             total_tokens,
@@ -2351,6 +2368,8 @@ class RWKV7ForCausalLM(nn.Module):
         neg_kk: torch.Tensor,
         kka: torch.Tensor,
         elapsed_t: torch.Tensor,
+        *,
+        validated_metadata: object,
     ) -> torch.Tensor:
         """Run the fused raw-decay packed-varlen recurrent operator."""
         hidden_size = r.shape[-1]
@@ -2376,6 +2395,7 @@ class RWKV7ForCausalLM(nn.Module):
             kka_rows.view(packed_shape),
             decay_bias=w0.view(hidden_size // self.head_size, self.head_size),
             elapsed_t=elapsed_t if self.wkv_mode == "fp16" else None,
+            validated_metadata=validated_metadata,
             state_pool=state,
             cu_seqlens=query_start_loc,
             state_indices=slot_indices,
@@ -2394,6 +2414,8 @@ class RWKV7ForCausalLM(nn.Module):
         p: str,
         path: PathConfig,
         pre_mix=None,
+        *,
+        validated_wkv_metadata: object,
         slot_indices: torch.Tensor | None = None,
         query_start_loc: torch.Tensor | None = None,
         wkv_slot_indices: torch.Tensor | None = None,
@@ -2468,6 +2490,7 @@ class RWKV7ForCausalLM(nn.Module):
             neg_kk,
             kka,
             elapsed_t,
+            validated_metadata=validated_wkv_metadata,
         )
         lnx = (
             ops.tmix_lnx_rkvres_xg_warp

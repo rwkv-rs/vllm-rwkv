@@ -253,6 +253,7 @@ def test_rwkv7_run_wkv_passes_raw_decay_to_fused_backend(monkeypatch, wkv_mode) 
     r, w, k, v, neg_kk, kka = tensors
     w0 = torch.randn((128,), dtype=torch.float16)
     elapsed = torch.tensor([2, 0, 7, 11], dtype=torch.int32)
+    validated_metadata = object()
     expected_output = torch.randn((1, 3, 2, 64), dtype=torch.float16)
     calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
 
@@ -285,6 +286,7 @@ def test_rwkv7_run_wkv_passes_raw_decay_to_fused_backend(monkeypatch, wkv_mode) 
         neg_kk,
         kka,
         elapsed,
+        validated_metadata=validated_metadata,
     )
 
     assert len(calls) == 1
@@ -297,6 +299,7 @@ def test_rwkv7_run_wkv_passes_raw_decay_to_fused_backend(monkeypatch, wkv_mode) 
     )
     expected_elapsed = elapsed if wkv_mode == "fp16" else None
     assert kwargs["elapsed_t"] is expected_elapsed
+    assert kwargs["validated_metadata"] is validated_metadata
     assert kwargs["state_pool"] is state
     assert kwargs["cu_seqlens"] is query_start_loc
     assert kwargs["state_indices"] is slot_indices
@@ -311,6 +314,25 @@ def test_rwkv7_forward_layer_range_uses_slot_fused_tmix_for_batched_decode(
     monkeypatch,
 ):
     calls: list[Any] = []
+    validated_metadata = object()
+
+    def prepare_metadata(
+        query_start_loc,
+        state_indices,
+        *,
+        total_tokens,
+        state_pool_size,
+    ):
+        calls.append(
+            (
+                "prepare",
+                query_start_loc.tolist(),
+                state_indices.tolist(),
+                total_tokens,
+                state_pool_size,
+            )
+        )
+        return validated_metadata
 
     def fused_cmix(x, residual, shift_state, weight, bias, x_k, slot_indices):
         calls.append(("fused_cmix", slot_indices.tolist()))
@@ -337,6 +359,11 @@ def test_rwkv7_forward_layer_range_uses_slot_fused_tmix_for_batched_decode(
     def advance_slots(elapsed, slot_indices, amount):
         calls.append(("advance", slot_indices.tolist(), amount))
 
+    monkeypatch.setattr(
+        rwkv7,
+        "prepare_fla_rwkv7_recurrent_metadata",
+        prepare_metadata,
+    )
     monkeypatch.setattr(
         torch.ops.rwkv7_v3a_ops,
         "add_layer_norm_cmix_mix_f16_slots",
@@ -394,6 +421,7 @@ def test_rwkv7_forward_layer_range_uses_slot_fused_tmix_for_batched_decode(
         path,
         pre_mix=None,
         *,
+        validated_wkv_metadata,
         slot_indices=None,
         query_start_loc=None,
         wkv_slot_indices=None,
@@ -403,6 +431,7 @@ def test_rwkv7_forward_layer_range_uses_slot_fused_tmix_for_batched_decode(
                 "tmix",
                 layer,
                 pre_mix is not None,
+                validated_wkv_metadata is validated_metadata,
                 slot_indices.tolist(),
                 query_start_loc.tolist(),
                 wkv_slot_indices.tolist(),
@@ -422,7 +451,7 @@ def test_rwkv7_forward_layer_range_uses_slot_fused_tmix_for_batched_decode(
     query_start_loc = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
     state = [
         torch.zeros((2, 2, 6, 4)),
-        torch.empty((2,)),
+        torch.empty((2, 6, 1, 1, 1)),
         torch.zeros((6,), dtype=torch.int32),
     ]
 
@@ -440,13 +469,114 @@ def test_rwkv7_forward_layer_range_uses_slot_fused_tmix_for_batched_decode(
     )
 
     assert calls == [
-        ("tmix", 0, False, [3, 1, 4], [0, 1, 2, 3], [3, 1, 4]),
+        ("prepare", [0, 1, 2, 3], [3, 1, 4], 3, 6),
+        ("tmix", 0, False, True, [3, 1, 4], [0, 1, 2, 3], [3, 1, 4]),
         ("fused_cmix", [3, 1, 4]),
         ("fused_tmix", 3, [3, 1, 4]),
-        ("tmix", 1, True, [3, 1, 4], [0, 1, 2, 3], [3, 1, 4]),
+        ("tmix", 1, True, True, [3, 1, 4], [0, 1, 2, 3], [3, 1, 4]),
         ("fused_cmix", [3, 1, 4]),
         ("advance", [3, 1, 4], 1),
     ]
+
+
+def test_rwkv7_varlen_layer_range_prepares_metadata_once_for_all_layers(
+    monkeypatch,
+) -> None:
+    prepare_calls: list[tuple[Any, ...]] = []
+    layer_tickets: list[object] = []
+    advance_calls: list[tuple[torch.Tensor, ...]] = []
+    validated_metadata = object()
+
+    def prepare_metadata(
+        query_start_loc,
+        state_indices,
+        *,
+        total_tokens,
+        state_pool_size,
+    ):
+        prepare_calls.append(
+            (query_start_loc, state_indices, total_tokens, state_pool_size)
+        )
+        return validated_metadata
+
+    def advance_varlen(elapsed, query_start_loc, slot_indices):
+        advance_calls.append((elapsed, query_start_loc, slot_indices))
+
+    monkeypatch.setattr(
+        rwkv7,
+        "prepare_fla_rwkv7_recurrent_metadata",
+        prepare_metadata,
+    )
+    monkeypatch.setattr(
+        torch.ops.rwkv7_v3a_ops,
+        "advance_i32_varlen",
+        advance_varlen,
+        raising=False,
+    )
+
+    model = _new_rwkv7_forward_test_model(hidden_size=4)
+    model.start_layer = 0
+    model.end_layer = 2
+    model.z = {}
+    for layer in range(2):
+        model.z.update(
+            {
+                f"blocks.{layer}.ln1.weight": torch.empty(4),
+                f"blocks.{layer}.ln1.bias": torch.empty(4),
+                f"blocks.{layer}.ln2.weight": torch.empty(4),
+                f"blocks.{layer}.ln2.bias": torch.empty(4),
+            }
+        )
+    model.ln = lambda x, weight, bias: x
+    model.add = lambda x, residual: x + residual
+    model.add_ln = lambda x, residual, weight, bias: (
+        x + residual,
+        x + residual,
+    )
+
+    def tmix_varlen(
+        layer,
+        x,
+        shift_state,
+        wkv_state,
+        elapsed_t,
+        v_first,
+        p,
+        path,
+        *,
+        validated_wkv_metadata,
+        query_start_loc,
+        slot_indices,
+        req_id,
+    ):
+        layer_tickets.append(validated_wkv_metadata)
+        return x, v_first
+
+    model.tmix_varlen = tmix_varlen
+    model.cmix_varlen = lambda *args, **kwargs: args[0]
+    query_start_loc = torch.tensor([0, 2, 3], dtype=torch.int32)
+    slot_indices = torch.tensor([3, 1], dtype=torch.int32)
+    req_id = torch.tensor([0, 0, 1], dtype=torch.int32)
+    state = [
+        torch.zeros((2, 2, 6, 4)),
+        torch.empty((2, 6, 1, 1, 1)),
+        torch.zeros((6,), dtype=torch.int32),
+    ]
+
+    RWKV7ForCausalLM.forward_varlen_layer_range(
+        model,
+        torch.zeros((3, 4)),
+        state,
+        query_start_loc=query_start_loc,
+        slot_indices=slot_indices,
+        req_id=req_id,
+        v_first=None,
+        final=False,
+    )
+
+    assert prepare_calls == [(query_start_loc, slot_indices, 3, 6)]
+    assert layer_tickets == [validated_metadata, validated_metadata]
+    assert advance_calls == [(state[2], query_start_loc, slot_indices)]
 
 
 def _rwkv7_vllm_config(

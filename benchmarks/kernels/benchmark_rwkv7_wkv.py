@@ -15,6 +15,7 @@ from pathlib import Path
 import torch
 
 from vllm.model_executor.models.rwkv7_wkv_backend import (
+    prepare_fla_rwkv7_recurrent_metadata,
     run_fla_rwkv7_recurrent_from_decay_logits,
 )
 
@@ -204,6 +205,7 @@ def _execute(
     case: ProfileCase,
     state: torch.Tensor,
     legacy_output: torch.Tensor | None,
+    validated_metadata: object | None,
 ) -> torch.Tensor:
     hidden_size = case.r.shape[-1]
     if provider == "legacy_native":
@@ -246,6 +248,8 @@ def _execute(
 
     if provider != "fla_fused":
         raise ValueError(f"unknown provider: {provider}")
+    if validated_metadata is None:
+        raise ValueError("fla_fused execution requires prevalidated metadata")
     total_tokens = case.r.shape[0]
     head_count = hidden_size // HEAD_SIZE
     packed_shape = (1, total_tokens, head_count, HEAD_SIZE)
@@ -258,6 +262,7 @@ def _execute(
         case.b.view(packed_shape),
         decay_bias=case.w0.view(head_count, HEAD_SIZE),
         elapsed_t=case.elapsed if mode == "fp16" else None,
+        validated_metadata=validated_metadata,
         state_pool=state,
         cu_seqlens=case.query_start_loc,
         state_indices=case.slot_indices,
@@ -279,9 +284,24 @@ def _run_provider(
 ) -> tuple[dict[str, object], torch.Tensor, torch.Tensor]:
     benchmark_state = _provider_state(provider, case.initial_state)
     benchmark_output = torch.empty_like(case.r) if provider == "legacy_native" else None
+    validated_metadata = None
+    if provider == "fla_fused":
+        validated_metadata = prepare_fla_rwkv7_recurrent_metadata(
+            case.query_start_loc,
+            case.slot_indices,
+            total_tokens=case.r.shape[0],
+            state_pool_size=case.initial_state.shape[0],
+        )
 
     def call() -> None:
-        _execute(provider, mode, case, benchmark_state, benchmark_output)
+        _execute(
+            provider,
+            mode,
+            case,
+            benchmark_state,
+            benchmark_output,
+            validated_metadata,
+        )
 
     latencies_ms = _measure_samples(
         call,
@@ -297,7 +317,14 @@ def _run_provider(
         output_buffer = (
             torch.empty_like(case.r) if provider == "legacy_native" else None
         )
-        output = _execute(provider, mode, case, state, output_buffer)
+        output = _execute(
+            provider,
+            mode,
+            case,
+            state,
+            output_buffer,
+            validated_metadata,
+        )
         outputs.append(output.clone())
         states.append(
             _canonical_state_from_legacy(state)
@@ -314,6 +341,7 @@ def _run_provider(
         "profile": case.name,
         "provider": provider,
         "wkv_mode": mode,
+        "prevalidated_metadata": validated_metadata is not None,
         "batch_size": len(case.lengths),
         "total_tokens": sum(case.lengths),
         "min_length": min(case.lengths),

@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from vllm.model_executor.models.rwkv7_wkv_backend import (
+    prepare_fla_rwkv7_recurrent_metadata,
     run_fla_rwkv7_recurrent_from_decay_logits,
 )
 
@@ -368,6 +369,12 @@ def test_fla_fused_raw_decay_matches_legacy_varlen_state_semantics(
         )
 
     canonical_state = initial_legacy_state.transpose(-1, -2).contiguous()
+    validated_metadata = prepare_fla_rwkv7_recurrent_metadata(
+        query_start_loc,
+        slot_indices,
+        total_tokens=r.shape[0],
+        state_pool_size=canonical_state.shape[0],
+    )
     fused_output = run_fla_rwkv7_recurrent_from_decay_logits(
         r.view(1, -1, 1, HEAD_SIZE),
         w.view(1, -1, 1, HEAD_SIZE),
@@ -377,6 +384,7 @@ def test_fla_fused_raw_decay_matches_legacy_varlen_state_semantics(
         b.view(1, -1, 1, HEAD_SIZE),
         decay_bias=w0.view(1, HEAD_SIZE),
         elapsed_t=elapsed if mode == "fp16" else None,
+        validated_metadata=validated_metadata,
         state_pool=canonical_state,
         cu_seqlens=query_start_loc,
         state_indices=slot_indices,
