@@ -309,6 +309,26 @@ def test_standard_rwkv7_hf_artifact_config_is_accepted() -> None:
     validate_rwkv7_hf_artifact_config(_standard_rwkv7_hf_config())
 
 
+def test_rwkv7_explicit_projection_ranks_drive_checkpoint_shapes() -> None:
+    config = _standard_rwkv7_hf_config(
+        hidden_size=2048,
+        head_size=64,
+        num_hidden_layers=2,
+        intermediate_size=8192,
+        decay_low_rank_dim=96,
+        a_low_rank_dim=96,
+        v_low_rank_dim=64,
+        gate_low_rank_dim=256,
+    )
+
+    shapes = rwkv7_checkpoint_weight_shapes(config)
+
+    assert shapes["model.blocks.0.att.w1.weight"] == (96, 2048)
+    assert shapes["model.blocks.0.att.a1.weight"] == (96, 2048)
+    assert shapes["model.blocks.0.att.g1.weight"] == (256, 2048)
+    assert shapes["model.blocks.1.att.v1.weight"] == (64, 2048)
+
+
 def test_rwkv7_schema_v3_quantization_metadata_is_validated() -> None:
     config = _quantized_rwkv7_config()
 
