@@ -4,6 +4,7 @@
 import json
 from itertools import combinations
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -15,7 +16,7 @@ class _FakeRecurrentModel:
 
     def __init__(self) -> None:
         self.embed_calls = 0
-        self.forward_initial_states = []
+        self.forward_initial_states: list[Any] = []
 
     def zero_state(self, batch_size):
         torch = pytest.importorskip("torch")

@@ -145,7 +145,12 @@ def validate_build_profile_capabilities(
     if architecture is None:
         architectures = getattr(model_config, "architectures", ())
         architecture = architectures[0] if architectures else None
-    profile_architecture = _RWKV7_ARCHITECTURE_ALIASES.get(architecture, architecture)
+    architecture_name = str(architecture) if architecture is not None else None
+    profile_architecture = (
+        _RWKV7_ARCHITECTURE_ALIASES.get(architecture_name, architecture_name)
+        if architecture_name is not None
+        else None
+    )
     if profile_architecture not in metadata.supported_architectures:
         reasons.append(
             "requires architecture " + ", ".join(metadata.supported_architectures)
@@ -161,18 +166,18 @@ def validate_build_profile_capabilities(
     quantization = getattr(model_config, "quantization", None)
     quantization_config = getattr(model_config, "quantization_config", None)
     if metadata.profile == "rwkv-nvfp4":
-        quantization_names = {
-            name
-            for value in (quantization, quantization_config)
-            if value is not None
-            for name in (
-                value.get_name()
-                if callable(getattr(value, "get_name", None))
-                else (
-                    value.get("quant_method") if isinstance(value, dict) else str(value)
-                ),
-            )
-        }
+        quantization_names: set[str] = set()
+        for value in (quantization, quantization_config):
+            if value is None:
+                continue
+            if callable(getattr(value, "get_name", None)):
+                name = value.get_name()
+            elif isinstance(value, dict):
+                name = value.get("quant_method")
+            else:
+                name = str(value)
+            if name is not None:
+                quantization_names.add(str(name))
         if quantization_names != {"compressed-tensors"}:
             reasons.append(
                 "requires compressed-tensors NVFP4 quantization and rejects "

@@ -423,7 +423,10 @@ def rwkv7_albatross_settings() -> AlbatrossSettings:
     hf_config = get_config(vllm_model_env, trust_remote_code=False)
     source_sha256 = getattr(hf_config, "rwkv_source_sha256", None)
     with checkpoint.open("rb") as source:
-        checkpoint_sha256 = hashlib.file_digest(source, "sha256").hexdigest()
+        digest = hashlib.sha256()
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+        checkpoint_sha256 = digest.hexdigest()
     if source_sha256 != checkpoint_sha256:
         pytest.fail(
             "RWKV7 HF artifact source digest does not match the Albatross "

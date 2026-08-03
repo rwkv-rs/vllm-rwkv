@@ -387,6 +387,7 @@ def test_tiny_hf_artifact_generates_through_public_recurrent_flash_chain(
     _write_tiny_standard_hf_artifact(artifact)
 
     llm = None
+    request: Any = [{"prompt_token_ids": PROMPT_TOKEN_IDS}]
     try:
         llm = LLM(
             model=str(artifact),
@@ -400,7 +401,7 @@ def test_tiny_hf_artifact_generates_through_public_recurrent_flash_chain(
             disable_log_stats=True,
         )
         outputs = llm.generate(
-            [{"prompt_token_ids": PROMPT_TOKEN_IDS}],
+            request,
             SamplingParams(
                 temperature=1.0,
                 top_k=1,
@@ -412,7 +413,7 @@ def test_tiny_hf_artifact_generates_through_public_recurrent_flash_chain(
     finally:
         if llm is not None:
             with contextlib.suppress(Exception):
-                llm.shutdown()
+                llm.shutdown()  # type: ignore[attr-defined]
 
     assert len(outputs) == 1
     assert outputs[0].prompt_token_ids == NORMALIZED_PROMPT_TOKEN_IDS

@@ -1685,7 +1685,7 @@ class EngineArgs:
             hf_config_path=self.hf_config_path,
             runner=self.runner,
             convert=self.convert,
-            tokenizer=self.tokenizer,
+            tokenizer=cast(str, self.tokenizer),
             tokenizer_mode=self.tokenizer_mode,
             trust_remote_code=self.trust_remote_code,
             allowed_local_media_path=self.allowed_local_media_path,

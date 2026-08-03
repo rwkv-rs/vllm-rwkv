@@ -547,8 +547,9 @@ class RWKV7ModelState(ModelState):
 
         prompt_token_ids = tuple(new_req_data.prompt_token_ids or ())
         sampling_params = new_req_data.sampling_params
+        prefix_state_cache = self.prefix_state_cache
         cache_eligible = bool(
-            self.prefix_state_cache is not None
+            prefix_state_cache is not None
             and prompt_token_ids
             and (
                 sampling_params is None
@@ -558,7 +559,8 @@ class RWKV7ModelState(ModelState):
         cache_hit_length = 0
         cached_snapshot = None
         if cache_eligible:
-            hit = self.prefix_state_cache.get_longest_prefix(
+            assert prefix_state_cache is not None
+            hit = prefix_state_cache.get_longest_prefix(
                 self._prefix_identity(prompt_token_ids),
                 max_prefix_length=len(prompt_token_ids) - 1,
             )

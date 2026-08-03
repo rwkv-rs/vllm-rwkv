@@ -18,7 +18,6 @@ import torch
 from vllm import LLM, SamplingParams
 from vllm.platforms import current_platform
 
-
 CHECKPOINT_SHA256 = "737079d81865801fd85e5459488d89a36d5304a524e890244eb83d44f531c89c"
 FIXED_PROMPT_TOKEN_IDS = [1, 7, 11, 3]
 EXPECTED_GPU_NAME = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
