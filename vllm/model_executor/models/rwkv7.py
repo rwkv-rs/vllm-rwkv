@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only RWKV7 model."""
 
-import math
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -24,7 +23,9 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.models.rwkv7_wkv_backend import run_fla_rwkv7_recurrent
+from vllm.model_executor.models.rwkv7_wkv_backend import (
+    run_fla_rwkv7_recurrent_from_decay_logits,
+)
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.rwkv7 import (
@@ -2275,8 +2276,7 @@ class RWKV7ForCausalLM(nn.Module):
         local_c = r.shape[-1]
         local_h = local_c // self.head_size
 
-        y = torch.empty_like(r)
-        self._run_wkv(
+        y = self._run_wkv(
             query_start_loc,
             slot_indices,
             wkv_state,
@@ -2287,7 +2287,6 @@ class RWKV7ForCausalLM(nn.Module):
             v,
             neg_kk,
             kka,
-            y,
             elapsed_t,
         )
         y = ops.tmix_lnx_rkvres_xg(
@@ -2351,11 +2350,9 @@ class RWKV7ForCausalLM(nn.Module):
         v: torch.Tensor,
         neg_kk: torch.Tensor,
         kka: torch.Tensor,
-        y: torch.Tensor,
         elapsed_t: torch.Tensor,
-    ) -> None:
-        """Run fla-rwkv's public packed recurrent WKV operator."""
-        del elapsed_t
+    ) -> torch.Tensor:
+        """Run the fused raw-decay packed-varlen recurrent operator."""
         hidden_size = r.shape[-1]
         if hidden_size % self.head_size != 0:
             raise ValueError(
@@ -2364,23 +2361,27 @@ class RWKV7ForCausalLM(nn.Module):
             )
         total_tokens = r.numel() // hidden_size
         packed_shape = (1, total_tokens, hidden_size // self.head_size, self.head_size)
-        decay_logits = w.view(-1, hidden_size) + w0.view(1, hidden_size)
-        log_decay = (-math.exp(-0.5) * torch.sigmoid(decay_logits.float())).to(
-            dtype=w.dtype
-        )
-        output = run_fla_rwkv7_recurrent(
-            r.view(packed_shape).contiguous(),
-            log_decay.view(packed_shape).contiguous(),
-            k.view(packed_shape).contiguous(),
-            v.view(packed_shape).contiguous(),
-            neg_kk.view(packed_shape).contiguous(),
-            kka.view(packed_shape).contiguous(),
+        r_rows = r.view(-1, hidden_size).contiguous()
+        w_rows = w.view(-1, hidden_size).contiguous()
+        k_rows = k.view(-1, hidden_size).contiguous()
+        v_rows = v.view(-1, hidden_size).contiguous()
+        neg_kk_rows = neg_kk.view(-1, hidden_size).contiguous()
+        kka_rows = kka.view(-1, hidden_size).contiguous()
+        output = run_fla_rwkv7_recurrent_from_decay_logits(
+            r_rows.view(packed_shape),
+            w_rows.view(packed_shape),
+            k_rows.view(packed_shape),
+            v_rows.view(packed_shape),
+            neg_kk_rows.view(packed_shape),
+            kka_rows.view(packed_shape),
+            decay_bias=w0.view(hidden_size // self.head_size, self.head_size),
+            elapsed_t=elapsed_t if self.wkv_mode == "fp16" else None,
             state_pool=state,
             cu_seqlens=query_start_loc,
             state_indices=slot_indices,
             mode=self.wkv_mode,
         )
-        y.copy_(output.view_as(y))
+        return output.view_as(r)
 
     def tmix(
         self,
@@ -2453,10 +2454,9 @@ class RWKV7ForCausalLM(nn.Module):
         local_c = r.shape[-1]
         local_h = local_c // self.head_size
 
-        y = torch.empty_like(r)
         if query_start_loc is None or wkv_slot_indices is None:
             raise RuntimeError("RWKV7 WKV requires packed request metadata")
-        self._run_wkv(
+        y = self._run_wkv(
             query_start_loc,
             wkv_slot_indices,
             wkv_state,
@@ -2467,7 +2467,6 @@ class RWKV7ForCausalLM(nn.Module):
             v,
             neg_kk,
             kka,
-            y,
             elapsed_t,
         )
         lnx = (

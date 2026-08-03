@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""fla-rwkv public recurrent RWKV7 dispatch contract."""
+"""Public fused RWKV7 recurrent backend contract."""
 
 from __future__ import annotations
 
 import importlib
 import inspect
 from collections.abc import Callable
+from functools import cache
 from typing import Any
 
 import torch
@@ -18,11 +19,15 @@ from vllm.transformers_utils.rwkv7_runtime_contract import (
     FLASH_RWKV_REVISION,
 )
 
+_EXPECTED_PROVIDER = "flash_rwkv"
+_EXPECTED_KERNEL = "rwkv7_recurrent_stateful_from_decay_logits"
 _REQUIRED_RECURRENT_PARAMETERS = frozenset(
     {
         "initial_state",
         "output_final_state",
         "cu_seqlens",
+        "decay_bias",
+        "elapsed_t",
         "state_indices",
         "mode",
     }
@@ -36,27 +41,32 @@ def _with_required_revisions(message: str) -> str:
     )
 
 
+@cache
 def _load_fla_rwkv7_recurrent_contract() -> tuple[
-    Callable[..., Any], Callable[[], str | None]
+    Callable[..., Any], Callable[[], str | None], Callable[[], str | None]
 ]:
+    """Resolve and validate the pinned FLA contract once per process."""
     try:
         rwkv7 = importlib.import_module("fla.ops.rwkv7")
     except ImportError as exc:
         raise RuntimeError(
             _with_required_revisions(
-                "RWKV7 WKV execution requires the fla-rwkv public recurrent "
-                "FlashRWKV backend "
-                "with request-indexed state-pool support"
+                "RWKV7 WKV execution requires the pinned fla-rwkv/FlashRWKV "
+                "fused recurrent backend"
             )
         ) from exc
 
     recurrent_rwkv7 = getattr(rwkv7, "recurrent_rwkv7", None)
     get_last_provider = getattr(rwkv7, "get_last_rwkv7_provider", None)
-    if not callable(recurrent_rwkv7) or not callable(get_last_provider):
+    get_last_kernel = getattr(rwkv7, "get_last_rwkv7_kernel", None)
+    if not all(
+        callable(value)
+        for value in (recurrent_rwkv7, get_last_provider, get_last_kernel)
+    ):
         raise RuntimeError(
             _with_required_revisions(
-                "the installed fla-rwkv RWKV7 API does not expose recurrent_rwkv7 "
-                "and get_last_rwkv7_provider"
+                "the installed fla-rwkv API must expose recurrent_rwkv7, "
+                "get_last_rwkv7_provider, and get_last_rwkv7_kernel"
             )
         )
 
@@ -73,35 +83,41 @@ def _load_fla_rwkv7_recurrent_contract() -> tuple[
         raise RuntimeError(
             _with_required_revisions(
                 "the installed fla-rwkv recurrent_rwkv7 API lacks the required "
-                f"recurrent inference contract: missing parameters {missing}"
+                f"packed stateful contract: missing parameters {missing}"
             )
         )
-    return recurrent_rwkv7, get_last_provider
+    return recurrent_rwkv7, get_last_provider, get_last_kernel
 
 
-def run_fla_rwkv7_recurrent(
+def run_fla_rwkv7_recurrent_from_decay_logits(
     r: torch.Tensor,
-    log_decay: torch.Tensor,
+    decay_logits: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
     *,
+    decay_bias: torch.Tensor,
+    elapsed_t: torch.Tensor | None,
     state_pool: torch.Tensor,
     cu_seqlens: torch.Tensor,
     state_indices: torch.Tensor,
     mode: str,
 ) -> torch.Tensor:
-    """Run fla-rwkv's public recurrent path with vLLM state ownership."""
-    recurrent_rwkv7, get_last_provider = _load_fla_rwkv7_recurrent_contract()
+    """Fuse decay delta, bias, and recurrence into vLLM-owned state slots."""
+    recurrent_rwkv7, get_last_provider, get_last_kernel = (
+        _load_fla_rwkv7_recurrent_contract()
+    )
     try:
         result = recurrent_rwkv7(
             r,
-            log_decay,
+            decay_logits,
             k,
             v,
             a,
             b,
+            decay_bias=decay_bias,
+            elapsed_t=elapsed_t,
             initial_state=state_pool,
             output_final_state=True,
             cu_seqlens=cu_seqlens,
@@ -110,39 +126,39 @@ def run_fla_rwkv7_recurrent(
         )
     except (RuntimeError, TypeError, ValueError) as exc:
         raise RuntimeError(
-            _with_required_revisions(
-                f"fla-rwkv recurrent FlashRWKV execution failed: {exc}"
-            )
+            _with_required_revisions(f"fla-rwkv fused recurrent execution failed: {exc}")
         ) from exc
-    if get_last_provider() != "flash_rwkv":
+
+    provider = get_last_provider()
+    kernel = get_last_kernel()
+    if provider != _EXPECTED_PROVIDER or kernel != _EXPECTED_KERNEL:
         raise RuntimeError(
             _with_required_revisions(
-                "fla-rwkv did not execute the required recurrent FlashRWKV "
-                "backend; "
-                "fallback is disabled"
+                "fla-rwkv did not execute the required fused raw-decay stateful "
+                f"kernel: provider={provider!r}, kernel={kernel!r}; fallback is "
+                "disabled"
             )
         )
     if not isinstance(result, tuple) or len(result) != 2:
         raise RuntimeError(
             _with_required_revisions(
-                "fla-rwkv recurrent FlashRWKV execution must return "
-                "(output, state_pool)"
+                "fla-rwkv fused recurrent execution must return (output, state_pool)"
             )
         )
     output, final_state = result
     if final_state is not state_pool:
         raise RuntimeError(
             _with_required_revisions(
-                "fla-rwkv recurrent FlashRWKV must update the supplied "
-                "request-indexed "
-                "state pool in place"
+                "fla-rwkv must update the supplied request-indexed state pool in place"
             )
         )
     if not isinstance(output, torch.Tensor):
         raise RuntimeError(
-            _with_required_revisions(
-                "fla-rwkv recurrent FlashRWKV returned a non-tensor output"
-            )
+            _with_required_revisions("fla-rwkv returned a non-tensor recurrent output")
+        )
+    if not output.is_contiguous():
+        raise RuntimeError(
+            _with_required_revisions("fla-rwkv returned a non-contiguous recurrent output")
         )
     return output
 
@@ -152,5 +168,5 @@ __all__ = [
     "FLASH_RWKV_REVISION",
     "FLA_RWKV_REPOSITORY",
     "FLA_RWKV_REVISION",
-    "run_fla_rwkv7_recurrent",
+    "run_fla_rwkv7_recurrent_from_decay_logits",
 ]

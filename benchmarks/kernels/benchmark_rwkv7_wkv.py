@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Throughput benchmark for the canonical packed-varlen RWKV7 WKV op."""
+"""Compare legacy native and fused FLA packed-varlen RWKV7 WKV paths."""
 
 from __future__ import annotations
 
@@ -14,7 +14,13 @@ from pathlib import Path
 
 import torch
 
+from vllm.model_executor.models.rwkv7_wkv_backend import (
+    run_fla_rwkv7_recurrent_from_decay_logits,
+)
+
 HEAD_SIZE = 64
+PROVIDERS = ("legacy_native", "fla_fused")
+WKV_MODES = ("fp16", "fp32io16")
 PROFILE_LENGTHS: dict[str, tuple[int, ...]] = {
     "decode_b1": (1,),
     "decode_b16": (1,) * 16,
@@ -33,11 +39,30 @@ PROFILE_LENGTHS: dict[str, tuple[int, ...]] = {
 class BenchmarkConfig:
     hidden_size: int
     profiles: tuple[str, ...]
+    providers: tuple[str, ...]
+    wkv_modes: tuple[str, ...]
     warmup_iters: int
     samples: int
     sample_iters: int
     seed: int
     output: Path | None
+
+
+@dataclass(frozen=True)
+class ProfileCase:
+    name: str
+    lengths: tuple[int, ...]
+    query_start_loc: torch.Tensor
+    slot_indices: torch.Tensor
+    initial_state: torch.Tensor
+    r: torch.Tensor
+    w: torch.Tensor
+    w0: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    a: torch.Tensor
+    b: torch.Tensor
+    elapsed: torch.Tensor
 
 
 def _percentile(samples: Sequence[float], quantile: float) -> float:
@@ -80,6 +105,9 @@ def _source_sha256() -> dict[str, str]:
     relative_paths = (
         "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp16_v2.cpp",
         "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp16_v2.cu",
+        "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp32_v2.cpp",
+        "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp32_v2.cu",
+        "vllm/model_executor/models/rwkv7_wkv_backend.py",
     )
     return {
         relative: hashlib.sha256((source_root / relative).read_bytes()).hexdigest()
@@ -93,69 +121,35 @@ def _payload(
     generator: torch.Generator,
 ) -> tuple[torch.Tensor, ...]:
     shape = (total_tokens, hidden_size)
-    return (
+    return tuple(
         0.02
         * torch.randn(
             shape,
             dtype=torch.float16,
             device="cuda",
             generator=generator,
-        ),
-        -2.0
-        + 0.02
-        * torch.randn(
-            shape,
-            dtype=torch.float16,
-            device="cuda",
-            generator=generator,
-        ),
-        0.02
-        * torch.randn(
-            shape,
-            dtype=torch.float16,
-            device="cuda",
-            generator=generator,
-        ),
-        0.02
-        * torch.randn(
-            shape,
-            dtype=torch.float16,
-            device="cuda",
-            generator=generator,
-        ),
-        0.02
-        * torch.randn(
-            shape,
-            dtype=torch.float16,
-            device="cuda",
-            generator=generator,
-        ),
-        0.02
-        * torch.randn(
-            shape,
-            dtype=torch.float16,
-            device="cuda",
-            generator=generator,
-        ),
+        )
+        for _ in range(6)
     )
 
 
-def _run_profile(
+def _build_case(
     name: str,
     lengths: tuple[int, ...],
-    config: BenchmarkConfig,
+    *,
+    hidden_size: int,
+    mode: str,
     generator: torch.Generator,
-) -> dict[str, object]:
+) -> ProfileCase:
+    if any(length <= 0 for length in lengths):
+        raise ValueError(f"{name} contains a non-positive length")
     batch_size = len(lengths)
     total_tokens = sum(lengths)
-    head_count = config.hidden_size // HEAD_SIZE
+    head_count = hidden_size // HEAD_SIZE
     slot_count = batch_size + 7
     offsets = [0]
     for length in lengths:
-        if length <= 0:
-            raise ValueError(f"{name} contains a non-positive length: {length}")
         offsets.append(offsets[-1] + length)
-
     query_start_loc = torch.tensor(offsets, dtype=torch.int32, device="cuda")
     slot_indices = torch.arange(
         batch_size - 1,
@@ -164,40 +158,130 @@ def _run_profile(
         dtype=torch.int32,
         device="cuda",
     )
-    payload = _payload(total_tokens, config.hidden_size, generator)
-    r, w, k, v, a, b = payload
+    r, w, k, v, a, b = _payload(total_tokens, hidden_size, generator)
     w0 = -2.0 + 0.02 * torch.randn(
-        (config.hidden_size,),
+        (hidden_size,),
         dtype=torch.float16,
         device="cuda",
         generator=generator,
     )
+    state_dtype = torch.float16 if mode == "fp16" else torch.float32
     initial_state = 0.02 * torch.randn(
         (slot_count, head_count, HEAD_SIZE, HEAD_SIZE),
-        dtype=torch.float16,
+        dtype=state_dtype,
         device="cuda",
         generator=generator,
     )
     elapsed = torch.arange(slot_count, dtype=torch.int32, device="cuda")
+    return ProfileCase(
+        name=name,
+        lengths=lengths,
+        query_start_loc=query_start_loc,
+        slot_indices=slot_indices,
+        initial_state=initial_state,
+        r=r,
+        w=w,
+        w0=w0,
+        k=k,
+        v=v,
+        a=a,
+        b=b,
+        elapsed=elapsed,
+    )
 
-    benchmark_state = initial_state.clone()
-    benchmark_output = torch.empty_like(r)
+
+def _legacy_state_from_canonical(state: torch.Tensor) -> torch.Tensor:
+    return state.transpose(-1, -2).contiguous()
+
+
+def _canonical_state_from_legacy(state: torch.Tensor) -> torch.Tensor:
+    return state.transpose(-1, -2).contiguous()
+
+
+def _execute(
+    provider: str,
+    mode: str,
+    case: ProfileCase,
+    state: torch.Tensor,
+    legacy_output: torch.Tensor | None,
+) -> torch.Tensor:
+    hidden_size = case.r.shape[-1]
+    if provider == "legacy_native":
+        if legacy_output is None:
+            raise ValueError("legacy native execution requires an output buffer")
+        if mode == "fp16":
+            torch.ops.rwkv7_wkv_fp16_v2.wkv(
+                case.query_start_loc,
+                case.slot_indices,
+                state,
+                case.r,
+                case.w,
+                case.w0,
+                case.k,
+                case.v,
+                case.a,
+                case.b,
+                legacy_output,
+                case.elapsed,
+            )
+        else:
+            decay_logits = torch.ops.rwkv7_fast_ops_fp16.add_vec(
+                hidden_size,
+                case.w,
+                case.w0,
+            )
+            torch.ops.rwkv7_wkv_fp32_v2.wkv(
+                case.query_start_loc,
+                case.slot_indices,
+                state,
+                case.r,
+                decay_logits,
+                case.k,
+                case.v,
+                case.a,
+                case.b,
+                legacy_output,
+            )
+        return legacy_output
+
+    if provider != "fla_fused":
+        raise ValueError(f"unknown provider: {provider}")
+    total_tokens = case.r.shape[0]
+    head_count = hidden_size // HEAD_SIZE
+    packed_shape = (1, total_tokens, head_count, HEAD_SIZE)
+    return run_fla_rwkv7_recurrent_from_decay_logits(
+        case.r.view(packed_shape),
+        case.w.view(packed_shape),
+        case.k.view(packed_shape),
+        case.v.view(packed_shape),
+        case.a.view(packed_shape),
+        case.b.view(packed_shape),
+        decay_bias=case.w0.view(head_count, HEAD_SIZE),
+        elapsed_t=case.elapsed if mode == "fp16" else None,
+        state_pool=state,
+        cu_seqlens=case.query_start_loc,
+        state_indices=case.slot_indices,
+        mode=mode,
+    ).view_as(case.r)
+
+
+def _provider_state(provider: str, canonical_state: torch.Tensor) -> torch.Tensor:
+    if provider == "legacy_native":
+        return _legacy_state_from_canonical(canonical_state)
+    return canonical_state.clone()
+
+
+def _run_provider(
+    provider: str,
+    mode: str,
+    case: ProfileCase,
+    config: BenchmarkConfig,
+) -> tuple[dict[str, object], torch.Tensor, torch.Tensor]:
+    benchmark_state = _provider_state(provider, case.initial_state)
+    benchmark_output = torch.empty_like(case.r) if provider == "legacy_native" else None
 
     def call() -> None:
-        torch.ops.rwkv7_wkv_fp16_v2.wkv(
-            query_start_loc,
-            slot_indices,
-            benchmark_state,
-            r,
-            w,
-            w0,
-            k,
-            v,
-            a,
-            b,
-            benchmark_output,
-            elapsed,
-        )
+        _execute(provider, mode, case, benchmark_state, benchmark_output)
 
     latencies_ms = _measure_samples(
         call,
@@ -206,42 +290,36 @@ def _run_profile(
         sample_iters=config.sample_iters,
     )
 
-    first_state = initial_state.clone()
-    first_output = torch.empty_like(r)
-    second_state = initial_state.clone()
-    second_output = torch.empty_like(r)
-    for state, output in (
-        (first_state, first_output),
-        (second_state, second_output),
-    ):
-        torch.ops.rwkv7_wkv_fp16_v2.wkv(
-            query_start_loc,
-            slot_indices,
-            state,
-            r,
-            w,
-            w0,
-            k,
-            v,
-            a,
-            b,
-            output,
-            elapsed,
+    outputs = []
+    states = []
+    for _ in range(2):
+        state = _provider_state(provider, case.initial_state)
+        output_buffer = (
+            torch.empty_like(case.r) if provider == "legacy_native" else None
+        )
+        output = _execute(provider, mode, case, state, output_buffer)
+        outputs.append(output.clone())
+        states.append(
+            _canonical_state_from_legacy(state)
+            if provider == "legacy_native"
+            else state.clone()
         )
     torch.accelerator.synchronize()
 
     median_ms = statistics.median(latencies_ms)
-    active_slots = slot_indices.long()
-    untouched = torch.ones(slot_count, dtype=torch.bool, device="cuda")
+    active_slots = case.slot_indices.long()
+    untouched = torch.ones(case.initial_state.size(0), dtype=torch.bool, device="cuda")
     untouched[active_slots] = False
-    return {
-        "profile": name,
-        "batch_size": batch_size,
-        "total_tokens": total_tokens,
-        "min_length": min(lengths),
-        "max_length": max(lengths),
-        "padding_ratio": 1.0 - total_tokens / (batch_size * max(lengths)),
-        "kernel_launches": 1,
+    result: dict[str, object] = {
+        "profile": case.name,
+        "provider": provider,
+        "wkv_mode": mode,
+        "batch_size": len(case.lengths),
+        "total_tokens": sum(case.lengths),
+        "min_length": min(case.lengths),
+        "max_length": max(case.lengths),
+        "padding_ratio": 1.0
+        - sum(case.lengths) / (len(case.lengths) * max(case.lengths)),
         "latency_ms": {
             "min": min(latencies_ms),
             "mean": statistics.fmean(latencies_ms),
@@ -249,17 +327,25 @@ def _run_profile(
             "p50": median_ms,
             "p90": _percentile(latencies_ms, 0.90),
         },
-        "useful_tokens_per_s_p50": total_tokens * 1000.0 / median_ms,
-        "deterministic_output": torch.equal(first_output, second_output),
-        "deterministic_state": torch.equal(first_state, second_state),
+        "useful_tokens_per_s_p50": sum(case.lengths) * 1000.0 / median_ms,
+        "deterministic_output": torch.equal(outputs[0], outputs[1]),
+        "deterministic_state": torch.equal(states[0], states[1]),
         "untouched_slots_preserved": torch.equal(
-            first_state[untouched],
-            initial_state[untouched],
+            states[0][untouched],
+            case.initial_state[untouched],
         ),
-        "finite_output": bool(torch.isfinite(first_output).all().item()),
-        "finite_state": bool(torch.isfinite(first_state[active_slots]).all().item()),
+        "finite_output": bool(torch.isfinite(outputs[0]).all().item()),
+        "finite_state": bool(torch.isfinite(states[0][active_slots]).all().item()),
         "latency_samples_ms": latencies_ms,
     }
+    return result, outputs[0], states[0]
+
+
+def _rrmse(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    difference = actual.float() - expected.float()
+    numerator = difference.square().mean().sqrt()
+    denominator = expected.float().square().mean().sqrt().clamp_min(1e-12)
+    return float((numerator / denominator).item())
 
 
 def run(config: BenchmarkConfig) -> dict[str, object]:
@@ -274,26 +360,65 @@ def run(config: BenchmarkConfig) -> dict[str, object]:
 
     generator = torch.Generator(device="cuda")
     generator.manual_seed(config.seed)
-    results = [
-        _run_profile(name, PROFILE_LENGTHS[name], config, generator)
-        for name in config.profiles
-    ]
+    results: list[dict[str, object]] = []
+    comparisons: list[dict[str, object]] = []
+    for mode in config.wkv_modes:
+        for name in config.profiles:
+            case = _build_case(
+                name,
+                PROFILE_LENGTHS[name],
+                hidden_size=config.hidden_size,
+                mode=mode,
+                generator=generator,
+            )
+            provider_results = {}
+            provider_outputs = {}
+            provider_states = {}
+            for provider in config.providers:
+                result, output, state = _run_provider(provider, mode, case, config)
+                results.append(result)
+                provider_results[provider] = result
+                provider_outputs[provider] = output
+                provider_states[provider] = state
+            if {"legacy_native", "fla_fused"} <= provider_results.keys():
+                legacy_latency = provider_results["legacy_native"]["latency_ms"]
+                fused_latency = provider_results["fla_fused"]["latency_ms"]
+                assert isinstance(legacy_latency, dict)
+                assert isinstance(fused_latency, dict)
+                comparisons.append(
+                    {
+                        "profile": name,
+                        "wkv_mode": mode,
+                        "fla_speedup_over_legacy_p50": (
+                            float(legacy_latency["p50"]) / float(fused_latency["p50"])
+                        ),
+                        "output_rrmse": _rrmse(
+                            provider_outputs["fla_fused"],
+                            provider_outputs["legacy_native"],
+                        ),
+                        "state_rrmse": _rrmse(
+                            provider_states["fla_fused"],
+                            provider_states["legacy_native"],
+                        ),
+                    }
+                )
     payload: dict[str, object] = {
-        "benchmark": "rwkv7_canonical_varlen_wkv",
-        "provider": "rwkv7_wkv_fp16_v2::wkv",
+        "benchmark": "rwkv7_varlen_wkv_provider_comparison",
         "device": torch.cuda.get_device_name(),
         "cuda_version": torch.version.cuda,
         "torch_version": torch.__version__,
         "vllm_version": vllm.__version__,
         "hidden_size": config.hidden_size,
         "head_count": config.hidden_size // HEAD_SIZE,
-        "wkv_mode": "fp16-state-fp16-io",
+        "providers": config.providers,
+        "wkv_modes": config.wkv_modes,
         "warmup_iters": config.warmup_iters,
         "samples": config.samples,
         "sample_iters": config.sample_iters,
         "seed": config.seed,
         "source_sha256": _source_sha256(),
         "results": results,
+        "comparisons": comparisons,
     }
     if config.output is not None:
         config.output.parent.mkdir(parents=True, exist_ok=True)
@@ -324,6 +449,18 @@ def parse_args() -> argparse.Namespace:
             "equal_chunk16_b320",
         ],
     )
+    parser.add_argument(
+        "--providers",
+        nargs="+",
+        choices=PROVIDERS,
+        default=list(PROVIDERS),
+    )
+    parser.add_argument(
+        "--wkv-modes",
+        nargs="+",
+        choices=WKV_MODES,
+        default=list(WKV_MODES),
+    )
     parser.add_argument("--warmup-iters", type=int, default=20)
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--sample-iters", type=int, default=20)
@@ -338,6 +475,8 @@ def main() -> None:
         BenchmarkConfig(
             hidden_size=args.hidden_size,
             profiles=tuple(args.profiles),
+            providers=tuple(args.providers),
+            wkv_modes=tuple(args.wkv_modes),
             warmup_iters=args.warmup_iters,
             samples=args.samples,
             sample_iters=args.sample_iters,
