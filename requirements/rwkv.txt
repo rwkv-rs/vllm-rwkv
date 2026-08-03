@@ -11,8 +11,8 @@ torch==2.11.0
 
 # Stateful packed-varlen RWKV7 provider. Keep both source revisions exact:
 # FLA owns dispatch and FlashRWKV owns the recurrent CUDA implementation.
-flash-linear-attention[flash-rwkv] @ git+https://github.com/rwkv-rs/fla-rwkv.git@f1888c9a81cb24bfa46d84dc9ab38c4abd746225
-flash-rwkv @ git+https://github.com/rwkv-rs/FlashRWKV.git@9fe104c8c748771ba981058a6efcd95c150e453d
+flash-linear-attention[flash-rwkv] @ git+https://github.com/rwkv-rs/fla-rwkv.git@606752b7dff79eb326eeebf2d046102027da5306
+flash-rwkv @ git+https://github.com/rwkv-rs/FlashRWKV.git@8b3d08a9a9430df23fb9da9b35fb0aa625faa1fb
 
 # Core configuration, model loading, tokenizer, and process runtime.
 regex
@@ -23,7 +23,7 @@ requests>=2.26.0
 tqdm
 blake3
 py-cpuinfo
-transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@2bf8c01b7993f6b351678418664bb7bd798d0c71
+transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@2fe087ee6379ac0b33e9e23b684478cbc51af070
 tokenizers>=0.21.1
 safetensors>=0.6.2
 protobuf>=5.29.6,!=6.30.*,!=6.31.*,!=6.32.*,!=6.33.0.*,!=6.33.1.*,!=6.33.2.*,!=6.33.3.*,!=6.33.4.*

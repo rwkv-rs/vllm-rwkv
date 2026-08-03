@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from types import SimpleNamespace
 import os
 import subprocess
 import sys
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -206,16 +206,16 @@ def test_fused_contract_forwards_raw_decay_metadata_and_state_identity(
     ticket = object()
 
     def prepare_metadata(
-        actual_cu_seqlens,
-        actual_state_indices,
+        cu_seqlens,
+        state_indices,
         *,
         total_tokens,
         state_pool_size,
     ):
         prepare_calls.append(
             (
-                actual_cu_seqlens,
-                actual_state_indices,
+                cu_seqlens,
+                state_indices,
                 total_tokens,
                 state_pool_size,
             )
@@ -417,18 +417,20 @@ def test_noncontiguous_scheduler_metadata_is_not_silently_copied(monkeypatch) ->
     tensors, state_pool, _cu_seqlens, _state_indices = _inputs()
     cu_seqlens = torch.arange(6, dtype=torch.int32)[::2]
     state_indices = torch.arange(4, dtype=torch.int32)[::2]
+    expected_cu_seqlens = cu_seqlens
+    expected_state_indices = state_indices
 
     def prepare_metadata(
-        actual_cu_seqlens,
-        actual_state_indices,
+        cu_seqlens,
+        state_indices,
         *,
         total_tokens,
         state_pool_size,
     ):
-        assert actual_cu_seqlens is cu_seqlens
-        assert actual_state_indices is state_indices
-        assert not actual_cu_seqlens.is_contiguous()
-        assert not actual_state_indices.is_contiguous()
+        assert cu_seqlens is expected_cu_seqlens
+        assert state_indices is expected_state_indices
+        assert not cu_seqlens.is_contiguous()
+        assert not state_indices.is_contiguous()
         raise ValueError("packed metadata must be contiguous")
 
     module = _module(

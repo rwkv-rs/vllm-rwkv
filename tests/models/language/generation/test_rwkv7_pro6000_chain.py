@@ -19,9 +19,9 @@ import pytest
 import torch
 from safetensors import safe_open
 
-FLASH_RWKV_TEST_REVISION = "94cf28084a899f7157fb987a178ad02205966706"
-FLA_RWKV_TEST_REVISION = "02093e6be24e07f285d466ab7fb62ce0597891dc"
-TRANSFORMERS_RWKV_TEST_REVISION = "fb78db2e04868fc005ea622791ed6ee2175e82f0"
+FLASH_RWKV_TEST_REVISION = "8b3d08a9a9430df23fb9da9b35fb0aa625faa1fb"
+FLA_RWKV_TEST_REVISION = "606752b7dff79eb326eeebf2d046102027da5306"
+TRANSFORMERS_RWKV_TEST_REVISION = "2fe087ee6379ac0b33e9e23b684478cbc51af070"
 
 EXPECTED_GPU_NAME = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
 BOS_TOKEN_ID = 0
@@ -242,18 +242,24 @@ def _write_tiny_standard_hf_artifact(artifact: Path) -> None:
 
 
 @requires_pro6000_chain
-def test_controlled_heads_remain_rejected_by_final_product_provenance() -> None:
-    """The development chain must never silently become the product chain."""
+def test_controlled_chain_matches_final_product_provenance() -> None:
+    """The focused GPU chain must exercise the exact product revisions."""
     from vllm.transformers_utils.rwkv7_provenance import (
         TRANSFORMERS_RWKV_REVISION,
         validate_transformers_rwkv7_runtime_provenance,
     )
 
-    _assert_controlled_test_dependencies()
-    assert TRANSFORMERS_RWKV_REVISION != TRANSFORMERS_RWKV_TEST_REVISION
+    dependencies = _assert_controlled_test_dependencies()
+    assert TRANSFORMERS_RWKV_REVISION == TRANSFORMERS_RWKV_TEST_REVISION
     validate_transformers_rwkv7_runtime_provenance.cache_clear()
-    with pytest.raises(RuntimeError, match="Transformers provenance mismatch"):
-        validate_transformers_rwkv7_runtime_provenance()
+    provenance = validate_transformers_rwkv7_runtime_provenance()
+    assert provenance["revision"] == TRANSFORMERS_RWKV_REVISION
+    assert provenance["operator_runtime"]["revision"] == FLA_RWKV_TEST_REVISION
+    assert (
+        provenance["operator_runtime"]["flash_rwkv_revision"]
+        == FLASH_RWKV_TEST_REVISION
+    )
+    assert dependencies["transformers"]["revision"] == TRANSFORMERS_RWKV_REVISION
 
 
 @requires_pro6000_chain

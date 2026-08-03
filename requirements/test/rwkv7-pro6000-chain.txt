@@ -1,6 +1,7 @@
 # Controlled development-chain overrides for the focused RWKV7 PRO6000 job.
-# These are test-only revisions. requirements/rwkv.txt remains the product
-# source of truth for the final runtime provenance chain.
-flash-linear-attention[flash-rwkv] @ git+https://github.com/rwkv-rs/fla-rwkv.git@02093e6be24e07f285d466ab7fb62ce0597891dc
-flash-rwkv @ git+https://github.com/rwkv-rs/FlashRWKV.git@94cf28084a899f7157fb987a178ad02205966706
-transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@fb78db2e04868fc005ea622791ed6ee2175e82f0
+# The focused PRO6000 chain must install the same exact publication chain as
+# requirements/rwkv.txt; this file only makes the workflow's three VCS pins
+# explicit and reviewable.
+flash-linear-attention[flash-rwkv] @ git+https://github.com/rwkv-rs/fla-rwkv.git@606752b7dff79eb326eeebf2d046102027da5306
+flash-rwkv @ git+https://github.com/rwkv-rs/FlashRWKV.git@8b3d08a9a9430df23fb9da9b35fb0aa625faa1fb
+transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@2fe087ee6379ac0b33e9e23b684478cbc51af070
