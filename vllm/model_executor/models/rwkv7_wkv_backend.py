@@ -231,7 +231,9 @@ def run_fla_rwkv7_recurrent_from_decay_logits(
         )
     except (RuntimeError, TypeError, ValueError) as exc:
         raise RuntimeError(
-            _with_required_revisions(f"fla-rwkv fused recurrent execution failed: {exc}")
+            _with_required_revisions(
+                f"fla-rwkv fused recurrent execution failed: {exc}"
+            )
         ) from exc
 
     provider = get_last_provider()
@@ -263,7 +265,9 @@ def run_fla_rwkv7_recurrent_from_decay_logits(
         )
     if not output.is_contiguous():
         raise RuntimeError(
-            _with_required_revisions("fla-rwkv returned a non-contiguous recurrent output")
+            _with_required_revisions(
+                "fla-rwkv returned a non-contiguous recurrent output"
+            )
         )
     return output
 
