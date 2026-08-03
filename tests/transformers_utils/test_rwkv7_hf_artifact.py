@@ -563,14 +563,10 @@ def test_invalid_rwkv7_hf_artifact_config_fails_closed(
 def test_runtime_loader_rejects_raw_pth_directory(tmp_path: Path) -> None:
     (tmp_path / "model.pth").touch()
     loader: Any = object.__new__(DefaultModelLoader)
-    setattr(
-        loader,
-        "load_config",
-        SimpleNamespace(
-            load_format="auto",
-            download_dir=None,
-            ignore_patterns=None,
-        ),
+    loader.load_config = SimpleNamespace(
+        load_format="auto",
+        download_dir=None,
+        ignore_patterns=None,
     )
 
     with pytest.raises(RuntimeError, match="Cannot find any model weights"):
@@ -781,12 +777,8 @@ def _exercise_nvfp4_consumer_candidate(
     )
     save_file(artifact_tensors, artifact / "model.safetensors")
 
-    setattr(model, "_preprocess_weights", lambda _weights: None)
-    setattr(
-        model,
-        "_commit_preprocessed_weights",
-        lambda weights: setattr(model, "z", weights),
-    )
+    model._preprocess_weights = lambda _weights: None
+    model._commit_preprocessed_weights = lambda weights: setattr(model, "z", weights)
     loader = DefaultModelLoader(LoadConfig(load_format="safetensors"))
     monkeypatch.setattr(loader, "_init_ep_weight_filter", lambda _config: None)
     model_config: Any = SimpleNamespace(
@@ -1018,12 +1010,8 @@ def test_default_loader_nvfp4_candidate_reaches_native_gpu_kernel(
         encoding="utf-8",
     )
     save_file(artifact_tensors, artifact / "model.safetensors")
-    setattr(model, "_preprocess_weights", lambda _weights: None)
-    setattr(
-        model,
-        "_commit_preprocessed_weights",
-        lambda weights: setattr(model, "z", weights),
-    )
+    model._preprocess_weights = lambda _weights: None
+    model._commit_preprocessed_weights = lambda weights: setattr(model, "z", weights)
     loader = DefaultModelLoader(LoadConfig(load_format="safetensors"))
     monkeypatch.setattr(loader, "_init_ep_weight_filter", lambda _config: None)
     model_config: Any = SimpleNamespace(
