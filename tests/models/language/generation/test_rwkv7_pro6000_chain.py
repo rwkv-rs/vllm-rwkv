@@ -286,6 +286,8 @@ def test_tiny_hf_artifact_generates_through_public_recurrent_flash_chain(
     )
 
     import flash_rwkv
+    import flash_rwkv.ops as flash_rwkv_ops
+    import flash_rwkv.reference as flash_rwkv_reference
     from fla.ops.rwkv7 import get_last_rwkv7_provider
     from fla.ops.rwkv7.backends.flash_rwkv import (
         FLASH_RWKV_SOURCE_REVISION,
@@ -308,19 +310,43 @@ def test_tiny_hf_artifact_generates_through_public_recurrent_flash_chain(
 
         return forbidden
 
-    monkeypatch.setattr(flash_rwkv, "rwkv7_reference", forbid("reference"))
+    # The canonical package keeps the independent oracle in the reference
+    # module. Patch both implementation and public aliases so an accidental
+    # fallback cannot hide behind either import path.
+    monkeypatch.setattr(
+        flash_rwkv_reference,
+        "rwkv7_reference",
+        forbid("reference"),
+    )
+    monkeypatch.setattr(
+        flash_rwkv_ops,
+        "rwkv7_reference",
+        forbid("reference"),
+    )
     monkeypatch.setattr(
         flash_rwkv,
         "infer_chunk_bf16_forward",
         forbid("chunk"),
+        raising=False,
     )
     monkeypatch.setattr(
         flash_rwkv,
         "infer_chunk_bf16_forward_varlen",
         forbid("chunk-varlen"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        flash_rwkv_ops,
+        "infer_chunk_bf16_forward",
+        forbid("chunk"),
+    )
+    monkeypatch.setattr(
+        flash_rwkv_ops,
+        "infer_chunk_bf16_forward_varlen",
+        forbid("chunk-varlen"),
     )
 
-    real_recurrent = vllm_rwkv7.run_fla_rwkv7_recurrent
+    real_recurrent = vllm_rwkv7.run_fla_rwkv7_recurrent_from_decay_logits
     calls: list[dict[str, Any]] = []
 
     def traced_recurrent(*args: torch.Tensor, **kwargs: Any) -> torch.Tensor:
@@ -347,7 +373,11 @@ def test_tiny_hf_artifact_generates_through_public_recurrent_flash_chain(
         )
         return output
 
-    monkeypatch.setattr(vllm_rwkv7, "run_fla_rwkv7_recurrent", traced_recurrent)
+    monkeypatch.setattr(
+        vllm_rwkv7,
+        "run_fla_rwkv7_recurrent_from_decay_logits",
+        traced_recurrent,
+    )
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     monkeypatch.setenv("VLLM_USE_RAPID_SAMPLER", "1")
