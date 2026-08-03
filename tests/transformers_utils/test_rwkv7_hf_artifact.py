@@ -562,7 +562,7 @@ def test_invalid_rwkv7_hf_artifact_config_fails_closed(
 
 def test_runtime_loader_rejects_raw_pth_directory(tmp_path: Path) -> None:
     (tmp_path / "model.pth").touch()
-    loader = object.__new__(DefaultModelLoader)
+    loader: Any = object.__new__(DefaultModelLoader)
     setattr(
         loader,
         "load_config",
@@ -712,7 +712,7 @@ def _exercise_nvfp4_consumer_candidate(
     quant_config = CompressedTensorsConfig.from_config(
         deepcopy(config.quantization_config)
     )
-    model = object.__new__(RWKV7ForCausalLM)
+    model: Any = object.__new__(RWKV7ForCausalLM)
     nn.Module.__init__(model)
     model.config = config
     model.quant_config = quant_config
@@ -977,7 +977,7 @@ def test_default_loader_nvfp4_candidate_reaches_native_gpu_kernel(
     quant_config = CompressedTensorsConfig.from_config(
         deepcopy(config.quantization_config)
     )
-    model = object.__new__(RWKV7ForCausalLM)
+    model: Any = object.__new__(RWKV7ForCausalLM)
     nn.Module.__init__(model)
     model.config = config
     model.quant_config = quant_config
