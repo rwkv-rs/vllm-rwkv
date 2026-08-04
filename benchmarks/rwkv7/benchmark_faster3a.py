@@ -63,12 +63,12 @@ VLLM_RUNNER_TIMING_TARGET = "worker.execute_model + worker.sample_tokens"
 VLLM_RUNNER_TIMING_CLOCK = "cuda_event"
 DEFAULT_RUNNER_PREFILL_CHUNK_TOKENS = 16
 RUNNER_INPUT_SEED = 0
+# Keep prompt inputs deterministic; rapid-sampling rejects per-request seeds.
 VLLM_RUNNER_SAMPLING = {
     "temperature": 1.0,
     "top_p": 1.0,
     "ignore_eos": True,
     "detokenize": False,
-    "seed": RUNNER_INPUT_SEED,
 }
 # The outer benchmark launcher can still provide these historical variables,
 # but vLLM deliberately rejects them because their model behavior is fixed.
@@ -1086,7 +1086,6 @@ def _run_vllm_worker_internal_prefill(
         top_p=VLLM_RUNNER_SAMPLING["top_p"],
         ignore_eos=VLLM_RUNNER_SAMPLING["ignore_eos"],
         detokenize=VLLM_RUNNER_SAMPLING["detokenize"],
-        seed=VLLM_RUNNER_SAMPLING["seed"],
     )
     prompt_token_ids, input_provenance = _worker_prompt_inputs(
         worker, batch_size, prompt_len
@@ -1200,7 +1199,6 @@ def _run_vllm_worker_internal_decode_only(
         top_p=VLLM_RUNNER_SAMPLING["top_p"],
         ignore_eos=VLLM_RUNNER_SAMPLING["ignore_eos"],
         detokenize=VLLM_RUNNER_SAMPLING["detokenize"],
-        seed=VLLM_RUNNER_SAMPLING["seed"],
     )
     prompt_token_ids, input_provenance = _worker_prompt_inputs(
         worker, batch_size, prompt_len
@@ -1317,7 +1315,6 @@ def _run_vllm_worker_internal_steady_decode(
         top_p=VLLM_RUNNER_SAMPLING["top_p"],
         ignore_eos=VLLM_RUNNER_SAMPLING["ignore_eos"],
         detokenize=VLLM_RUNNER_SAMPLING["detokenize"],
-        seed=VLLM_RUNNER_SAMPLING["seed"],
     )
     prompt_token_ids, input_provenance = _worker_prompt_inputs(
         worker, batch_size, prompt_len
