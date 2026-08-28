@@ -224,7 +224,10 @@ def _config() -> SimpleNamespace:
             decode_context_parallel_size=1,
             prefill_context_parallel_size=1,
         ),
-        scheduler_config=SimpleNamespace(enable_chunked_prefill=True),
+        scheduler_config=SimpleNamespace(
+            enable_chunked_prefill=True,
+            async_scheduling=None,
+        ),
         speculative_config=None,
         lora_config=None,
         quant_config=None,
@@ -242,6 +245,7 @@ def test_config_uses_fp16_state_and_full_graph_defaults() -> None:
     assert vllm_config.cache_config.mamba_ssm_cache_dtype == "float16"
     assert vllm_config.cache_config.mamba_cache_mode == "align"
     assert vllm_config.cache_config.mamba_block_size == 16
+    assert not vllm_config.scheduler_config.async_scheduling
     assert vllm_config.compilation_config.mode == CompilationMode.NONE
     assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL
 
@@ -262,3 +266,14 @@ def test_config_rejects_tensor_parallelism() -> None:
         assert "tensor parallelism" in str(error)
     else:
         raise AssertionError("tensor parallelism must be rejected")
+
+
+def test_config_rejects_async_scheduling() -> None:
+    vllm_config = _config()
+    vllm_config.scheduler_config.async_scheduling = True
+    try:
+        RwkvForCausalLMConfig.verify_and_update_config(vllm_config)
+    except ValueError as error:
+        assert "asynchronous scheduling" in str(error)
+    else:
+        raise AssertionError("asynchronous scheduling must be rejected")
