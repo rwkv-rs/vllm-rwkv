@@ -79,7 +79,7 @@ XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS = frozenset(
     }
 )
 VLLM_BUILTIN_STRUCTURAL_TAG_MODELS = frozenset(
-    {"glm_4_7", "hermes", "hy_v4", "kimi_k3", "longcat", "plamo3"}
+    {"glm_4_7", "hermes", "hy_v4", "kimi_k3", "longcat", "plamo3", "rwkv"}
 )
 SUPPORTED_STRUCTURAL_TAG_MODELS = (
     XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS | VLLM_BUILTIN_STRUCTURAL_TAG_MODELS
@@ -430,6 +430,60 @@ def get_longcat_structural_tag(
     return _hermes_style_structural_tag(
         tools, tool_choice, "<longcat_tool_call>", "</longcat_tool_call>"
     )
+
+
+_RWKV_TOOL_CALL_TRIGGER = "**Tool Call:**"
+
+
+def _rwkv_tool_tags(tools: list[FunctionToolParam]) -> list[TagFormat]:
+    return [
+        TagFormat(
+            begin=(
+                f'{_RWKV_TOOL_CALL_TRIGGER}\n```json\n{{"name": "'
+                f'{tool.function.name}", "arguments": '
+            ),
+            content=JSONSchemaFormat(
+                json_schema=get_function_parameters(tool.function)
+            ),
+            end="}\n```",
+        )
+        for tool in tools
+    ]
+
+
+@register_vllm_structural_tag("rwkv")
+def get_rwkv_structural_tag(
+    tools: list[FunctionToolParam],
+    builtin_tools: list[BuiltinToolParam],
+    tool_choice: SimplifiedToolChoice,
+    reasoning: bool,
+    token_suffix: str = "",
+) -> StructuralTag:
+    del builtin_tools, reasoning, token_suffix
+
+    tags = _rwkv_tool_tags(tools)
+    if tool_choice == "auto":
+        output = (
+            TriggeredTagsFormat(
+                triggers=[_RWKV_TOOL_CALL_TRIGGER],
+                tags=tags,
+            )
+            if tags
+            else AnyTextFormat()
+        )
+    else:
+        output = SequenceFormat(
+            elements=[
+                AnyTextFormat(excludes=[_RWKV_TOOL_CALL_TRIGGER]),
+                TagsWithSeparatorFormat(
+                    tags=tags,
+                    separator="\n",
+                    at_least_one=True,
+                    stop_after_first=tool_choice == "forced",
+                ),
+            ]
+        )
+    return StructuralTag(format=output)
 
 
 def _minimax_tool_tags(tools: list[FunctionToolParam]) -> list[TagFormat]:
