@@ -454,6 +454,15 @@ Flags: `--tool-call-parser hf --reasoning-parser hf --enable-auto-tool-choice`
 The `hf` parsers read Kolibri 1's output format from the [checkpoint response template](#checkpoint-response-templates-hf), so the limits of the `hf` parser apply.
 Kolibri 1 emits Hermes-style tool calls, so `--tool-call-parser hermes --reasoning-parser qwen3` also works, for example for tool choices the `hf` parser rejects.
 
+### RWKV Models (`rwkv`)
+
+RWKV artifacts that use the canonical RWKV chat template emit tool calls as
+`**Tool Call:**` followed by a fenced JSON object. The parser supports automatic,
+required, named, streaming, and non-streaming tool calls. The chat template is
+loaded from the model artifact and does not need a separate `--chat-template`.
+
+Flags: `--tool-call-parser rwkv`
+
 ### Hunyuan Models (`hunyuan_a13b`)
 
 Supported models:

@@ -226,6 +226,10 @@ _TOOL_PARSERS_TO_REGISTER = {
         "ripple_engine_tool_parser",
         "RippleEngineToolParser",
     ),
+    "rwkv": (
+        "rwkv_tool_parser",
+        "RwkvToolParser",
+    ),
     "seed_oss": (
         "seed_oss_engine_tool_parser",
         "SeedOssEngineToolParser",
