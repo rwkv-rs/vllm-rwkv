@@ -16,17 +16,26 @@ from vllm.v1.worker.gpu.model_states.rwkv import RwkvModelState
 
 class _FakeStateHandle:
     def __init__(
-        self, state: torch.Tensor, elapsed: torch.Tensor | None = None
+        self,
+        state_pool_size: int,
+        channels: int,
+        state_dtype: torch.dtype,
+        has_elapsed: bool,
     ) -> None:
-        self.state = state
-        self.elapsed = elapsed
+        self.state = torch.zeros((state_pool_size, channels), dtype=state_dtype)
+        self.elapsed = (
+            torch.zeros(state_pool_size, dtype=torch.int32) if has_elapsed else None
+        )
         self.materialized: list[torch.Tensor] = []
 
     @property
     def memory_layout(self) -> dict[str, int]:
         return {
+            "base_bytes_per_slot": 1,
             "private_bytes_per_slot": 17,
+            "bytes_per_slot": 18,
             "fixed_workspace_nbytes": 13,
+            "total_nbytes": self.state.shape[0] * 18 + 13,
         }
 
     def reset_slots_(self, indices: torch.Tensor) -> None:
@@ -61,24 +70,28 @@ def _fake_flashrwkv2() -> ModuleType:
     module: Any = ModuleType("flashrwkv2")
     module.__version__ = "0.1.0a10"
 
-    def memory_layout(*args, **kwargs):
-        del args, kwargs
-        return {
-            "base_bytes_per_slot": 1,
-            "private_bytes_per_slot": 17,
-            "bytes_per_slot": 18,
-            "fixed_workspace_nbytes": 13,
-        }
+    def prepare_fp16(
+        state_pool_size,
+        channels,
+        *,
+        sequence_capacity,
+        head_size=64,
+        device=None,
+    ):
+        del sequence_capacity, head_size, device
+        return _FakeStateHandle(state_pool_size, channels, torch.float16, True)
 
-    def prepare_fp16(state, elapsed, *, sequence_capacity):
-        del sequence_capacity
-        return _FakeStateHandle(state, elapsed)
+    def prepare_fp32(
+        state_pool_size,
+        channels,
+        *,
+        sequence_capacity,
+        head_size=64,
+        device=None,
+    ):
+        del sequence_capacity, head_size, device
+        return _FakeStateHandle(state_pool_size, channels, torch.float32, False)
 
-    def prepare_fp32(state, *, sequence_capacity):
-        del sequence_capacity
-        return _FakeStateHandle(state)
-
-    module.get_tmix_wkv7_recurrent_state_memory_layout = memory_layout
     module.prepare_tmix_wkv7_recurrent_fp16_state = prepare_fp16
     module.prepare_tmix_wkv7_recurrent_fp32io16_state = prepare_fp32
     module.prepare_tmix_wkv7_recurrent_metadata = lambda *args, **kwargs: (args, kwargs)
@@ -121,7 +134,7 @@ def test_state_spec_accounts_provider_memory_and_slot_lifecycle(monkeypatch) -> 
     state_layer = RwkvStateLayer(vllm_config, 2, "model.layers.0.rwkv_state")
     spec = state_layer.get_kv_cache_spec(vllm_config)
 
-    assert spec.provider_private_bytes_per_page == 34
+    assert spec.provider_state_bytes_per_page == 36
     assert spec.provider_fixed_workspace_bytes == 26
     assert spec.num_prefill_checkpoint_blocks == 1
 
@@ -129,6 +142,7 @@ def test_state_spec_accounts_provider_memory_and_slot_lifecycle(monkeypatch) -> 
     raw = torch.zeros((num_slots, 1, 1, spec.page_size_bytes), dtype=torch.int8)
     state_layer.bind_kv_cache(raw)
     tmix, handle, cmix = state_layer.get_layer_state(0)
+    assert handle.state.untyped_storage().data_ptr() != raw.untyped_storage().data_ptr()
     tmix[1].fill_(1)
     handle.state[1].fill_(2)
     assert handle.elapsed is not None

@@ -20,14 +20,14 @@ from vllm.v1.kv_cache_interface import KVCacheLayout, MambaSpec
 
 @dataclass(frozen=True)
 class RwkvStateSpec(MambaSpec):
-    """Visible RWKV state plus provider-owned workspace accounting."""
+    """Scheduler-visible shifts plus provider-owned state accounting."""
 
-    provider_private_bytes_per_page: int = 0
+    provider_state_bytes_per_page: int = 0
     provider_fixed_workspace_bytes: int = 0
 
     @property
     def external_bytes_per_page(self) -> int:
-        return self.provider_private_bytes_per_page
+        return self.provider_state_bytes_per_page
 
     @property
     def external_fixed_memory_bytes(self) -> int:
