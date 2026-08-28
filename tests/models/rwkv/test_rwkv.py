@@ -20,6 +20,7 @@ class _FakeStateHandle:
     ) -> None:
         self.state = state
         self.elapsed = elapsed
+        self.materialized: list[torch.Tensor] = []
 
     @property
     def memory_layout(self) -> dict[str, int]:
@@ -53,7 +54,7 @@ class _FakeStateHandle:
             )
 
     def materialize_slots_(self, indices: torch.Tensor) -> None:
-        del indices
+        self.materialized.append(indices.clone())
 
 
 def _fake_flashrwkv2() -> ModuleType:
@@ -147,6 +148,35 @@ def test_state_spec_accounts_provider_memory_and_slot_lifecycle(monkeypatch) -> 
     assert torch.count_nonzero(handle.state[2]) == 0
     assert torch.count_nonzero(handle.elapsed[2]) == 0
     assert torch.count_nonzero(cmix[2]) == 0
+
+    tmix[0].fill_(5)
+    tmix[1].fill_(1)
+    handle.state[0].fill_(6)
+    handle.state[1].fill_(2)
+    handle.elapsed[0].fill_(7)
+    handle.elapsed[1].fill_(3)
+    cmix[0].fill_(8)
+    cmix[1].fill_(4)
+    state_layer.copy_state_slots(
+        torch.tensor([0, 1], dtype=torch.int32),
+        torch.tensor([1, 0], dtype=torch.int32),
+    )
+    assert torch.all(tmix[0] == 1) and torch.all(tmix[1] == 5)
+    assert torch.all(handle.state[0] == 2) and torch.all(handle.state[1] == 6)
+    assert torch.all(handle.elapsed[0] == 3) and torch.all(handle.elapsed[1] == 7)
+    assert torch.all(cmix[0] == 4) and torch.all(cmix[1] == 8)
+
+    state_layer.materialize_state_slots(source)
+    handles = []
+    for layer_idx in range(2):
+        layer_handle = state_layer.get_layer_state(layer_idx)[1]
+        assert isinstance(layer_handle, _FakeStateHandle)
+        handles.append(layer_handle)
+    assert all(
+        len(layer_handle.materialized) == 1
+        and torch.equal(layer_handle.materialized[0], source)
+        for layer_handle in handles
+    )
 
 
 def test_channel_mix_value_loads_checkpoint_weight_transposed() -> None:
@@ -255,6 +285,21 @@ def test_config_accepts_fp32_wkv_state() -> None:
     vllm_config.cache_config.mamba_ssm_cache_dtype = "float32"
     RwkvForCausalLMConfig.verify_and_update_config(vllm_config)
     assert vllm_config.cache_config.mamba_ssm_cache_dtype == "float32"
+
+
+def test_config_accepts_pipeline_parallel_size_two() -> None:
+    vllm_config = _config()
+    vllm_config.parallel_config.pipeline_parallel_size = 2
+    RwkvForCausalLMConfig.verify_and_update_config(vllm_config)
+    assert vllm_config.parallel_config.pipeline_parallel_size == 2
+
+
+def test_config_uses_eager_cuda_graph_mode_for_diagnostics() -> None:
+    vllm_config = _config()
+    vllm_config.model_config.enforce_eager = True
+    RwkvForCausalLMConfig.verify_and_update_config(vllm_config)
+    assert vllm_config.compilation_config.mode == CompilationMode.NONE
+    assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
 
 
 def test_config_rejects_tensor_parallelism() -> None:
