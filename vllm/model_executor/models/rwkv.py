@@ -166,11 +166,13 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
 
         block_size = vllm_config.cache_config.mamba_block_size
         assert block_size is not None
+        cache_mode = vllm_config.cache_config.mamba_cache_mode
         return RwkvStateSpec(
             block_size=block_size,
             shapes=tuple(shapes),
             dtypes=tuple(dtypes),
-            mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
+            mamba_cache_mode=cache_mode,
+            num_prefill_checkpoint_blocks=1 if cache_mode == "align" else 0,
             provider_private_bytes_per_page=(
                 layer_count * layout["private_bytes_per_slot"]
             ),
