@@ -278,11 +278,13 @@ def test_channel_mix_value_loads_checkpoint_weight_transposed() -> None:
 
 def test_align_state_advance_copies_only_crossing_requests() -> None:
     copies: list[tuple[torch.Tensor, torch.Tensor]] = []
+    resets: list[torch.Tensor] = []
     state_layer = SimpleNamespace(
         prefix="model.layers.0.rwkv_state",
         copy_state_slots=lambda source, destination: copies.append(
             (source.clone(), destination.clone())
         ),
+        reset_state_slots=lambda slots: resets.append(slots.clone()),
     )
     model_state = object.__new__(RwkvModelState)
     model_state._align_mode = True
@@ -307,11 +309,46 @@ def test_align_state_advance_copies_only_crossing_requests() -> None:
     )
 
     assert len(copies) == 1
+    assert not resets
     assert torch.equal(copies[0][0], torch.tensor([3], dtype=torch.int32))
     assert torch.equal(copies[0][1], torch.tensor([4], dtype=torch.int32))
     assert np.array_equal(
         model_state._state_block_columns, np.array([0, 1], dtype=np.int32)
     )
+
+
+def test_align_state_advance_resets_new_request_destination() -> None:
+    resets: list[torch.Tensor] = []
+    state_layer = SimpleNamespace(
+        prefix="model.layers.0.rwkv_state",
+        copy_state_slots=lambda source, destination: None,
+        reset_state_slots=lambda slots: resets.append(slots.clone()),
+    )
+    model_state = object.__new__(RwkvModelState)
+    model_state._align_mode = True
+    model_state._block_size = 16
+    model_state._state_block_columns = np.array([-1], dtype=np.int32)
+    model_state._state_layer = state_layer
+    model_state._rwkv_group_id = 0
+    model_state.device = torch.device("cpu")
+
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        idx_mapping_np=np.array([0]),
+        num_computed_tokens_np=np.array([0], dtype=np.int32),
+        num_scheduled_tokens=np.array([32], dtype=np.int32),
+    )
+    block_table = torch.tensor([[7, 9]], dtype=torch.int32)
+    model_state.preprocess_state(
+        input_batch,
+        (block_table,),
+        SimpleNamespace(kv_cache_groups=[]),
+        torch.empty(0),
+    )
+
+    assert len(resets) == 1
+    assert torch.equal(resets[0], torch.tensor([9], dtype=torch.int32))
+    assert np.array_equal(model_state._state_block_columns, np.array([1]))
 
 
 def _config() -> SimpleNamespace:
