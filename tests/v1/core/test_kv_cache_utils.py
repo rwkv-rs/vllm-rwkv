@@ -49,6 +49,7 @@ from vllm.v1.kv_cache_interface import (
     HiddenStateCacheSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheLayout,
     KVCacheSpec,
     KVCacheSpecKind,
     KVCacheTensor,
@@ -2101,6 +2102,49 @@ def test_get_kv_cache_configs_attention_free():
             kv_cache_groups=[],
         )
     ]
+
+
+def test_provider_owned_kv_memory_is_counted_but_not_backed():
+    class ProviderOwnedMemorySpec(MambaSpec):
+        @property
+        def external_bytes_per_page(self) -> int:
+            return 64
+
+        @property
+        def external_fixed_memory_bytes(self) -> int:
+            return 128
+
+    spec = ProviderOwnedMemorySpec(
+        block_size=16,
+        shapes=((4,),),
+        dtypes=(torch.float32,),
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBNHC,
+            num_gpu_blocks_override=None,
+            prefix_cache_retention_interval=None,
+        )
+    )
+    groups = [KVCacheGroupSpec(["layer_1"], spec)]
+
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        available_memory=128 + 10 * (16 + 64),
+    )
+
+    assert config.num_blocks == 10
+    assert config.kv_cache_tensors == [
+        KVCacheTensor(
+            size=10 * 16,
+            layers=["layer_1"],
+            layer_stride=10 * 16,
+            block_stride=16,
+        )
+    ]
+    assert kv_cache_utils._pool_bytes_per_block(groups) == 80
+    assert kv_cache_utils._pool_fixed_memory_bytes(groups) == 128
 
 
 def test_generate_uniform_type_kv_cache_specs():

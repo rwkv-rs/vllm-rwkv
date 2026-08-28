@@ -1077,17 +1077,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
-            assert self.kv_block_zeroer is not None
-            self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            block_ids = scheduler_output.new_block_ids_to_zero
+            if not self.model_state.reset_kv_cache_blocks(block_ids):
+                assert self.kv_block_zeroer is not None
+                self.kv_block_zeroer.zero_block_ids(block_ids)
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
         # zeroing new blocks and before the forward pass reads them.
         if scheduler_output.kv_cache_block_copies:
-            copy_kv_cache_blocks_inplace(
-                self.kv_caches,
-                self.kv_cache_config.num_blocks,
-                scheduler_output.kv_cache_block_copies,
-            )
+            block_copies = scheduler_output.kv_cache_block_copies
+            if not self.model_state.copy_kv_cache_blocks(block_copies):
+                copy_kv_cache_blocks_inplace(
+                    self.kv_caches,
+                    self.kv_cache_config.num_blocks,
+                    block_copies,
+                )
 
     def gather_batch_req_state(
         self, scheduler_output: SchedulerOutput, dummy_run: bool

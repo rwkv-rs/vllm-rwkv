@@ -16,7 +16,6 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_block_hashes,
 )
 from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
     FullAttentionSpec,
@@ -83,8 +82,8 @@ class SingleTypeKVCacheManager(ABC):
         self._max_admission_blocks_per_request = max_admission_blocks_per_request
         # Record newly allocated block ids only when worker-side zeroing will
         # consume them and this manager holds a spec type that gets zeroed.
-        self._record_new_block_ids = needs_kv_cache_zeroing and isinstance(
-            kv_cache_spec, AttentionSpec
+        self._record_new_block_ids = (
+            needs_kv_cache_zeroing and kv_cache_spec.requires_block_zeroing
         )
         self.new_block_ids: list[int] = []
 

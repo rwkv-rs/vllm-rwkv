@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from typing import Any, ClassVar, cast
 
 import torch
@@ -125,6 +126,14 @@ class ModelState(ABC):
 
     def apply_staged_writes(self) -> None:
         return None
+
+    def reset_kv_cache_blocks(self, block_ids: Sequence[int]) -> bool:
+        """Reset model-owned state for freshly allocated scheduler blocks."""
+        return False
+
+    def copy_kv_cache_blocks(self, block_copies: Sequence[tuple[int, int]]) -> bool:
+        """Apply simultaneous model-owned state copies for scheduler blocks."""
+        return False
 
     def get_additional_cg_support(self) -> tuple[AttentionCGSupport, str | None]:
         """Cudagraph support of attention groups this ModelState builds outside

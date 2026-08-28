@@ -151,6 +151,21 @@ class KVCacheSpec:
     block_size: int
 
     @property
+    def external_bytes_per_page(self) -> int:
+        """Bytes per cache page allocated outside vLLM's backing tensor."""
+        return 0
+
+    @property
+    def external_fixed_memory_bytes(self) -> int:
+        """Fixed memory allocated outside vLLM's backing tensor."""
+        return 0
+
+    @property
+    def requires_block_zeroing(self) -> bool:
+        """Whether newly allocated scheduler blocks must be reset."""
+        return False
+
+    @property
     def num_heads(self) -> int:
         raise NotImplementedError
 
@@ -393,6 +408,10 @@ class AttentionSpec(KVCacheSpec):
     def __post_init__(self):
         if self.head_size_v is None:
             object.__setattr__(self, "head_size_v", self.head_size)
+
+    @property
+    def requires_block_zeroing(self) -> bool:
+        return True
 
     @property
     def num_heads(self) -> int:
@@ -959,6 +978,22 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     """
 
     kv_cache_specs: dict[str, KVCacheSpec]
+
+    @property
+    def external_bytes_per_page(self) -> int:
+        return sum(
+            spec.external_bytes_per_page for spec in self.kv_cache_specs.values()
+        )
+
+    @property
+    def external_fixed_memory_bytes(self) -> int:
+        return sum(
+            spec.external_fixed_memory_bytes for spec in self.kv_cache_specs.values()
+        )
+
+    @property
+    def requires_block_zeroing(self) -> bool:
+        return any(spec.requires_block_zeroing for spec in self.kv_cache_specs.values())
 
     @property
     def page_size_bytes(self) -> int:

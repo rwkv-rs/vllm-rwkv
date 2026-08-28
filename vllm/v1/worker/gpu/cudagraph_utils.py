@@ -874,7 +874,9 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
         runner.model_state.encoder_runner.clear()
     # Detach profiling KV tensors held by attention layers.
     for layer in runner.compilation_config.static_forward_context.values():
-        if hasattr(layer, "kv_cache"):
+        if hasattr(layer, "clear_kv_cache"):
+            layer.clear_kv_cache()
+        elif hasattr(layer, "kv_cache"):
             kv_cache = layer.kv_cache
             layer.kv_cache = (
                 torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
