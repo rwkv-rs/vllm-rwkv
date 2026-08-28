@@ -501,6 +501,7 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
     "Qwen3ForCausalLM": _HfExamplesInfo("Qwen/Qwen3-8B"),
     "Qwen3MoeForCausalLM": _HfExamplesInfo("Qwen/Qwen3-30B-A3B"),
     "Qwen3_5ForCausalLM": _HfExamplesInfo("codecho/Qwen3.5-0.8B-text-only"),
+    "RwkvForCausalLM": _HfExamplesInfo("rwkv-rs/rwkv7-g1-st", dtype="float16"),
     "Qwen3_5MoeForCausalLM": _HfExamplesInfo(
         "codecho/Qwen3.5-35B-A3B-text-only",
         extras={"native-prefix": "imdatta0/small_qwen3_5_20b"},
