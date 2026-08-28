@@ -29,6 +29,7 @@ from vllm.tool_parsers.kimi_k3_tool_parser import KimiK3ToolParser
 from vllm.tool_parsers.llama_tool_parser import Llama3JsonToolParser
 from vllm.tool_parsers.minimax_m2_tool_parser import MinimaxM2ToolParser
 from vllm.tool_parsers.qwen3_engine_tool_parser import Qwen3EngineToolParser
+from vllm.tool_parsers.rwkv_tool_parser import RwkvToolParser
 from vllm.tool_parsers.structural_tag_registry import (
     SUPPORTED_STRUCTURAL_TAG_MODELS,
     VLLM_BUILTIN_STRUCTURAL_TAG_MODELS,
@@ -165,6 +166,82 @@ def test_hermes_required_tool_calls_use_empty_separator():
 
     assert tag is not None
     assert tag.format.separator == ""
+
+
+def _rwkv_tool_call(name: str, arguments: str) -> str:
+    return (
+        '**Tool Call:**\n```json\n{"name": "'
+        + name
+        + '", "arguments": '
+        + arguments
+        + "}\n```"
+    )
+
+
+def _rwkv_grammar(tool_choice, tools=None):
+    tag = get_model_structural_tag(
+        model="rwkv",
+        tools=tools if tools is not None else _k3_tools_by_name(),
+        tool_choice=tool_choice,
+        reasoning=False,
+    )
+    assert isinstance(tag, StructuralTag)
+    return Grammar.from_structural_tag(tag)
+
+
+def test_rwkv_registered_as_vllm_builtin():
+    assert "rwkv" in VLLM_BUILTIN_STRUCTURAL_TAG_MODELS
+    assert RwkvToolParser.structural_tag_model == "rwkv"
+
+
+def test_rwkv_required_accepts_reasoning_and_parallel_calls():
+    body = "</think>\n" + "\n".join(
+        [
+            _rwkv_tool_call("get_weather", '{"city": "Paris", "days": 2}'),
+            _rwkv_tool_call("run_command", '{"command": "date"}'),
+        ]
+    )
+
+    assert _is_grammar_accept_string(_rwkv_grammar("required"), body)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "content without a required call",
+        _rwkv_tool_call("unknown", "{}"),
+        _rwkv_tool_call("get_weather", '{"days": 2}'),
+        '**Tool Call:**\n```json\n{"name": "get_weather"}\n```',
+    ],
+)
+def test_rwkv_required_rejects_invalid_calls(body: str):
+    assert not _is_grammar_accept_string(_rwkv_grammar("required"), body)
+
+
+def test_rwkv_named_choice_accepts_only_the_selected_tool():
+    choice = ChatCompletionNamedToolChoiceParam(
+        function=ChatCompletionNamedFunction(name="get_weather")
+    )
+    grammar = _rwkv_grammar(choice)
+
+    assert _is_grammar_accept_string(
+        grammar,
+        _rwkv_tool_call("get_weather", '{"city": "Paris"}'),
+    )
+    assert not _is_grammar_accept_string(
+        grammar,
+        _rwkv_tool_call("run_command", '{"command": "date"}'),
+    )
+
+
+def test_rwkv_strict_auto_allows_content_or_a_valid_call(sample_tools_strict):
+    grammar = _rwkv_grammar("auto", tools=sample_tools_strict)
+
+    assert _is_grammar_accept_string(grammar, "No tool is needed.")
+    assert _is_grammar_accept_string(
+        grammar,
+        _rwkv_tool_call("get_weather", '{"city": "Paris"}'),
+    )
 
 
 # ---------------------------------------------------------------------------
