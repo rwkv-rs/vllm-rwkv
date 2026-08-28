@@ -159,9 +159,8 @@ class RwkvAttentionMetadataBuilder(AttentionMetadataBuilder[RwkvAttentionMetadat
             self._num_active_tokens.zero_()
             self._num_active_sequences.zero_()
             batch_size = sequence_capacity
-            max_seqlen = max_seqlen_capacity
         else:
-            num_tokens, batch_size, max_seqlen = self._active_shape(metadata)
+            num_tokens, batch_size, _ = self._active_shape(metadata)
             self._num_active_tokens.fill_(num_tokens)
             self._num_active_sequences.fill_(batch_size)
 
@@ -169,7 +168,7 @@ class RwkvAttentionMetadataBuilder(AttentionMetadataBuilder[RwkvAttentionMetadat
             cu_seqlens=cu_seqlens,
             state_indices=live_state_indices,
             batch_size=batch_size,
-            max_seqlen=max_seqlen,
+            max_seqlen=max_seqlen_capacity,
             token_capacity=token_capacity,
             sequence_capacity=sequence_capacity,
             max_seqlen_capacity=max_seqlen_capacity,
