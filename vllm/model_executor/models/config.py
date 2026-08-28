@@ -967,6 +967,10 @@ class RwkvForCausalLMConfig(VerifyAndUpdateConfig):
             raise ValueError("RWKV does not support stochastic cache rounding")
         if not vllm_config.scheduler_config.enable_chunked_prefill:
             raise ValueError("RWKV requires chunked prefill")
+        if vllm_config.scheduler_config.async_scheduling:
+            raise ValueError("RWKV does not support asynchronous scheduling")
+        if vllm_config.scheduler_config.async_scheduling is None:
+            vllm_config.scheduler_config.async_scheduling = False
         if cache_config.mamba_cache_mode == "all":
             raise ValueError("RWKV does not support Mamba cache mode 'all'")
 
