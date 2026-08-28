@@ -85,9 +85,7 @@ class RwkvAttentionMetadata:
 class RwkvAttentionMetadataBuilder(AttentionMetadataBuilder[RwkvAttentionMetadata]):
     kv_cache_spec: RwkvStateSpec
 
-    # The live ticket path is implemented for full graphs, but this must remain
-    # disabled until prefill, mixed, and decode captures pass the RWKV GPU gate.
-    _cudagraph_support = AttentionCGSupport.NEVER
+    _cudagraph_support = AttentionCGSupport.ALWAYS
     reorder_batch_threshold = None
 
     def __init__(
