@@ -107,6 +107,8 @@ class RwkvAttentionMetadataBuilder(AttentionMetadataBuilder[RwkvAttentionMetadat
         self._live_state_indices = torch.empty(
             max_num_seqs, dtype=torch.int32, device=device
         )
+        self._live_cu_seqlens_views: dict[int, torch.Tensor] = {}
+        self._live_state_indices_views: dict[int, torch.Tensor] = {}
         self._num_active_tokens = torch.empty(1, dtype=torch.int32, device=device)
         self._num_active_sequences = torch.empty(1, dtype=torch.int32, device=device)
         cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
@@ -140,8 +142,15 @@ class RwkvAttentionMetadataBuilder(AttentionMetadataBuilder[RwkvAttentionMetadat
         sequence_capacity = metadata.num_reqs
         token_capacity = metadata.num_actual_tokens
         max_seqlen_capacity = metadata.max_query_len
-        cu_seqlens = self._live_cu_seqlens[: sequence_capacity + 1]
-        live_state_indices = self._live_state_indices[:sequence_capacity]
+        if sequence_capacity not in self._live_cu_seqlens_views:
+            self._live_cu_seqlens_views[sequence_capacity] = self._live_cu_seqlens[
+                : sequence_capacity + 1
+            ]
+            self._live_state_indices_views[sequence_capacity] = (
+                self._live_state_indices[:sequence_capacity]
+            )
+        cu_seqlens = self._live_cu_seqlens_views[sequence_capacity]
+        live_state_indices = self._live_state_indices_views[sequence_capacity]
         cu_seqlens.copy_(metadata.query_start_loc[: sequence_capacity + 1])
         live_state_indices.copy_(state_indices[:sequence_capacity])
 
