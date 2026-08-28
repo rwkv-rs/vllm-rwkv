@@ -1,0 +1,3 @@
+transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@f708325e46025404c807c5d4b0cb5803bb63d11d
+tokenizers @ git+https://github.com/rwkv-rs/tokenizers-rwkv.git@c5d8dde5ff49c70e4656199d5033a84e03c21b2b#subdirectory=bindings/python
+FlashRWKV2==0.1.0a10
