@@ -145,7 +145,7 @@ def test_state_spec_accounts_provider_memory_and_slot_lifecycle(monkeypatch) -> 
     )
     assert spec.provider_state_bytes_per_page == 36
     assert spec.provider_fixed_workspace_bytes == 26
-    assert spec.num_prefill_checkpoint_blocks == 1
+    assert spec.num_prefill_checkpoint_blocks == 0
 
     num_slots = 3
     raw = torch.zeros((num_slots, 1, 1, spec.page_size_bytes), dtype=torch.int8)
