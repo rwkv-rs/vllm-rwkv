@@ -38,6 +38,7 @@ class _ToolCallMatch:
 
 
 class RwkvToolParser(ToolParser):
+    structural_tag_model = "rwkv"
     supports_required_and_named = False
 
     def __init__(
