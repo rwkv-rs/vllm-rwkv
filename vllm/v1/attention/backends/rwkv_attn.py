@@ -142,7 +142,7 @@ class RwkvAttentionMetadataBuilder(AttentionMetadataBuilder[RwkvAttentionMetadat
     ) -> RwkvAttentionMetadata:
         sequence_capacity = metadata.num_reqs
         token_capacity = metadata.num_actual_tokens
-        max_seqlen_capacity = metadata.max_query_len
+        max_seqlen_capacity = token_capacity
         if sequence_capacity not in self._live_cu_seqlens_views:
             self._live_cu_seqlens_views[sequence_capacity] = self._live_cu_seqlens[
                 : sequence_capacity + 1
