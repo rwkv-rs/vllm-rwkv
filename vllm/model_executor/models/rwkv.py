@@ -44,7 +44,6 @@ from .utils import (
 
 _FLASHRWKV2_VERSION = "0.1.0a10"
 _FLASHRWKV2_APIS = (
-    "get_tmix_wkv7_recurrent_state_memory_layout",
     "infer_cmix_forward_varlen",
     "infer_embedding_ln0_forward_varlen",
     "infer_post_norm_output_forward_varlen",
@@ -125,8 +124,6 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         self._spec: RwkvStateSpec | None = None
         self._num_slots = 0
         self._tmix_shift_pool: torch.Tensor | None = None
-        self._wkv_pool: torch.Tensor | None = None
-        self._elapsed_pool: torch.Tensor | None = None
         self._cmix_shift_pool: torch.Tensor | None = None
         self._wkv_handles: list[object] = []
         self._live_ticket_cache: dict[tuple[int, ...], object] = {}
@@ -138,31 +135,43 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         static_context[prefix] = self
 
-    def _build_spec(self, vllm_config: VllmConfig) -> RwkvStateSpec:
+    def _prepare_wkv_state(
+        self,
+        state_pool_size: int,
+        device: torch.device,
+    ) -> object:
         flashrwkv2 = _load_flashrwkv2()
-        layout = flashrwkv2.get_tmix_wkv7_recurrent_state_memory_layout(
+        prepare = (
+            flashrwkv2.prepare_tmix_wkv7_recurrent_fp32io16_state
+            if self.state_dtype == torch.float32
+            else flashrwkv2.prepare_tmix_wkv7_recurrent_fp16_state
+        )
+        return prepare(
+            state_pool_size,
             self.hidden_size,
-            state_dtype=self.state_dtype,
             sequence_capacity=self.sequence_capacity,
             head_size=self.head_size,
-            device=vllm_config.device_config.device,
+            device=device,
         )
+
+    def _probe_wkv_state_layout(self, device: torch.device) -> dict[str, int]:
+        handle = self._prepare_wkv_state(1, device)
+        try:
+            return handle.memory_layout
+        finally:
+            del handle
+            if device.type == "cuda":
+                torch.accelerator.empty_cache()
+
+    def _build_spec(self, vllm_config: VllmConfig) -> RwkvStateSpec:
+        device = torch.device(vllm_config.device_config.device)
+        layout = self._probe_wkv_state_layout(device)
         layer_count = self.num_local_layers
         shapes: list[tuple[int, ...]] = [
             (layer_count, self.hidden_size),
-            (
-                layer_count,
-                self.num_heads,
-                self.head_size,
-                self.head_size,
-            ),
+            (layer_count, self.hidden_size),
         ]
-        dtypes = [torch.float16, self.state_dtype]
-        if self.state_dtype == torch.float16:
-            shapes.append((layer_count,))
-            dtypes.append(torch.int32)
-        shapes.append((layer_count, self.hidden_size))
-        dtypes.append(torch.float16)
+        dtypes = [torch.float16, torch.float16]
 
         block_size = vllm_config.cache_config.mamba_block_size
         assert block_size is not None
@@ -173,9 +182,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
             dtypes=tuple(dtypes),
             mamba_cache_mode=cache_mode,
             num_prefill_checkpoint_blocks=1 if cache_mode == "align" else 0,
-            provider_private_bytes_per_page=(
-                layer_count * layout["private_bytes_per_slot"]
-            ),
+            provider_state_bytes_per_page=(layer_count * layout["bytes_per_slot"]),
             provider_fixed_workspace_bytes=(
                 layer_count * layout["fixed_workspace_nbytes"]
             ),
@@ -222,27 +229,6 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
             (layer_count, slot_count, self.hidden_size),
             torch.float16,
         )
-        self._wkv_pool, offset = self._typed_view(
-            raw,
-            offset,
-            (
-                layer_count,
-                slot_count,
-                self.num_heads,
-                self.head_size,
-                self.head_size,
-            ),
-            self.state_dtype,
-        )
-        if self.state_dtype == torch.float16:
-            self._elapsed_pool, offset = self._typed_view(
-                raw,
-                offset,
-                (layer_count, slot_count),
-                torch.int32,
-            )
-        else:
-            self._elapsed_pool = None
         self._cmix_shift_pool, offset = self._typed_view(
             raw,
             offset,
@@ -252,30 +238,21 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         if offset != total_bytes:
             raise ValueError("RWKV state pool layout does not fill its allocation")
 
-        flashrwkv2 = _load_flashrwkv2()
         self._wkv_handles = []
-        for layer_idx in range(layer_count):
-            if self.state_dtype == torch.float16:
-                assert self._elapsed_pool is not None
-                handle = flashrwkv2.prepare_tmix_wkv7_recurrent_fp16_state(
-                    self._wkv_pool[layer_idx],
-                    self._elapsed_pool[layer_idx],
-                    sequence_capacity=self.sequence_capacity,
-                )
-            else:
-                handle = flashrwkv2.prepare_tmix_wkv7_recurrent_fp32io16_state(
-                    self._wkv_pool[layer_idx],
-                    sequence_capacity=self.sequence_capacity,
-                )
+        for _ in range(layer_count):
+            handle = self._prepare_wkv_state(slot_count, kv_cache.device)
             handle_layout = handle.memory_layout
             if (
-                handle_layout["private_bytes_per_slot"]
-                != spec.provider_private_bytes_per_page // layer_count
+                handle_layout["bytes_per_slot"]
+                != spec.provider_state_bytes_per_page // layer_count
                 or handle_layout["fixed_workspace_nbytes"]
                 != spec.provider_fixed_workspace_bytes // layer_count
+                or handle_layout["total_nbytes"]
+                != slot_count * handle_layout["bytes_per_slot"]
+                + handle_layout["fixed_workspace_nbytes"]
             ):
                 raise RuntimeError(
-                    "FlashRWKV2 allocated a different private state layout "
+                    "FlashRWKV2 allocated a different recurrent state layout "
                     "than it reported during cache planning"
                 )
             self._wkv_handles.append(handle)
@@ -284,8 +261,6 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
     def clear_kv_cache(self) -> None:
         self._wkv_handles.clear()
         self._tmix_shift_pool = None
-        self._wkv_pool = None
-        self._elapsed_pool = None
         self._cmix_shift_pool = None
         self._num_slots = 0
         self._live_ticket_cache.clear()
