@@ -2136,3 +2136,52 @@ def test_kv_cache_groups_tp_replicas(specs, tp_size, dcp_size, expected):
     """Replicas are the gcd of each layer's tp_size // max_tp_shards."""
     groups = [KVCacheGroupSpec([f"l.{i}"], spec) for i, spec in enumerate(specs)]
     assert kv_cache_groups_tp_replicas(groups, tp_size, dcp_size) == expected
+
+
+def test_provider_owned_kv_memory_is_counted_but_not_backed():
+    class ProviderOwnedMemorySpec(MambaSpec):
+        @property
+        def external_bytes_per_page(self) -> int:
+            return 64
+
+        @property
+        def external_fixed_memory_bytes(self) -> int:
+            return 128
+
+    spec = ProviderOwnedMemorySpec(
+        block_size=16,
+        shapes=((4,),),
+        dtypes=(torch.float32,),
+    )
+    vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=None),
+        cache_config=SimpleNamespace(
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBNHC,
+            num_gpu_blocks_override=None,
+            prefix_cache_retention_interval=None,
+        ),
+    )
+    groups = [KVCacheGroupSpec(["layer_1"], spec)]
+
+    config = kv_cache_planning.get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        available_memory=128 + 10 * (16 + 64),
+    )
+
+    assert config.num_blocks == 10
+    assert config.kv_cache_tensors == [
+        KVCacheTensor(
+            size=10 * 16,
+            layers=["layer_1"],
+            layer_stride=10 * 16,
+            block_stride=16,
+        )
+    ]
+    assert (
+        kv_cache_planning._pool_bytes_per_block_from_builder(
+            kv_cache_planning.DefaultKVCacheConfigBuilder(), vllm_config, groups
+        )
+        == 80
+    )
+    assert kv_cache_planning._pool_fixed_memory_bytes(groups) == 128
