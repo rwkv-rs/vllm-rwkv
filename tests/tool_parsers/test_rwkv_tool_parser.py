@@ -168,6 +168,23 @@ def test_extracts_parallel_calls_and_json_string_arguments() -> None:
     ]
 
 
+def test_keeps_complete_calls_before_trailing_incomplete_call() -> None:
+    tools = [_tool("get_weather")]
+    complete = _tool_call("get_weather", {"city": "Paris"})
+    trailing = '**Tool Call:**\n```json\n{"name": "get_weather"'
+
+    result = _parser(tools).extract_tool_calls(
+        complete + "\n" + trailing,
+        _request(tools, "required"),
+    )
+
+    assert result.tools_called
+    assert result.content is None
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].function.name == "get_weather"
+    assert json.loads(result.tool_calls[0].function.arguments) == {"city": "Paris"}
+
+
 @pytest.mark.parametrize("chunk_size", [1, 5, 17])
 def test_streams_content_and_complete_tool_calls(chunk_size: int) -> None:
     tools = [_tool("get_weather")]
