@@ -77,11 +77,21 @@ class RwkvModelState(DefaultModelState):
         query_lens = input_batch.num_scheduled_tokens[:num_reqs]
         old_columns = self._state_block_columns[req_indices]
         new_columns = (computed + query_lens - 1) // self._block_size
+        block_table = block_tables[self._get_rwkv_group_id(kv_cache_config)]
+        reset_rows_np = np.flatnonzero(old_columns < 0)
+        if reset_rows_np.size:
+            reset_rows = torch.as_tensor(
+                reset_rows_np, dtype=torch.int64, device=self.device
+            )
+            reset_columns = torch.as_tensor(
+                new_columns[reset_rows_np], dtype=torch.int64, device=self.device
+            )
+            reset_indices = block_table[reset_rows, reset_columns].contiguous()
+            self._state_layer.reset_state_slots(reset_indices)
         row_indices_np = np.flatnonzero(
             (old_columns >= 0) & (old_columns != new_columns)
         )
         if row_indices_np.size:
-            block_table = block_tables[self._get_rwkv_group_id(kv_cache_config)]
             row_indices = torch.as_tensor(
                 row_indices_np, dtype=torch.int64, device=self.device
             )
