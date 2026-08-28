@@ -180,7 +180,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
             shapes=tuple(shapes),
             dtypes=tuple(dtypes),
             mamba_cache_mode=cache_mode,
-            num_prefill_checkpoint_blocks=1 if cache_mode == "align" else 0,
+            num_prefill_checkpoint_blocks=0,
             provider_state_bytes_per_page=(layer_count * layout["bytes_per_slot"]),
             provider_fixed_workspace_bytes=(
                 layer_count * layout["fixed_workspace_nbytes"]
