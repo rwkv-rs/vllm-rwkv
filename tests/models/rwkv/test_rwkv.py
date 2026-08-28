@@ -12,7 +12,10 @@ from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.model_executor.models.config import RwkvForCausalLMConfig
 from vllm.model_executor.models.rwkv import RwkvChannelMixValue, RwkvStateLayer
 from vllm.v1.attention.backend import AttentionCGSupport
-from vllm.v1.attention.backends.rwkv_attn import RwkvAttentionMetadataBuilder
+from vllm.v1.attention.backends.rwkv_attn import (
+    RwkvAttentionMetadata,
+    RwkvAttentionMetadataBuilder,
+)
 from vllm.v1.worker.gpu.model_states.rwkv import RwkvModelState
 
 
@@ -224,6 +227,39 @@ def test_live_metadata_reuses_provider_ticket_tensor_identity() -> None:
 
     assert first.cu_seqlens is second.cu_seqlens
     assert first.state_indices is second.state_indices
+
+
+def test_live_metadata_prepares_and_retains_each_capture_ticket(monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "flashrwkv2", _fake_flashrwkv2())
+    vllm_config = _state_vllm_config()
+    state_layer = RwkvStateLayer(vllm_config, 1, "model.layers.0.rwkv_state")
+    spec = state_layer.get_kv_cache_spec(vllm_config)
+    raw = torch.zeros((1, 1, 1, spec.page_size_bytes), dtype=torch.int8)
+    state_layer.bind_kv_cache(raw)
+    metadata = RwkvAttentionMetadata(
+        cu_seqlens=torch.tensor([0, 1], dtype=torch.int32),
+        state_indices=torch.tensor([0], dtype=torch.int32),
+        batch_size=1,
+        max_seqlen=1,
+        token_capacity=1,
+        sequence_capacity=1,
+        max_seqlen_capacity=1,
+        num_active_tokens=torch.tensor([0], dtype=torch.int32),
+        num_active_sequences=torch.tensor([0], dtype=torch.int32),
+        retain_ticket=True,
+    )
+
+    state_layer.warmup_live_metadata(metadata)
+    warmup_ticket = state_layer._live_graph_tickets[-1]
+    capture_ticket = state_layer.prepare_metadata_ticket(metadata)
+    next_capture_ticket = state_layer.prepare_metadata_ticket(metadata)
+
+    assert capture_ticket is not warmup_ticket
+    assert next_capture_ticket is not capture_ticket
+    assert len(state_layer._live_graph_tickets) == 3
+    assert state_layer._live_graph_tickets[0] is warmup_ticket
+    assert state_layer._live_graph_tickets[1] is capture_ticket
+    assert state_layer._live_graph_tickets[2] is next_capture_ticket
 
 
 def test_channel_mix_value_loads_checkpoint_weight_transposed() -> None:
