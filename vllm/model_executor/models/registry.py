@@ -207,6 +207,7 @@ _TEXT_GENERATION_MODELS = {
     "Qwen3_5ForCausalLM": ("vllm.models.qwen3_5", "Qwen3_5ForCausalLM"),
     "Qwen3_5MoeForCausalLM": ("vllm.models.qwen3_5", "Qwen3_5MoeForCausalLM"),
     "RicursiveForCausalLM": ("ricursive", "RicursiveForCausalLM"),
+    "RwkvForCausalLM": ("rwkv", "RwkvForCausalLM"),
     "SarvamMoEForCausalLM": ("sarvam", "SarvamMoEForCausalLM"),
     "SarvamMLAForCausalLM": ("sarvam", "SarvamMLAForCausalLM"),
     "Step1ForCausalLM": ("step1", "Step1ForCausalLM"),
