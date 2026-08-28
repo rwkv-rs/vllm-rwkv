@@ -199,6 +199,33 @@ def test_state_spec_accounts_provider_memory_and_slot_lifecycle(monkeypatch) -> 
     )
 
 
+def test_live_metadata_reuses_provider_ticket_tensor_identity() -> None:
+    builder = object.__new__(RwkvAttentionMetadataBuilder)
+    builder._live_cu_seqlens = torch.empty(5, dtype=torch.int32)
+    builder._live_state_indices = torch.empty(4, dtype=torch.int32)
+    builder._live_cu_seqlens_views = {}
+    builder._live_state_indices_views = {}
+    builder._num_active_tokens = torch.empty(1, dtype=torch.int32)
+    builder._num_active_sequences = torch.empty(1, dtype=torch.int32)
+    builder._state_layer = SimpleNamespace(warmup_live_metadata=lambda metadata: None)
+
+    query_start_loc = torch.tensor([0, 2, 3], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        num_reqs=2,
+        num_actual_tokens=3,
+        max_query_len=2,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc,
+    )
+    state_indices = torch.tensor([1, 2], dtype=torch.int32)
+
+    first = builder._build_live(metadata, state_indices, for_capture=True)
+    second = builder._build_live(metadata, state_indices, for_capture=True)
+
+    assert first.cu_seqlens is second.cu_seqlens
+    assert first.state_indices is second.state_indices
+
+
 def test_channel_mix_value_loads_checkpoint_weight_transposed() -> None:
     value = RwkvChannelMixValue(hidden_size=2, intermediate_size=8)
     checkpoint_weight = torch.arange(16, dtype=torch.float16).view(2, 8)
