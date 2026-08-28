@@ -126,8 +126,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         self._tmix_shift_pool: torch.Tensor | None = None
         self._cmix_shift_pool: torch.Tensor | None = None
         self._wkv_handles: list[object] = []
-        self._live_ticket_cache: dict[tuple[int, ...], object] = {}
-        self._live_warmup_tickets: list[object] = []
+        self._live_graph_tickets: list[object] = []
         self.kv_cache = torch.tensor([])
 
         static_context = vllm_config.compilation_config.static_forward_context
@@ -263,8 +262,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         self._tmix_shift_pool = None
         self._cmix_shift_pool = None
         self._num_slots = 0
-        self._live_ticket_cache.clear()
-        self._live_warmup_tickets.clear()
+        self._live_graph_tickets.clear()
         self.kv_cache = torch.tensor([])
 
     @property
@@ -356,18 +354,10 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         if metadata.is_live:
             assert metadata.num_active_tokens is not None
             assert metadata.num_active_sequences is not None
-            key = (
-                metadata.cu_seqlens.data_ptr(),
-                metadata.state_indices.data_ptr(),
-                metadata.num_active_tokens.data_ptr(),
-                metadata.num_active_sequences.data_ptr(),
-                metadata.token_capacity,
-                metadata.sequence_capacity,
-                metadata.max_seqlen_capacity,
-            )
-            if key not in self._live_ticket_cache:
-                self._live_ticket_cache[key] = self._prepare_live_ticket(metadata)
-            return self._live_ticket_cache[key]
+            ticket = self._prepare_live_ticket(metadata)
+            if metadata.retain_ticket:
+                self._live_graph_tickets.append(ticket)
+            return ticket
         flashrwkv2 = _load_flashrwkv2()
         return flashrwkv2.prepare_tmix_wkv7_recurrent_metadata(
             metadata.cu_seqlens,
@@ -378,7 +368,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         )
 
     def warmup_live_metadata(self, metadata: RwkvAttentionMetadata) -> None:
-        self._live_warmup_tickets.append(self._prepare_live_ticket(metadata))
+        self._live_graph_tickets.append(self._prepare_live_ticket(metadata))
 
 
 class RwkvChannelMixValue(nn.Module):

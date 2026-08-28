@@ -76,6 +76,7 @@ class RwkvAttentionMetadata:
     num_active_tokens: torch.Tensor | None = None
     num_active_sequences: torch.Tensor | None = None
     validated_metadata: object | None = None
+    retain_ticket: bool = False
 
     @property
     def is_live(self) -> bool:
@@ -174,6 +175,7 @@ class RwkvAttentionMetadataBuilder(AttentionMetadataBuilder[RwkvAttentionMetadat
             max_seqlen_capacity=max_seqlen_capacity,
             num_active_tokens=self._num_active_tokens,
             num_active_sequences=self._num_active_sequences,
+            retain_ticket=for_capture,
         )
         if for_capture:
             self._state_layer.warmup_live_metadata(rwkv_metadata)
