@@ -210,7 +210,10 @@ def test_live_metadata_reuses_provider_ticket_tensor_identity() -> None:
     builder._live_state_indices_views = {}
     builder._num_active_tokens = torch.empty(1, dtype=torch.int32)
     builder._num_active_sequences = torch.empty(1, dtype=torch.int32)
-    builder._state_layer = SimpleNamespace(warmup_live_metadata=lambda metadata: None)
+    builder._state_layer = SimpleNamespace(
+        warmup_live_metadata=lambda metadata: None,
+        prepare_metadata_ticket=lambda metadata: object(),
+    )
 
     query_start_loc = torch.tensor([0, 2, 3], dtype=torch.int32)
     metadata = SimpleNamespace(
@@ -224,11 +227,13 @@ def test_live_metadata_reuses_provider_ticket_tensor_identity() -> None:
 
     first = builder._build_live(metadata, state_indices, for_capture=True)
     second = builder._build_live(metadata, state_indices, for_capture=True)
+    runtime = builder._build_live(metadata, state_indices, for_capture=False)
 
     assert first.cu_seqlens is second.cu_seqlens
     assert first.state_indices is second.state_indices
     assert first.max_seqlen_capacity == first.token_capacity
     assert first.max_seqlen == first.token_capacity
+    assert runtime.max_seqlen == runtime.token_capacity
 
 
 def test_live_metadata_prepares_and_retains_each_capture_ticket(monkeypatch) -> None:
