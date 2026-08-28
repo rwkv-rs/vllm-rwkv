@@ -746,9 +746,9 @@ class RwkvModel(nn.Module):
             self.embed_tokens = PPMissingLayer()
             self.embedding_norm = PPMissingLayer()
 
-        def make_layer(layer_prefix: str) -> RwkvDecoderLayer:
-            layer_idx = int(layer_prefix.rsplit(".", 1)[1])
-            return RwkvDecoderLayer(config, layer_idx, layer_prefix)
+        def make_layer(prefix: str) -> RwkvDecoderLayer:
+            layer_idx = int(prefix.rsplit(".", 1)[1])
+            return RwkvDecoderLayer(config, layer_idx, prefix)
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
