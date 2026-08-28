@@ -11,6 +11,8 @@ import torch
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.model_executor.models.config import RwkvForCausalLMConfig
 from vllm.model_executor.models.rwkv import RwkvChannelMixValue, RwkvStateLayer
+from vllm.v1.attention.backend import AttentionCGSupport
+from vllm.v1.attention.backends.rwkv_attn import RwkvAttentionMetadataBuilder
 from vllm.v1.worker.gpu.model_states.rwkv import RwkvModelState
 
 
@@ -134,6 +136,10 @@ def test_state_spec_accounts_provider_memory_and_slot_lifecycle(monkeypatch) -> 
     state_layer = RwkvStateLayer(vllm_config, 2, "model.layers.0.rwkv_state")
     spec = state_layer.get_kv_cache_spec(vllm_config)
 
+    assert (
+        RwkvAttentionMetadataBuilder.get_cudagraph_support(vllm_config, spec)
+        is AttentionCGSupport.ALWAYS
+    )
     assert spec.provider_state_bytes_per_page == 36
     assert spec.provider_fixed_workspace_bytes == 26
     assert spec.num_prefill_checkpoint_blocks == 1
