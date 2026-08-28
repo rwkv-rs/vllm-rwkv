@@ -5,11 +5,13 @@ import sys
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
+import numpy as np
 import torch
 
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.model_executor.models.config import RwkvForCausalLMConfig
 from vllm.model_executor.models.rwkv import RwkvChannelMixValue, RwkvStateLayer
+from vllm.v1.worker.gpu.model_states.rwkv import RwkvModelState
 
 
 class _FakeStateHandle:
@@ -152,6 +154,44 @@ def test_channel_mix_value_loads_checkpoint_weight_transposed() -> None:
     checkpoint_weight = torch.arange(16, dtype=torch.float16).view(2, 8)
     assert value.load_weights([("weight", checkpoint_weight)]) == {"weight"}
     assert torch.equal(value.weight, checkpoint_weight.T.contiguous())
+
+
+def test_align_state_advance_copies_only_crossing_requests() -> None:
+    copies: list[tuple[torch.Tensor, torch.Tensor]] = []
+    state_layer = SimpleNamespace(
+        prefix="model.layers.0.rwkv_state",
+        copy_state_slots=lambda source, destination: copies.append(
+            (source.clone(), destination.clone())
+        ),
+    )
+    model_state = object.__new__(RwkvModelState)
+    model_state._align_mode = True
+    model_state._block_size = 16
+    model_state._state_block_columns = np.array([0, 0], dtype=np.int32)
+    model_state._state_layer = state_layer
+    model_state._rwkv_group_id = 0
+    model_state.device = torch.device("cpu")
+
+    input_batch = SimpleNamespace(
+        num_reqs=2,
+        idx_mapping_np=np.array([0, 1]),
+        num_computed_tokens_np=np.array([15, 16], dtype=np.int32),
+        num_scheduled_tokens=np.array([1, 1], dtype=np.int32),
+    )
+    block_table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    model_state.preprocess_state(
+        input_batch,
+        (block_table,),
+        SimpleNamespace(kv_cache_groups=[]),
+        torch.empty(0),
+    )
+
+    assert len(copies) == 1
+    assert torch.equal(copies[0][0], torch.tensor([3], dtype=torch.int32))
+    assert torch.equal(copies[0][1], torch.tensor([4], dtype=torch.int32))
+    assert np.array_equal(
+        model_state._state_block_columns, np.array([0, 1], dtype=np.int32)
+    )
 
 
 def _config() -> SimpleNamespace:
