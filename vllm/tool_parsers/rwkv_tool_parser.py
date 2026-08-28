@@ -121,17 +121,17 @@ class RwkvToolParser(ToolParser):
             marker_end = marker_start + len(_TOOL_CALL_MARKER)
             fence_start = text.find(_JSON_FENCE_START, marker_end)
             if fence_start == -1 or text[marker_end:fence_start].strip():
-                return []
+                return matches
             payload_start = fence_start + len(_JSON_FENCE_START)
             fence_end = text.find(_JSON_FENCE_END, payload_start)
             if fence_end == -1:
-                return []
+                return matches
             payload = self._parse_payload(
                 text[payload_start:fence_end].strip(),
                 request,
             )
             if payload is None:
-                return []
+                return matches
             matches.append(_ToolCallMatch(marker_start, payload))
             cursor = fence_end + len(_JSON_FENCE_END)
         return matches
