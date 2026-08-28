@@ -19,7 +19,6 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.hisparse.block_pool import SharedEventQueueBlockPool
 from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
     ChunkedLocalAttentionSpec,
     CircularBufferSpec,
     CrossAttentionSpec,
@@ -114,7 +113,7 @@ class SingleTypeKVCacheManager(ABC):
         # consume them and this manager holds a spec type that gets zeroed.
         self._record_new_block_ids = (
             needs_kv_cache_zeroing
-            and isinstance(kv_cache_spec, AttentionSpec)
+            and kv_cache_spec.requires_block_zeroing
             and not isinstance(kv_cache_spec, CircularBufferSpec)
         )
         self.new_block_ids: list[int] = []
