@@ -115,7 +115,7 @@ jobs:
           else
             changed="$(git diff --name-only "$BASE_SHA"...HEAD)"
             if grep -Eq \
-              '^(\.github/workflows/rwkv-production\.yml|setup\.py|csrc/|CMakeLists.txt|cmake/|requirements/rwkv\.txt|vllm/(platforms/cuda\.py|model_executor/models/rwkv\.py|sampling_params\.py|v1/attention/backends/rwkv_attn\.py|v1/worker/gpu/))' \
+              '^(\.github/workflows/rwkv-production\.yml|setup\.py|csrc/|CMakeLists.txt|cmake/|vllm/(platforms/cuda\.py|model_executor/models/rwkv\.py|sampling_params\.py|v1/attention/backends/rwkv_attn\.py|v1/worker/gpu/))' \
               <<<"$changed"; then
               required=true
             else
@@ -130,7 +130,9 @@ jobs:
           uv venv --clear --python 3.12 .venv
           uv pip install --python .venv/bin/python \
             --requirements requirements/build/cuda.txt \
-            --requirements requirements/rwkv.txt \
+            --torch-backend=auto
+          uv pip install --python .venv/bin/python \
+            --editable . --no-build-isolation \
             pytest==9.1.0 pytest-asyncio tblib==3.2.2 \
             --torch-backend=auto
 
@@ -140,7 +142,6 @@ jobs:
           uv tool run --from pre-commit==4.5.1 \
             pre-commit run --hook-stage manual --files \
               .github/workflows/rwkv-production.yml \
-              requirements/rwkv.txt \
               scripts/deploy_rwkv_production.sh \
               setup.py \
               vllm/platforms/cuda.py
