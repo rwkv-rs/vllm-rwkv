@@ -145,14 +145,16 @@ jobs:
               scripts/deploy_rwkv_production.sh \
               setup.py \
               vllm/platforms/cuda.py
-          .venv/bin/python -m pytest --import-mode=importlib -q \
+          VLLM_TARGET_DEVICE=empty .venv/bin/python -m pytest \
+            --import-mode=importlib -q \
             tests/models/rwkv/test_rwkv.py \
             tests/tool_parsers/test_rwkv_tool_parser.py \
             tests/transformers_utils/test_config.py::test_named_generation_config_does_not_fall_back_to_model_config \
             tests/v1/core/test_single_type_kv_cache_manager.py::test_state_spec_can_request_provider_managed_block_reset
-          .venv/bin/python -m pytest --noconftest --import-mode=importlib -q \
+          VLLM_TARGET_DEVICE=empty .venv/bin/python -m pytest \
+            --noconftest --import-mode=importlib -q \
             tests/entrypoints/openai/responses/test_sampling_params.py
-          .venv/bin/python - <<'PY'
+          VLLM_TARGET_DEVICE=empty .venv/bin/python - <<'PY'
           from vllm.entrypoints.openai.chat_completion.protocol import (
               ChatCompletionRequest,
           )
