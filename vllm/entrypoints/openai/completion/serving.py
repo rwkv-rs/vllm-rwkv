@@ -83,7 +83,6 @@ class OpenAIServingCompletion(GenerateBaseServing):
         self.enable_log_deltas = enable_log_deltas
         self.enable_per_request_metrics = enable_per_request_metrics
 
-        self.default_sampling_params = self.model_config.get_diff_sampling_param()
         mc = self.model_config
         self.override_max_tokens = (
             self.default_sampling_params.get("max_tokens")

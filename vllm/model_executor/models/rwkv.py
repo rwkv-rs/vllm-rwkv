@@ -48,6 +48,7 @@ _FLASHRWKV2_APIS = (
     "infer_cmix_forward_varlen",
     "infer_embedding_ln0_forward_varlen",
     "infer_post_norm_output_forward_varlen",
+    "infer_sampling_six_parameter_forward_varlen",
     "infer_tmix_postnorm_tokenshift_forward_varlen",
     "infer_tmix_readout_forward_varlen",
     "infer_tmix_wkv7_recurrent_fp16_forward_varlen",
@@ -56,6 +57,7 @@ _FLASHRWKV2_APIS = (
     "prepare_tmix_wkv7_recurrent_fp16_state",
     "prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor",
     "prepare_tmix_wkv7_recurrent_metadata",
+    "setup_sampling_states",
 )
 
 

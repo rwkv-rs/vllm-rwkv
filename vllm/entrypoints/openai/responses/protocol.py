@@ -444,6 +444,7 @@ class ResponsesRequest(OpenAIBaseModel):
     )
 
     repetition_penalty: float | None = None
+    penalty_decay: float | None = Field(default=None, ge=0.0, le=1.0)
     seed: int | None = Field(None, ge=_INT64_MIN, le=_INT64_MAX)
     stop: StopParam = []
     stop_token_ids: list[int] | None = []
@@ -609,6 +610,8 @@ class ResponsesRequest(OpenAIBaseModel):
 
         if (frequency_penalty := self.frequency_penalty) is None:
             frequency_penalty = default_sampling_params.get("frequency_penalty", 0.0)
+        if (penalty_decay := self.penalty_decay) is None:
+            penalty_decay = default_sampling_params.get("penalty_decay", 1.0)
 
         if (skip_special_tokens := self.skip_special_tokens) is None:
             skip_special_tokens = default_sampling_params.get(
@@ -643,6 +646,7 @@ class ResponsesRequest(OpenAIBaseModel):
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
             repetition_penalty=repetition_penalty,
+            penalty_decay=penalty_decay,
             seed=self.seed,
             ignore_eos=self.ignore_eos,
             output_kind=(
