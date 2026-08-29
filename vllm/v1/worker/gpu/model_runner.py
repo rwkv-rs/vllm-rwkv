@@ -743,6 +743,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             lora_capture_cases=self.lora_capture_cases,
             varlen_decode=self.adaptive_verification is not None,
             ubatch_runner=self.ubatch_runner,
+            requires_max_query_len=(self.model_state.requires_cudagraph_max_query_len),
         )
         if self.cache_config.kv_sharing_fast_prefill and self.pcp_manager is None:
             self.fast_prefill = FastPrefillHelper(
@@ -1536,9 +1537,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prompt_lens=prompt_lens,
             fast_prefill=fast_prefill,
             max_query_len=(
-                int(num_scheduled_tokens_upper_bound.max())
-                if adaptive_verification is not None
-                else None
+                batch_desc.max_query_len
+                if batch_desc.max_query_len is not None
+                else (
+                    int(num_scheduled_tokens_upper_bound.max())
+                    if adaptive_verification is not None
+                    else None
+                )
             ),
         )
         if self.pcp_manager is not None:

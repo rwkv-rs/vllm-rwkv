@@ -19,6 +19,8 @@ from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 class RwkvModelState(DefaultModelState):
     """Route scheduler block lifecycle events through FlashRWKV2 state handles."""
 
+    requires_cudagraph_max_query_len = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,
