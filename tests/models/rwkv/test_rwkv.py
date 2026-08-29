@@ -26,21 +26,28 @@ class _FakeStateHandle:
         channels: int,
         state_dtype: torch.dtype,
         has_elapsed: bool,
+        *,
+        bytes_per_slot: int = 18,
+        fixed_workspace_nbytes: int = 13,
     ) -> None:
         self.state = torch.zeros((state_pool_size, channels), dtype=state_dtype)
         self.elapsed = (
             torch.zeros(state_pool_size, dtype=torch.int32) if has_elapsed else None
         )
         self.materialized: list[torch.Tensor] = []
+        self.bytes_per_slot = bytes_per_slot
+        self.fixed_workspace_nbytes = fixed_workspace_nbytes
 
     @property
     def memory_layout(self) -> dict[str, int]:
         return {
             "base_bytes_per_slot": 1,
-            "private_bytes_per_slot": 17,
-            "bytes_per_slot": 18,
-            "fixed_workspace_nbytes": 13,
-            "total_nbytes": self.state.shape[0] * 18 + 13,
+            "private_bytes_per_slot": self.bytes_per_slot - 1,
+            "bytes_per_slot": self.bytes_per_slot,
+            "fixed_workspace_nbytes": self.fixed_workspace_nbytes,
+            "total_nbytes": (
+                self.state.shape[0] * self.bytes_per_slot + self.fixed_workspace_nbytes
+            ),
         }
 
     def reset_slots_(self, indices: torch.Tensor) -> None:
@@ -73,7 +80,7 @@ class _FakeStateHandle:
 
 def _fake_flashrwkv2() -> ModuleType:
     module: Any = ModuleType("flashrwkv2")
-    module.__version__ = "0.1.0a10"
+    module.__version__ = "0.1.0a11"
 
     def prepare_fp16(
         state_pool_size,
@@ -86,19 +93,22 @@ def _fake_flashrwkv2() -> ModuleType:
         del sequence_capacity, head_size, device
         return _FakeStateHandle(state_pool_size, channels, torch.float16, True)
 
-    def prepare_fp32(
-        state_pool_size,
-        channels,
-        *,
-        sequence_capacity,
-        head_size=64,
-        device=None,
-    ):
-        del sequence_capacity, head_size, device
-        return _FakeStateHandle(state_pool_size, channels, torch.float32, False)
+    def prepare_fp32_from_tensor(state):
+        handle = _FakeStateHandle(
+            state.shape[0],
+            state[0].numel(),
+            torch.float32,
+            False,
+            bytes_per_slot=state[0].numel() * state.element_size(),
+            fixed_workspace_nbytes=0,
+        )
+        handle.state = state
+        return handle
 
     module.prepare_tmix_wkv7_recurrent_fp16_state = prepare_fp16
-    module.prepare_tmix_wkv7_recurrent_fp32io16_state = prepare_fp32
+    module.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor = (
+        prepare_fp32_from_tensor
+    )
     module.prepare_tmix_wkv7_recurrent_metadata = lambda *args, **kwargs: (args, kwargs)
     for name in (
         "infer_cmix_forward_varlen",
@@ -114,7 +124,7 @@ def _fake_flashrwkv2() -> ModuleType:
     return module
 
 
-def _state_vllm_config() -> SimpleNamespace:
+def _state_vllm_config(state_dtype: str = "float16") -> SimpleNamespace:
     hf_config = SimpleNamespace(
         hidden_size=128,
         head_size=64,
@@ -124,7 +134,7 @@ def _state_vllm_config() -> SimpleNamespace:
         model_config=SimpleNamespace(hf_config=hf_config),
         scheduler_config=SimpleNamespace(max_num_seqs=4),
         cache_config=SimpleNamespace(
-            mamba_ssm_cache_dtype="float16",
+            mamba_ssm_cache_dtype=state_dtype,
             mamba_block_size=16,
             mamba_cache_mode="align",
         ),
@@ -200,6 +210,24 @@ def test_state_spec_accounts_provider_memory_and_slot_lifecycle(monkeypatch) -> 
         and torch.equal(layer_handle.materialized[0], source)
         for layer_handle in handles
     )
+
+
+def test_fp32_state_uses_caller_backed_cache_tensor(monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "flashrwkv2", _fake_flashrwkv2())
+    vllm_config = _state_vllm_config("float32")
+    state_layer = RwkvStateLayer(vllm_config, 2, "model.layers.0.rwkv_state")
+    spec = state_layer.get_kv_cache_spec(vllm_config)
+
+    assert spec.provider_state_bytes_per_page == 0
+    assert spec.provider_fixed_workspace_bytes == 0
+
+    num_slots = 3
+    raw = torch.zeros((num_slots, 1, 1, spec.page_size_bytes), dtype=torch.int8)
+    state_layer.bind_kv_cache(raw)
+    _, handle, _ = state_layer.get_layer_state(0)
+
+    assert handle.state.shape == (num_slots, 2, 64, 64)
+    assert handle.state.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
 
 
 def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:
