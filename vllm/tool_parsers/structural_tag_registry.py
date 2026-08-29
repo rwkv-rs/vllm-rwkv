@@ -110,7 +110,7 @@ def get_model_structural_tag(
     if not tools or tool_choice == "none":
         return None
 
-    if tool_choice == "auto" and model != "rwkv" and not _any_tool_strict(tools):
+    if tool_choice == "auto" and not _any_tool_strict(tools):
         return None
 
     dumped_tools = [_dump_tool_for_xgrammar(tool) for tool in tools]
@@ -307,7 +307,6 @@ def get_rwkv_structural_tag(
             TriggeredTagsFormat(
                 triggers=[_RWKV_TOOL_CALL_TRIGGER],
                 tags=tags,
-                stop_after_first=True,
             )
             if tags
             else AnyTextFormat()
@@ -320,7 +319,7 @@ def get_rwkv_structural_tag(
                     tags=tags,
                     separator="\n",
                     at_least_one=True,
-                    stop_after_first=True,
+                    stop_after_first=tool_choice == "forced",
                 ),
             ]
         )

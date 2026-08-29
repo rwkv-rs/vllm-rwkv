@@ -37,6 +37,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -428,36 +429,6 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         self._live_graph_tickets.append(self._prepare_live_ticket(metadata))
 
 
-class RwkvChannelMixValue(nn.Module):
-    """Checkpoint-compatible ChannelMix value in provider runtime layout."""
-
-    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(
-            torch.empty(intermediate_size, hidden_size, dtype=torch.float16)
-        )
-
-    @staticmethod
-    def weight_loader(parameter: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-        if loaded_weight.shape == parameter.shape:
-            parameter.data.copy_(loaded_weight)
-            return
-        if loaded_weight.T.shape != parameter.shape:
-            raise ValueError(
-                "RWKV ChannelMix value checkpoint weight has an invalid shape"
-            )
-        parameter.data.copy_(loaded_weight.T.contiguous())
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loaded = set[str]()
-        for name, weight in weights:
-            if name != "weight":
-                raise ValueError(f"unexpected RWKV ChannelMix value weight {name!r}")
-            self.weight_loader(self.weight, weight)
-            loaded.add(name)
-        return loaded
-
-
 class RwkvAttention(nn.Module):
     def __init__(self, config: Any, layer_idx: int, prefix: str) -> None:
         super().__init__()
@@ -505,19 +476,34 @@ class RwkvAttention(nn.Module):
             torch.empty(self.num_heads, self.head_size, dtype=dtype)
         )
 
-        def linear(name: str) -> ReplicatedLinear:
-            return ReplicatedLinear(
-                channels,
-                channels,
-                bias=False,
-                params_dtype=dtype,
-                prefix=f"{prefix}.{name}",
-            )
-
-        self.r_proj = linear("r_proj")
-        self.k_proj = linear("k_proj")
-        self.v_proj = linear("v_proj")
-        self.o_proj = linear("o_proj")
+        self.r_proj = ReplicatedLinear(
+            channels,
+            channels,
+            bias=False,
+            params_dtype=dtype,
+            prefix=f"{prefix}.r_proj",
+        )
+        self.k_proj = ReplicatedLinear(
+            channels,
+            channels,
+            bias=False,
+            params_dtype=dtype,
+            prefix=f"{prefix}.k_proj",
+        )
+        self.v_proj = ReplicatedLinear(
+            channels,
+            channels,
+            bias=False,
+            params_dtype=dtype,
+            prefix=f"{prefix}.v_proj",
+        )
+        self.o_proj = ReplicatedLinear(
+            channels,
+            channels,
+            bias=False,
+            params_dtype=dtype,
+            prefix=f"{prefix}.o_proj",
+        )
         self.g_norm = nn.GroupNorm(
             self.num_heads,
             channels,
@@ -565,7 +551,7 @@ class RwkvAttention(nn.Module):
         residual: torch.Tensor,
         layer_norm: nn.LayerNorm,
         v_first: torch.Tensor | None,
-        shift_state: torch.Tensor,
+        attention_shift: torch.Tensor,
         wkv_state: object,
         metadata: RwkvAttentionMetadata,
         state_dtype: torch.dtype,
@@ -584,7 +570,7 @@ class RwkvAttention(nn.Module):
                 self.x_v,
                 self.x_a,
                 self.x_g,
-                shift_state_pool=shift_state,
+                shift_state_pool=attention_shift,
                 cu_seqlens=metadata.cu_seqlens,
                 state_indices=metadata.state_indices,
                 max_seqlen=metadata.max_seqlen,
@@ -674,7 +660,7 @@ class RwkvAttention(nn.Module):
         return output, residual, v_first
 
 
-class RwkvMLP(nn.Module):
+class RwkvFeedForward(nn.Module):
     def __init__(self, config: Any, prefix: str) -> None:
         super().__init__()
         self.config = config
@@ -686,14 +672,23 @@ class RwkvMLP(nn.Module):
             params_dtype=torch.float16,
             prefix=f"{prefix}.key",
         )
-        self.value = RwkvChannelMixValue(config.hidden_size, config.intermediate_size)
+        self.value = ReplicatedLinear(
+            config.intermediate_size,
+            config.hidden_size,
+            bias=False,
+            params_dtype=torch.float16,
+            prefix=f"{prefix}.value",
+        )
+
+    def process_weights_after_loading(self) -> None:
+        self.value.weight.data = self.value.weight.T.contiguous()
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         layer_norm: nn.LayerNorm,
-        shift_state: torch.Tensor,
+        feed_forward_shift: torch.Tensor,
         metadata: RwkvAttentionMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         flashrwkv2 = _load_flashrwkv2()
@@ -705,7 +700,7 @@ class RwkvMLP(nn.Module):
             self.x_k,
             self.key.weight,
             self.value.weight,
-            shift_state_pool=shift_state,
+            shift_state_pool=feed_forward_shift,
             cu_seqlens=metadata.cu_seqlens,
             state_indices=metadata.state_indices,
             max_seqlen=metadata.max_seqlen,
@@ -716,10 +711,11 @@ class RwkvMLP(nn.Module):
 
 
 class RwkvDecoderLayer(nn.Module):
-    def __init__(self, config: Any, layer_idx: int, prefix: str) -> None:
+    def __init__(self, config: Any, prefix: str) -> None:
         super().__init__()
+        layer_idx = extract_layer_index(prefix)
         self.linear_attn = RwkvAttention(config, layer_idx, f"{prefix}.linear_attn")
-        self.mlp = RwkvMLP(config, f"{prefix}.mlp")
+        self.mlp = RwkvFeedForward(config, f"{prefix}.mlp")
         self.input_layernorm = nn.LayerNorm(
             config.hidden_size,
             eps=config.layer_norm_epsilon,
@@ -736,10 +732,19 @@ class RwkvDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         v_first: torch.Tensor | None,
-        state: tuple[torch.Tensor, object, torch.Tensor],
-        metadata: RwkvAttentionMetadata,
+        state: tuple[torch.Tensor, object, torch.Tensor] | None,
+        metadata: RwkvAttentionMetadata | None,
         state_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if metadata is None:
+            receptance, _ = self.linear_attn.r_proj(hidden_states)
+            key, _ = self.linear_attn.k_proj(hidden_states)
+            value, _ = self.linear_attn.v_proj(hidden_states)
+            hidden_states, _ = self.linear_attn.o_proj(receptance + key + value)
+            channel, _ = self.mlp.key(hidden_states)
+            return torch.relu(channel) @ self.mlp.value.weight, residual, v_first
+
+        assert state is not None
         attention_shift, wkv_state, feed_forward_shift = state
         attention_output, residual, v_first = self.linear_attn(
             hidden_states,
@@ -759,14 +764,6 @@ class RwkvDecoderLayer(nn.Module):
             metadata,
         )
         return hidden_states, residual, v_first
-
-    def profile_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        receptance, _ = self.linear_attn.r_proj(hidden_states)
-        key, _ = self.linear_attn.k_proj(hidden_states)
-        value, _ = self.linear_attn.v_proj(hidden_states)
-        hidden_states, _ = self.linear_attn.o_proj(receptance + key + value)
-        channel, _ = self.mlp.key(hidden_states)
-        return torch.relu(channel) @ self.mlp.value.weight
 
 
 class RwkvModel(nn.Module):
@@ -793,13 +790,9 @@ class RwkvModel(nn.Module):
             self.embed_tokens = PPMissingLayer()
             self.embedding_norm = PPMissingLayer()
 
-        def make_layer(prefix: str) -> RwkvDecoderLayer:
-            layer_idx = int(prefix.rsplit(".", 1)[1])
-            return RwkvDecoderLayer(config, layer_idx, prefix)
-
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            make_layer,
+            lambda prefix: RwkvDecoderLayer(config, prefix),
             prefix=maybe_prefix(prefix, "layers"),
         )
         state_prefix = maybe_prefix(prefix, f"layers.{self.start_layer}.rwkv_state")
@@ -828,6 +821,7 @@ class RwkvModel(nn.Module):
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             assert isinstance(layer, RwkvDecoderLayer)
             layer.linear_attn.process_weights_after_loading()
+            layer.mlp.process_weights_after_loading()
 
     def forward(
         self,
@@ -856,29 +850,28 @@ class RwkvModel(nn.Module):
             v_first = intermediate_tensors["v_first"]
 
         metadata = get_rwkv_metadata()
+        if metadata is not None and metadata.validated_metadata is None:
+            metadata.validated_metadata = self.rwkv_state.prepare_metadata_ticket(
+                metadata
+            )
+        for local_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer)
+        ):
+            assert isinstance(layer, RwkvDecoderLayer)
+            state = (
+                None if metadata is None else self.rwkv_state.get_layer_state(local_idx)
+            )
+            hidden_states, residual, v_first = layer(
+                hidden_states,
+                residual,
+                v_first,
+                state,
+                metadata,
+                self.rwkv_state.state_dtype,
+            )
         if metadata is None:
-            for layer in islice(self.layers, self.start_layer, self.end_layer):
-                assert isinstance(layer, RwkvDecoderLayer)
-                hidden_states = layer.profile_forward(hidden_states)
             residual = torch.zeros_like(hidden_states)
             v_first = torch.zeros_like(hidden_states)
-        else:
-            if metadata.validated_metadata is None:
-                metadata.validated_metadata = self.rwkv_state.prepare_metadata_ticket(
-                    metadata
-                )
-            for local_idx, layer in enumerate(
-                islice(self.layers, self.start_layer, self.end_layer)
-            ):
-                assert isinstance(layer, RwkvDecoderLayer)
-                hidden_states, residual, v_first = layer(
-                    hidden_states,
-                    residual,
-                    v_first,
-                    self.rwkv_state.get_layer_state(local_idx),
-                    metadata,
-                    self.rwkv_state.state_dtype,
-                )
 
         if not get_pp_group().is_last_rank:
             assert v_first is not None
