@@ -106,6 +106,7 @@ class RwkvAttentionMetadataBuilder(AttentionMetadataBuilder[RwkvAttentionMetadat
             tuple[int, int, int],
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         ] = {}
+        self._captured_descriptors: set[tuple[int, int, int]] = set()
         cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
         self._use_live_metadata = bool(
             cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs()
@@ -190,8 +191,9 @@ class RwkvAttentionMetadataBuilder(AttentionMetadataBuilder[RwkvAttentionMetadat
             retain_ticket=for_capture,
         )
         if for_capture:
+            self._captured_descriptors.add(descriptor)
             self._state_layer.warmup_live_metadata(rwkv_metadata)
-        else:
+        elif descriptor not in self._captured_descriptors:
             rwkv_metadata.validated_metadata = (
                 self._state_layer.prepare_metadata_ticket(rwkv_metadata)
             )

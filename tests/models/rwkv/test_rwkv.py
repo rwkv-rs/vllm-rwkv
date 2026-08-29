@@ -206,9 +206,11 @@ def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:
     builder = object.__new__(RwkvAttentionMetadataBuilder)
     builder._device = torch.device("cpu")
     builder._live_buffers = {}
+    builder._captured_descriptors = set()
+    prepared_ticket = object()
     builder._state_layer = SimpleNamespace(
         warmup_live_metadata=lambda metadata: None,
-        prepare_metadata_ticket=lambda metadata: object(),
+        prepare_metadata_ticket=lambda metadata: prepared_ticket,
     )
 
     query_start_loc = torch.tensor([0, 2, 4], dtype=torch.int32)
@@ -259,6 +261,22 @@ def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:
     assert first.max_seqlen_capacity == metadata.max_query_len
     assert first.max_seqlen == metadata.max_query_len
     assert runtime.max_seqlen == runtime_metadata.max_query_len
+    assert runtime.validated_metadata is None
+
+    eager_query_start_loc = torch.tensor([0, 3], dtype=torch.int32)
+    eager_metadata = SimpleNamespace(
+        num_reqs=1,
+        num_actual_tokens=3,
+        max_query_len=3,
+        query_start_loc=eager_query_start_loc,
+        query_start_loc_cpu=eager_query_start_loc,
+    )
+    eager = builder._build_live(
+        eager_metadata,
+        torch.tensor([4], dtype=torch.int32),
+        for_capture=False,
+    )
+    assert eager.validated_metadata is prepared_ticket
 
 
 def test_live_metadata_prepares_and_retains_each_capture_ticket(monkeypatch) -> None:
