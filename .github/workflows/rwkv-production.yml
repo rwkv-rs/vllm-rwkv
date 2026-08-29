@@ -476,6 +476,8 @@ jobs:
       DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
       DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
       DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_JUMP_HOST: ${{ secrets.DEPLOY_JUMP_HOST }}
+      DEPLOY_JUMP_PORT: ${{ secrets.DEPLOY_JUMP_PORT }}
       DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
       DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
     steps:
@@ -489,6 +491,8 @@ jobs:
           test -n "$DEPLOY_HOST"
           test -n "$DEPLOY_PORT"
           test -n "$DEPLOY_USER"
+          test -n "$DEPLOY_JUMP_HOST"
+          test -n "$DEPLOY_JUMP_PORT"
           test -n "$DEPLOY_SSH_KEY"
           test -n "$DEPLOY_KNOWN_HOSTS"
           install -m 0700 -d "$RUNNER_TEMP/deploy-ssh"
@@ -503,12 +507,14 @@ jobs:
           REQUESTED_SHA: ${{ github.event.inputs.sha }}
         run: |
           set -euo pipefail
+          proxy_jump="$DEPLOY_USER@$DEPLOY_JUMP_HOST:$DEPLOY_JUMP_PORT"
           ssh_args=(
             -i "$RUNNER_TEMP/deploy-ssh/key"
             -o BatchMode=yes
             -o IdentitiesOnly=yes
             -o StrictHostKeyChecking=yes
             -o "UserKnownHostsFile=$RUNNER_TEMP/deploy-ssh/known_hosts"
+            -J "$proxy_jump"
             -p "$DEPLOY_PORT"
           )
           target="$DEPLOY_USER@$DEPLOY_HOST"
@@ -518,6 +524,7 @@ jobs:
             -o IdentitiesOnly=yes
             -o StrictHostKeyChecking=yes
             -o "UserKnownHostsFile=$RUNNER_TEMP/deploy-ssh/known_hosts"
+            -o "ProxyJump=$proxy_jump"
             -P "$DEPLOY_PORT"
           )
           scp "${scp_args[@]}" scripts/deploy_rwkv_production.sh \
