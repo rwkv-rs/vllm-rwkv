@@ -10,7 +10,7 @@ import torch
 
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.model_executor.models.config import RwkvForCausalLMConfig
-from vllm.model_executor.models.rwkv import RwkvChannelMixValue, RwkvStateLayer
+from vllm.model_executor.models.rwkv import RwkvFeedForward, RwkvStateLayer
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.rwkv_attn import (
     RwkvAttentionMetadata,
@@ -369,11 +369,17 @@ def test_live_metadata_prepares_and_retains_each_capture_ticket(monkeypatch) -> 
     assert state_layer._live_graph_tickets[2] is next_capture_ticket
 
 
-def test_channel_mix_value_loads_checkpoint_weight_transposed() -> None:
-    value = RwkvChannelMixValue(hidden_size=2, intermediate_size=8)
+def test_feed_forward_prepares_value_weight_for_provider() -> None:
+    feed_forward = object.__new__(RwkvFeedForward)
+    torch.nn.Module.__init__(feed_forward)
     checkpoint_weight = torch.arange(16, dtype=torch.float16).view(2, 8)
-    assert value.load_weights([("weight", checkpoint_weight)]) == {"weight"}
-    assert torch.equal(value.weight, checkpoint_weight.T.contiguous())
+    feed_forward.value = SimpleNamespace(
+        weight=torch.nn.Parameter(checkpoint_weight.clone())
+    )
+
+    feed_forward.process_weights_after_loading()
+
+    assert torch.equal(feed_forward.value.weight, checkpoint_weight.T.contiguous())
 
 
 def test_align_state_advance_uses_execution_owned_token_counts() -> None:
