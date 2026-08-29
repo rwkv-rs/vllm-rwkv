@@ -131,7 +131,7 @@ jobs:
           uv pip install --python .venv/bin/python \
             --requirements requirements/build/cuda.txt \
             --requirements requirements/rwkv.txt \
-            pytest==9.1.0 pytest-asyncio tblib==3.2.2 \
+            anthropic==0.112.0 pytest==9.1.0 pytest-asyncio tblib==3.2.2 \
             --torch-backend=auto
 
       - name: Run repository checks
