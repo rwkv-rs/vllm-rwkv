@@ -1,3 +1,45 @@
+# Dense RWKV7 inference and OpenAI-compatible serving. The model and sampling
+# CUDA kernels are provided exclusively by the pinned FlashRWKV2 wheel.
+
+torch==2.13.0
 transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@f708325e46025404c807c5d4b0cb5803bb63d11d
 tokenizers @ git+https://github.com/rwkv-rs/tokenizers-rwkv.git@c5d8dde5ff49c70e4656199d5033a84e03c21b2b#subdirectory=bindings/python
 FlashRWKV2==0.1.0a11
+
+regex
+cachetools
+psutil
+numpy
+requests>=2.26.0
+tqdm
+blake3
+py-cpuinfo
+huggingface_hub>=1.28.0
+safetensors>=0.6.2
+protobuf>=5.29.6,!=6.30.*,!=6.31.*,!=6.32.*,!=6.33.0.*,!=6.33.1.*,!=6.33.2.*,!=6.33.3.*,!=6.33.4.*
+typing_extensions>=4.10
+filelock>=3.16.1
+pyyaml
+cloudpickle
+packaging>=24.2
+jinja2>=3.1.6
+pillow
+
+fastapi[standard]>=0.133.0,<0.137.0
+starlette>=1.0.1
+aiohttp>=3.13.3
+openai>=2.0.0
+openai-harmony>=0.0.3
+partial-json-parser
+pydantic>=2.12.0
+prometheus_client>=0.18.0
+prometheus-fastapi-instrumentator>=8.0.0
+pyzmq>=25.0.0
+msgspec
+watchfiles
+python-json-logger
+setproctitle
+pybase64
+cbor2
+jsonschema>=4.23.0
+xgrammar>=0.2.1,<1.0.0

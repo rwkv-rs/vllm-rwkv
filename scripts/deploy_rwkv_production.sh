@@ -243,6 +243,15 @@ stage_release() {
   [[ -x $staging/.venv/bin/python ]] || die "bundle is missing .venv/bin/python"
   [[ -f $staging/GIT_SHA ]] || die "bundle is missing GIT_SHA"
   [[ $(<"$staging/GIT_SHA") == "$sha" ]] || die "bundle SHA does not match $sha"
+  CUDA_VISIBLE_DEVICES=0 "$staging/.venv/bin/python" - <<'PY'
+import torch
+
+if torch.cuda.get_device_capability() != (8, 9):
+    raise SystemExit("production GPU0 is not SM89")
+
+import flashrwkv2  # noqa: E402, F401
+import vllm.platforms.cuda  # noqa: E402, F401
+PY
   chown -R root:root "$staging"
   chmod -R a+rX "$staging"
   mv "$staging" "$release"

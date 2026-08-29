@@ -33,6 +33,11 @@ def load_module_from_path(module_name, path):
 
 ROOT_DIR = Path(__file__).parent
 logger = logging.getLogger(__name__)
+VLLM_BUILD_PROFILE = os.getenv("VLLM_BUILD_PROFILE", "full")
+if VLLM_BUILD_PROFILE not in {"full", "rwkv"}:
+    raise ValueError(
+        f"VLLM_BUILD_PROFILE={VLLM_BUILD_PROFILE!r} must be 'full' or 'rwkv'"
+    )
 
 PRECOMPILED_RUST_FRONTEND_PATH = ROOT_DIR / "vllm" / "vllm-rs"
 # setuptools-rust installs PyO3 artifacts as `<module>.<ext-suffix>`, where the
@@ -52,6 +57,13 @@ USE_PRECOMPILED_EXTENSIONS = envs.VLLM_USE_PRECOMPILED
 USE_PRECOMPILED_RUST_FRONTEND = (
     envs.VLLM_USE_PRECOMPILED or envs.VLLM_USE_PRECOMPILED_RUST
 )
+if VLLM_BUILD_PROFILE == "rwkv" and (
+    USE_PRECOMPILED_EXTENSIONS or USE_PRECOMPILED_RUST_FRONTEND
+):
+    raise ValueError(
+        "VLLM_BUILD_PROFILE='rwkv' requires a source build; "
+        "full precompiled extensions cannot be relabeled as an RWKV artifact"
+    )
 
 
 def should_require_rust_frontend() -> bool:
@@ -1286,6 +1298,10 @@ def get_vllm_version() -> str:
     else:
         raise RuntimeError("Unknown runtime environment")
 
+    if VLLM_BUILD_PROFILE == "rwkv":
+        profile_separator = "+" if "+" not in version else "."
+        version += f"{profile_separator}rwkv"
+
     return version
 
 
@@ -1308,7 +1324,9 @@ def get_requirements() -> list[str]:
                 resolved_requirements.append(line)
         return resolved_requirements
 
-    if _no_device():
+    if VLLM_BUILD_PROFILE == "rwkv":
+        requirements = _read_requirements("rwkv.txt")
+    elif _no_device():
         requirements = _read_requirements("common.txt")
     elif _is_cuda():
         requirements = _read_requirements("cuda.txt")
@@ -1414,6 +1432,11 @@ if _build_custom_ops():
         ext_modules.append(CMakeExtension(name="vllm._C_stable_libtorch"))
         ext_modules.append(CMakeExtension(name="vllm._moe_C_stable_libtorch"))
 
+if VLLM_BUILD_PROFILE == "rwkv":
+    if not _is_cuda():
+        raise ValueError("VLLM_BUILD_PROFILE='rwkv' requires VLLM_TARGET_DEVICE='cuda'")
+    ext_modules = []
+
 package_data = {
     "vllm": [
         "py.typed",
@@ -1460,12 +1483,13 @@ if USE_PRECOMPILED_RUST_FRONTEND and not is_metadata_only_build():
     for pkg, files in patch.items():
         package_data.setdefault(pkg, []).extend(files)
 
-# If the rust frontend binary is already present in the source tree (e.g.,
-# pre-built in a separate Docker build stage), ship it as-is.
-if PRECOMPILED_RUST_FRONTEND_PATH.exists():
-    add_vllm_package_data("vllm-rs")
-for rust_extension_path in get_precompiled_rust_extension_paths():
-    add_vllm_package_data(rust_extension_path.name)
+if VLLM_BUILD_PROFILE == "full":
+    # If the rust frontend binary is already present in the source tree (e.g.,
+    # pre-built in a separate Docker build stage), ship it as-is.
+    if PRECOMPILED_RUST_FRONTEND_PATH.exists():
+        add_vllm_package_data("vllm-rs")
+    for rust_extension_path in get_precompiled_rust_extension_paths():
+        add_vllm_package_data(rust_extension_path.name)
 
 if _no_device():
     ext_modules = []
@@ -1478,7 +1502,7 @@ else:
         if USE_PRECOMPILED_EXTENSIONS
         else cmake_build_ext,
     }
-if (
+if VLLM_BUILD_PROFILE == "full" and (
     USE_PRECOMPILED_RUST_FRONTEND
     or PRECOMPILED_RUST_FRONTEND_PATH.exists()
     or has_precompiled_rust_extensions()
@@ -1488,13 +1512,13 @@ if (
 # Resolve the Python version first because get_vllm_version() may set
 # SETUPTOOLS_SCM_PRETEND_VERSION, which the Rust version should inherit.
 vllm_version = get_vllm_version()
-rust_build.prepare_build_environment()
-
-# Rust artifacts, built via setuptools-rust and installed into the package
-# directory alongside the Python modules.
-rust_extensions = rust_build.rust_extensions(
-    optional=not should_require_rust_frontend()
-)
+if VLLM_BUILD_PROFILE == "full":
+    rust_build.prepare_build_environment()
+    rust_extensions = rust_build.rust_extensions(
+        optional=not should_require_rust_frontend()
+    )
+else:
+    rust_extensions = []
 
 setup(
     # static metadata should rather go in pyproject.toml
