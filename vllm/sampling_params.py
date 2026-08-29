@@ -302,6 +302,9 @@ class SamplingParams(
     """Penalizes new tokens based on whether they appear in the prompt and the
     generated text so far. Values > 1 encourage the model to use new tokens,
     while values < 1 encourage the model to repeat tokens."""
+    penalty_decay: float = 1.0
+    """Decay applied to model-specific additive token penalties after each
+    sampled token. One disables decay."""
     temperature: float = 1.0
     """Controls the randomness of the sampling. Lower values make the model
     more deterministic, while higher values make the model more random. Zero
@@ -451,6 +454,7 @@ class SamplingParams(
         presence_penalty: float | None = 0.0,
         frequency_penalty: float | None = 0.0,
         repetition_penalty: float | None = 1.0,
+        penalty_decay: float | None = 1.0,
         temperature: float | None = 1.0,
         watermarking: bool | None = None,
         top_p: float | None = 1.0,
@@ -519,6 +523,7 @@ class SamplingParams(
             repetition_penalty=1.0
             if repetition_penalty is None
             else repetition_penalty,
+            penalty_decay=1.0 if penalty_decay is None else penalty_decay,
             temperature=1.0 if temperature is None else temperature,
             watermarking=watermarking,
             top_p=1.0 if top_p is None else top_p,
@@ -649,6 +654,13 @@ class SamplingParams(
             raise VLLMValidationError(
                 "repetition_penalty must be greater than zero, got "
                 f"{self.repetition_penalty}."
+            )
+        if (
+            not math.isfinite(self.penalty_decay)
+            or not 0.0 <= self.penalty_decay <= 1.0
+        ):
+            raise VLLMValidationError(
+                f"penalty_decay must be finite and in [0, 1], got {self.penalty_decay}."
             )
         if not math.isfinite(self.temperature):
             raise VLLMValidationError(

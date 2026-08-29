@@ -273,6 +273,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     min_p: float | None = None
     repetition_penalty: float | None = None
     watermarking: bool | None = None
+    penalty_decay: float | None = Field(default=None, ge=0.0, le=1.0)
     length_penalty: float = 1.0
     stop_token_ids: list[int] | None = []
     include_stop_str_in_output: bool = False
@@ -662,6 +663,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         "repetition_penalty": 1.0,
         "presence_penalty": 0.0,
         "frequency_penalty": 0.0,
+        "penalty_decay": 1.0,
         "temperature": 1.0,
         "top_p": 1.0,
         "top_k": 0,
