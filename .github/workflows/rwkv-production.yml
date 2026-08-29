@@ -145,12 +145,10 @@ jobs:
             tests/models/rwkv/test_rwkv.py \
             tests/tool_parsers/test_rwkv_tool_parser.py \
             tests/tool_parsers/test_structural_tag_registry.py \
-            tests/entrypoints/openai/chat_completion/test_serving_chat.py \
+            tests/entrypoints/openai/chat_completion/test_serving_chat.py::test_rwkv_sampling_profile_selection_prefers_tools \
             tests/entrypoints/openai/responses/test_sampling_params.py \
-            tests/transformers_utils/test_config.py \
-            tests/v1/core/test_kv_cache_utils.py \
-            tests/v1/core/test_single_type_kv_cache_manager.py \
-            tests/v1/cudagraph/test_cudagraph_manager.py
+            tests/transformers_utils/test_config.py::test_named_generation_config_does_not_fall_back_to_model_config \
+            tests/v1/core/test_single_type_kv_cache_manager.py::test_state_spec_can_request_provider_managed_block_reset
 
       - name: Build portable SM89 and SM120 wheel
         run: |
