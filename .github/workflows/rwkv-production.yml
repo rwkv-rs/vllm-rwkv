@@ -42,7 +42,12 @@ jobs:
             const pull = context.payload.pull_request;
             const trustedAssociation = trustedAssociations.has(pull.author_association);
             const trustedLabel = pull.labels.some(label => trustedLabels.has(label.name));
-            if (!trustedAssociation && !trustedLabel) {
+            const { data: mergedPulls } = await github.rest.search.issuesAndPullRequests({
+              q: `repo:${context.repo.owner}/${context.repo.repo} is:pr is:merged author:${pull.user.login}`,
+              per_page: 4,
+            });
+            const establishedContributor = mergedPulls.total_count >= 4;
+            if (!trustedAssociation && !trustedLabel && !establishedContributor) {
               core.setFailed(
                 'This revision is not authorized to execute on the RWKV GPU runner.'
               );
