@@ -131,7 +131,7 @@ jobs:
           uv pip install --python .venv/bin/python \
             --requirements requirements/build/cuda.txt \
             --requirements requirements/rwkv.txt \
-            anthropic==0.112.0 pytest==9.1.0 pytest-asyncio tblib==3.2.2 \
+            pytest==9.1.0 pytest-asyncio tblib==3.2.2 \
             --torch-backend=auto
 
       - name: Run repository checks
@@ -149,9 +149,10 @@ jobs:
             tests/tool_parsers/test_rwkv_tool_parser.py \
             tests/tool_parsers/test_structural_tag_registry.py \
             tests/entrypoints/openai/chat_completion/test_serving_chat.py::test_rwkv_sampling_profile_selection_prefers_tools \
-            tests/entrypoints/openai/responses/test_sampling_params.py \
             tests/transformers_utils/test_config.py::test_named_generation_config_does_not_fall_back_to_model_config \
             tests/v1/core/test_single_type_kv_cache_manager.py::test_state_spec_can_request_provider_managed_block_reset
+          .venv/bin/python -m pytest --noconftest --import-mode=importlib -q \
+            tests/entrypoints/openai/responses/test_sampling_params.py
 
       - name: Build the reduced RWKV wheel
         run: |
