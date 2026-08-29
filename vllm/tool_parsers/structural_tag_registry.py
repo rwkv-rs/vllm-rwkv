@@ -49,6 +49,7 @@ StructuralTagBuilder: TypeAlias = Callable[
         list[BuiltinToolParam],
         SimplifiedToolChoice,
         bool,
+        bool,
     ],
     StructuralTag,
 ]
@@ -104,6 +105,7 @@ def get_model_structural_tag(
     tools: Sequence[ChatCompletionToolsParam | ResponsesTool] | None,
     tool_choice: ToolChoice,
     reasoning: bool,
+    parallel_tool_calls: bool = True,
 ) -> StructuralTag | None:
     """Build a structural tag with xgrammar's builtin model templates."""
 
@@ -126,6 +128,7 @@ def get_model_structural_tag(
             builtin_tools,
             simplified_tool_choice,
             reasoning,
+            parallel_tool_calls,
         )
 
     if model not in XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS:
@@ -244,8 +247,9 @@ def get_hermes_structural_tag(
     builtin_tools: list[BuiltinToolParam],
     tool_choice: SimplifiedToolChoice,
     reasoning: bool,
+    parallel_tool_calls: bool,
 ) -> StructuralTag:
-    del builtin_tools, reasoning
+    del builtin_tools, reasoning, parallel_tool_calls
 
     tool_call_trigger = "<tool_call>"
 
@@ -298,6 +302,7 @@ def get_rwkv_structural_tag(
     builtin_tools: list[BuiltinToolParam],
     tool_choice: SimplifiedToolChoice,
     reasoning: bool,
+    parallel_tool_calls: bool,
 ) -> StructuralTag:
     del builtin_tools, reasoning
 
@@ -307,6 +312,7 @@ def get_rwkv_structural_tag(
             TriggeredTagsFormat(
                 triggers=[_RWKV_TOOL_CALL_TRIGGER],
                 tags=tags,
+                stop_after_first=not parallel_tool_calls,
             )
             if tags
             else AnyTextFormat()
@@ -319,7 +325,9 @@ def get_rwkv_structural_tag(
                     tags=tags,
                     separator="\n",
                     at_least_one=True,
-                    stop_after_first=tool_choice == "forced",
+                    stop_after_first=(
+                        tool_choice == "forced" or not parallel_tool_calls
+                    ),
                 ),
             ]
         )
@@ -346,8 +354,9 @@ def get_minimax_structural_tag(
     builtin_tools: list[BuiltinToolParam],
     tool_choice: SimplifiedToolChoice,
     reasoning: bool,
+    parallel_tool_calls: bool,
 ) -> StructuralTag:
-    del builtin_tools, reasoning
+    del builtin_tools, reasoning, parallel_tool_calls
 
     tool_call_begin = "<minimax:tool_call>\n"
     tool_call_end = "</minimax:tool_call>"
@@ -642,8 +651,9 @@ def get_kimi_k3_structural_tag(
     builtin_tools: list[BuiltinToolParam],
     tool_choice: SimplifiedToolChoice,
     reasoning: bool,
+    parallel_tool_calls: bool,
 ) -> StructuralTag:
-    del builtin_tools, reasoning
+    del builtin_tools, reasoning, parallel_tool_calls
 
     trailer = OptionalFormat(content=ConstStringFormat(value=_K3_MESSAGE_CLOSE))
 

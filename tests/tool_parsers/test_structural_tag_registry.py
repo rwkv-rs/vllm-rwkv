@@ -195,6 +195,15 @@ def test_rwkv_registered_as_vllm_builtin():
 
 
 def test_rwkv_required_accepts_reasoning_and_parallel_calls():
+    tag = get_model_structural_tag(
+        model="rwkv",
+        tools=_k3_tools_by_name(),
+        tool_choice="required",
+        reasoning=False,
+    )
+    assert isinstance(tag, StructuralTag)
+    assert tag.format.elements[1].stop_after_first is False
+
     body = "</think>\n" + "\n".join(
         [
             _rwkv_tool_call("get_weather", '{"city": "Paris", "days": 2}'),
@@ -203,6 +212,23 @@ def test_rwkv_required_accepts_reasoning_and_parallel_calls():
     )
 
     assert _is_grammar_accept_string(_rwkv_grammar("required"), body)
+
+
+@pytest.mark.parametrize("tool_choice", ["auto", "required"])
+def test_rwkv_non_parallel_choice_stops_after_one_call(
+    tool_choice,
+    sample_tools_strict,
+):
+    tag = get_model_structural_tag(
+        model="rwkv",
+        tools=sample_tools_strict,
+        tool_choice=tool_choice,
+        reasoning=False,
+        parallel_tool_calls=False,
+    )
+    assert isinstance(tag, StructuralTag)
+    output = tag.format if tool_choice == "auto" else tag.format.elements[1]
+    assert output.stop_after_first is True
 
 
 @pytest.mark.parametrize(
@@ -528,10 +554,12 @@ def test_get_structural_tag_disables_reasoning(
     monkeypatch: pytest.MonkeyPatch,
     sample_tools_strict: list[ChatCompletionToolsParam],
 ):
-    captured: list[bool] = []
+    captured: list[tuple[bool, bool]] = []
 
-    def fake_get_model_structural_tag(*, reasoning: bool, **kwargs):
-        captured.append(reasoning)
+    def fake_get_model_structural_tag(
+        *, reasoning: bool, parallel_tool_calls: bool, **kwargs
+    ):
+        captured.append((reasoning, parallel_tool_calls))
         return None
 
     monkeypatch.setattr(
@@ -544,12 +572,13 @@ def test_get_structural_tag_disables_reasoning(
         model="m",
         tools=sample_tools_strict,
         tool_choice="auto",
+        parallel_tool_calls=False,
     )
     parser = Qwen3EngineToolParser(MagicMock(), tools=sample_tools_strict)
 
     parser.get_structural_tag(request)
 
-    assert captured == [False]
+    assert captured == [(False, False)]
 
 
 def test_unified_parser_get_structural_tag_disables_reasoning(
