@@ -101,17 +101,11 @@ class RwkvAttentionMetadataBuilder(AttentionMetadataBuilder[RwkvAttentionMetadat
         self._state_layer = vllm_config.compilation_config.static_forward_context[
             layer_names[0]
         ]
-        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        self._live_cu_seqlens = torch.empty(
-            max_num_seqs + 1, dtype=torch.int32, device=device
-        )
-        self._live_state_indices = torch.empty(
-            max_num_seqs, dtype=torch.int32, device=device
-        )
-        self._live_cu_seqlens_views: dict[int, torch.Tensor] = {}
-        self._live_state_indices_views: dict[int, torch.Tensor] = {}
-        self._num_active_tokens = torch.empty(1, dtype=torch.int32, device=device)
-        self._num_active_sequences = torch.empty(1, dtype=torch.int32, device=device)
+        self._device = device
+        self._live_buffers: dict[
+            tuple[int, int, int],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = {}
         cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
         self._use_live_metadata = bool(
             cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs()
@@ -143,26 +137,45 @@ class RwkvAttentionMetadataBuilder(AttentionMetadataBuilder[RwkvAttentionMetadat
         sequence_capacity = metadata.num_reqs
         token_capacity = metadata.num_actual_tokens
         max_seqlen_capacity = metadata.max_query_len
-        if sequence_capacity not in self._live_cu_seqlens_views:
-            self._live_cu_seqlens_views[sequence_capacity] = self._live_cu_seqlens[
-                : sequence_capacity + 1
-            ]
-            self._live_state_indices_views[sequence_capacity] = (
-                self._live_state_indices[:sequence_capacity]
+        descriptor = (
+            sequence_capacity,
+            token_capacity,
+            max_seqlen_capacity,
+        )
+        buffers = self._live_buffers.get(descriptor)
+        if buffers is None:
+            buffers = (
+                torch.empty(
+                    sequence_capacity + 1,
+                    dtype=torch.int32,
+                    device=self._device,
+                ),
+                torch.empty(
+                    sequence_capacity,
+                    dtype=torch.int32,
+                    device=self._device,
+                ),
+                torch.empty(1, dtype=torch.int32, device=self._device),
+                torch.empty(1, dtype=torch.int32, device=self._device),
             )
-        cu_seqlens = self._live_cu_seqlens_views[sequence_capacity]
-        live_state_indices = self._live_state_indices_views[sequence_capacity]
+            self._live_buffers[descriptor] = buffers
+        (
+            cu_seqlens,
+            live_state_indices,
+            num_active_tokens,
+            num_active_sequences,
+        ) = buffers
         cu_seqlens.copy_(metadata.query_start_loc[: sequence_capacity + 1])
         live_state_indices.copy_(state_indices[:sequence_capacity])
 
         if for_capture:
-            self._num_active_tokens.zero_()
-            self._num_active_sequences.zero_()
+            num_active_tokens.zero_()
+            num_active_sequences.zero_()
             batch_size = sequence_capacity
         else:
             num_tokens, batch_size, _ = self._active_shape(metadata)
-            self._num_active_tokens.fill_(num_tokens)
-            self._num_active_sequences.fill_(batch_size)
+            num_active_tokens.fill_(num_tokens)
+            num_active_sequences.fill_(batch_size)
 
         rwkv_metadata = RwkvAttentionMetadata(
             cu_seqlens=cu_seqlens,
@@ -172,8 +185,8 @@ class RwkvAttentionMetadataBuilder(AttentionMetadataBuilder[RwkvAttentionMetadat
             token_capacity=token_capacity,
             sequence_capacity=sequence_capacity,
             max_seqlen_capacity=max_seqlen_capacity,
-            num_active_tokens=self._num_active_tokens,
-            num_active_sequences=self._num_active_sequences,
+            num_active_tokens=num_active_tokens,
+            num_active_sequences=num_active_sequences,
             retain_ticket=for_capture,
         )
         if for_capture:
