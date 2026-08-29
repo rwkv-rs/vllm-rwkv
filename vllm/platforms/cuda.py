@@ -19,8 +19,10 @@ from torch.distributed import PrefixStore, ProcessGroup
 from torch.distributed.distributed_c10d import is_nccl_available
 from typing_extensions import ParamSpec
 
-# import custom ops, trigger op registration
-import vllm._C_stable_libtorch  # noqa
+# Import custom ops when the wheel contains them. The RWKV production profile
+# delegates all model and sampling kernels to FlashRWKV2.
+with contextlib.suppress(ImportError):
+    import vllm._C_stable_libtorch  # noqa
 
 with contextlib.suppress(ImportError):
     import vllm._qutlass_C  # noqa

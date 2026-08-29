@@ -72,6 +72,7 @@ jobs:
       UV_LINK_MODE: copy
       MAX_JOBS: "8"
       TORCH_CUDA_ARCH_LIST: "8.9 12.0"
+      VLLM_BUILD_PROFILE: rwkv
       RWKV15_ARTIFACT: /home/caizus/Weights/RWKV/hf/rwkv7-g1i-1.5b-20260805-ctx16384
       RWKV72_ARTIFACT: /home/caizus/Weights/RWKV/hf/rwkv7-g1i-7.2b-20260805-ctx16384
       RWKV72_PTH: /home/caizus/Weights/RWKV/rwkv7/pth/rwkv7-g1i-7.2b-20260805-ctx16384.pth
@@ -114,7 +115,7 @@ jobs:
           else
             changed="$(git diff --name-only "$BASE_SHA"...HEAD)"
             if grep -Eq \
-              '^(\.github/workflows/rwkv-production\.yml|csrc/|CMakeLists.txt|cmake/|requirements/rwkv\.txt|vllm/(model_executor/models/rwkv\.py|sampling_params\.py|v1/attention/backends/rwkv_attn\.py|v1/worker/gpu/))' \
+              '^(\.github/workflows/rwkv-production\.yml|setup\.py|csrc/|CMakeLists.txt|cmake/|requirements/rwkv\.txt|vllm/(platforms/cuda\.py|model_executor/models/rwkv\.py|sampling_params\.py|v1/attention/backends/rwkv_attn\.py|v1/worker/gpu/))' \
               <<<"$changed"; then
               required=true
             else
@@ -129,7 +130,6 @@ jobs:
           uv venv --clear --python 3.12 .venv
           uv pip install --python .venv/bin/python \
             --requirements requirements/build/cuda.txt \
-            --requirements requirements/cuda.txt \
             --requirements requirements/rwkv.txt \
             pytest==9.1.0 pytest-asyncio tblib==3.2.2 \
             --torch-backend=auto
@@ -140,7 +140,10 @@ jobs:
           uv tool run --from pre-commit==4.5.1 \
             pre-commit run --hook-stage manual --files \
               .github/workflows/rwkv-production.yml \
-              scripts/deploy_rwkv_production.sh
+              requirements/rwkv.txt \
+              scripts/deploy_rwkv_production.sh \
+              setup.py \
+              vllm/platforms/cuda.py
           .venv/bin/python -m pytest --import-mode=importlib -q \
             tests/models/rwkv/test_rwkv.py \
             tests/tool_parsers/test_rwkv_tool_parser.py \
@@ -150,16 +153,28 @@ jobs:
             tests/transformers_utils/test_config.py::test_named_generation_config_does_not_fall_back_to_model_config \
             tests/v1/core/test_single_type_kv_cache_manager.py::test_state_spec_can_request_provider_managed_block_reset
 
-      - name: Build portable SM89 and SM120 wheel
+      - name: Build the reduced RWKV wheel
         run: |
           set -euo pipefail
           rm -rf dist release
           .venv/bin/python setup.py bdist_wheel --dist-dir dist
           test "$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 1
+          .venv/bin/python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheel = next(Path("dist").glob("*.whl"))
+          with ZipFile(wheel) as archive:
+              native_members = [
+                  name
+                  for name in archive.namelist()
+                  if name.startswith("vllm/") and name.endswith(".so")
+              ]
+          assert not native_members, native_members
+          PY
           uv venv --clear --relocatable --python 3.12 release/.venv
           uv pip install --python release/.venv/bin/python \
             dist/*.whl \
-            --requirements requirements/rwkv.txt \
             --torch-backend=auto
           release/.venv/bin/python - <<'PY'
           import flashrwkv2
@@ -167,6 +182,25 @@ jobs:
 
           assert flashrwkv2.__version__ == "0.1.0a11"
           print(f"vLLM={vllm.__version__} FlashRWKV2={flashrwkv2.__version__}")
+          PY
+          release/.venv/bin/python - <<'PY'
+          import subprocess
+          from pathlib import Path
+
+          import flashrwkv2
+
+          package_dir = Path(flashrwkv2.__file__).parent
+          cubins = "\n".join(
+              subprocess.check_output(
+                  ["/usr/local/cuda/bin/cuobjdump", "--list-elf", extension],
+                  text=True,
+              )
+              for extension in sorted(package_dir.glob("*.so"))
+          )
+          for architecture in ("sm_89", "sm_120"):
+              assert architecture in cubins, (
+                  f"FlashRWKV2 is missing the required {architecture} cubin"
+              )
           PY
 
       - name: Smoke-test the exact release environment
