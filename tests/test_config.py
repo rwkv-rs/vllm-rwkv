@@ -2632,7 +2632,11 @@ def test_generation_config_loading():
     assert model_config.get_diff_sampling_param() == correct_generation_config
 
     # The generation config could be overridden by the user.
-    override_generation_config = {"temperature": 0.5, "top_k": 5}
+    override_generation_config = {
+        "temperature": 0.5,
+        "top_k": 5,
+        "stop_strings": ["<stop>"],
+    }
 
     model_config = ModelConfig(
         model_id,
@@ -2640,8 +2644,11 @@ def test_generation_config_loading():
         override_generation_config=override_generation_config,
     )
 
-    override_result = correct_generation_config.copy()
-    override_result.update(override_generation_config)
+    override_result = correct_generation_config | {
+        "temperature": 0.5,
+        "top_k": 5,
+        "stop": ["<stop>"],
+    }
 
     assert model_config.get_diff_sampling_param() == override_result
 
@@ -2653,7 +2660,11 @@ def test_generation_config_loading():
         override_generation_config=override_generation_config,
     )
 
-    assert model_config.get_diff_sampling_param() == override_generation_config
+    assert model_config.get_diff_sampling_param() == {
+        "temperature": 0.5,
+        "top_k": 5,
+        "stop": ["<stop>"],
+    }
 
 
 @pytest.mark.parametrize(
