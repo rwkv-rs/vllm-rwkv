@@ -805,9 +805,33 @@ class SamplingParams(
         self._validate_allowed_token_ids(tokenizer)
         self._validate_spec_decode(speculative_config)
         self._validate_diffusion(model_config)
+        self._validate_rwkv(model_config)
         self._validate_structured_outputs(
             model_config, structured_outputs_config, tokenizer
         )
+
+    def _validate_rwkv(self, model_config: ModelConfig) -> None:
+        if model_config.hf_config.model_type != "rwkv":
+            if self.penalty_decay != 1.0:
+                raise VLLMValidationError(
+                    "penalty_decay is supported only by RWKV Rapid-Sampling",
+                    parameter="penalty_decay",
+                    value=self.penalty_decay,
+                )
+            return
+        if self.repetition_penalty != 1.0:
+            raise VLLMValidationError(
+                "RWKV Rapid-Sampling does not support multiplicative "
+                "repetition_penalty",
+                parameter="repetition_penalty",
+                value=self.repetition_penalty,
+            )
+        if self.min_p != 0.0:
+            raise VLLMValidationError(
+                "RWKV Rapid-Sampling does not support min_p",
+                parameter="min_p",
+                value=self.min_p,
+            )
 
     def _validate_logprobs(self, model_config: ModelConfig) -> None:
         max_logprobs = model_config.max_logprobs

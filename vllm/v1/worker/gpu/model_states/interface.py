@@ -125,6 +125,9 @@ class ModelState(ABC):
     def remove_request(self, req_id: str) -> None:
         return None
 
+    def preempt_request(self, req_id: str) -> None:
+        return None
+
     def apply_staged_writes(self) -> None:
         return None
 

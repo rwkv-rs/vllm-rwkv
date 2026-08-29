@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import TYPE_CHECKING
 
+from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.logger import init_logger
 from vllm.utils.math_utils import round_up
 
@@ -946,6 +947,12 @@ class RwkvForCausalLMConfig(VerifyAndUpdateConfig):
             raise ValueError("RWKV does not support prefill context parallelism")
         if vllm_config.speculative_config is not None:
             raise ValueError("RWKV does not support speculative decoding")
+        if model_config.logprobs_mode in PROCESSED_LOGPROBS_MODES:
+            raise ValueError("RWKV Rapid-Sampling supports only raw logprobs")
+        if model_config.return_sampling_mask:
+            raise ValueError("RWKV Rapid-Sampling does not return sampling masks")
+        if model_config.enable_trace_replay:
+            raise ValueError("RWKV Rapid-Sampling does not support trace replay")
         if vllm_config.lora_config is not None:
             raise ValueError("RWKV does not support vLLM LoRA adapters")
         if (
