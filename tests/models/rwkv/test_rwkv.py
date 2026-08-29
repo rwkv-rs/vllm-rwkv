@@ -276,7 +276,7 @@ def test_channel_mix_value_loads_checkpoint_weight_transposed() -> None:
     assert torch.equal(value.weight, checkpoint_weight.T.contiguous())
 
 
-def test_align_state_advance_copies_only_crossing_requests() -> None:
+def test_align_state_advance_uses_execution_owned_token_counts() -> None:
     copies: list[tuple[torch.Tensor, torch.Tensor]] = []
     resets: list[torch.Tensor] = []
     state_layer = SimpleNamespace(
@@ -290,6 +290,7 @@ def test_align_state_advance_copies_only_crossing_requests() -> None:
     model_state._align_mode = True
     model_state._block_size = 16
     model_state._state_block_columns = np.array([0, 0], dtype=np.int32)
+    model_state._state_num_computed_tokens = np.array([15, 16], dtype=np.int64)
     model_state._state_layer = state_layer
     model_state._rwkv_group_id = 0
     model_state.device = torch.device("cpu")
@@ -297,7 +298,7 @@ def test_align_state_advance_copies_only_crossing_requests() -> None:
     input_batch = SimpleNamespace(
         num_reqs=2,
         idx_mapping_np=np.array([0, 1]),
-        num_computed_tokens_np=np.array([15, 16], dtype=np.int32),
+        num_computed_tokens_np=np.array([31, 32], dtype=np.int32),
         num_scheduled_tokens=np.array([1, 1], dtype=np.int32),
     )
     block_table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
@@ -315,6 +316,7 @@ def test_align_state_advance_copies_only_crossing_requests() -> None:
     assert np.array_equal(
         model_state._state_block_columns, np.array([0, 1], dtype=np.int32)
     )
+    assert np.array_equal(model_state._state_num_computed_tokens, np.array([16, 17]))
 
 
 def test_align_state_advance_resets_new_request_destination() -> None:
@@ -328,6 +330,7 @@ def test_align_state_advance_resets_new_request_destination() -> None:
     model_state._align_mode = True
     model_state._block_size = 16
     model_state._state_block_columns = np.array([-1], dtype=np.int32)
+    model_state._state_num_computed_tokens = np.array([0], dtype=np.int64)
     model_state._state_layer = state_layer
     model_state._rwkv_group_id = 0
     model_state.device = torch.device("cpu")
@@ -349,6 +352,7 @@ def test_align_state_advance_resets_new_request_destination() -> None:
     assert len(resets) == 1
     assert torch.equal(resets[0], torch.tensor([9], dtype=torch.int32))
     assert np.array_equal(model_state._state_block_columns, np.array([1]))
+    assert np.array_equal(model_state._state_num_computed_tokens, np.array([32]))
 
 
 def _config() -> SimpleNamespace:
@@ -402,7 +406,7 @@ def test_config_uses_fp16_state_and_full_graph_defaults() -> None:
     assert vllm_config.cache_config.mamba_ssm_cache_dtype == "float16"
     assert vllm_config.cache_config.mamba_cache_mode == "align"
     assert vllm_config.cache_config.mamba_block_size == 16
-    assert not vllm_config.scheduler_config.async_scheduling
+    assert vllm_config.scheduler_config.async_scheduling is None
     assert vllm_config.compilation_config.mode == CompilationMode.NONE
     assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL
 
@@ -440,12 +444,8 @@ def test_config_rejects_tensor_parallelism() -> None:
         raise AssertionError("tensor parallelism must be rejected")
 
 
-def test_config_rejects_async_scheduling() -> None:
+def test_config_accepts_async_scheduling() -> None:
     vllm_config = _config()
     vllm_config.scheduler_config.async_scheduling = True
-    try:
-        RwkvForCausalLMConfig.verify_and_update_config(vllm_config)
-    except ValueError as error:
-        assert "asynchronous scheduling" in str(error)
-    else:
-        raise AssertionError("asynchronous scheduling must be rejected")
+    RwkvForCausalLMConfig.verify_and_update_config(vllm_config)
+    assert vllm_config.scheduler_config.async_scheduling

@@ -33,6 +33,7 @@ class RwkvModelState(DefaultModelState):
         assert block_size is not None
         self._block_size = block_size
         self._state_block_columns = np.full(self.max_num_reqs, -1, dtype=np.int32)
+        self._state_num_computed_tokens = np.zeros(self.max_num_reqs, dtype=np.int64)
         self._rwkv_group_id: int | None = None
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
@@ -40,6 +41,7 @@ class RwkvModelState(DefaultModelState):
         self._state_block_columns[req_index] = (
             new_req_data.num_computed_tokens - 1
         ) // self._block_size
+        self._state_num_computed_tokens[req_index] = new_req_data.num_computed_tokens
 
     def reset_kv_cache_blocks(self, block_ids: Sequence[int]) -> bool:
         self._state_layer.reset_state_slots(block_ids)
@@ -73,7 +75,7 @@ class RwkvModelState(DefaultModelState):
 
         num_reqs = input_batch.num_reqs
         req_indices = input_batch.idx_mapping_np[:num_reqs]
-        computed = input_batch.num_computed_tokens_np[:num_reqs]
+        computed = self._state_num_computed_tokens[req_indices]
         query_lens = input_batch.num_scheduled_tokens[:num_reqs]
         old_columns = self._state_block_columns[req_indices]
         new_columns = (computed + query_lens - 1) // self._block_size
@@ -107,4 +109,5 @@ class RwkvModelState(DefaultModelState):
             ].contiguous()
             self._state_layer.copy_state_slots(source_indices, destination_indices)
         self._state_block_columns[req_indices] = new_columns
+        self._state_num_computed_tokens[req_indices] = computed + query_lens
         del num_computed_tokens
