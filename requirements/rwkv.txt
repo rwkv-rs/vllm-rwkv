@@ -36,6 +36,7 @@ prometheus_client>=0.18.0
 prometheus-fastapi-instrumentator>=8.0.0
 pyzmq>=25.0.0
 msgspec
+model-hosting-container-standards>=0.1.14,<1.0.0
 watchfiles
 python-json-logger
 setproctitle
