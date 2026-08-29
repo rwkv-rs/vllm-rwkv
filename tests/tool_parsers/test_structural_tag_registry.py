@@ -194,15 +194,18 @@ def test_rwkv_registered_as_vllm_builtin():
     assert RwkvToolParser.structural_tag_model == "rwkv"
 
 
-def test_rwkv_required_accepts_reasoning_and_parallel_calls():
-    body = "</think>\n" + "\n".join(
-        [
-            _rwkv_tool_call("get_weather", '{"city": "Paris", "days": 2}'),
-            _rwkv_tool_call("run_command", '{"command": "date"}'),
-        ]
+def test_rwkv_required_accepts_reasoning_and_stops_after_one_call():
+    tag = get_model_structural_tag(
+        model="rwkv",
+        tools=_k3_tools_by_name(),
+        tool_choice="required",
+        reasoning=False,
     )
+    assert isinstance(tag, StructuralTag)
+    assert tag.format.elements[1].stop_after_first is True
 
-    assert _is_grammar_accept_string(_rwkv_grammar("required"), body)
+    body = "</think>\n" + _rwkv_tool_call("get_weather", '{"city": "Paris", "days": 2}')
+    assert _is_grammar_accept_string(Grammar.from_structural_tag(tag), body)
 
 
 @pytest.mark.parametrize(
@@ -234,8 +237,16 @@ def test_rwkv_named_choice_accepts_only_the_selected_tool():
     )
 
 
-def test_rwkv_strict_auto_allows_content_or_a_valid_call(sample_tools_strict):
-    grammar = _rwkv_grammar("auto", tools=sample_tools_strict)
+def test_rwkv_auto_allows_content_or_one_valid_call(sample_tools):
+    tag = get_model_structural_tag(
+        model="rwkv",
+        tools=sample_tools,
+        tool_choice="auto",
+        reasoning=False,
+    )
+    assert isinstance(tag, StructuralTag)
+    assert tag.format.stop_after_first is True
+    grammar = Grammar.from_structural_tag(tag)
 
     assert _is_grammar_accept_string(grammar, "No tool is needed.")
     assert _is_grammar_accept_string(
