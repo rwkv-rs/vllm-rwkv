@@ -129,7 +129,6 @@ class RwkvSampler(Sampler):
         if not np.any(self.needs_logits_processing[slots_np]):
             return logits
 
-        logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
         self.logit_bias_state.apply_logit_bias(logits, slots, slots_np, pos)
         self.bad_words_state.apply_bad_words(
             logits, slots, slots_np, input_ids, local_pos
@@ -180,6 +179,11 @@ class RwkvSampler(Sampler):
         active_slots = self._active_slots.copy_to_uva(num_active)
         active_slots_i64 = idx_mapping[active_rows]
         active_logits = logits if num_active == num_reqs else logits[active_rows]
+        active_logits = torch.empty(
+            active_logits.shape,
+            dtype=torch.float32,
+            device=active_logits.device,
+        ).copy_(active_logits)
         active_logits = self._apply_logits_processors(
             active_logits,
             active_slots_i64,
