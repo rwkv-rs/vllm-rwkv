@@ -1913,6 +1913,7 @@ class ModelConfig:
             "min_p",
             "max_new_tokens",
             "skip_special_tokens",
+            "stop_strings",
         ]
         if any(p in config for p in available_params):
             diff_sampling_param = {
@@ -1924,6 +1925,8 @@ class ModelConfig:
                 diff_sampling_param["max_tokens"] = diff_sampling_param.pop(
                     "max_new_tokens"
                 )
+            if "stop_strings" in diff_sampling_param:
+                diff_sampling_param["stop"] = diff_sampling_param.pop("stop_strings")
         else:
             diff_sampling_param = {}
 
