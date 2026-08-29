@@ -106,6 +106,9 @@ class RwkvAttentionMetadataBuilder(AttentionMetadataBuilder[RwkvAttentionMetadat
             tuple[int, int, int],
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         ] = {}
+        self._live_query_layouts: dict[
+            tuple[int, int, int], tuple[torch.Tensor, int]
+        ] = {}
         self._captured_descriptors: set[tuple[int, int, int]] = set()
         cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
         self._use_live_metadata = bool(
@@ -166,17 +169,28 @@ class RwkvAttentionMetadataBuilder(AttentionMetadataBuilder[RwkvAttentionMetadat
             num_active_tokens,
             num_active_sequences,
         ) = buffers
-        cu_seqlens.copy_(metadata.query_start_loc[: sequence_capacity + 1])
         live_state_indices.copy_(state_indices[:sequence_capacity])
 
         if for_capture:
+            cu_seqlens.copy_(metadata.query_start_loc[: sequence_capacity + 1])
             num_active_tokens.zero_()
             num_active_sequences.zero_()
             batch_size = sequence_capacity
+            self._live_query_layouts.pop(descriptor, None)
         else:
-            num_tokens, batch_size, _ = self._active_shape(metadata)
-            num_active_tokens.fill_(num_tokens)
-            num_active_sequences.fill_(batch_size)
+            query_layout = metadata.query_start_loc_cpu[: sequence_capacity + 1]
+            cached_layout = self._live_query_layouts.get(descriptor)
+            if cached_layout is None or not torch.equal(cached_layout[0], query_layout):
+                num_tokens, batch_size, _ = self._active_shape(metadata)
+                cu_seqlens.copy_(metadata.query_start_loc[: sequence_capacity + 1])
+                num_active_tokens.fill_(num_tokens)
+                num_active_sequences.fill_(batch_size)
+                self._live_query_layouts[descriptor] = (
+                    query_layout.clone(),
+                    batch_size,
+                )
+            else:
+                _, batch_size = cached_layout
 
         rwkv_metadata = RwkvAttentionMetadata(
             cu_seqlens=cu_seqlens,
