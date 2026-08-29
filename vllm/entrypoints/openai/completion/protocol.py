@@ -353,6 +353,15 @@ class CompletionRequest(OpenAIBaseModel):
                     dict.fromkeys([*stop_token_ids, *default_stop_ids])
                 )
 
+        stop = self.stop
+        default_stop = default_sampling_params.get("stop")
+        if default_stop:
+            if isinstance(stop, str):
+                stop = [stop]
+            if isinstance(default_stop, str):
+                default_stop = [default_stop]
+            stop = list(dict.fromkeys([*(stop or []), *default_stop]))
+
         prompt_logprobs = self.prompt_logprobs
         if prompt_logprobs is None and self.echo:
             prompt_logprobs = self.logprobs
@@ -376,7 +385,7 @@ class CompletionRequest(OpenAIBaseModel):
             top_k=top_k,
             min_p=min_p,
             seed=self.seed,
-            stop=self.stop,
+            stop=stop,
             stop_token_ids=stop_token_ids,
             logprobs=None if self.logprob_token_ids else self.logprobs,
             ignore_eos=self.ignore_eos,

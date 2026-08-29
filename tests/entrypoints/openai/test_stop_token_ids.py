@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Unit tests for stop_token_ids propagation from default_sampling_params
+Unit tests for stop condition propagation from default_sampling_params
 to SamplingParams in ChatCompletionRequest and CompletionRequest.
 
 Regression test for https://github.com/vllm-project/vllm/issues/22519
@@ -121,6 +121,20 @@ class TestChatCompletionStopTokenIds:
         assert sampling_params.stop_token_ids == [200012, 55555, 200002]
         assert len(sampling_params.stop_token_ids) == 3
 
+    def test_stop_strings_merged_with_defaults(self):
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "hello"}],
+            stop=["CLIENT", "SHARED"],
+        )
+
+        sampling_params = request.to_sampling_params(
+            max_tokens=100,
+            default_sampling_params={"stop": ["SHARED", "MODEL"]},
+        )
+
+        assert sampling_params.stop == ["CLIENT", "SHARED", "MODEL"]
+
 
 class TestCompletionStopTokenIds:
     """Test stop_token_ids merging in CompletionRequest.to_sampling_params()."""
@@ -172,3 +186,11 @@ class TestCompletionStopTokenIds:
         )
 
         assert not sampling_params.stop_token_ids
+
+    def test_default_stop_strings_applied(self, minimal_completion_request):
+        sampling_params = minimal_completion_request.to_sampling_params(
+            max_tokens=100,
+            default_sampling_params={"stop": "MODEL"},
+        )
+
+        assert sampling_params.stop == ["MODEL"]

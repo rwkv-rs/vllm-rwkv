@@ -71,6 +71,20 @@ class TestResponsesRequestSamplingParams:
 
         assert sampling_params.stop == ["STOP"]
 
+    def test_stop_strings_merged_with_defaults(self):
+        request = ResponsesRequest(
+            model="test-model",
+            input="test input",
+            stop=["CLIENT", "SHARED"],
+        )
+
+        sampling_params = request.to_sampling_params(
+            default_max_tokens=1000,
+            default_sampling_params={"stop": ["SHARED", "MODEL"]},
+        )
+
+        assert sampling_params.stop == ["CLIENT", "SHARED", "MODEL"]
+
     def test_default_values(self):
         """Test default values for optional parameters."""
         request = ResponsesRequest(

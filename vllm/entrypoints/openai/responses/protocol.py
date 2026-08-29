@@ -425,6 +425,11 @@ class ResponsesRequest(OpenAIBaseModel):
         stop = self.stop if self.stop else []
         if isinstance(stop, str):
             stop = [stop]
+        default_stop = default_sampling_params.get("stop")
+        if default_stop:
+            if isinstance(default_stop, str):
+                default_stop = [default_stop]
+            stop = list(dict.fromkeys([*stop, *default_stop]))
 
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
         if self.kv_transfer_params:
