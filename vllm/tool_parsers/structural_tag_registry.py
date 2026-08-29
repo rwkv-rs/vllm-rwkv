@@ -208,6 +208,8 @@ def get_model_structural_tag(
     tools = get_structural_tag_tools(model, tools, tool_choice)
     if not tools:
         return None
+    if model == "rwkv":
+        strict_level = max(strict_level, ToolStrictLevel.FUNCTION)
     tools = resolve_tool_strictness(tools, tool_choice, strict_level)
     if tools is None:
         return None
@@ -467,6 +469,7 @@ def get_rwkv_structural_tag(
             TriggeredTagsFormat(
                 triggers=[_RWKV_TOOL_CALL_TRIGGER],
                 tags=tags,
+                stop_after_first=True,
             )
             if tags
             else AnyTextFormat()
@@ -479,7 +482,7 @@ def get_rwkv_structural_tag(
                     tags=tags,
                     separator="\n",
                     at_least_one=True,
-                    stop_after_first=tool_choice == "forced",
+                    stop_after_first=True,
                 ),
             ]
         )
