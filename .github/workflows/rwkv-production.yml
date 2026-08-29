@@ -26,7 +26,7 @@ permissions:
 
 concurrency:
   group: rwkv-production-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'production' }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   authorize:
@@ -144,6 +144,7 @@ jobs:
             tests/tool_parsers/test_structural_tag_registry.py \
             tests/entrypoints/openai/chat_completion/test_serving_chat.py \
             tests/entrypoints/openai/responses/test_sampling_params.py \
+            tests/transformers_utils/test_config.py \
             tests/v1/core/test_kv_cache_utils.py \
             tests/v1/core/test_single_type_kv_cache_manager.py \
             tests/v1/cudagraph/test_cudagraph_manager.py
@@ -230,6 +231,58 @@ jobs:
               "max_output_tokens": 8,
           })
           assert responses["output"]
+          completions = post("/v1/completions", {
+              "model": "rwkv7-g1i-1.5b",
+              "prompt": "Reply with OK.",
+              "temperature": 0,
+              "max_tokens": 8,
+          })
+          assert completions["choices"]
+          fake_think = post("/v1/chat/completions", {
+              "model": "rwkv7-g1i-1.5b",
+              "messages": [{"role": "user", "content": "Reply with OK."}],
+              "chat_template_kwargs": {"rwkv_generation_prompt": "fake_think"},
+              "max_tokens": 8,
+          })
+          assert fake_think["choices"]
+          tools = post("/v1/chat/completions", {
+              "model": "rwkv7-g1i-1.5b",
+              "messages": [{"role": "user", "content": "Reply with OK."}],
+              "tools": [{
+                  "type": "function",
+                  "function": {
+                      "name": "noop",
+                      "description": "Do nothing.",
+                      "parameters": {"type": "object", "properties": {}},
+                  },
+              }],
+              "tool_choice": "none",
+              "max_tokens": 8,
+          })
+          assert tools["choices"]
+          structured = post("/v1/chat/completions", {
+              "model": "rwkv7-g1i-1.5b",
+              "messages": [{"role": "user", "content": "Reply with OK."}],
+              "structured_outputs": {"choice": ["OK"]},
+              "max_tokens": 8,
+          })
+          assert structured["choices"][0]["message"]["content"] == "OK"
+
+          stream_request = urllib.request.Request(
+              "http://127.0.0.1:18080/v1/chat/completions",
+              data=json.dumps({
+                  "model": "rwkv7-g1i-1.5b",
+                  "messages": [{"role": "user", "content": "Reply with OK."}],
+                  "temperature": 0,
+                  "max_tokens": 8,
+                  "stream": True,
+              }).encode(),
+              headers={"Content-Type": "application/json"},
+          )
+          with urllib.request.urlopen(stream_request, timeout=180) as response:
+              stream = response.read().decode()
+          assert "data: " in stream
+          assert "data: [DONE]" in stream
           PY
 
       - name: Run Albatross numerical reference
@@ -353,24 +406,26 @@ jobs:
             fi
             sleep 5
           done
-          for batch in 1 4 64 320 512; do
-            release/.venv/bin/vllm bench serve \
-              --backend vllm \
-              --base-url http://127.0.0.1:18080 \
-              --model "$RWKV72_ARTIFACT" \
-              --served-model-name rwkv7-g1i-7.2b \
-              --dataset-name random \
-              --random-input-len 16 \
-              --random-output-len 32 \
-              --num-prompts "$batch" \
-              --num-warmups 1 \
-              --request-rate inf \
-              --max-concurrency "$batch" \
-              --temperature 0 \
-              --ignore-eos \
-              --save-result \
-              --result-dir "$evidence" \
-              --result-filename "vllm-b${batch}.json"
+          for repetition in 1 2 3; do
+            for batch in 1 4 64 320 512; do
+              release/.venv/bin/vllm bench serve \
+                --backend vllm \
+                --base-url http://127.0.0.1:18080 \
+                --model "$RWKV72_ARTIFACT" \
+                --served-model-name rwkv7-g1i-7.2b \
+                --dataset-name random \
+                --random-input-len 16 \
+                --random-output-len 32 \
+                --num-prompts "$batch" \
+                --num-warmups 1 \
+                --request-rate inf \
+                --max-concurrency "$batch" \
+                --temperature 0 \
+                --ignore-eos \
+                --save-result \
+                --result-dir "$evidence" \
+                --result-filename "vllm-b${batch}-r${repetition}.json"
+            done
           done
 
       - name: Enforce Albatross performance parity
@@ -380,6 +435,7 @@ jobs:
           release/.venv/bin/python - "$RUNNER_TEMP/rwkv-gate" <<'PY'
           import json
           import re
+          import statistics
           import sys
           from pathlib import Path
 
@@ -396,14 +452,29 @@ jobs:
           report = {"batches": {}}
           failures = []
           for batch in (1, 4, 64, 320, 512):
-              result = json.loads((root / f"vllm-b{batch}.json").read_text())
-              if result["completed"] != batch or result.get("failed", 0):
-                  failures.append(f"B={batch}: incomplete requests")
+              prefills = []
+              decodes = []
+              for repetition in (1, 2, 3):
+                  result = json.loads(
+                      (root / f"vllm-b{batch}-r{repetition}.json").read_text()
+                  )
+                  if result["completed"] != batch or result.get("failed", 0):
+                      failures.append(
+                          f"B={batch} R={repetition}: incomplete requests"
+                      )
+                      continue
+                  first_token_latency = max(result["ttfts"])
+                  prefills.append(
+                      result["total_input_tokens"] / first_token_latency
+                  )
+                  decodes.append(
+                      result["total_output_tokens"]
+                      / (result["duration"] - first_token_latency)
+                  )
+              if len(prefills) != 3:
                   continue
-              max_ttft = max(result["ttfts"])
-              prefill = result["total_input_tokens"] / max_ttft
-              decode_duration = result["duration"] - max_ttft
-              decode = result["total_output_tokens"] / decode_duration
+              prefill = statistics.median(prefills)
+              decode = statistics.median(decodes)
               ref_prefill = reference[(batch, 16)]
               ref_decode = reference[(batch, 1)]
               report["batches"][str(batch)] = {
