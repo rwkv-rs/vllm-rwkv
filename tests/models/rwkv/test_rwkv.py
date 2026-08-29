@@ -9,14 +9,16 @@ import numpy as np
 import torch
 
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.exceptions import VLLMValidationError
 from vllm.model_executor.models.config import RwkvForCausalLMConfig
 from vllm.model_executor.models.rwkv import RwkvFeedForward, RwkvStateLayer
+from vllm.sampling_params import SamplingParams
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.rwkv_attn import (
     RwkvAttentionMetadata,
     RwkvAttentionMetadataBuilder,
 )
-from vllm.v1.worker.gpu.model_states.rwkv import RwkvModelState
+from vllm.v1.worker.gpu.model_states.rwkv import RwkvModelState, RwkvSampler
 
 
 class _FakeStateHandle:
@@ -470,6 +472,9 @@ def _config() -> SimpleNamespace:
         supports_mamba_prefix_caching=True,
         max_model_len=1024,
         enforce_eager=False,
+        logprobs_mode="raw_logprobs",
+        return_sampling_mask=False,
+        enable_trace_replay=False,
         quantization=None,
         quantization_config=None,
     )
@@ -550,6 +555,79 @@ def test_config_rejects_tensor_parallelism() -> None:
         assert "tensor parallelism" in str(error)
     else:
         raise AssertionError("tensor parallelism must be rejected")
+
+
+def test_config_rejects_unsupported_rapid_sampling_modes() -> None:
+    for field, value, message in (
+        ("logprobs_mode", "processed_logprobs", "raw logprobs"),
+        ("return_sampling_mask", True, "sampling masks"),
+        ("enable_trace_replay", True, "trace replay"),
+    ):
+        vllm_config = _config()
+        setattr(vllm_config.model_config, field, value)
+        try:
+            RwkvForCausalLMConfig.verify_and_update_config(vllm_config)
+        except ValueError as error:
+            assert message in str(error)
+        else:
+            raise AssertionError(f"{field} must be rejected")
+
+
+def test_sampling_params_verify_rejects_unsupported_rwkv_controls() -> None:
+    for model_type, sampling_params, message in (
+        ("rwkv", SamplingParams(repetition_penalty=1.1), "repetition_penalty"),
+        ("rwkv", SamplingParams(min_p=0.1), "min_p"),
+        ("qwen2", SamplingParams(penalty_decay=0.9), "penalty_decay"),
+    ):
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(model_type=model_type),
+            max_logprobs=20,
+            get_vocab_size=lambda: 64,
+            logits_processors=None,
+            is_diffusion=False,
+        )
+        try:
+            sampling_params.verify(model_config, None, None, None)
+        except VLLMValidationError as error:
+            assert message in str(error)
+        else:
+            raise AssertionError(f"{message} must be rejected")
+
+
+def test_rapid_sampler_preserves_preempted_request_state() -> None:
+    sampler = object.__new__(RwkvSampler)
+    sampler.req_states = SimpleNamespace(req_id_to_index={"request": 1})
+    sampler._rapid_sampling_states = torch.arange(8, dtype=torch.int8).view(2, 4)
+    sampler._rapid_penalties = torch.arange(12, dtype=torch.float32).view(2, 6)
+    sampler._preserved_requests = {}
+    sampler._new_requests = []
+
+    sampler.preempt_request("request")
+    state, penalties = sampler._preserved_requests["request"]
+    sampler._rapid_sampling_states[1].zero_()
+    sampler._rapid_penalties[1].zero_()
+
+    assert torch.equal(state, torch.tensor([4, 5, 6, 7], dtype=torch.int8))
+    assert torch.equal(
+        penalties,
+        torch.tensor([6, 7, 8, 9, 10, 11], dtype=torch.float32),
+    )
+    sampler.remove_request("request")
+    assert "request" in sampler._preserved_requests
+
+    sampler.req_states.req_id_to_index.clear()
+    sampler.stage_request(0, "request")
+    assert "request" not in sampler._preserved_requests
+    assert len(sampler._new_requests) == 1
+    req_idx, preserved = sampler._new_requests[0]
+    assert req_idx == 0
+    assert preserved is not None
+    assert preserved[0] is state
+    assert preserved[1] is penalties
+
+    sampler._preserved_requests["request"] = (state, penalties)
+    sampler.remove_request("request")
+    assert "request" not in sampler._preserved_requests
 
 
 def test_config_accepts_async_scheduling() -> None:

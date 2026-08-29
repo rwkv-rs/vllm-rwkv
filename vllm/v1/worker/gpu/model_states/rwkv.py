@@ -3,7 +3,6 @@
 """MRV2 request state for RWKV recurrent-state lifecycle management."""
 
 from collections.abc import Sequence
-from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
@@ -11,7 +10,6 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
-from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.model_executor.models.rwkv import _load_flashrwkv2
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import NewRequestData
@@ -23,25 +21,12 @@ from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
-_NO_RWKV_PENALTIES_STATE = SimpleNamespace(output_bin_counts=None)
-
 
 class RwkvSampler(Sampler):
     """FlashRWKV2 Rapid-Sampling with state isolated by request slot."""
 
     def __init__(self, sampler: Sampler) -> None:
         self.__dict__.update(sampler.__dict__)
-        if self.num_speculative_tokens != 1:
-            raise ValueError(
-                "RWKV Rapid-Sampling does not support speculative decoding"
-            )
-        if self.logprobs_mode in PROCESSED_LOGPROBS_MODES:
-            raise ValueError("RWKV Rapid-Sampling supports only raw logprobs")
-        if self.return_sampling_mask:
-            raise ValueError("RWKV Rapid-Sampling does not return sampling masks")
-        if self.trace_replay_state is not None:
-            raise ValueError("RWKV Rapid-Sampling does not support trace replay")
-
         flashrwkv2 = _load_flashrwkv2()
         self._sample = flashrwkv2.infer_sampling_six_parameter_forward_varlen
         self._setup_sampling_states = flashrwkv2.setup_sampling_states
@@ -49,7 +34,7 @@ class RwkvSampler(Sampler):
         vocab_size = self.sampling_states.vocab_size
         device = self.req_states.device
 
-        self.penalties_state = cast(Any, _NO_RWKV_PENALTIES_STATE)
+        cast(Any, self.penalties_state).output_bin_counts = None
         self._rapid_penalties = torch.zeros(
             max_num_reqs, vocab_size, dtype=torch.float32, device=device
         )
@@ -61,19 +46,29 @@ class RwkvSampler(Sampler):
         self._penalty_decay.copy_to_uva()
         self._active_rows = UvaBackedTensor(max_num_reqs, dtype=torch.int64)
         self._active_slots = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
-        self._new_request_slots: list[int] = []
+        self._preserved_requests: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._new_requests: list[
+            tuple[int, tuple[torch.Tensor, torch.Tensor] | None]
+        ] = []
         self._input_batch: InputBatch | None = None
+
+    def stage_request(self, req_idx: int, req_id: str) -> None:
+        self._new_requests.append((req_idx, self._preserved_requests.pop(req_id, None)))
+
+    def preempt_request(self, req_id: str) -> None:
+        req_idx = self.req_states.req_id_to_index[req_id]
+        self._preserved_requests[req_id] = (
+            self._rapid_sampling_states[req_idx].to(device="cpu", copy=True),
+            self._rapid_penalties[req_idx].to(device="cpu", copy=True),
+        )
+
+    def remove_request(self, req_id: str) -> None:
+        if req_id not in self.req_states.req_id_to_index:
+            self._preserved_requests.pop(req_id, None)
 
     def add_request(
         self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
     ) -> None:
-        if sampling_params.repetition_penalty != 1.0:
-            raise ValueError(
-                "RWKV Rapid-Sampling does not support multiplicative repetition_penalty"
-            )
-        if sampling_params.min_p != 0.0:
-            raise ValueError("RWKV Rapid-Sampling does not support min_p")
-
         self.sampling_states.add_request(req_idx, sampling_params)
         self.logit_bias_state.add_request(req_idx, prompt_len, sampling_params)
         self.bad_words_state.add_request(req_idx, sampling_params)
@@ -83,7 +78,6 @@ class RwkvSampler(Sampler):
         self._presence_penalty.np[req_idx] = sampling_params.presence_penalty
         self._frequency_penalty.np[req_idx] = sampling_params.frequency_penalty
         self._penalty_decay.np[req_idx] = sampling_params.penalty_decay
-        self._new_request_slots.append(req_idx)
         self.needs_logits_processing[req_idx] = (
             self.logit_bias_state.use_logit_bias[req_idx]
             or self.bad_words_state.num_bad_words.np[req_idx] > 0
@@ -103,12 +97,17 @@ class RwkvSampler(Sampler):
         self._frequency_penalty.copy_to_uva()
         self._penalty_decay.copy_to_uva()
 
-        for req_idx in self._new_request_slots:
-            seed = int(self.sampling_states.seeds.np[req_idx])
-            request_state = self._setup_sampling_states(seed, 1)
-            self._rapid_sampling_states[req_idx].copy_(request_state[0])
-            self._rapid_penalties[req_idx].zero_()
-        self._new_request_slots.clear()
+        for req_idx, preserved in self._new_requests:
+            if preserved is None:
+                seed = int(self.sampling_states.seeds.np[req_idx])
+                request_state = self._setup_sampling_states(seed, 1)
+                self._rapid_sampling_states[req_idx].copy_(request_state[0])
+                self._rapid_penalties[req_idx].zero_()
+            else:
+                request_state, penalties = preserved
+                self._rapid_sampling_states[req_idx].copy_(request_state)
+                self._rapid_penalties[req_idx].copy_(penalties)
+        self._new_requests.clear()
 
     def __call__(
         self,
@@ -226,16 +225,29 @@ class RwkvModelState(DefaultModelState):
         self._state_block_columns = np.full(self.max_num_reqs, -1, dtype=np.int32)
         self._state_num_computed_tokens = np.zeros(self.max_num_reqs, dtype=np.int64)
         self._rwkv_group_id: int | None = None
+        self._sampler: RwkvSampler | None = None
 
     def custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
-        return RwkvSampler(sampler), None
+        self._sampler = RwkvSampler(sampler)
+        return self._sampler, None
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
+        if self._sampler is not None:
+            self._sampler.stage_request(req_index, new_req_data.req_id)
         self._state_block_columns[req_index] = (
             new_req_data.num_computed_tokens - 1
         ) // self._block_size
         self._state_num_computed_tokens[req_index] = new_req_data.num_computed_tokens
+
+    def preempt_request(self, req_id: str) -> None:
+        if self._sampler is not None:
+            self._sampler.preempt_request(req_id)
+
+    def remove_request(self, req_id: str) -> None:
+        super().remove_request(req_id)
+        if self._sampler is not None:
+            self._sampler.remove_request(req_id)
 
     def reset_kv_cache_blocks(self, block_ids: Sequence[int]) -> bool:
         self._state_layer.reset_state_slots(block_ids)
