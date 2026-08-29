@@ -148,11 +148,38 @@ jobs:
             tests/models/rwkv/test_rwkv.py \
             tests/tool_parsers/test_rwkv_tool_parser.py \
             tests/tool_parsers/test_structural_tag_registry.py \
-            tests/entrypoints/openai/chat_completion/test_serving_chat.py::test_rwkv_sampling_profile_selection_prefers_tools \
             tests/transformers_utils/test_config.py::test_named_generation_config_does_not_fall_back_to_model_config \
             tests/v1/core/test_single_type_kv_cache_manager.py::test_state_spec_can_request_provider_managed_block_reset
           .venv/bin/python -m pytest --noconftest --import-mode=importlib -q \
             tests/entrypoints/openai/responses/test_sampling_params.py
+          .venv/bin/python - <<'PY'
+          from vllm.entrypoints.openai.chat_completion.protocol import (
+              ChatCompletionRequest,
+          )
+          from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+
+          serving = object.__new__(OpenAIServingChat)
+          serving.default_sampling_params = {"profile": "open_think"}
+          serving._rwkv_sampling_profiles = {
+              "open_think": serving.default_sampling_params,
+              "fake_think": {"profile": "fake_think"},
+              "tools": {"profile": "tools"},
+          }
+          request = ChatCompletionRequest(
+              messages=[{"role": "user", "content": "Hello"}],
+              tools=[{
+                  "type": "function",
+                  "function": {
+                      "name": "get_weather",
+                      "parameters": {"type": "object"},
+                  },
+              }],
+          )
+          defaults = serving._sampling_defaults_for_request(
+              request, {"rwkv_generation_prompt": "fake_think"}
+          )
+          assert defaults["profile"] == "tools"
+          PY
 
       - name: Build the reduced RWKV wheel
         run: |
