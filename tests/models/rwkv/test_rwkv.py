@@ -202,14 +202,10 @@ def test_state_spec_accounts_provider_memory_and_slot_lifecycle(monkeypatch) -> 
     )
 
 
-def test_live_metadata_reuses_provider_ticket_tensor_identity() -> None:
+def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:
     builder = object.__new__(RwkvAttentionMetadataBuilder)
-    builder._live_cu_seqlens = torch.empty(5, dtype=torch.int32)
-    builder._live_state_indices = torch.empty(4, dtype=torch.int32)
-    builder._live_cu_seqlens_views = {}
-    builder._live_state_indices_views = {}
-    builder._num_active_tokens = torch.empty(1, dtype=torch.int32)
-    builder._num_active_sequences = torch.empty(1, dtype=torch.int32)
+    builder._device = torch.device("cpu")
+    builder._live_buffers = {}
     builder._state_layer = SimpleNamespace(
         warmup_live_metadata=lambda metadata: None,
         prepare_metadata_ticket=lambda metadata: object(),
@@ -228,9 +224,26 @@ def test_live_metadata_reuses_provider_ticket_tensor_identity() -> None:
     first = builder._build_live(metadata, state_indices, for_capture=True)
     second = builder._build_live(metadata, state_indices, for_capture=True)
     runtime = builder._build_live(metadata, state_indices, for_capture=False)
+    other_query_start_loc = torch.tensor([0, 2], dtype=torch.int32)
+    other_metadata = SimpleNamespace(
+        num_reqs=1,
+        num_actual_tokens=2,
+        max_query_len=2,
+        query_start_loc=other_query_start_loc,
+        query_start_loc_cpu=other_query_start_loc,
+    )
+    other = builder._build_live(
+        other_metadata,
+        torch.tensor([3], dtype=torch.int32),
+        for_capture=True,
+    )
 
     assert first.cu_seqlens is second.cu_seqlens
     assert first.state_indices is second.state_indices
+    assert first.cu_seqlens is runtime.cu_seqlens
+    assert first.state_indices is runtime.state_indices
+    assert other.cu_seqlens is not first.cu_seqlens
+    assert other.state_indices is not first.state_indices
     assert first.max_seqlen_capacity == metadata.max_query_len
     assert first.max_seqlen == metadata.max_query_len
     assert runtime.max_seqlen == metadata.max_query_len
