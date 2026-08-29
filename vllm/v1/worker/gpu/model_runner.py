@@ -636,6 +636,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             decode_query_len=self.decode_query_len,
             lora_capture_cases=self.lora_capture_cases,
             varlen_decode=self.adaptive_verification is not None,
+            requires_max_query_len=(self.model_state.requires_cudagraph_max_query_len),
         )
         check_attention_cp_compatibility(self.vllm_config)
         if isinstance(self.speculator, DraftModelSpeculator):
@@ -1340,9 +1341,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             has_structured_output_reqs=scheduler_output.has_structured_output_requests,
             prompt_lens=prompt_lens,
             max_query_len=(
-                int(num_scheduled_tokens_upper_bound.max())
-                if adaptive_verification is not None
-                else None
+                batch_desc.max_query_len
+                if batch_desc.max_query_len is not None
+                else (
+                    int(num_scheduled_tokens_upper_bound.max())
+                    if adaptive_verification is not None
+                    else None
+                )
             ),
         )
         return pcp.maybe_partition_pcp_batch(

@@ -115,6 +115,47 @@ def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
     mock_cuda_graph.assert_called_once()
 
 
+def test_query_sensitive_full_graphs_separate_decode_and_prefill(monkeypatch):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform,
+        "get_global_graph_pool",
+        lambda: object(),
+    )
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=_create_vllm_config(),
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL,
+        decode_query_len=1,
+        requires_max_query_len=True,
+    )
+    manager._graphs_captured = True
+
+    decode = manager.dispatch(
+        num_reqs=2,
+        num_tokens=2,
+        uniform_token_count=1,
+        num_active_loras=0,
+        max_query_len=1,
+    )
+    prefill = manager.dispatch(
+        num_reqs=1,
+        num_tokens=2,
+        uniform_token_count=None,
+        num_active_loras=0,
+        max_query_len=2,
+    )
+
+    assert decode.max_query_len == 1
+    assert decode.uniform_token_count == 1
+    assert prefill.max_query_len == 4
+    assert prefill.uniform_token_count is None
+
+
 def test_piecewise_capture_uses_pcp_dummy_slot_mappings():
     num_reqs = 32
     num_tokens = 56

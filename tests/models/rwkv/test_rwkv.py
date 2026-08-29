@@ -211,11 +211,11 @@ def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:
         prepare_metadata_ticket=lambda metadata: object(),
     )
 
-    query_start_loc = torch.tensor([0, 2, 3], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 2, 4], dtype=torch.int32)
     metadata = SimpleNamespace(
         num_reqs=2,
-        num_actual_tokens=3,
-        max_query_len=2,
+        num_actual_tokens=4,
+        max_query_len=4,
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc,
     )
@@ -223,7 +223,19 @@ def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:
 
     first = builder._build_live(metadata, state_indices, for_capture=True)
     second = builder._build_live(metadata, state_indices, for_capture=True)
-    runtime = builder._build_live(metadata, state_indices, for_capture=False)
+    runtime_query_start_loc = torch.tensor([0, 3, 3], dtype=torch.int32)
+    runtime_metadata = SimpleNamespace(
+        num_reqs=2,
+        num_actual_tokens=4,
+        max_query_len=4,
+        query_start_loc=runtime_query_start_loc,
+        query_start_loc_cpu=runtime_query_start_loc,
+    )
+    runtime = builder._build_live(
+        runtime_metadata,
+        state_indices,
+        for_capture=False,
+    )
     other_query_start_loc = torch.tensor([0, 2], dtype=torch.int32)
     other_metadata = SimpleNamespace(
         num_reqs=1,
@@ -246,7 +258,7 @@ def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:
     assert other.state_indices is not first.state_indices
     assert first.max_seqlen_capacity == metadata.max_query_len
     assert first.max_seqlen == metadata.max_query_len
-    assert runtime.max_seqlen == metadata.max_query_len
+    assert runtime.max_seqlen == runtime_metadata.max_query_len
 
 
 def test_live_metadata_prepares_and_retains_each_capture_ticket(monkeypatch) -> None:

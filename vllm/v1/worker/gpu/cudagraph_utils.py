@@ -115,6 +115,7 @@ class CudaGraphManager:
         decode_query_len: int,
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
+        requires_max_query_len: bool = False,
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -124,6 +125,7 @@ class CudaGraphManager:
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
         self.varlen_decode = varlen_decode
+        self.requires_max_query_len = requires_max_query_len
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -245,7 +247,11 @@ class CudaGraphManager:
                 descs_by_mode[decode_mode].append(desc)
             # Capture uniform decode specfifc graphs if required
             #  (i.e. separate decode routine)
-            elif separate_decode_routine and decode_mode and not self.varlen_decode:
+            elif (
+                (separate_decode_routine or self.requires_max_query_len)
+                and decode_mode
+                and not self.varlen_decode
+            ):
                 for decode_query_len in decode_query_lens:
                     rounded_num_tokens = round_up(num_tokens, decode_query_len)
                     rounded_num_reqs = rounded_num_tokens // decode_query_len
@@ -262,6 +268,9 @@ class CudaGraphManager:
                         num_tokens=rounded_num_tokens,
                         num_reqs=rounded_num_reqs,
                         uniform_token_count=decode_query_len,
+                        max_query_len=(
+                            decode_query_len if self.requires_max_query_len else None
+                        ),
                         num_active_loras=num_active_loras,
                     )
 
@@ -282,6 +291,12 @@ class CudaGraphManager:
                     cg_mode=mixed_mode,
                     num_tokens=num_tokens,
                     num_reqs=num_reqs,
+                    max_query_len=(
+                        num_tokens
+                        if self.requires_max_query_len
+                        and mixed_mode == CUDAGraphMode.FULL
+                        else None
+                    ),
                     num_active_loras=num_active_loras,
                 )
                 descs_by_mode[mixed_mode].append(desc)
@@ -301,6 +316,10 @@ class CudaGraphManager:
                 # num_tokens. Group them so each graph covers the same candidate range.
                 for num_tokens, group in groupby(lora_descs, lambda d: d.num_tokens):
                     matching = list(group)
+                    if self.requires_max_query_len:
+                        matching.sort(
+                            key=lambda desc: desc.max_query_len or desc.num_tokens
+                        )
                     for i in range(current_range_start, num_tokens + 1):
                         key = (i, num_active_loras)
                         self._candidates.setdefault(key, []).extend(matching)
@@ -472,6 +491,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         decode_query_len: int,
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
+        requires_max_query_len: bool = False,
     ):
         super().__init__(
             vllm_config,
@@ -480,6 +500,7 @@ class ModelCudaGraphManager(CudaGraphManager):
             decode_query_len,
             lora_capture_cases=lora_capture_cases,
             varlen_decode=varlen_decode,
+            requires_max_query_len=requires_max_query_len,
         )
         self.hidden_states: torch.Tensor | None = None
         self.aux_hidden_states: list[torch.Tensor] = []
