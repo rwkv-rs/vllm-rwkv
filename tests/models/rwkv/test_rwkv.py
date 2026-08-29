@@ -234,6 +234,7 @@ def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:
     builder = object.__new__(RwkvAttentionMetadataBuilder)
     builder._device = torch.device("cpu")
     builder._live_buffers = {}
+    builder._live_query_layouts = {}
     builder._captured_descriptors = set()
     prepared_ticket = object()
     builder._state_layer = SimpleNamespace(
@@ -266,6 +267,26 @@ def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:
         state_indices,
         for_capture=False,
     )
+    versions = (
+        runtime.cu_seqlens._version,
+        runtime.num_active_tokens._version,
+        runtime.num_active_sequences._version,
+    )
+    repeated_runtime = builder._build_live(
+        runtime_metadata,
+        state_indices,
+        for_capture=False,
+    )
+    repeated_versions = (
+        repeated_runtime.cu_seqlens._version,
+        repeated_runtime.num_active_tokens._version,
+        repeated_runtime.num_active_sequences._version,
+    )
+    changed_runtime = builder._build_live(
+        metadata,
+        state_indices,
+        for_capture=False,
+    )
     other_query_start_loc = torch.tensor([0, 2], dtype=torch.int32)
     other_metadata = SimpleNamespace(
         num_reqs=1,
@@ -284,6 +305,14 @@ def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:
     assert first.state_indices is second.state_indices
     assert first.cu_seqlens is runtime.cu_seqlens
     assert first.state_indices is runtime.state_indices
+    assert repeated_runtime.cu_seqlens is runtime.cu_seqlens
+    assert versions == repeated_versions
+    assert repeated_versions == (
+        changed_runtime.cu_seqlens._version - 1,
+        changed_runtime.num_active_tokens._version - 1,
+        changed_runtime.num_active_sequences._version - 1,
+    )
+    assert changed_runtime.num_active_sequences.item() == 2
     assert other.cu_seqlens is not first.cu_seqlens
     assert other.state_indices is not first.state_indices
     assert first.max_seqlen_capacity == metadata.max_query_len
