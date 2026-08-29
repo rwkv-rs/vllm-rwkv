@@ -231,9 +231,9 @@ def test_live_metadata_reuses_provider_ticket_tensor_identity() -> None:
 
     assert first.cu_seqlens is second.cu_seqlens
     assert first.state_indices is second.state_indices
-    assert first.max_seqlen_capacity == first.token_capacity
-    assert first.max_seqlen == first.token_capacity
-    assert runtime.max_seqlen == runtime.token_capacity
+    assert first.max_seqlen_capacity == metadata.max_query_len
+    assert first.max_seqlen == metadata.max_query_len
+    assert runtime.max_seqlen == metadata.max_query_len
 
 
 def test_live_metadata_prepares_and_retains_each_capture_ticket(monkeypatch) -> None:
