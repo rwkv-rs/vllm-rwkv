@@ -1079,14 +1079,18 @@ def try_get_generation_config(
     code_revision: str | None = None,
     config_format: str | ConfigFormat = "auto",
     hf_token: bool | str | None = None,
+    config_file_name: str = "generation_config.json",
 ) -> GenerationConfig | None:
     try:
         return GenerationConfig.from_pretrained(
             model,
             revision=revision,
             token=hf_token,
+            config_file_name=config_file_name,
         )
     except OSError:  # Not found
+        if config_file_name != "generation_config.json":
+            return None
         try:
             config = get_config(
                 model,

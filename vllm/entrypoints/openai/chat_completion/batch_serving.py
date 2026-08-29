@@ -150,18 +150,22 @@ class OpenAIServingChatBatch(OpenAIServingChat):
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         for i, engine_prompt in enumerate(engine_prompts):
             sub_request_id = f"{request_id}_{i}"
+            single_request = single_requests[i]
+            request_sampling_defaults = self._sampling_defaults_for_request(
+                single_request,
+                self._effective_chat_template_kwargs(single_request),
+            )
             max_tokens = get_max_tokens(
                 max_model_len,
                 request.max_completion_tokens
                 if request.max_completion_tokens is not None
                 else request.max_tokens,
                 self._extract_prompt_len(engine_prompt),
-                self.default_sampling_params,
+                request_sampling_defaults,
                 self.override_max_tokens,
             )
-            single_request = single_requests[i]
             sampling_params = single_request.to_sampling_params(
-                max_tokens, self.default_sampling_params
+                max_tokens, request_sampling_defaults
             )
             self._log_inputs(
                 sub_request_id,

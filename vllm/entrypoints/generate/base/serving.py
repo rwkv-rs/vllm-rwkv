@@ -5,7 +5,7 @@ import time
 from collections.abc import Awaitable, Mapping
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import TYPE_CHECKING, ClassVar, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
 
 from fastapi import Request
 from pydantic import ConfigDict
@@ -47,6 +47,20 @@ RequestT = TypeVar("RequestT", bound=AnyRequest)
 _T = TypeVar("_T")
 SESSION_ID_HEADER = "X-Session-ID"
 PRIORITY_HEADER = "X-Vllm-Priority"
+_RWKV_SAMPLING_PROFILE_FILES = {
+    "fake_think": "fake_think_generation_config.json",
+    "tools": "tools_generation_config.json",
+}
+_RWKV_SAMPLING_FIELDS = frozenset(
+    {
+        "temperature",
+        "top_p",
+        "top_k",
+        "presence_penalty",
+        "frequency_penalty",
+        "penalty_decay",
+    }
+)
 
 
 def build_per_request_timing_metrics(
@@ -156,6 +170,8 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
         self.return_tokens_as_token_ids = return_tokens_as_token_ids
         self.renderer = engine_client.renderer
         self.input_processor = engine_client.input_processor
+        self.default_sampling_params = self.model_config.get_diff_sampling_param()
+        self._rwkv_sampling_profiles = self._load_rwkv_sampling_profiles()
         vllm_config = getattr(engine_client, "vllm_config", None)
         kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
         self.has_kv_connector = kv_transfer_config is not None
@@ -172,6 +188,47 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
         except Exception:
             # Never fail server startup over the fingerprint.
             self.system_fingerprint = None
+
+    def _load_rwkv_sampling_profiles(self) -> dict[str, dict[str, Any]] | None:
+        if (
+            self.model_config.hf_config.model_type != "rwkv"
+            or self.model_config.generation_config == "vllm"
+        ):
+            return None
+
+        profiles = {"open_think": self.default_sampling_params}
+        for profile, config_file_name in _RWKV_SAMPLING_PROFILE_FILES.items():
+            profiles[profile] = self.model_config.get_diff_sampling_param(
+                config_file_name=config_file_name
+            )
+
+        for profile, params in profiles.items():
+            missing = _RWKV_SAMPLING_FIELDS.difference(params)
+            if missing:
+                config_file_name = (
+                    "generation_config.json"
+                    if profile == "open_think"
+                    else _RWKV_SAMPLING_PROFILE_FILES[profile]
+                )
+                raise ValueError(
+                    f"RWKV {config_file_name} is missing Rapid-Sampling fields: "
+                    + ", ".join(sorted(missing))
+                )
+        return profiles
+
+    def _sampling_defaults_for_request(
+        self,
+        request: ChatCompletionRequest | CompletionRequest | ResponsesRequest,
+        chat_template_kwargs: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        profiles = self._rwkv_sampling_profiles
+        if profiles is None:
+            return self.default_sampling_params
+        if getattr(request, "tools", None):
+            return profiles["tools"]
+        if (chat_template_kwargs or {}).get("rwkv_generation_prompt") == "fake_think":
+            return profiles["fake_think"]
+        return profiles["open_think"]
 
     def create_streaming_error_response(
         self,

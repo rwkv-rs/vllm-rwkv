@@ -53,6 +53,27 @@ Continuous batching, asynchronous scheduling, prefix sharing and copy-on-write,
 structured outputs, and the OpenAI-compatible Chat and Responses APIs use the
 standard vLLM paths.
 
+## Decoding defaults
+
+RWKV samples through FlashRWKV2 Rapid-Sampling. The model artifact must publish
+three standalone generation configs:
+
+| Request mode | Config file | temperature | top_p | top_k | presence | frequency | decay |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Open Think | `generation_config.json` | 0.96 | 0.76 | 32 | 1.0 | 0.1 | 0.988 |
+| Fake Think | `fake_think_generation_config.json` | 1.0 | 0.28 | 32 | 0.0 | 0.0 | 1.0 |
+| Tools | `tools_generation_config.json` | 0.96 | 0.76 | 32 | 0.0 | 0.0 | 1.0 |
+
+The default template mode selects Open Think. Setting
+`chat_template_kwargs.rwkv_generation_prompt` to `fake_think` selects Fake
+Think. Supplying tools always selects the Tools profile, regardless of the
+thinking mode. Explicit request sampling fields override the selected profile.
+
+All six controls are executed by
+`infer_sampling_six_parameter_forward_varlen`; `frequency_penalty` is the
+Rapid-Sampling additive increment and `penalty_decay` decays its per-request
+token state. `--generation-config vllm` explicitly disables artifact profiles.
+
 ## Pipeline parallelism
 
 Single GPU and two-stage pipeline parallelism are supported. For PP2, run one
@@ -90,4 +111,6 @@ required, or named tool choice. Do not pass a copied chat template.
 RWKV rejects tensor parallelism, decode or prefill context parallelism,
 speculative decoding, quantized weights, vLLM LoRA adapters, KV cache
 offloading/connectors, ReplaySSM, stochastic cache rounding, and Mamba cache
-mode `all`. Pipeline parallel sizes other than one or two are also rejected.
+mode `all`. Multiplicative `repetition_penalty`, `min_p`, processed logprobs,
+sampling masks, and trace replay are not supported by Rapid-Sampling. Pipeline
+parallel sizes other than one or two are also rejected.

@@ -3,17 +3,206 @@
 """MRV2 request state for RWKV recurrent-state lifecycle management."""
 
 from collections.abc import Sequence
+from types import SimpleNamespace
+from typing import Any, cast
 
 import numpy as np
 import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.config.model import PROCESSED_LOGPROBS_MODES
+from vllm.model_executor.models.rwkv import _load_flashrwkv2
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
+from vllm.v1.worker.gpu.sample.sampler import Sampler
+
+_NO_RWKV_PENALTIES_STATE = SimpleNamespace(output_bin_counts=None)
+
+
+class RwkvSampler(Sampler):
+    """FlashRWKV2 Rapid-Sampling with state isolated by request slot."""
+
+    def __init__(self, sampler: Sampler) -> None:
+        self.__dict__.update(sampler.__dict__)
+        if self.num_speculative_tokens != 1:
+            raise ValueError(
+                "RWKV Rapid-Sampling does not support speculative decoding"
+            )
+        if self.logprobs_mode in PROCESSED_LOGPROBS_MODES:
+            raise ValueError("RWKV Rapid-Sampling supports only raw logprobs")
+        if self.return_sampling_mask:
+            raise ValueError("RWKV Rapid-Sampling does not return sampling masks")
+        if self.trace_replay_state is not None:
+            raise ValueError("RWKV Rapid-Sampling does not support trace replay")
+
+        flashrwkv2 = _load_flashrwkv2()
+        self._sample = flashrwkv2.infer_sampling_six_parameter_forward_varlen
+        self._setup_sampling_states = flashrwkv2.setup_sampling_states
+        max_num_reqs = self.sampling_states.max_num_reqs
+        vocab_size = self.sampling_states.vocab_size
+        device = self.req_states.device
+
+        self.penalties_state = cast(Any, _NO_RWKV_PENALTIES_STATE)
+        self._rapid_penalties = torch.zeros(
+            max_num_reqs, vocab_size, dtype=torch.float32, device=device
+        )
+        self._rapid_sampling_states = self._setup_sampling_states(0, max_num_reqs)
+        self._presence_penalty = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
+        self._frequency_penalty = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
+        self._penalty_decay = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
+        self._penalty_decay.np.fill(1.0)
+        self._penalty_decay.copy_to_uva()
+        self._active_rows = UvaBackedTensor(max_num_reqs, dtype=torch.int64)
+        self._active_slots = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
+        self._new_request_slots: list[int] = []
+        self._input_batch: InputBatch | None = None
+
+    def add_request(
+        self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
+    ) -> None:
+        if sampling_params.repetition_penalty != 1.0:
+            raise ValueError(
+                "RWKV Rapid-Sampling does not support multiplicative repetition_penalty"
+            )
+        if sampling_params.min_p != 0.0:
+            raise ValueError("RWKV Rapid-Sampling does not support min_p")
+
+        self.sampling_states.add_request(req_idx, sampling_params)
+        self.logit_bias_state.add_request(req_idx, prompt_len, sampling_params)
+        self.bad_words_state.add_request(req_idx, sampling_params)
+        self.logprob_token_ids_state.add_request(req_idx, sampling_params)
+        self.thinking_budget_state.add_request(req_idx, sampling_params)
+
+        self._presence_penalty.np[req_idx] = sampling_params.presence_penalty
+        self._frequency_penalty.np[req_idx] = sampling_params.frequency_penalty
+        self._penalty_decay.np[req_idx] = sampling_params.penalty_decay
+        self._new_request_slots.append(req_idx)
+        self.needs_logits_processing[req_idx] = (
+            self.logit_bias_state.use_logit_bias[req_idx]
+            or self.bad_words_state.num_bad_words.np[req_idx] > 0
+            or (
+                self.thinking_budget_state.enabled
+                and self.thinking_budget_state.use_thinking_budget[req_idx]
+            )
+        )
+
+    def apply_staged_writes(self) -> None:
+        self.sampling_states.apply_staged_writes()
+        self.logit_bias_state.apply_staged_writes()
+        self.bad_words_state.apply_staged_writes()
+        self.logprob_token_ids_state.apply_staged_writes()
+        self.thinking_budget_state.apply_staged_writes()
+        self._presence_penalty.copy_to_uva()
+        self._frequency_penalty.copy_to_uva()
+        self._penalty_decay.copy_to_uva()
+
+        for req_idx in self._new_request_slots:
+            seed = int(self.sampling_states.seeds.np[req_idx])
+            request_state = self._setup_sampling_states(seed, 1)
+            self._rapid_sampling_states[req_idx].copy_(request_state[0])
+            self._rapid_penalties[req_idx].zero_()
+        self._new_request_slots.clear()
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        input_batch: InputBatch,
+    ) -> SamplerOutput:
+        self._input_batch = input_batch
+        return super().__call__(logits, input_batch)
+
+    def _apply_logits_processors(
+        self,
+        logits: torch.Tensor,
+        slots: torch.Tensor,
+        slots_np: np.ndarray,
+        pos: torch.Tensor,
+        input_ids: torch.Tensor,
+        local_pos: torch.Tensor,
+    ) -> torch.Tensor:
+        if not np.any(self.needs_logits_processing[slots_np]):
+            return logits
+
+        logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
+        self.logit_bias_state.apply_logit_bias(logits, slots, slots_np, pos)
+        self.bad_words_state.apply_bad_words(
+            logits, slots, slots_np, input_ids, local_pos
+        )
+        self.thinking_budget_state.apply(
+            logits,
+            slots,
+            slots,
+            slots_np,
+            input_ids,
+            local_pos,
+        )
+        return logits
+
+    def sample(
+        self,
+        logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        idx_mapping_np: np.ndarray,
+        pos: torch.Tensor,
+        input_ids: torch.Tensor,
+        expanded_local_pos: torch.Tensor,
+        return_logprobs: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del return_logprobs
+        input_batch = self._input_batch
+        assert input_batch is not None
+        if expanded_idx_mapping.shape != idx_mapping.shape:
+            raise ValueError("RWKV Rapid-Sampling does not support expanded logits")
+
+        num_reqs = input_batch.num_reqs
+        finishes_prefill = (
+            input_batch.num_computed_prefill_tokens_np[:num_reqs]
+            + input_batch.num_scheduled_tokens[:num_reqs]
+            >= input_batch.prefill_len_np[:num_reqs]
+        )
+        active_rows_np = np.flatnonzero(finishes_prefill)
+        num_active = len(active_rows_np)
+        sampled = torch.zeros(num_reqs, dtype=torch.int64, device=logits.device)
+        if num_active == 0:
+            return sampled, logits
+
+        active_slots_np = idx_mapping_np[active_rows_np]
+        self._active_rows.np[:num_active] = active_rows_np
+        self._active_slots.np[:num_active] = active_slots_np
+        active_rows = self._active_rows.copy_to_uva(num_active)
+        active_slots = self._active_slots.copy_to_uva(num_active)
+        active_slots_i64 = idx_mapping[active_rows]
+        active_logits = logits if num_active == num_reqs else logits[active_rows]
+        active_logits = self._apply_logits_processors(
+            active_logits,
+            active_slots_i64,
+            active_slots_np,
+            pos[active_rows],
+            input_ids[active_rows],
+            expanded_local_pos[active_rows],
+        )
+        sampled_active = self._sample(
+            active_logits,
+            self._rapid_penalties,
+            self._rapid_sampling_states,
+            active_slots,
+            presence_penalty=self._presence_penalty.gpu[active_slots_i64],
+            frequency_penalty=self._frequency_penalty.gpu[active_slots_i64],
+            penalty_decay=self._penalty_decay.gpu[active_slots_i64],
+            temperature=self.sampling_states.temperature.gpu[active_slots_i64],
+            top_k=self.sampling_states.top_k.gpu[active_slots_i64],
+            top_p=self.sampling_states.top_p.gpu[active_slots_i64],
+        )
+        sampled[active_rows] = sampled_active.to(torch.int64)
+        return sampled, logits
 
 
 class RwkvModelState(DefaultModelState):
@@ -37,6 +226,9 @@ class RwkvModelState(DefaultModelState):
         self._state_block_columns = np.full(self.max_num_reqs, -1, dtype=np.int32)
         self._state_num_computed_tokens = np.zeros(self.max_num_reqs, dtype=np.int64)
         self._rwkv_group_id: int | None = None
+
+    def custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
+        return RwkvSampler(sampler), None
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)

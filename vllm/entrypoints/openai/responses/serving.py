@@ -192,7 +192,6 @@ class OpenAIServingResponses(GenerateBaseServing):
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
 
-        self.default_sampling_params = self.model_config.get_diff_sampling_param()
         mc = self.model_config
         self.override_max_tokens = (
             self.default_sampling_params.get("max_tokens")
@@ -425,6 +424,10 @@ class OpenAIServingResponses(GenerateBaseServing):
             assert len(builtin_tool_list) == 0
             available_tools = []
         tokenizer = self.renderer.get_tokenizer()
+        chat_template_kwargs = self._effective_chat_template_kwargs(request)
+        request_sampling_defaults = self._sampling_defaults_for_request(
+            request, chat_template_kwargs
+        )
 
         for engine_input in engine_inputs:
             maybe_error = self._validate_generator_input(engine_input)
@@ -435,7 +438,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 max_model_len,
                 request.max_output_tokens,
                 self._extract_prompt_len(engine_input),
-                self.default_sampling_params,
+                request_sampling_defaults,
                 self.override_max_tokens,
                 truncate_prompt_tokens=(
                     -1 if request.truncation != "disabled" else None
@@ -443,7 +446,7 @@ class OpenAIServingResponses(GenerateBaseServing):
             )
 
             sampling_params = request.to_sampling_params(
-                default_max_tokens, self.default_sampling_params
+                default_max_tokens, request_sampling_defaults
             )
 
             trace_headers = (
@@ -453,7 +456,6 @@ class OpenAIServingResponses(GenerateBaseServing):
             )
             session_id = self._get_session_id(request, raw_request)
 
-            chat_template_kwargs = self._effective_chat_template_kwargs(request)
             response_parser = self._make_response_parser(
                 request, tokenizer, chat_template_kwargs
             )

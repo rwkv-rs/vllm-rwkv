@@ -114,11 +114,13 @@ def _fake_flashrwkv2() -> ModuleType:
         "infer_cmix_forward_varlen",
         "infer_embedding_ln0_forward_varlen",
         "infer_post_norm_output_forward_varlen",
+        "infer_sampling_six_parameter_forward_varlen",
         "infer_tmix_postnorm_tokenshift_forward_varlen",
         "infer_tmix_readout_forward_varlen",
         "infer_tmix_wkv7_recurrent_fp16_forward_varlen",
         "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
         "infer_tmix_wkv_prepare_forward_varlen",
+        "setup_sampling_states",
     ):
         setattr(module, name, lambda *args, **kwargs: None)
     return module

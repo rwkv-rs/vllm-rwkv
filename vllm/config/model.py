@@ -1677,7 +1677,9 @@ class ModelConfig:
 
         return self.multimodal_config
 
-    def try_get_generation_config(self) -> dict[str, Any]:
+    def try_get_generation_config(
+        self, config_file_name: str = "generation_config.json"
+    ) -> dict[str, Any]:
         """
         This method attempts to retrieve the non-default values of the
         generation config for this model.
@@ -1697,6 +1699,7 @@ class ModelConfig:
                 code_revision=self.code_revision,
                 config_format=self.config_format,
                 hf_token=self.hf_token,
+                config_file_name=config_file_name,
             )
         else:
             config = try_get_generation_config(
@@ -1705,6 +1708,7 @@ class ModelConfig:
                 code_revision=self.code_revision,
                 config_format=self.config_format,
                 hf_token=self.hf_token,
+                config_file_name=config_file_name,
             )
 
         if config is None:
@@ -1712,7 +1716,9 @@ class ModelConfig:
 
         return config.to_diff_dict()
 
-    def get_diff_sampling_param(self) -> dict[str, Any]:
+    def get_diff_sampling_param(
+        self, config_file_name: str = "generation_config.json"
+    ) -> dict[str, Any]:
         """
         This method returns a dictionary containing the non-default sampling
         parameters with `override_generation_config` applied.
@@ -1729,13 +1735,20 @@ class ModelConfig:
         """
         src = self.generation_config
 
-        config = {} if src == "vllm" else self.try_get_generation_config()
+        config = (
+            {}
+            if src == "vllm"
+            else self.try_get_generation_config(config_file_name=config_file_name)
+        )
 
         # Overriding with given generation config
         config.update(self.override_generation_config)
 
         available_params = [
             "repetition_penalty",
+            "presence_penalty",
+            "frequency_penalty",
+            "penalty_decay",
             "temperature",
             "top_k",
             "top_p",
