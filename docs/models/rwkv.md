@@ -49,8 +49,9 @@ RWKV defaults to `CompilationMode.NONE` and full CUDA Graph capture so that
 TorchDynamo does not decompose the external fused operators. Use
 `--enforce-eager` only for diagnostics.
 
-Continuous batching, prefix sharing and copy-on-write, structured outputs, and
-the OpenAI-compatible Chat and Responses APIs use the standard vLLM paths.
+Continuous batching, asynchronous scheduling, prefix sharing and copy-on-write,
+structured outputs, and the OpenAI-compatible Chat and Responses APIs use the
+standard vLLM paths.
 
 ## Pipeline parallelism
 
@@ -88,6 +89,5 @@ required, or named tool choice. Do not pass a copied chat template.
 
 RWKV rejects tensor parallelism, decode or prefill context parallelism,
 speculative decoding, quantized weights, vLLM LoRA adapters, KV cache
-offloading/connectors, ReplaySSM, stochastic cache rounding, asynchronous
-scheduling, and Mamba cache mode `all`. Pipeline parallel sizes other than one
-or two are also rejected.
+offloading/connectors, ReplaySSM, stochastic cache rounding, and Mamba cache
+mode `all`. Pipeline parallel sizes other than one or two are also rejected.
