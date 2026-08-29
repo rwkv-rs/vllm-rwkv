@@ -355,6 +355,17 @@ Supported models:
 
 Flags: `--tool-call-parser kimi_k2`
 
+### RWKV Models (`rwkv`)
+
+RWKV artifacts that use the canonical RWKV chat template emit tool calls as
+`**Tool Call:**` followed by a fenced JSON object. The parser supports automatic,
+required, named, streaming, and non-streaming tool calls. The chat template is
+loaded from the model artifact and does not need a separate `--chat-template`.
+See the [RWKV-7 model guide](../models/rwkv.md) for installation and serving
+configuration.
+
+Flags: `--tool-call-parser rwkv`
+
 ### Hunyuan Models (`hunyuan_a13b`)
 
 Supported models:

@@ -636,6 +636,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             decode_query_len=self.decode_query_len,
             lora_capture_cases=self.lora_capture_cases,
             varlen_decode=self.adaptive_verification is not None,
+            requires_max_query_len=(self.model_state.requires_cudagraph_max_query_len),
         )
         check_attention_cp_compatibility(self.vllm_config)
         if isinstance(self.speculator, DraftModelSpeculator):
@@ -975,6 +976,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.pooling_runner.on_requests_finished(finished_req_ids)
         preempted_req_ids = scheduler_output.preempted_req_ids
         if preempted_req_ids:
+            for req_id in sorted(preempted_req_ids):
+                self.model_state.preempt_request(req_id)
             finished_req_ids = finished_req_ids.union(preempted_req_ids)
         # Sorted so every TP rank frees request slots in the same order.
         # Features like batch-sharded sampling derive rank request ownership
@@ -1077,17 +1080,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
-            assert self.kv_block_zeroer is not None
-            self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            block_ids = scheduler_output.new_block_ids_to_zero
+            if not self.model_state.reset_kv_cache_blocks(block_ids):
+                assert self.kv_block_zeroer is not None
+                self.kv_block_zeroer.zero_block_ids(block_ids)
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
         # zeroing new blocks and before the forward pass reads them.
         if scheduler_output.kv_cache_block_copies:
-            copy_kv_cache_blocks_inplace(
-                self.kv_caches,
-                self.kv_cache_config.num_blocks,
-                scheduler_output.kv_cache_block_copies,
-            )
+            block_copies = scheduler_output.kv_cache_block_copies
+            if not self.model_state.copy_kv_cache_blocks(block_copies):
+                copy_kv_cache_blocks_inplace(
+                    self.kv_caches,
+                    self.kv_cache_config.num_blocks,
+                    block_copies,
+                )
 
     def gather_batch_req_state(
         self, scheduler_output: SchedulerOutput, dummy_run: bool
@@ -1336,9 +1343,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             has_structured_output_reqs=scheduler_output.has_structured_output_requests,
             prompt_lens=prompt_lens,
             max_query_len=(
-                int(num_scheduled_tokens_upper_bound.max())
-                if adaptive_verification is not None
-                else None
+                batch_desc.max_query_len
+                if batch_desc.max_query_len is not None
+                else (
+                    int(num_scheduled_tokens_upper_bound.max())
+                    if adaptive_verification is not None
+                    else None
+                )
             ),
         )
         return pcp.maybe_partition_pcp_batch(

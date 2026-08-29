@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import TYPE_CHECKING
 
+from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.logger import init_logger
 from vllm.utils.math_utils import round_up
 
@@ -921,6 +922,82 @@ class LongcatFlashNgramForCausalLMConfig(VerifyAndUpdateConfig):
             compilation_config.cudagraph_mode = CUDAGraphMode.FULL
 
 
+class RwkvForCausalLMConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        import torch
+
+        from vllm.config.compilation import CompilationMode, CUDAGraphMode
+
+        model_config = vllm_config.model_config
+        parallel_config = vllm_config.parallel_config
+        cache_config = vllm_config.cache_config
+
+        if not vllm_config.use_v2_model_runner:
+            raise ValueError("RWKV requires the V2 model runner")
+        if model_config.dtype != torch.float16:
+            raise ValueError("RWKV inference requires --dtype float16")
+        if parallel_config.tensor_parallel_size != 1:
+            raise ValueError("RWKV does not support tensor parallelism")
+        if parallel_config.pipeline_parallel_size not in (1, 2):
+            raise ValueError("RWKV supports pipeline parallel size 1 or 2")
+        if parallel_config.decode_context_parallel_size != 1:
+            raise ValueError("RWKV does not support decode context parallelism")
+        if parallel_config.prefill_context_parallel_size != 1:
+            raise ValueError("RWKV does not support prefill context parallelism")
+        if vllm_config.speculative_config is not None:
+            raise ValueError("RWKV does not support speculative decoding")
+        if model_config.logprobs_mode in PROCESSED_LOGPROBS_MODES:
+            raise ValueError("RWKV Rapid-Sampling supports only raw logprobs")
+        if model_config.return_sampling_mask:
+            raise ValueError("RWKV Rapid-Sampling does not return sampling masks")
+        if model_config.enable_trace_replay:
+            raise ValueError("RWKV Rapid-Sampling does not support trace replay")
+        if vllm_config.lora_config is not None:
+            raise ValueError("RWKV does not support vLLM LoRA adapters")
+        if (
+            vllm_config.quant_config is not None
+            or model_config.quantization is not None
+            or model_config.quantization_config is not None
+        ):
+            raise ValueError("RWKV does not support quantized weights")
+        if cache_config.kv_offloading_size is not None:
+            raise ValueError("RWKV does not support KV cache offloading")
+        if (
+            vllm_config.kv_transfer_config is not None
+            and vllm_config.kv_transfer_config.is_kv_transfer_instance
+        ):
+            raise ValueError("RWKV does not support KV cache connectors")
+        if cache_config.use_replayssm:
+            raise ValueError("RWKV does not support ReplaySSM")
+        if vllm_config.mamba_config.enable_stochastic_rounding:
+            raise ValueError("RWKV does not support stochastic cache rounding")
+        if not vllm_config.scheduler_config.enable_chunked_prefill:
+            raise ValueError("RWKV requires chunked prefill")
+        if cache_config.mamba_cache_mode == "all":
+            raise ValueError("RWKV does not support Mamba cache mode 'all'")
+
+        if cache_config.mamba_cache_dtype == "auto":
+            cache_config.mamba_cache_dtype = "float16"
+        elif cache_config.mamba_cache_dtype != "float16":
+            raise ValueError("RWKV shift state requires float16 cache dtype")
+
+        if cache_config.mamba_ssm_cache_dtype == "auto":
+            cache_config.mamba_ssm_cache_dtype = "float16"
+        elif cache_config.mamba_ssm_cache_dtype not in ("float16", "float32"):
+            raise ValueError("RWKV WKV state supports float16 or float32")
+
+        MambaModelConfig.verify_and_update_config(vllm_config)
+
+        compilation_config = vllm_config.compilation_config
+        if compilation_config.mode is None:
+            compilation_config.mode = CompilationMode.NONE
+        if compilation_config.cudagraph_mode is None:
+            compilation_config.cudagraph_mode = (
+                CUDAGraphMode.NONE if model_config.enforce_eager else CUDAGraphMode.FULL
+            )
+
+
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "ColBERTJinaRobertaModel": JinaRobertaModelConfig,
     "ColQwen3_5": ColQwen3_5Config,
@@ -963,6 +1040,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Qwen3_5ForConditionalGeneration": Qwen3_5ForConditionalGenerationConfig,
     "Qwen3_5MoeForCausalLM": Qwen3_5ForCausalLMConfig,
     "Qwen3_5MoeForConditionalGeneration": Qwen3_5ForConditionalGenerationConfig,
+    "RwkvForCausalLM": RwkvForCausalLMConfig,
     "UnlimitedOCRForCausalLM": UnlimitedOCRForCausalLMConfig,
     "VoyageQwen3BidirectionalEmbedModel": VoyageQwen3BidirectionalEmbedModelConfig,
     "XLMRobertaModel": JinaRobertaModelConfig,

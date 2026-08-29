@@ -1008,7 +1008,18 @@ def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
     `available_memory` into `num_blocks`. Used to compute the effective KV cache
     capacity once `num_gpu_blocks_override` is applied.
     """
-    return _get_kv_cache_bytes_per_block(kv_cache_groups)
+    return _get_kv_cache_bytes_per_block(
+        kv_cache_groups
+    ) + _get_external_kv_cache_bytes_per_block(kv_cache_groups)
+
+
+def _pool_fixed_memory_bytes(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
+    """Fixed provider-owned memory that cannot alias across cache groups."""
+    return sum(
+        _get_per_layer_spec(group, layer_name).external_fixed_memory_bytes
+        for group in kv_cache_groups
+        for layer_name in group.layer_names
+    )
 
 
 def get_uniform_page_size(kv_cache_specs: Iterable[KVCacheSpec]) -> int:
@@ -1292,6 +1303,21 @@ def _get_kv_cache_bytes_per_block(
     return bytes_per_block
 
 
+def _get_external_kv_cache_bytes_per_block(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
+    """Return provider-owned bytes allocated for every scheduler block.
+
+    vLLM's backing tensors alias cache groups in one shared allocation. External
+    provider allocations are independent, so their per-layer costs add instead.
+    """
+    return sum(
+        _get_per_layer_spec(group, layer_name).external_bytes_per_page
+        for group in kv_cache_groups
+        for layer_name in group.layer_names
+    )
+
+
 def validate_kv_cache_layout(
     layout: KVCacheLayout,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1356,12 +1382,17 @@ def get_kv_cache_config_from_groups(
 
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
     validate_kv_cache_layout(layout, kv_cache_groups)
-    bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups)
-    interleaved_block_stride = bytes_per_block if layout.is_block_outermost else None
+    visible_bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups)
+    pool_bytes_per_block = _pool_bytes_per_block(kv_cache_groups)
+    fixed_memory_bytes = _pool_fixed_memory_bytes(kv_cache_groups)
+    interleaved_block_stride = (
+        visible_bytes_per_block if layout.is_block_outermost else None
+    )
 
-    num_blocks = available_memory // bytes_per_block
+    allocatable_memory = max(available_memory - fixed_memory_bytes, 0)
+    num_blocks = allocatable_memory // pool_bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
-    size = bytes_per_block * num_blocks
+    size = visible_bytes_per_block * num_blocks
 
     # Groups alias from byte 0. Spec regions are laid out differently:
     #
@@ -1914,7 +1945,7 @@ def _max_memory_usage_bytes_from_groups(
                 spec.page_size_bytes,
             )
 
-    return bytes_per_block * total_blocks
+    return _pool_fixed_memory_bytes(kv_cache_groups) + bytes_per_block * total_blocks
 
 
 def _estimate_max_model_len_from_groups(
@@ -2152,12 +2183,13 @@ def get_kv_cache_configs(
                 adjusted_memory.append(avail_mem)
                 continue
             bytes_per_block = _pool_bytes_per_block(groups)
+            fixed_memory_bytes = _pool_fixed_memory_bytes(groups)
             logger.info(
                 "Overriding num_gpu_blocks=%d with num_gpu_blocks_override=%d",
-                avail_mem // bytes_per_block,
+                max(avail_mem - fixed_memory_bytes, 0) // bytes_per_block,
                 override,
             )
-            adjusted_memory.append(override * bytes_per_block)
+            adjusted_memory.append(fixed_memory_bytes + override * bytes_per_block)
         available_memory = adjusted_memory
 
     # Reserve the null block BlockPool permanently holds back, so auto-fit and
@@ -2208,7 +2240,10 @@ def get_kv_cache_configs(
         # strides and offsets stay consistent with the shrunken allocation.
         groups = kv_cache_config.kv_cache_groups
         kv_cache_configs[i] = get_kv_cache_config_from_groups(
-            vllm_config, groups, min_num_blocks * _pool_bytes_per_block(groups)
+            vllm_config,
+            groups,
+            _pool_fixed_memory_bytes(groups)
+            + min_num_blocks * _pool_bytes_per_block(groups),
         )
 
     return kv_cache_configs

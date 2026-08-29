@@ -82,6 +82,31 @@ def test_model_config_generation_fallback_forwards_code_revision():
     )
 
 
+def test_named_generation_config_does_not_fall_back_to_model_config():
+    with (
+        patch.object(
+            config_module.GenerationConfig,
+            "from_pretrained",
+            side_effect=OSError,
+        ) as from_pretrained,
+        patch.object(config_module, "get_config") as get_config,
+    ):
+        generation_config = try_get_generation_config(
+            "org/model",
+            trust_remote_code=False,
+            config_file_name="tools_generation_config.json",
+        )
+
+    assert generation_config is None
+    from_pretrained.assert_called_once_with(
+        "org/model",
+        revision=None,
+        token=None,
+        config_file_name="tools_generation_config.json",
+    )
+    get_config.assert_not_called()
+
+
 def test_safetensors_metadata_of_repo_without_safetensors():
     """A repo storing its weights in another format is an answer, not a failure,
     so it must not be retried."""

@@ -71,6 +71,20 @@ class TestResponsesRequestSamplingParams:
 
         assert sampling_params.stop == ["STOP"]
 
+    def test_stop_strings_merged_with_defaults(self):
+        request = ResponsesRequest(
+            model="test-model",
+            input="test input",
+            stop=["CLIENT", "SHARED"],
+        )
+
+        sampling_params = request.to_sampling_params(
+            default_max_tokens=1000,
+            default_sampling_params={"stop": ["SHARED", "MODEL"]},
+        )
+
+        assert sampling_params.stop == ["CLIENT", "SHARED", "MODEL"]
+
     def test_default_values(self):
         """Test default values for optional parameters."""
         request = ResponsesRequest(
@@ -83,6 +97,38 @@ class TestResponsesRequestSamplingParams:
         assert sampling_params.repetition_penalty == 1.0  # None → 1.0
         assert sampling_params.stop == []  # Empty list
         assert sampling_params.extra_args == {}  # Empty dict
+
+    def test_rapid_sampling_defaults_and_request_override(self):
+        defaults = {
+            "temperature": 0.96,
+            "top_p": 0.76,
+            "top_k": 32,
+            "presence_penalty": 1.0,
+            "frequency_penalty": 0.1,
+            "penalty_decay": 0.988,
+        }
+        request = ResponsesRequest(model="test-model", input="test input")
+
+        sampling_params = request.to_sampling_params(1000, defaults)
+
+        assert sampling_params.temperature == 0.96
+        assert sampling_params.top_p == 0.76
+        assert sampling_params.top_k == 32
+        assert sampling_params.presence_penalty == 1.0
+        assert sampling_params.frequency_penalty == 0.1
+        assert sampling_params.penalty_decay == 0.988
+
+        request = ResponsesRequest(
+            model="test-model",
+            input="test input",
+            presence_penalty=0.0,
+            frequency_penalty=0.0,
+            penalty_decay=1.0,
+        )
+        sampling_params = request.to_sampling_params(1000, defaults)
+        assert sampling_params.presence_penalty == 0.0
+        assert sampling_params.frequency_penalty == 0.0
+        assert sampling_params.penalty_decay == 1.0
 
     def test_seed_bounds_validation(self):
         """Test that seed values outside torch.long bounds are rejected."""

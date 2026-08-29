@@ -167,7 +167,6 @@ class OpenAIServingChat(GenerateBaseServing):
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
         self.enable_per_request_metrics = enable_per_request_metrics
-        self.default_sampling_params = self.model_config.get_diff_sampling_param()
         mc = self.model_config
         self.override_max_tokens = (
             self.default_sampling_params.get("max_tokens")
@@ -266,6 +265,9 @@ class OpenAIServingChat(GenerateBaseServing):
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
         chat_template_kwargs = self._effective_chat_template_kwargs(request)
+        request_sampling_defaults = self._sampling_defaults_for_request(
+            request, chat_template_kwargs
+        )
         parser: Parser | None = None
         if self.parser_cls is not None:
             parser = self.parser_cls(
@@ -315,7 +317,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 if request.max_completion_tokens is not None
                 else request.max_tokens,
                 self._extract_prompt_len(engine_input),
-                self.default_sampling_params,
+                request_sampling_defaults,
                 self.override_max_tokens,
                 truncate_prompt_tokens=request.truncate_prompt_tokens,
             )
@@ -323,12 +325,12 @@ class OpenAIServingChat(GenerateBaseServing):
             sampling_params: SamplingParams | BeamSearchParams
             if request.use_beam_search:
                 sampling_params = request.to_beam_search_params(
-                    max_tokens, self.default_sampling_params
+                    max_tokens, request_sampling_defaults
                 )
             else:
                 sampling_params = request.to_sampling_params(
                     max_tokens,
-                    self.default_sampling_params,
+                    request_sampling_defaults,
                 )
 
             self._log_inputs(

@@ -49,6 +49,7 @@ StructuralTagBuilder: TypeAlias = Callable[
         list[BuiltinToolParam],
         SimplifiedToolChoice,
         bool,
+        bool,
     ],
     StructuralTag,
 ]
@@ -70,7 +71,7 @@ XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS = frozenset(
         "deepseek_v4",
     }
 )
-VLLM_BUILTIN_STRUCTURAL_TAG_MODELS = frozenset({"hermes", "kimi_k3"})
+VLLM_BUILTIN_STRUCTURAL_TAG_MODELS = frozenset({"hermes", "kimi_k3", "rwkv"})
 SUPPORTED_STRUCTURAL_TAG_MODELS = (
     XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS | VLLM_BUILTIN_STRUCTURAL_TAG_MODELS
 )
@@ -104,6 +105,7 @@ def get_model_structural_tag(
     tools: Sequence[ChatCompletionToolsParam | ResponsesTool] | None,
     tool_choice: ToolChoice,
     reasoning: bool,
+    parallel_tool_calls: bool = True,
 ) -> StructuralTag | None:
     """Build a structural tag with xgrammar's builtin model templates."""
 
@@ -126,6 +128,7 @@ def get_model_structural_tag(
             builtin_tools,
             simplified_tool_choice,
             reasoning,
+            parallel_tool_calls,
         )
 
     if model not in XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS:
@@ -244,8 +247,9 @@ def get_hermes_structural_tag(
     builtin_tools: list[BuiltinToolParam],
     tool_choice: SimplifiedToolChoice,
     reasoning: bool,
+    parallel_tool_calls: bool,
 ) -> StructuralTag:
-    del builtin_tools, reasoning
+    del builtin_tools, reasoning, parallel_tool_calls
 
     tool_call_trigger = "<tool_call>"
 
@@ -273,6 +277,63 @@ def get_hermes_structural_tag(
     return StructuralTag(format=suffix_tag)
 
 
+_RWKV_TOOL_CALL_TRIGGER = "**Tool Call:**"
+
+
+def _rwkv_tool_tags(tools: list[FunctionToolParam]) -> list[TagFormat]:
+    return [
+        TagFormat(
+            begin=(
+                f'{_RWKV_TOOL_CALL_TRIGGER}\n```json\n{{"name": "'
+                f'{tool.function.name}", "arguments": '
+            ),
+            content=JSONSchemaFormat(
+                json_schema=get_function_parameters(tool.function)
+            ),
+            end="}\n```",
+        )
+        for tool in tools
+    ]
+
+
+@register_vllm_structural_tag("rwkv")
+def get_rwkv_structural_tag(
+    tools: list[FunctionToolParam],
+    builtin_tools: list[BuiltinToolParam],
+    tool_choice: SimplifiedToolChoice,
+    reasoning: bool,
+    parallel_tool_calls: bool,
+) -> StructuralTag:
+    del builtin_tools, reasoning
+
+    tags = _rwkv_tool_tags(tools)
+    if tool_choice == "auto":
+        output = (
+            TriggeredTagsFormat(
+                triggers=[_RWKV_TOOL_CALL_TRIGGER],
+                tags=tags,
+                stop_after_first=not parallel_tool_calls,
+            )
+            if tags
+            else AnyTextFormat()
+        )
+    else:
+        output = SequenceFormat(
+            elements=[
+                AnyTextFormat(excludes=[_RWKV_TOOL_CALL_TRIGGER]),
+                TagsWithSeparatorFormat(
+                    tags=tags,
+                    separator="\n",
+                    at_least_one=True,
+                    stop_after_first=(
+                        tool_choice == "forced" or not parallel_tool_calls
+                    ),
+                ),
+            ]
+        )
+    return StructuralTag(format=output)
+
+
 def _minimax_tool_tags(tools: list[FunctionToolParam]) -> list[TagFormat]:
     return [
         TagFormat(
@@ -293,8 +354,9 @@ def get_minimax_structural_tag(
     builtin_tools: list[BuiltinToolParam],
     tool_choice: SimplifiedToolChoice,
     reasoning: bool,
+    parallel_tool_calls: bool,
 ) -> StructuralTag:
-    del builtin_tools, reasoning
+    del builtin_tools, reasoning, parallel_tool_calls
 
     tool_call_begin = "<minimax:tool_call>\n"
     tool_call_end = "</minimax:tool_call>"
@@ -589,8 +651,9 @@ def get_kimi_k3_structural_tag(
     builtin_tools: list[BuiltinToolParam],
     tool_choice: SimplifiedToolChoice,
     reasoning: bool,
+    parallel_tool_calls: bool,
 ) -> StructuralTag:
-    del builtin_tools, reasoning
+    del builtin_tools, reasoning, parallel_tool_calls
 
     trailer = OptionalFormat(content=ConstStringFormat(value=_K3_MESSAGE_CLOSE))
 

@@ -1012,6 +1012,36 @@ def test_chat_completion_request_n_parameter_default():
     assert sampling_params.n == 1, f"Expected n=1 (default), got n={sampling_params.n}"
 
 
+def test_chat_completion_request_uses_rapid_sampling_defaults():
+    defaults = {
+        "presence_penalty": 1.0,
+        "frequency_penalty": 0.1,
+        "penalty_decay": 0.988,
+    }
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "Hello"}],
+    )
+
+    sampling_params = request.to_sampling_params(10, defaults)
+
+    assert sampling_params.presence_penalty == 1.0
+    assert sampling_params.frequency_penalty == 0.1
+    assert sampling_params.penalty_decay == 0.988
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "Hello"}],
+        presence_penalty=0.0,
+        frequency_penalty=0.0,
+        penalty_decay=1.0,
+    )
+    sampling_params = request.to_sampling_params(10, defaults)
+    assert sampling_params.presence_penalty == 0.0
+    assert sampling_params.frequency_penalty == 0.0
+    assert sampling_params.penalty_decay == 1.0
+
+
 def test_chat_completion_request_accepts_model_specific_reasoning_effort():
     request = ChatCompletionRequest(
         model="test-model",

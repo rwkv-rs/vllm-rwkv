@@ -29,6 +29,7 @@ from vllm.tool_parsers.kimi_k3_tool_parser import KimiK3ToolParser
 from vllm.tool_parsers.llama_tool_parser import Llama3JsonToolParser
 from vllm.tool_parsers.minimax_m2_tool_parser import MinimaxM2ToolParser
 from vllm.tool_parsers.qwen3_engine_tool_parser import Qwen3EngineToolParser
+from vllm.tool_parsers.rwkv_tool_parser import RwkvToolParser
 from vllm.tool_parsers.structural_tag_registry import (
     SUPPORTED_STRUCTURAL_TAG_MODELS,
     VLLM_BUILTIN_STRUCTURAL_TAG_MODELS,
@@ -165,6 +166,120 @@ def test_hermes_required_tool_calls_use_empty_separator():
 
     assert tag is not None
     assert tag.format.separator == ""
+
+
+def _rwkv_tool_call(name: str, arguments: str) -> str:
+    return (
+        '**Tool Call:**\n```json\n{"name": "'
+        + name
+        + '", "arguments": '
+        + arguments
+        + "}\n```"
+    )
+
+
+def _rwkv_grammar(tool_choice, tools=None):
+    tag = get_model_structural_tag(
+        model="rwkv",
+        tools=tools if tools is not None else _k3_tools_by_name(),
+        tool_choice=tool_choice,
+        reasoning=False,
+    )
+    assert isinstance(tag, StructuralTag)
+    return Grammar.from_structural_tag(tag)
+
+
+def test_rwkv_registered_as_vllm_builtin():
+    assert "rwkv" in VLLM_BUILTIN_STRUCTURAL_TAG_MODELS
+    assert RwkvToolParser.structural_tag_model == "rwkv"
+
+
+def test_rwkv_required_accepts_reasoning_and_parallel_calls():
+    tag = get_model_structural_tag(
+        model="rwkv",
+        tools=_k3_tools_by_name(),
+        tool_choice="required",
+        reasoning=False,
+    )
+    assert isinstance(tag, StructuralTag)
+    assert tag.format.elements[1].stop_after_first is False
+
+    body = "</think>\n" + "\n".join(
+        [
+            _rwkv_tool_call("get_weather", '{"city": "Paris", "days": 2}'),
+            _rwkv_tool_call("run_command", '{"command": "date"}'),
+        ]
+    )
+
+    assert _is_grammar_accept_string(_rwkv_grammar("required"), body)
+
+
+@pytest.mark.parametrize("tool_choice", ["auto", "required"])
+def test_rwkv_non_parallel_choice_stops_after_one_call(
+    tool_choice,
+    sample_tools_strict,
+):
+    tag = get_model_structural_tag(
+        model="rwkv",
+        tools=sample_tools_strict,
+        tool_choice=tool_choice,
+        reasoning=False,
+        parallel_tool_calls=False,
+    )
+    assert isinstance(tag, StructuralTag)
+    output = tag.format if tool_choice == "auto" else tag.format.elements[1]
+    assert output.stop_after_first is True
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "content without a required call",
+        _rwkv_tool_call("unknown", "{}"),
+        _rwkv_tool_call("get_weather", '{"days": 2}'),
+        '**Tool Call:**\n```json\n{"name": "get_weather"}\n```',
+    ],
+)
+def test_rwkv_required_rejects_invalid_calls(body: str):
+    assert not _is_grammar_accept_string(_rwkv_grammar("required"), body)
+
+
+def test_rwkv_named_choice_accepts_only_the_selected_tool():
+    choice = ChatCompletionNamedToolChoiceParam(
+        function=ChatCompletionNamedFunction(name="get_weather")
+    )
+    grammar = _rwkv_grammar(choice)
+
+    assert _is_grammar_accept_string(
+        grammar,
+        _rwkv_tool_call("get_weather", '{"city": "Paris"}'),
+    )
+    assert not _is_grammar_accept_string(
+        grammar,
+        _rwkv_tool_call("run_command", '{"command": "date"}'),
+    )
+
+
+def test_rwkv_auto_without_strict_is_unconstrained(sample_tools):
+    assert (
+        get_model_structural_tag(
+            model="rwkv",
+            tools=sample_tools,
+            tool_choice="auto",
+            reasoning=False,
+        )
+        is None
+    )
+
+
+def test_rwkv_strict_auto_allows_content_or_a_valid_call(sample_tools_strict):
+    grammar = _rwkv_grammar("auto", tools=sample_tools_strict)
+
+    assert _is_grammar_accept_string(grammar, "No tool is needed.")
+    assert _is_grammar_accept_string(
+        grammar,
+        _rwkv_tool_call("get_weather", '{"city": "Paris"}'),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -439,10 +554,12 @@ def test_get_structural_tag_disables_reasoning(
     monkeypatch: pytest.MonkeyPatch,
     sample_tools_strict: list[ChatCompletionToolsParam],
 ):
-    captured: list[bool] = []
+    captured: list[tuple[bool, bool]] = []
 
-    def fake_get_model_structural_tag(*, reasoning: bool, **kwargs):
-        captured.append(reasoning)
+    def fake_get_model_structural_tag(
+        *, reasoning: bool, parallel_tool_calls: bool, **kwargs
+    ):
+        captured.append((reasoning, parallel_tool_calls))
         return None
 
     monkeypatch.setattr(
@@ -455,12 +572,13 @@ def test_get_structural_tag_disables_reasoning(
         model="m",
         tools=sample_tools_strict,
         tool_choice="auto",
+        parallel_tool_calls=False,
     )
     parser = Qwen3EngineToolParser(MagicMock(), tools=sample_tools_strict)
 
     parser.get_structural_tag(request)
 
-    assert captured == [False]
+    assert captured == [(False, False)]
 
 
 def test_unified_parser_get_structural_tag_disables_reasoning(

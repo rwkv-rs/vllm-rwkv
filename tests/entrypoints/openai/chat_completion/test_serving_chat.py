@@ -67,6 +67,45 @@ _PER_REQUEST_STATS = RequestStateStats(
 )
 
 
+def test_rwkv_sampling_profile_selection_prefers_tools():
+    serving = object.__new__(OpenAIServingChat)
+    serving.default_sampling_params = {"profile": "open_think"}
+    serving._rwkv_sampling_profiles = {
+        "open_think": serving.default_sampling_params,
+        "fake_think": {"profile": "fake_think"},
+        "tools": {"profile": "tools"},
+    }
+    request = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "Hello"}],
+    )
+    assert serving._sampling_defaults_for_request(request)["profile"] == "open_think"
+    assert (
+        serving._sampling_defaults_for_request(
+            request, {"rwkv_generation_prompt": "fake_think"}
+        )["profile"]
+        == "fake_think"
+    )
+
+    request = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "Hello"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
+    )
+    assert (
+        serving._sampling_defaults_for_request(
+            request, {"rwkv_generation_prompt": "fake_think"}
+        )["profile"]
+        == "tools"
+    )
+
+
 @pytest.fixture(scope="module")
 def monkeypatch_module():
     from _pytest.monkeypatch import MonkeyPatch

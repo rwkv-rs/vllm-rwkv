@@ -75,6 +75,7 @@ class CompletionRequest(OpenAIBaseModel):
     top_k: int | None = None
     min_p: float | None = None
     repetition_penalty: float | None = None
+    penalty_decay: float | None = Field(default=None, ge=0.0, le=1.0)
     length_penalty: float = 1.0
     stop_token_ids: list[int] | None = []
     include_stop_str_in_output: bool = False
@@ -340,6 +341,14 @@ class CompletionRequest(OpenAIBaseModel):
             min_p = default_sampling_params.get(
                 "min_p", self._DEFAULT_SAMPLING_PARAMS["min_p"]
             )
+        presence_penalty = self.presence_penalty
+        if "presence_penalty" not in self.model_fields_set:
+            presence_penalty = default_sampling_params.get("presence_penalty", 0.0)
+        frequency_penalty = self.frequency_penalty
+        if "frequency_penalty" not in self.model_fields_set:
+            frequency_penalty = default_sampling_params.get("frequency_penalty", 0.0)
+        if (penalty_decay := self.penalty_decay) is None:
+            penalty_decay = default_sampling_params.get("penalty_decay", 1.0)
 
         # Merge server-default stop_token_ids (e.g., model-specific tokens
         # like </call> for gpt-oss) with any request-specified ones
@@ -352,6 +361,15 @@ class CompletionRequest(OpenAIBaseModel):
                 stop_token_ids = list(
                     dict.fromkeys([*stop_token_ids, *default_stop_ids])
                 )
+
+        stop = self.stop
+        default_stop = default_sampling_params.get("stop")
+        if default_stop:
+            if isinstance(stop, str):
+                stop = [stop]
+            if isinstance(default_stop, str):
+                default_stop = [default_stop]
+            stop = list(dict.fromkeys([*(stop or []), *default_stop]))
 
         prompt_logprobs = self.prompt_logprobs
         if prompt_logprobs is None and self.echo:
@@ -368,15 +386,16 @@ class CompletionRequest(OpenAIBaseModel):
             extra_args["ec_transfer_params"] = self.ec_transfer_params
         return SamplingParams.from_optional(
             n=self.n,
-            presence_penalty=self.presence_penalty,
-            frequency_penalty=self.frequency_penalty,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
             repetition_penalty=repetition_penalty,
+            penalty_decay=penalty_decay,
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
             seed=self.seed,
-            stop=self.stop,
+            stop=stop,
             stop_token_ids=stop_token_ids,
             logprobs=None if self.logprob_token_ids else self.logprobs,
             ignore_eos=self.ignore_eos,

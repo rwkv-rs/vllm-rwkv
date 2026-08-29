@@ -15,12 +15,14 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
     FullAttentionManager,
+    MambaManager,
     RSWAManager,
     SlidingWindowManager,
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
+    MambaSpec,
     RSWASpec,
     SlidingWindowSpec,
 )
@@ -158,6 +160,38 @@ def test_chunked_local_attention_records_new_blocks_for_zeroing():
     assert manager.records_new_block_ids
     assert manager.take_new_block_ids() == [block.block_id for block in blocks]
     assert manager.take_new_block_ids() == []
+
+
+def test_state_spec_can_request_provider_managed_block_reset():
+    class ResettableStateSpec(MambaSpec):
+        @property
+        def requires_block_zeroing(self) -> bool:
+            return True
+
+    block_size = 2
+    spec = ResettableStateSpec(
+        block_size=block_size,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=10, enable_caching=False, hash_block_size=block_size
+    )
+    manager = MambaManager(
+        spec,
+        block_pool=block_pool,
+        enable_caching=False,
+        kv_cache_group_id=0,
+        scheduler_block_size=block_size,
+        needs_kv_cache_zeroing=True,
+    )
+
+    blocks = manager.allocate_new_blocks(
+        "request", num_tokens=block_size, num_tokens_main_model=block_size
+    )
+
+    assert manager.records_new_block_ids
+    assert manager.take_new_block_ids() == [block.block_id for block in blocks]
 
 
 def test_chunked_local_attention_possible_cached_prefix():

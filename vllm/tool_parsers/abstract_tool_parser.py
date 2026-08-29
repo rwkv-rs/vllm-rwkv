@@ -182,6 +182,7 @@ class ToolParser:
             tools=request.tools,
             tool_choice=request.tool_choice,
             reasoning=reasoning,
+            parallel_tool_calls=request.parallel_tool_calls is not False,
         )
 
     def extract_tool_calls(
