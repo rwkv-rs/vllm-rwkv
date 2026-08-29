@@ -64,6 +64,10 @@ three standalone generation configs:
 | Fake Think | `fake_think_generation_config.json` | 1.0 | 0.28 | 32 | 0.0 | 0.0 | 1.0 |
 | Tools | `tools_generation_config.json` | 0.96 | 0.76 | 32 | 0.0 | 0.0 | 1.0 |
 
+These must be standalone `GenerationConfig` documents. Omit
+`_from_model_config` or set it to `false`; otherwise Transformers rebuilds the
+configuration from the model config and drops the RWKV-only penalty fields.
+
 The default template mode selects Open Think. Setting
 `chat_template_kwargs.rwkv_generation_prompt` to `fake_think` selects Fake
 Think. Supplying tools always selects the Tools profile, regardless of the
