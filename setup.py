@@ -405,6 +405,9 @@ class cmake_build_ext(build_ext):
         if should_bundle_tcmalloc():
             bundle_tcmalloc(self.build_lib)
 
+        if VLLM_BUILD_PROFILE == "rwkv":
+            return
+
         # copy vllm/vllm_flash_attn/**/*.py from self.build_lib to current
         # directory so that they can be included in the editable build
         import glob
