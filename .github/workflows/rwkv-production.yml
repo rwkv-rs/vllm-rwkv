@@ -145,9 +145,11 @@ jobs:
               requirements/rwkv.txt \
               scripts/deploy_rwkv_production.sh \
               setup.py \
+              tests/v1/structured_output/test_validation.py \
               vllm/model_executor/layers/quantization/utils/w8a8_utils.py \
               vllm/model_executor/models/rwkv.py \
               vllm/platforms/cuda.py \
+              vllm/sampling_params.py \
               vllm/v1/attention/backends/fa_utils.py \
               vllm/v1/sample/ops/topk_topp_sampler.py \
               vllm/v1/worker/gpu_worker.py \
@@ -156,6 +158,7 @@ jobs:
             tests/models/rwkv/test_rwkv.py \
             tests/tool_parsers/test_rwkv_tool_parser.py \
             tests/transformers_utils/test_config.py::test_named_generation_config_does_not_fall_back_to_model_config \
+            tests/v1/structured_output/test_validation.py::test_explicit_xgrammar_does_not_import_optional_backends \
             tests/v1/core/test_single_type_kv_cache_manager.py::test_state_spec_can_request_provider_managed_block_reset
           .venv/bin/python -m pytest --noconftest --import-mode=importlib -q \
             tests/entrypoints/openai/responses/test_sampling_params.py
@@ -268,7 +271,7 @@ jobs:
             --enable-chunked-prefill \
             --enable-prefix-caching \
             --async-scheduling \
-            --structured-outputs-config.backend guidance \
+            --structured-outputs-config.backend xgrammar \
             --enable-auto-tool-choice \
             --tool-call-parser rwkv >"$log" 2>&1 &
           server_pid=$!
@@ -355,9 +358,28 @@ jobs:
               "model": "rwkv7-g1i-1.5b",
               "messages": [{"role": "user", "content": "Reply with OK."}],
               "structured_outputs": {"choice": ["OK"]},
+              "temperature": 0,
               "max_tokens": 8,
           })
           assert structured["choices"][0]["message"]["content"] == "OK"
+          json_schema = post("/v1/chat/completions", {
+              "model": "rwkv7-g1i-1.5b",
+              "messages": [{
+                  "role": "user",
+                  "content": "Return a JSON object with the boolean field ok.",
+              }],
+              "structured_outputs": {"json": {
+                  "type": "object",
+                  "properties": {"ok": {"type": "boolean"}},
+                  "required": ["ok"],
+                  "additionalProperties": False,
+              }},
+              "temperature": 0,
+              "max_tokens": 16,
+          })
+          parsed = json.loads(json_schema["choices"][0]["message"]["content"])
+          assert set(parsed) == {"ok"}
+          assert isinstance(parsed["ok"], bool)
 
           stream_request = urllib.request.Request(
               "http://127.0.0.1:18080/v1/chat/completions",
