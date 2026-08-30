@@ -271,7 +271,7 @@ jobs:
             --enable-auto-tool-choice \
             --tool-call-parser rwkv >"$log" 2>&1 &
           server_pid=$!
-          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+          trap 'status=$?; kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; if (( status )); then tail -200 "$log"; fi; exit "$status"' EXIT
           for _ in $(seq 1 240); do
             if release/.venv/bin/python - <<'PY' >/dev/null 2>&1
           import urllib.request
@@ -289,6 +289,8 @@ jobs:
           done
           release/.venv/bin/python - <<'PY'
           import json
+          import sys
+          import urllib.error
           import urllib.request
 
           def post(path: str, body: dict) -> dict:
@@ -297,9 +299,13 @@ jobs:
                   data=json.dumps(body).encode(),
                   headers={"Content-Type": "application/json"},
               )
-              with urllib.request.urlopen(request, timeout=180) as response:
-                  assert response.status == 200
-                  return json.load(response)
+              try:
+                  with urllib.request.urlopen(request, timeout=180) as response:
+                      assert response.status == 200
+                      return json.load(response)
+              except urllib.error.HTTPError as error:
+                  print(error.read().decode(), file=sys.stderr)
+                  raise
 
           chat = post("/v1/chat/completions", {
               "model": "rwkv7-g1i-1.5b",
