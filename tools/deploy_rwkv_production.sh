@@ -142,7 +142,7 @@ ExecStart=$release/.venv/bin/vllm serve $models_dir/$model \\
   --enable-chunked-prefill \\
   --enable-prefix-caching \\
   --async-scheduling \\
-  --structured-outputs-config.backend guidance \\
+  --structured-outputs-config.backend xgrammar \\
   --enable-auto-tool-choice \\
   --tool-call-parser rwkv$parallel_args
 Restart=on-failure
