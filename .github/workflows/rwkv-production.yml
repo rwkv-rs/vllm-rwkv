@@ -71,6 +71,7 @@ jobs:
       NO_PROXY: 127.0.0.1,localhost
       UV_LINK_MODE: copy
       MAX_JOBS: "8"
+      TORCH_CUDA_ARCH_LIST: "8.9 12.0"
       VLLM_BUILD_PROFILE: rwkv
       RWKV15_ARTIFACT: /home/caizus/Weights/RWKV/hf/rwkv7-g1i-1.5b-20260805-ctx16384
       RWKV72_ARTIFACT: /home/caizus/Weights/RWKV/hf/rwkv7-g1i-7.2b-20260805-ctx16384
@@ -139,6 +140,8 @@ jobs:
           uv tool run --from pre-commit==4.5.1 \
             pre-commit run --hook-stage manual --files \
               .github/workflows/rwkv-production.yml \
+              CMakeLists.txt \
+              csrc/libtorch_stable/rwkv7/rwkv7_registration.cpp \
               requirements/rwkv.txt \
               scripts/deploy_rwkv_production.sh \
               setup.py \
@@ -200,7 +203,8 @@ jobs:
                   for name in archive.namelist()
                   if name.startswith("vllm/") and name.endswith(".so")
               ]
-          assert not native_members, native_members
+          assert len(native_members) == 1, native_members
+          assert "/rwkv7_ops." in native_members[0], native_members
           PY
           uv venv --clear --relocatable --python 3.12 release/.venv
           uv pip install --python release/.venv/bin/python \
@@ -210,11 +214,15 @@ jobs:
           from importlib.metadata import version
 
           import flashrwkv2
+          import torch
           import vllm
+          import vllm.rwkv7_ops
 
           assert flashrwkv2.__version__ == "0.1.0a12"
           distribution_version = version("vllm")
           assert "rwkv" in distribution_version.split("+", 1)[1].split(".")
+          cpu = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+          assert torch.ops._C.get_cuda_view_from_cpu_tensor(cpu).is_cuda
           print(
               f"vLLM={distribution_version} "
               f"FlashRWKV2={flashrwkv2.__version__}"
