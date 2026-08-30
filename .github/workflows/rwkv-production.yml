@@ -71,8 +71,8 @@ jobs:
       NO_PROXY: 127.0.0.1,localhost
       UV_LINK_MODE: copy
       MAX_JOBS: "8"
-      TORCH_CUDA_ARCH_LIST: "8.9 12.0"
       VLLM_BUILD_PROFILE: rwkv
+      TORCH_EXTENSIONS_DIR: ${{ github.workspace }}/release/.flashrwkv2-cache
       RWKV15_ARTIFACT: /home/caizus/Weights/RWKV/hf/rwkv7-g1i-1.5b-20260805-ctx16384
       RWKV72_ARTIFACT: /home/caizus/Weights/RWKV/hf/rwkv7-g1i-7.2b-20260805-ctx16384
       RWKV72_PTH: /home/caizus/Weights/RWKV/rwkv7/pth/rwkv7-g1i-7.2b-20260805-ctx16384.pth
@@ -207,27 +207,24 @@ jobs:
           import flashrwkv2
           import vllm
 
-          assert flashrwkv2.__version__ == "0.1.0a11"
+          assert flashrwkv2.__version__ == "0.1.0a12"
           print(f"vLLM={vllm.__version__} FlashRWKV2={flashrwkv2.__version__}")
           PY
+          printf '%s\n' "$PWD/release/.venv/bin" >> "$GITHUB_PATH"
+          PATH="$PWD/release/.venv/bin:$PATH" \
+            release/.venv/bin/python -m flashrwkv2.compile \
+            > release/flashrwkv2-sm120.json
           release/.venv/bin/python - <<'PY'
-          import subprocess
+          import json
           from pathlib import Path
 
-          import flashrwkv2
-
-          package_dir = Path(flashrwkv2.__file__).parent
-          cubins = "\n".join(
-              subprocess.check_output(
-                  ["/usr/local/cuda/bin/cuobjdump", "--list-elf", extension],
-                  text=True,
-              )
-              for extension in sorted(package_dir.glob("*.so"))
-          )
-          for architecture in ("sm_89", "sm_120"):
-              assert architecture in cubins, (
-                  f"FlashRWKV2 is missing the required {architecture} cubin"
-              )
+          result = json.loads(Path("release/flashrwkv2-sm120.json").read_text())
+          cache = Path("release/.flashrwkv2-cache").resolve()
+          library = Path(result["library"]).resolve()
+          assert result["status"] in {"compiled", "cached"}, result
+          assert result["target"] == "sm120", result
+          assert library.is_relative_to(cache), (library, cache)
+          assert library.is_file(), library
           PY
 
       - name: Smoke-test the exact release environment
@@ -582,6 +579,7 @@ jobs:
             artifacts/rwkv-production/
           cp "$RUNNER_TEMP/rwkv-gate/vllm_tokens.json" \
             artifacts/rwkv-production/
+          cp release/flashrwkv2-sm120.json artifacts/rwkv-production/
           cp "$artifact_root/$(basename "$bundle").sha256" \
             artifacts/rwkv-production/
 
