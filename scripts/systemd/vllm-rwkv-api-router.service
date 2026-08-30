@@ -1,0 +1,21 @@
+[Unit]
+Description=RWKV multi-model OpenAI API router
+After=network-online.target vllm-rwkv-1_5b.service vllm-rwkv-2_9b.service vllm-rwkv-7_2b.service vllm-rwkv-13_3b.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rwkv
+Group=rwkv
+WorkingDirectory=/opt/rwkv/vllm/current
+LoadCredential=api-key-sha256:/etc/rwkv/api.rwkv.rs.key.sha256
+ExecStart=/opt/rwkv/vllm/current/.venv/bin/python /usr/local/libexec/rwkv_api_router.py --api-key-sha256-file ${CREDENTIALS_DIRECTORY}/api-key-sha256
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target
