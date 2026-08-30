@@ -82,7 +82,7 @@ class _FakeStateHandle:
 
 def _fake_flashrwkv2() -> ModuleType:
     module: Any = ModuleType("flashrwkv2")
-    module.__version__ = "0.1.0a11"
+    module.__version__ = "0.1.0a12"
 
     def prepare_fp16(
         state_pool_size,
