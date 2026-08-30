@@ -1611,6 +1611,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logits = logits[:, : self.vocab_size]
         else:
             sample_hidden_states = hidden_states[input_batch.logits_indices]
+            custom_output = self.model_state.custom_sample(
+                self.model,
+                sample_hidden_states,
+                input_batch,
+                grammar_output,
+            )
+            if custom_output is not None:
+                return (
+                    custom_output,
+                    custom_output.num_sampled,
+                    custom_output.num_rejected,
+                )
             logits = self.model.compute_logits(sample_hidden_states)
 
         invalid_drafts = None
