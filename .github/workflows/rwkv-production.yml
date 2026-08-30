@@ -224,7 +224,7 @@ jobs:
           import vllm
           import vllm.rwkv7_ops
 
-          assert flashrwkv2.__version__ == "0.1.0a12"
+          assert flashrwkv2.__version__ == "0.1.0a13"
           distribution_version = version("vllm")
           assert "rwkv" in distribution_version.split("+", 1)[1].split(".")
           cpu = torch.zeros(1, dtype=torch.int32, pin_memory=True)
