@@ -1,0 +1,18 @@
+name = "api-rwkv-rs"
+server_name = "api.rwkv.rs"
+static_root = "/var/empty"
+
+[response_headers]
+X-Content-Type-Options = "nosniff"
+X-Frame-Options = "DENY"
+Referrer-Policy = "no-referrer"
+
+[[routes]]
+id = "openai-api"
+path_prefix = "/v1/"
+action = "proxy"
+upstream = "http://127.0.0.1:18000"
+allowed_methods = ["GET", "POST", "OPTIONS"]
+buffer_response = false
+read_timeout_secs = 3600
+send_timeout_secs = 3600
