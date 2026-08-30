@@ -72,7 +72,6 @@ jobs:
       UV_LINK_MODE: copy
       MAX_JOBS: "8"
       VLLM_BUILD_PROFILE: rwkv
-      XDG_CACHE_HOME: ${{ github.workspace }}/release/.cache
       RWKV15_ARTIFACT: /home/caizus/Weights/RWKV/hf/rwkv7-g1i-1.5b-20260805-ctx16384
       RWKV72_ARTIFACT: /home/caizus/Weights/RWKV/hf/rwkv7-g1i-7.2b-20260805-ctx16384
       RWKV72_PTH: /home/caizus/Weights/RWKV/rwkv7/pth/rwkv7-g1i-7.2b-20260805-ctx16384.pth
@@ -211,7 +210,8 @@ jobs:
           print(f"vLLM={vllm.__version__} FlashRWKV2={flashrwkv2.__version__}")
           PY
           printf '%s\n' "$PWD/release/.venv/bin" >> "$GITHUB_PATH"
-          PATH="$PWD/release/.venv/bin:$PATH" \
+          XDG_CACHE_HOME="$PWD/release/.cache" \
+            PATH="$PWD/release/.venv/bin:$PATH" \
             release/.venv/bin/python -m flashrwkv2.compile \
             > release/flashrwkv2-sm120.json
           release/.venv/bin/python - <<'PY'
@@ -230,6 +230,7 @@ jobs:
       - name: Smoke-test the exact release environment
         run: |
           set -euo pipefail
+          export XDG_CACHE_HOME="$PWD/release/.cache"
           log="$RUNNER_TEMP/rwkv15-service.log"
           release/.venv/bin/vllm serve "$RWKV15_ARTIFACT" \
             --served-model-name rwkv7-g1i-1.5b \
@@ -386,7 +387,8 @@ jobs:
               "output_token_ids": generated,
           }))
           PY
-          release/.venv/bin/python - "$RWKV72_ARTIFACT" "$evidence" <<'PY'
+          XDG_CACHE_HOME="$PWD/release/.cache" \
+            release/.venv/bin/python - "$RWKV72_ARTIFACT" "$evidence" <<'PY'
           import json
           import sys
           from pathlib import Path
@@ -434,6 +436,7 @@ jobs:
         if: steps.scope.outputs.required == 'true'
         run: |
           set -euo pipefail
+          export XDG_CACHE_HOME="$PWD/release/.cache"
           evidence="$RUNNER_TEMP/rwkv-gate"
           log="$evidence/vllm72-service.log"
           release/.venv/bin/vllm serve "$RWKV72_ARTIFACT" \
