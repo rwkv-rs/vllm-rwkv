@@ -43,7 +43,7 @@ from .utils import (
     maybe_prefix,
 )
 
-_FLASHRWKV2_VERSION = "0.1.0a11"
+_FLASHRWKV2_VERSION = "0.1.0a12"
 _FLASHRWKV2_APIS = (
     "infer_cmix_forward_varlen",
     "infer_embedding_ln0_forward_varlen",
@@ -66,8 +66,8 @@ def _load_flashrwkv2() -> Any:
         import flashrwkv2
     except ImportError as error:
         raise RuntimeError(
-            "RWKV requires FlashRWKV2 0.1.0a11 with the public recurrent-state "
-            "provider API"
+            f"RWKV requires FlashRWKV2 {_FLASHRWKV2_VERSION} with the public "
+            "recurrent-state provider API"
         ) from error
 
     version = getattr(flashrwkv2, "__version__", None)
