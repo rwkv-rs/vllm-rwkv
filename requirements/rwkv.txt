@@ -1,10 +1,12 @@
-# Dense RWKV7 inference and OpenAI-compatible serving. The model and sampling
-# CUDA kernels are provided exclusively by the pinned FlashRWKV2 wheel.
+# Dense RWKV7 inference and OpenAI-compatible serving. FlashRWKV2 compiles its
+# pinned native extension lazily for the visible CUDA architecture.
 
 torch==2.13.0
 transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@f708325e46025404c807c5d4b0cb5803bb63d11d
 tokenizers @ git+https://github.com/rwkv-rs/tokenizers-rwkv.git@c5d8dde5ff49c70e4656199d5033a84e03c21b2b#subdirectory=bindings/python
-FlashRWKV2==0.1.0a11
+FlashRWKV2==0.1.0a12
+ninja
+setuptools>=77.0.3,<81.0.0
 
 regex
 cachetools
