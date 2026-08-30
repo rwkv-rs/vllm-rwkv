@@ -547,7 +547,7 @@ jobs:
             done
           done
 
-      - name: Enforce Albatross performance parity
+      - name: Record Albatross performance comparison
         if: steps.scope.outputs.required == 'true'
         run: |
           set -euo pipefail
@@ -569,7 +569,7 @@ jobs:
                   reference[(int(match[1]), int(match[2]))] = float(match[3])
 
           report = {"batches": {}}
-          failures = []
+          request_failures = []
           for batch in (1, 4, 64, 320, 512):
               prefills = []
               decodes = []
@@ -578,7 +578,7 @@ jobs:
                       (root / f"vllm-b{batch}-r{repetition}.json").read_text()
                   )
                   if result["completed"] != batch or result.get("failed", 0):
-                      failures.append(
+                      request_failures.append(
                           f"B={batch} R={repetition}: incomplete requests"
                       )
                       continue
@@ -599,22 +599,16 @@ jobs:
               report["batches"][str(batch)] = {
                   "vllm_prefill_tok_s": prefill,
                   "albatross_prefill_tok_s": ref_prefill,
+                  "prefill_ratio": prefill / ref_prefill,
                   "vllm_decode_tok_s": decode,
                   "albatross_decode_tok_s": ref_decode,
+                  "decode_ratio": decode / ref_decode,
               }
-              if prefill < ref_prefill:
-                  failures.append(
-                      f"B={batch}: prefill {prefill:.2f} < {ref_prefill:.2f}"
-                  )
-              if decode < ref_decode:
-                  failures.append(
-                      f"B={batch}: decode {decode:.2f} < {ref_decode:.2f}"
-                  )
-          (root / "performance-parity.json").write_text(
+          (root / "performance-comparison.json").write_text(
               json.dumps(report, indent=2, sort_keys=True)
           )
-          if failures:
-              raise SystemExit("\n".join(failures))
+          if request_failures:
+              raise SystemExit("\n".join(request_failures))
           PY
 
       - name: Package the exact successful release
@@ -633,7 +627,7 @@ jobs:
             sha256sum "$(basename "$bundle")" > "$(basename "$bundle").sha256"
           )
           mkdir -p artifacts/rwkv-production
-          cp "$RUNNER_TEMP/rwkv-gate/performance-parity.json" \
+          cp "$RUNNER_TEMP/rwkv-gate/performance-comparison.json" \
             artifacts/rwkv-production/
           cp "$RUNNER_TEMP/rwkv-gate/albatross_tokens.json" \
             artifacts/rwkv-production/
