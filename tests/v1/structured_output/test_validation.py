@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Request-time validation of structured output requests."""
 
+import builtins
+import importlib
+
 import pytest
 
 from vllm.config import StructuredOutputsConfig
@@ -49,6 +52,32 @@ def test_plain_request_allowed_for_diffusion_models():
         StructuredOutputsConfig(),
         tokenizer=None,
     )
+
+
+def test_explicit_xgrammar_does_not_import_optional_backends(monkeypatch):
+    importlib.import_module("vllm.v1.structured_output.backend_xgrammar")
+
+    original_import = builtins.__import__
+    optional_backends = {
+        "vllm.v1.structured_output.backend_guidance",
+        "vllm.v1.structured_output.backend_lm_format_enforcer",
+        "vllm.v1.structured_output.backend_outlines",
+    }
+
+    def import_without_optional_backends(name, *args, **kwargs):
+        if name in optional_backends:
+            raise AssertionError(f"unexpected optional backend import: {name}")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_optional_backends)
+    params = SamplingParams(structured_outputs=StructuredOutputsParams(choice=["OK"]))
+    params._validate_structured_outputs(
+        _StubModelConfig(is_diffusion=False),
+        StructuredOutputsConfig(backend="xgrammar"),
+        tokenizer=object(),
+    )
+
+    assert params.structured_outputs.grammar is not None
 
 
 @pytest.mark.parametrize(
