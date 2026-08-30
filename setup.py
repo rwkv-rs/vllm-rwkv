@@ -268,6 +268,7 @@ class cmake_build_ext(build_ext):
         cmake_args = [
             "-DCMAKE_BUILD_TYPE={}".format(cfg),
             "-DVLLM_TARGET_DEVICE={}".format(VLLM_TARGET_DEVICE),
+            "-DVLLM_BUILD_PROFILE={}".format(VLLM_BUILD_PROFILE),
         ]
 
         verbose = envs.VERBOSE
@@ -1435,7 +1436,7 @@ if _build_custom_ops():
 if VLLM_BUILD_PROFILE == "rwkv":
     if not _is_cuda():
         raise ValueError("VLLM_BUILD_PROFILE='rwkv' requires VLLM_TARGET_DEVICE='cuda'")
-    ext_modules = []
+    ext_modules = [CMakeExtension(name="vllm.rwkv7_ops")]
 
 package_data = {
     "vllm": [
