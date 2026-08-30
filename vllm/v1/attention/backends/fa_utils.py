@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
 import vllm.envs as envs
-from vllm import __version__
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_quantized_kv_cache
@@ -20,7 +20,11 @@ FA4_HD256_PAGE_SIZE = 128
 # consistent behavior (similar to IS_AITER_FOUND in _aiter_ops.py).
 _ROCM_FLASH_ATTN_AVAILABLE = False
 
-_local_version = __version__.partition("+")[2].split(".")
+try:
+    _distribution_version = version("vllm")
+except PackageNotFoundError:
+    _distribution_version = ""
+_local_version = _distribution_version.partition("+")[2].split(".")
 _is_reduced_rwkv_build = "rwkv" in _local_version
 
 if current_platform.is_cuda() and _is_reduced_rwkv_build:
