@@ -204,12 +204,18 @@ jobs:
             dist/*.whl \
             --torch-backend=auto
           PYTHONSAFEPATH=1 release/.venv/bin/python - <<'PY'
+          from importlib.metadata import version
+
           import flashrwkv2
           import vllm
 
           assert flashrwkv2.__version__ == "0.1.0a12"
-          assert "rwkv" in vllm.__version__.split("+", 1)[1].split(".")
-          print(f"vLLM={vllm.__version__} FlashRWKV2={flashrwkv2.__version__}")
+          distribution_version = version("vllm")
+          assert "rwkv" in distribution_version.split("+", 1)[1].split(".")
+          print(
+              f"vLLM={distribution_version} "
+              f"FlashRWKV2={flashrwkv2.__version__}"
+          )
           PY
           printf '%s\n' "$PWD/release/.venv/bin" >> "$GITHUB_PATH"
           PATH="$PWD/release/.venv/bin:$PATH" \
