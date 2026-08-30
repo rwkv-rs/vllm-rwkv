@@ -6,10 +6,15 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
+from vllm.version import is_reduced_rwkv_build
+
+
+def _full_stable_cutlass_ops_available() -> bool:
+    return not is_reduced_rwkv_build()
 
 
 def cutlass_fp8_supported() -> bool:
-    if not current_platform.is_cuda():
+    if not current_platform.is_cuda() or not _full_stable_cutlass_ops_available():
         return False
 
     capability_tuple = current_platform.get_device_capability()
@@ -19,7 +24,7 @@ def cutlass_fp8_supported() -> bool:
 
 
 def cutlass_block_fp8_supported() -> bool:
-    if not current_platform.is_cuda():
+    if not current_platform.is_cuda() or not _full_stable_cutlass_ops_available():
         return False
 
     capability_tuple = current_platform.get_device_capability()
@@ -29,7 +34,7 @@ def cutlass_block_fp8_supported() -> bool:
 
 
 def cutlass_group_gemm_supported() -> bool:
-    if not current_platform.is_cuda():
+    if not current_platform.is_cuda() or not _full_stable_cutlass_ops_available():
         return False
 
     capability_tuple = current_platform.get_device_capability()
