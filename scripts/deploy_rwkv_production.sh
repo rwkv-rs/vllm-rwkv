@@ -40,6 +40,7 @@ atomic_link() {
 check_host() {
   local free_kib
   local cuda_version
+  local toolkit_version
 
   [[ $(uname -m) == x86_64 ]] || die "production host must be x86_64"
   mapfile -t gpu_names < <(
@@ -53,6 +54,15 @@ check_host() {
 
   cuda_version=$(nvidia-smi | sed -n 's/.*CUDA Version: \([0-9.]*\).*/\1/p' | head -1)
   [[ $cuda_version == 13.1 ]] || die "expected CUDA 13.1 driver, got $cuda_version"
+  [[ -x /usr/local/cuda/bin/nvcc ]] || die "CUDA toolkit nvcc is missing"
+  toolkit_version=$(
+    /usr/local/cuda/bin/nvcc --version |
+      sed -n 's/.*release \([0-9.]*\),.*/\1/p' |
+      tail -1
+  )
+  [[ $toolkit_version == 13.1 ]] ||
+    die "expected CUDA 13.1 toolkit, got $toolkit_version"
+  command -v c++ >/dev/null || die "C++ compiler is missing"
 
   mkdir -p "$releases_dir" "$incoming_dir"
   free_kib=$(df -Pk "$root_dir" | awk 'NR == 2 {print $4}')
@@ -93,15 +103,16 @@ check_models() {
 }
 
 write_unit() {
-  local service=$1
-  local description=$2
-  local devices=$3
-  local model=$4
-  local served_name=$5
-  local port=$6
-  local max_num_seqs=$7
-  local memory_utilization=$8
-  local parallel_args=${9:-}
+  local release=$1
+  local service=$2
+  local description=$3
+  local devices=$4
+  local model=$5
+  local served_name=$6
+  local port=$7
+  local max_num_seqs=$8
+  local memory_utilization=$9
+  local parallel_args=${10:-}
 
   install -m 0644 /dev/stdin "/etc/systemd/system/$service" <<EOF
 [Unit]
@@ -113,11 +124,13 @@ Wants=network-online.target
 Type=simple
 User=rwkv
 Group=rwkv
-WorkingDirectory=$current_link
+WorkingDirectory=$release
 Environment=HOME=/home/rwkv
 Environment=CUDA_VISIBLE_DEVICES=$devices
 Environment=PYTHONUNBUFFERED=1
-ExecStart=$current_link/.venv/bin/vllm serve $models_dir/$model \\
+Environment=TORCH_EXTENSIONS_DIR=$release/.flashrwkv2-cache
+Environment=PATH=$release/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=$release/.venv/bin/vllm serve $models_dir/$model \\
   --served-model-name $served_name \\
   --host 127.0.0.1 \\
   --port $port \\
@@ -142,22 +155,28 @@ EOF
 }
 
 install_units() {
+  local release=$1
+
   write_unit \
+    "$release" \
     vllm-rwkv-1_5b.service \
     "RWKV7 g1i 1.5B vLLM service" \
     0 rwkv7-g1i-1.5b-20260805-ctx16384 rwkv7-g1i-1.5b \
     18001 1024 0.32
   write_unit \
+    "$release" \
     vllm-rwkv-2_9b.service \
     "RWKV7 g1i 2.9B vLLM service" \
     0 rwkv7-g1i-2.9b-20260805-ctx16384 rwkv7-g1i-2.9b \
     18002 1024 0.52
   write_unit \
+    "$release" \
     vllm-rwkv-7_2b.service \
     "RWKV7 g1i 7.2B vLLM service" \
     1 rwkv7-g1i-7.2b-20260805-ctx16384 rwkv7-g1i-7.2b \
     18003 960 0.90
   write_unit \
+    "$release" \
     vllm-rwkv-13_3b.service \
     "RWKV7 g1i 13.3B vLLM PP2 service" \
     2,3 rwkv7-g1i-13.3b-20260805-ctx16384 rwkv7-g1i-13.3b \
@@ -211,8 +230,50 @@ start_services() {
 restore_release() {
   local release=$1
   stop_services
+  install_units "$release"
   atomic_link "$release" "$current_link"
   start_services || die "failed to restore release $release"
+}
+
+prepare_flashrwkv2() {
+  local release=$1
+  local cache_dir="$release/.flashrwkv2-cache"
+  local result="$release/flashrwkv2-sm89.json"
+  local temporary_result
+
+  install -d -o rwkv -g rwkv -m 0755 "$cache_dir"
+  temporary_result=$(mktemp "$incoming_dir/flashrwkv2-sm89.XXXXXX")
+  if ! runuser -u rwkv -- env \
+    HOME=/home/rwkv \
+    CUDA_HOME=/usr/local/cuda \
+    CUDA_PATH=/usr/local/cuda \
+    CUDA_VISIBLE_DEVICES=0 \
+    TORCH_EXTENSIONS_DIR="$cache_dir" \
+    PATH="$release/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    "$release/.venv/bin/python" -m flashrwkv2.compile >"$temporary_result"; then
+    rm -f "$temporary_result"
+    return 1
+  fi
+  "$release/.venv/bin/python" - "$temporary_result" "$cache_dir" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+import flashrwkv2
+import torch
+
+result = json.loads(Path(sys.argv[1]).read_text())
+cache = Path(sys.argv[2]).resolve()
+library = Path(result["library"]).resolve()
+assert flashrwkv2.__version__ == "0.1.0a12"
+assert torch.cuda.get_device_capability() == (8, 9)
+assert result["status"] in {"compiled", "cached"}, result
+assert result["target"] == "sm89", result
+assert library.is_relative_to(cache), (library, cache)
+assert library.is_file(), library
+PY
+  install -o root -g root -m 0644 "$temporary_result" "$result"
+  rm -f "$temporary_result"
 }
 
 stage_release() {
@@ -232,6 +293,8 @@ stage_release() {
   if [[ -d $release ]]; then
     [[ $(<"$release/GIT_SHA") == "$sha" ]] ||
       die "existing release has the wrong GIT_SHA"
+    prepare_flashrwkv2 "$release" ||
+      die "FlashRWKV2 SM89 compilation failed for existing release $sha"
     echo "$release"
     return
   fi
@@ -243,18 +306,13 @@ stage_release() {
   [[ -x $staging/.venv/bin/python ]] || die "bundle is missing .venv/bin/python"
   [[ -f $staging/GIT_SHA ]] || die "bundle is missing GIT_SHA"
   [[ $(<"$staging/GIT_SHA") == "$sha" ]] || die "bundle SHA does not match $sha"
-  CUDA_VISIBLE_DEVICES=0 "$staging/.venv/bin/python" - <<'PY'
-import torch
-
-if torch.cuda.get_device_capability() != (8, 9):
-    raise SystemExit("production GPU0 is not SM89")
-
-import flashrwkv2  # noqa: E402, F401
-import vllm.platforms.cuda  # noqa: E402, F401
-PY
   chown -R root:root "$staging"
   chmod -R a+rX "$staging"
   mv "$staging" "$release"
+  if ! prepare_flashrwkv2 "$release"; then
+    rm -rf -- "$release"
+    die "FlashRWKV2 SM89 compilation failed for release $sha"
+  fi
   echo "$release"
 }
 
@@ -285,7 +343,7 @@ deploy_release() {
   check_models
   release=$(stage_release "$sha" "$bundle" "$checksum_file")
   old_release=$(readlink -f "$current_link" 2>/dev/null || true)
-  install_units
+  install_units "$release"
   stop_services
   atomic_link "$release" "$current_link"
 
