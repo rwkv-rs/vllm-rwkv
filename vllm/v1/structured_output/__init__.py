@@ -14,7 +14,6 @@ from vllm.logger import init_logger
 from vllm.reasoning import ReasoningParserManager
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.utils.import_utils import LazyLoader
-from vllm.v1.structured_output.backend_guidance import GuidanceBackend
 from vllm.v1.structured_output.backend_types import (
     StructuredOutputBackend,
     StructuredOutputGrammar,
@@ -164,6 +163,8 @@ class StructuredOutputManager:
                     vocab_size=vocab_size,
                 )
             elif request_backend == "guidance":
+                from vllm.v1.structured_output.backend_guidance import GuidanceBackend
+
                 self.backend = GuidanceBackend(
                     self.vllm_config,
                     tokenizer=self.tokenizer,
