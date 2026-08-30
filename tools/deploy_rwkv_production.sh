@@ -128,7 +128,7 @@ WorkingDirectory=$release
 Environment=HOME=/home/rwkv
 Environment=CUDA_VISIBLE_DEVICES=$devices
 Environment=PYTHONUNBUFFERED=1
-Environment=TORCH_EXTENSIONS_DIR=$release/.flashrwkv2-cache
+Environment=XDG_CACHE_HOME=$release/.cache
 Environment=PATH=$release/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=$release/.venv/bin/vllm serve $models_dir/$model \\
   --served-model-name $served_name \\
@@ -237,18 +237,19 @@ restore_release() {
 
 prepare_flashrwkv2() {
   local release=$1
-  local cache_dir="$release/.flashrwkv2-cache"
+  local cache_root="$release/.cache"
+  local cache_dir="$cache_root/torch_extensions"
   local result="$release/flashrwkv2-sm89.json"
   local temporary_result
 
-  install -d -o rwkv -g rwkv -m 0755 "$cache_dir"
+  install -d -o rwkv -g rwkv -m 0755 "$cache_root"
   temporary_result=$(mktemp "$incoming_dir/flashrwkv2-sm89.XXXXXX")
   if ! runuser -u rwkv -- env \
     HOME=/home/rwkv \
     CUDA_HOME=/usr/local/cuda \
     CUDA_PATH=/usr/local/cuda \
     CUDA_VISIBLE_DEVICES=0 \
-    TORCH_EXTENSIONS_DIR="$cache_dir" \
+    XDG_CACHE_HOME="$cache_root" \
     PATH="$release/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     "$release/.venv/bin/python" -m flashrwkv2.compile >"$temporary_result"; then
     rm -f "$temporary_result"
