@@ -31,8 +31,21 @@ endif()
 
 # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
 set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
+set(VLLM_BUILD_PROFILE "full" CACHE STRING "Native extension build profile")
+set_property(CACHE VLLM_BUILD_PROFILE PROPERTY STRINGS full rwkv)
+if(NOT VLLM_BUILD_PROFILE STREQUAL "full" AND
+   NOT VLLM_BUILD_PROFILE STREQUAL "rwkv")
+  message(FATAL_ERROR
+    "VLLM_BUILD_PROFILE='${VLLM_BUILD_PROFILE}' must be 'full' or 'rwkv'")
+endif()
+if(VLLM_BUILD_PROFILE STREQUAL "rwkv" AND
+   NOT VLLM_TARGET_DEVICE STREQUAL "cuda")
+  message(FATAL_ERROR
+    "VLLM_BUILD_PROFILE='rwkv' requires VLLM_TARGET_DEVICE='cuda'")
+endif()
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Target device: ${VLLM_TARGET_DEVICE}")
+message(STATUS "Build profile: ${VLLM_BUILD_PROFILE}")
 
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 
@@ -288,6 +301,30 @@ endif()
 # Each dependency that produces build artifacts should override its BINARY_DIR to avoid
 # conflicts between build types. It should instead be set to ${CMAKE_BINARY_DIR}/<dependency>.
 #
+if(VLLM_BUILD_PROFILE STREQUAL "rwkv")
+  set(RWKV7_RUNTIME_CUDA_SRC "csrc/libtorch_stable/cuda_view.cu")
+  set(RWKV7_RUNTIME_SRC
+    ${RWKV7_RUNTIME_CUDA_SRC}
+    "csrc/libtorch_stable/rwkv7/rwkv7_registration.cpp")
+  set_gencode_flags_for_srcs(
+    SRCS "${RWKV7_RUNTIME_CUDA_SRC}"
+    CUDA_ARCHS "${CUDA_ARCHS}")
+  define_extension_target(
+    rwkv7_ops
+    DESTINATION vllm
+    LANGUAGE CUDA
+    SOURCES ${RWKV7_RUNTIME_SRC}
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES ${VLLM_GPU_ARCHES}
+    USE_SABI 3
+    WITH_SOABI)
+  target_compile_definitions(rwkv7_ops PRIVATE
+    TORCH_TARGET_VERSION=0x020B000000000000ULL
+    USE_CUDA
+    VLLM_RWKV_RUNTIME_OPS)
+  return()
+endif()
+
 include(FetchContent)
 file(MAKE_DIRECTORY ${FETCHCONTENT_BASE_DIR}) # Ensure the directory exists
 message(STATUS "FetchContent base directory: ${FETCHCONTENT_BASE_DIR}")

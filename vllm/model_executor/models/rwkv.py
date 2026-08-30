@@ -43,7 +43,7 @@ from .utils import (
     maybe_prefix,
 )
 
-_FLASHRWKV2_VERSION = "0.1.0a11"
+_FLASHRWKV2_VERSION = "0.1.0a13"
 _FLASHRWKV2_APIS = (
     "infer_cmix_forward_varlen",
     "infer_embedding_ln0_forward_varlen",
@@ -66,8 +66,8 @@ def _load_flashrwkv2() -> Any:
         import flashrwkv2
     except ImportError as error:
         raise RuntimeError(
-            "RWKV requires FlashRWKV2 0.1.0a11 with the public recurrent-state "
-            "provider API"
+            f"RWKV requires FlashRWKV2 {_FLASHRWKV2_VERSION} with the public "
+            "recurrent-state provider API"
         ) from error
 
     version = getattr(flashrwkv2, "__version__", None)
@@ -788,6 +788,7 @@ class RwkvModel(nn.Module):
                 eps=config.layer_norm_epsilon,
                 dtype=torch.bfloat16,
             )
+            self._embedding_norm_folded = False
         else:
             self.embed_tokens = PPMissingLayer()
             self.embedding_norm = PPMissingLayer()
@@ -820,6 +821,22 @@ class RwkvModel(nn.Module):
         return self.embed_tokens(input_ids)
 
     def process_weights_after_loading(self) -> None:
+        if get_pp_group().is_first_rank:
+            flashrwkv2 = _load_flashrwkv2()
+            embedding = self.embed_tokens.weight
+            folded = torch.empty_like(embedding, dtype=torch.float16)
+            for start in range(0, embedding.shape[0], 4096):
+                end = min(start + 4096, embedding.shape[0])
+                folded[start:end].copy_(
+                    flashrwkv2.infer_embedding_ln0_forward_varlen(
+                        embedding[start:end],
+                        self.embedding_norm.weight,
+                        self.embedding_norm.bias,
+                        eps=self.config.layer_norm_epsilon,
+                    )
+                )
+            self.embed_tokens.weight.data = folded
+            self._embedding_norm_folded = True
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             assert isinstance(layer, RwkvDecoderLayer)
             layer.linear_attn.process_weights_after_loading()
@@ -836,13 +853,16 @@ class RwkvModel(nn.Module):
             if inputs_embeds is None:
                 assert input_ids is not None
                 inputs_embeds = self.embed_input_ids(input_ids)
-            inputs_embeds = inputs_embeds.to(torch.bfloat16).contiguous()
-            hidden_states = flashrwkv2.infer_embedding_ln0_forward_varlen(
-                inputs_embeds,
-                self.embedding_norm.weight,
-                self.embedding_norm.bias,
-                eps=self.config.layer_norm_epsilon,
-            ).to(torch.float16)
+                assert self._embedding_norm_folded
+                hidden_states = inputs_embeds
+            else:
+                inputs_embeds = inputs_embeds.to(torch.bfloat16).contiguous()
+                hidden_states = flashrwkv2.infer_embedding_ln0_forward_varlen(
+                    inputs_embeds,
+                    self.embedding_norm.weight,
+                    self.embedding_norm.bias,
+                    eps=self.config.layer_norm_epsilon,
+                ).to(torch.float16)
             residual = torch.zeros_like(hidden_states)
             v_first = None
         else:

@@ -1125,22 +1125,18 @@ class SamplingParams(
                 "structured_outputs.regex must not contain a NUL character ('\\x00')"
             )
 
-        from vllm.v1.structured_output.backend_guidance import (
-            has_guidance_unsupported_json_features,
-            validate_guidance_grammar,
-        )
-        from vllm.v1.structured_output.backend_lm_format_enforcer import (
-            validate_structured_output_request_lm_format_enforcer,
-        )
-        from vllm.v1.structured_output.backend_outlines import (
-            validate_structured_output_request_outlines,
-        )
-        from vllm.v1.structured_output.backend_xgrammar import validate_xgrammar_grammar
-
         if backend.startswith("xgrammar"):
             # xgrammar with no fallback
+            from vllm.v1.structured_output.backend_xgrammar import (
+                validate_xgrammar_grammar,
+            )
+
             validate_xgrammar_grammar(self)
         elif backend.startswith("guidance"):
+            from vllm.v1.structured_output.backend_guidance import (
+                validate_guidance_grammar,
+            )
+
             if _is_non_tekken_mistral(tokenizer=tokenizer):
                 raise VLLMValidationError(
                     "Non-tekken Mistral tokenizers are not supported for the 'guidance'"
@@ -1158,9 +1154,17 @@ class SamplingParams(
             )
         elif backend == "outlines":
             # outlines backend
+            from vllm.v1.structured_output.backend_outlines import (
+                validate_structured_output_request_outlines,
+            )
+
             validate_structured_output_request_outlines(self)
         elif backend == "lm-format-enforcer":
             # lm format enforcer backend
+            from vllm.v1.structured_output.backend_lm_format_enforcer import (
+                validate_structured_output_request_lm_format_enforcer,
+            )
+
             if is_mistral_tokenizer(tokenizer):
                 raise VLLMValidationError(
                     "Mistral tokenizer is not supported for the 'lm-format-enforcer' "
@@ -1175,6 +1179,10 @@ class SamplingParams(
             # will satisfy the most use cases without having to worry about
             # this setting. We include fallback behavior here, but not with any
             # other setting where a specific backend was specified.
+            from vllm.v1.structured_output.backend_xgrammar import (
+                validate_xgrammar_grammar,
+            )
+
             try:
                 validate_xgrammar_grammar(self)
                 self.structured_outputs._backend = "xgrammar"
@@ -1182,6 +1190,11 @@ class SamplingParams(
                 # The request either failed validation
                 # or includes some jsonschema feature(s) that
                 # are not supported in xgrammar.
+
+                from vllm.v1.structured_output.backend_guidance import (
+                    has_guidance_unsupported_json_features,
+                    validate_guidance_grammar,
+                )
 
                 skip_guidance = _is_non_tekken_mistral(tokenizer)
 
@@ -1202,6 +1215,10 @@ class SamplingParams(
                 if skip_guidance:
                     # Fall back to outlines if the tokenizer is non-tekken Mistral or
                     # the schema contains features unsupported by guidance
+                    from vllm.v1.structured_output.backend_outlines import (
+                        validate_structured_output_request_outlines,
+                    )
+
                     validate_structured_output_request_outlines(self)
                     self.structured_outputs._backend = "outlines"
                 else:

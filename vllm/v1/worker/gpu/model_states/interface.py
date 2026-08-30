@@ -246,6 +246,16 @@ class ModelState(ABC):
         """
         return None
 
+    def custom_sample(
+        self,
+        model: nn.Module,
+        hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+        grammar_output: Any | None,
+    ) -> Any | None:
+        """Optionally sample directly from hidden states."""
+        return None
+
     num_new_sampled_tokens_per_step: int = 1
     """New tokens sampled on each decode step 
     (excluding accepted draft tokens, a.k.a num bonus tokens)."""

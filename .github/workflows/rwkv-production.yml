@@ -1,0 +1,756 @@
+name: RWKV production
+
+on:
+  pull_request:
+    branches: [rwkv]
+    types: [opened, synchronize, reopened, labeled]
+  push:
+    branches: [rwkv]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Deploy an existing validated SHA or roll back
+        required: true
+        type: choice
+        options:
+          - redeploy
+          - rollback
+      sha:
+        description: Validated 40-character SHA for redeploy
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: rwkv-production-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'production' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  authorize:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject untrusted GPU revision
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const trustedAssociations = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+            const trustedLabels = new Set(['verified', 'ready', 'ready-run-all-tests']);
+            const pull = context.payload.pull_request;
+            const trustedAssociation = trustedAssociations.has(pull.author_association);
+            const trustedLabel = pull.labels.some(label => trustedLabels.has(label.name));
+            const { data: mergedPulls } = await github.rest.search.issuesAndPullRequests({
+              q: `repo:${context.repo.owner}/${context.repo.repo} is:pr is:merged author:${pull.user.login}`,
+              per_page: 4,
+            });
+            const establishedContributor = mergedPulls.total_count >= 4;
+            if (!trustedAssociation && !trustedLabel && !establishedContributor) {
+              core.setFailed(
+                'This revision is not authorized to execute on the RWKV GPU runner.'
+              );
+            }
+
+  quality-gate:
+    if: >-
+      always() &&
+      github.event_name != 'workflow_dispatch' &&
+      (needs.authorize.result == 'success' || needs.authorize.result == 'skipped')
+    needs: authorize
+    runs-on: [self-hosted, linux, x64, "${{ 'rwkv-pro6000' }}"]
+    timeout-minutes: 360
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+      CUDA_HOME: /usr/local/cuda
+      CUDA_PATH: /usr/local/cuda
+      LD_LIBRARY_PATH: /usr/local/cuda/lib64
+      HTTP_PROXY: http://127.0.0.1:58011
+      HTTPS_PROXY: http://127.0.0.1:58011
+      NO_PROXY: 127.0.0.1,localhost
+      UV_LINK_MODE: copy
+      MAX_JOBS: "8"
+      TORCH_CUDA_ARCH_LIST: "8.9 12.0"
+      VLLM_BUILD_PROFILE: rwkv
+      RWKV15_ARTIFACT: /home/caizus/Weights/RWKV/hf/rwkv7-g1i-1.5b-20260805-ctx16384
+      RWKV72_ARTIFACT: /home/caizus/Weights/RWKV/hf/rwkv7-g1i-7.2b-20260805-ctx16384
+      RWKV72_PTH: /home/caizus/Weights/RWKV/rwkv7/pth/rwkv7-g1i-7.2b-20260805-ctx16384.pth
+      ALBATROSS_ENTRY: /home/caizus/Projects/MachineLearning/Albatross-vllm-rwkv-benchmark/faster3a_2607/rwkv7_fast_v3a.py
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Verify controlled runner tooling
+        run: |
+          set -euo pipefail
+          test "$(uv --version | awk '{print $2}')" = 0.11.14
+          test "$(uv python find 3.12)" = /usr/bin/python3.12
+
+      - name: Verify controlled host and model artifacts
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          test "$(nvidia-smi --id=0 --query-gpu=name --format=csv,noheader)" = \
+            "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+          /usr/local/cuda/bin/nvcc --version
+          for artifact in "$RWKV15_ARTIFACT" "$RWKV72_ARTIFACT"; do
+            test -f "$artifact/config.json"
+            test -f "$artifact/generation_config.json"
+            test -f "$artifact/fake_think_generation_config.json"
+            test -f "$artifact/tools_generation_config.json"
+          done
+          test -f "$RWKV72_PTH"
+          test -f "$ALBATROSS_ENTRY"
+
+      - name: Detect the expensive model gate
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == push ]]; then
+            required=true
+          else
+            changed="$(git diff --name-only "$BASE_SHA"...HEAD)"
+            if grep -Eq \
+              '^(\.github/workflows/rwkv-production\.yml|setup\.py|csrc/|CMakeLists.txt|cmake/|requirements/rwkv\.txt|vllm/(version\.py|platforms/cuda\.py|model_executor/(models/rwkv\.py|layers/quantization/utils/w8a8_utils\.py)|sampling_params\.py|v1/(attention/backends/(fa_utils|rwkv_attn)\.py|sample/ops/topk_topp_sampler\.py|structured_output/__init__\.py|worker/(gpu/|gpu_worker\.py))))' \
+              <<<"$changed"; then
+              required=true
+            else
+              required=false
+            fi
+          fi
+          echo "required=$required" >> "$GITHUB_OUTPUT"
+
+      - name: Create build environment
+        run: |
+          set -euo pipefail
+          uv venv --clear --python 3.12 .venv
+          uv pip install --python .venv/bin/python \
+            --requirements requirements/build/cuda.txt \
+            --requirements requirements/rwkv.txt \
+            pytest==9.1.0 pytest-asyncio tblib==3.2.2 \
+            --torch-backend=auto
+
+      - name: Run repository checks
+        run: |
+          set -euo pipefail
+          uv tool run --from pre-commit==4.5.1 \
+            pre-commit run --hook-stage manual --files \
+              .github/workflows/rwkv-production.yml \
+              CMakeLists.txt \
+              csrc/libtorch_stable/rwkv7/rwkv7_registration.cpp \
+              requirements/rwkv.txt \
+              scripts/deploy_rwkv_production.sh \
+              setup.py \
+              tests/v1/structured_output/test_validation.py \
+              vllm/model_executor/layers/quantization/utils/w8a8_utils.py \
+              vllm/model_executor/models/rwkv.py \
+              vllm/platforms/cuda.py \
+              vllm/sampling_params.py \
+              vllm/v1/attention/backends/fa_utils.py \
+              vllm/v1/sample/ops/topk_topp_sampler.py \
+              vllm/v1/structured_output/__init__.py \
+              vllm/v1/worker/gpu_worker.py \
+              vllm/version.py
+          .venv/bin/python -m pytest --import-mode=importlib -q \
+            tests/models/rwkv/test_rwkv.py \
+            tests/tool_parsers/test_rwkv_tool_parser.py \
+            tests/transformers_utils/test_config.py::test_named_generation_config_does_not_fall_back_to_model_config \
+            tests/v1/structured_output/test_validation.py::test_explicit_xgrammar_does_not_import_optional_backends \
+            tests/v1/core/test_single_type_kv_cache_manager.py::test_state_spec_can_request_provider_managed_block_reset
+          .venv/bin/python -m pytest --noconftest --import-mode=importlib -q \
+            tests/entrypoints/openai/responses/test_sampling_params.py
+          .venv/bin/python - <<'PY'
+          from vllm.entrypoints.openai.chat_completion.protocol import (
+              ChatCompletionRequest,
+          )
+          from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+
+          serving = object.__new__(OpenAIServingChat)
+          serving.default_sampling_params = {"profile": "open_think"}
+          serving._rwkv_sampling_profiles = {
+              "open_think": serving.default_sampling_params,
+              "fake_think": {"profile": "fake_think"},
+              "tools": {"profile": "tools"},
+          }
+          request = ChatCompletionRequest(
+              messages=[{"role": "user", "content": "Hello"}],
+              tools=[{
+                  "type": "function",
+                  "function": {
+                      "name": "get_weather",
+                      "parameters": {"type": "object"},
+                  },
+              }],
+          )
+          defaults = serving._sampling_defaults_for_request(
+              request, {"rwkv_generation_prompt": "fake_think"}
+          )
+          assert defaults["profile"] == "tools"
+          PY
+
+      - name: Build the reduced RWKV wheel
+        run: |
+          set -euo pipefail
+          rm -rf dist release
+          .venv/bin/python setup.py bdist_wheel --dist-dir dist
+          test "$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 1
+          .venv/bin/python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheel = next(Path("dist").glob("*.whl"))
+          with ZipFile(wheel) as archive:
+              native_members = [
+                  name
+                  for name in archive.namelist()
+                  if name.startswith("vllm/") and name.endswith(".so")
+              ]
+          assert len(native_members) == 1, native_members
+          assert "/rwkv7_ops." in native_members[0], native_members
+          PY
+          uv venv --clear --relocatable --python 3.12 release/.venv
+          uv pip install --python release/.venv/bin/python \
+            dist/*.whl \
+            --torch-backend=auto
+          PYTHONSAFEPATH=1 release/.venv/bin/python - <<'PY'
+          from importlib.metadata import version
+
+          import flashrwkv2
+          import torch
+          import vllm
+          import vllm.rwkv7_ops
+
+          assert flashrwkv2.__version__ == "0.1.0a13"
+          distribution_version = version("vllm")
+          assert "rwkv" in distribution_version.split("+", 1)[1].split(".")
+          cpu = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+          assert torch.ops._C.get_cuda_view_from_cpu_tensor(cpu).is_cuda
+          print(
+              f"vLLM={distribution_version} "
+              f"FlashRWKV2={flashrwkv2.__version__}"
+          )
+          PY
+          printf '%s\n' "$PWD/release/.venv/bin" >> "$GITHUB_PATH"
+          PATH="$PWD/release/.venv/bin:$PATH" \
+            PYTHONSAFEPATH=1 \
+            release/.venv/bin/python -m flashrwkv2.compile \
+            > release/flashrwkv2-sm120.json
+          PYTHONSAFEPATH=1 release/.venv/bin/python - <<'PY'
+          import json
+          from pathlib import Path
+
+          from torch.utils.cpp_extension import get_default_build_root
+
+          result = json.loads(Path("release/flashrwkv2-sm120.json").read_text())
+          cache = Path(get_default_build_root()).resolve()
+          library = Path(result["library"]).resolve()
+          assert result["status"] in {"compiled", "cached"}, result
+          assert result["target"] == "sm120", result
+          assert library.is_relative_to(cache), (library, cache)
+          assert library.is_file(), library
+          PY
+
+      - name: Smoke-test the exact release environment
+        run: |
+          set -euo pipefail
+          export PYTHONSAFEPATH=1
+          unset VLLM_BUILD_PROFILE
+          log="$RUNNER_TEMP/rwkv15-service.log"
+          release/.venv/bin/vllm serve "$RWKV15_ARTIFACT" \
+            --served-model-name rwkv7-g1i-1.5b \
+            --host 127.0.0.1 \
+            --port 18080 \
+            --dtype float16 \
+            --mamba-ssm-cache-dtype float16 \
+            --max-model-len 16384 \
+            --max-num-seqs 4 \
+            --gpu-memory-utilization 0.70 \
+            --enable-chunked-prefill \
+            --enable-prefix-caching \
+            --async-scheduling \
+            --structured-outputs-config.backend xgrammar \
+            --enable-auto-tool-choice \
+            --tool-call-parser rwkv >"$log" 2>&1 &
+          server_pid=$!
+          trap 'status=$?; kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; if (( status )); then tail -200 "$log"; fi; exit "$status"' EXIT
+          for _ in $(seq 1 240); do
+            if release/.venv/bin/python - <<'PY' >/dev/null 2>&1
+          import urllib.request
+          with urllib.request.urlopen("http://127.0.0.1:18080/health", timeout=2) as response:
+              assert response.status == 200
+          PY
+            then
+              break
+            fi
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              tail -200 "$log"
+              exit 1
+            fi
+            sleep 5
+          done
+          release/.venv/bin/python - <<'PY'
+          import json
+          import sys
+          import urllib.error
+          import urllib.request
+
+          def post(path: str, body: dict) -> dict:
+              request = urllib.request.Request(
+                  f"http://127.0.0.1:18080{path}",
+                  data=json.dumps(body).encode(),
+                  headers={"Content-Type": "application/json"},
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=180) as response:
+                      assert response.status == 200
+                      return json.load(response)
+              except urllib.error.HTTPError as error:
+                  print(error.read().decode(), file=sys.stderr)
+                  raise
+
+          chat = post("/v1/chat/completions", {
+              "model": "rwkv7-g1i-1.5b",
+              "messages": [{"role": "user", "content": "Reply with OK."}],
+              "temperature": 0,
+              "max_tokens": 8,
+          })
+          assert chat["choices"]
+          responses = post("/v1/responses", {
+              "model": "rwkv7-g1i-1.5b",
+              "input": "Reply with OK.",
+              "temperature": 0,
+              "max_output_tokens": 8,
+          })
+          assert responses["output"]
+          completions = post("/v1/completions", {
+              "model": "rwkv7-g1i-1.5b",
+              "prompt": "Reply with OK.",
+              "temperature": 0,
+              "max_tokens": 8,
+          })
+          assert completions["choices"]
+          fake_think = post("/v1/chat/completions", {
+              "model": "rwkv7-g1i-1.5b",
+              "messages": [{"role": "user", "content": "Reply with OK."}],
+              "chat_template_kwargs": {"rwkv_generation_prompt": "fake_think"},
+              "max_tokens": 8,
+          })
+          assert fake_think["choices"]
+          tools = post("/v1/chat/completions", {
+              "model": "rwkv7-g1i-1.5b",
+              "messages": [{"role": "user", "content": "Reply with OK."}],
+              "tools": [{
+                  "type": "function",
+                  "function": {
+                      "name": "noop",
+                      "description": "Do nothing.",
+                      "parameters": {"type": "object", "properties": {}},
+                  },
+              }],
+              "tool_choice": "none",
+              "max_tokens": 8,
+          })
+          assert tools["choices"]
+          structured = post("/v1/chat/completions", {
+              "model": "rwkv7-g1i-1.5b",
+              "messages": [{"role": "user", "content": "Reply with OK."}],
+              "structured_outputs": {"choice": ["OK"]},
+              "temperature": 0,
+              "max_tokens": 8,
+          })
+          assert structured["choices"][0]["message"]["content"] == "OK"
+          json_schema = post("/v1/chat/completions", {
+              "model": "rwkv7-g1i-1.5b",
+              "messages": [{
+                  "role": "user",
+                  "content": "Return a JSON object with the boolean field ok.",
+              }],
+              "structured_outputs": {"json": {
+                  "type": "object",
+                  "properties": {"ok": {"type": "boolean"}},
+                  "required": ["ok"],
+                  "additionalProperties": False,
+              }},
+              "temperature": 0,
+              "max_tokens": 16,
+          })
+          parsed = json.loads(json_schema["choices"][0]["message"]["content"])
+          assert set(parsed) == {"ok"}
+          assert isinstance(parsed["ok"], bool)
+
+          stream_request = urllib.request.Request(
+              "http://127.0.0.1:18080/v1/chat/completions",
+              data=json.dumps({
+                  "model": "rwkv7-g1i-1.5b",
+                  "messages": [{"role": "user", "content": "Reply with OK."}],
+                  "temperature": 0,
+                  "max_tokens": 8,
+                  "stream": True,
+              }).encode(),
+              headers={"Content-Type": "application/json"},
+          )
+          with urllib.request.urlopen(stream_request, timeout=180) as response:
+              stream = response.read().decode()
+          assert "data: " in stream
+          assert "data: [DONE]" in stream
+          PY
+
+      - name: Run Albatross numerical reference
+        if: steps.scope.outputs.required == 'true'
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/rwkv-gate"
+          mkdir -p "$evidence"
+          release/.venv/bin/python - "$ALBATROSS_ENTRY" "$RWKV72_ARTIFACT" "$RWKV72_PTH" "$evidence" <<'PY'
+          import importlib.util
+          import json
+          import sys
+          from pathlib import Path
+
+          import torch
+          from transformers import AutoTokenizer
+
+          entry, artifact, model_path, evidence = sys.argv[1:]
+          spec = importlib.util.spec_from_file_location("albatross_rwkv7", entry)
+          assert spec and spec.loader
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          module.MODEL_PATH = model_path
+          module.WKV_MODE = "fp16"
+          module.load_extensions("fp16")
+          model = module.RWKV7()
+          tokenizer = AutoTokenizer.from_pretrained(artifact, trust_remote_code=True)
+          prompt_ids = tokenizer.encode("The capital of France is", add_special_tokens=False)
+          token_device = "cpu" if model.emb_cpu else module.first_device()
+          state = model.zero_state(1)
+          tokens = torch.tensor(prompt_ids, dtype=torch.long, device=token_device).view(1, -1)
+          logits = model.forward(tokens, state)
+          generated = []
+          for _ in range(16):
+              token = int(torch.argmax(logits, dim=-1).item())
+              generated.append(token)
+              step = torch.tensor([[token]], dtype=torch.long, device=token_device)
+              logits = model.forward(step, state)
+          Path(evidence, "albatross_tokens.json").write_text(json.dumps({
+              "prompt_token_ids": prompt_ids,
+              "output_token_ids": generated,
+          }))
+          PY
+          env -u VLLM_BUILD_PROFILE \
+            PYTHONSAFEPATH=1 \
+            release/.venv/bin/python - "$RWKV72_ARTIFACT" "$evidence" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          from vllm import LLM, SamplingParams
+
+          artifact, evidence = sys.argv[1:]
+          reference = json.loads(Path(evidence, "albatross_tokens.json").read_text())
+          llm = LLM(
+              model=artifact,
+              dtype="float16",
+              mamba_ssm_cache_dtype="float16",
+              enable_chunked_prefill=True,
+              enable_prefix_caching=True,
+              max_num_seqs=1,
+          )
+          output = llm.generate(
+              [{"prompt_token_ids": reference["prompt_token_ids"]}],
+              SamplingParams(temperature=0, max_tokens=16, ignore_eos=True),
+          )[0].outputs[0]
+          actual = list(output.token_ids)
+          Path(evidence, "vllm_tokens.json").write_text(json.dumps({
+              "output_token_ids": actual,
+          }))
+          if actual != reference["output_token_ids"]:
+              raise SystemExit(
+                  f"greedy token mismatch: Albatross={reference['output_token_ids']} "
+                  f"vLLM={actual}"
+              )
+          PY
+
+      - name: Run Albatross throughput reference
+        if: steps.scope.outputs.required == 'true'
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/rwkv-gate"
+          release/.venv/bin/python "$ALBATROSS_ENTRY" \
+            --model "$RWKV72_PTH" \
+            --warmup 3 \
+            --iters 5 \
+            --cases 1x1,4x1,64x1,320x1,512x1,1x16,4x16,64x16,320x16,512x16 \
+            | tee "$evidence/albatross-throughput.log"
+
+      - name: Run official vLLM serving benchmark
+        if: steps.scope.outputs.required == 'true'
+        run: |
+          set -euo pipefail
+          export PYTHONSAFEPATH=1
+          unset VLLM_BUILD_PROFILE
+          evidence="$RUNNER_TEMP/rwkv-gate"
+          log="$evidence/vllm72-service.log"
+          release/.venv/bin/vllm serve "$RWKV72_ARTIFACT" \
+            --served-model-name rwkv7-g1i-7.2b \
+            --host 127.0.0.1 \
+            --port 18080 \
+            --dtype float16 \
+            --mamba-ssm-cache-dtype float16 \
+            --max-model-len 16384 \
+            --max-num-seqs 512 \
+            --gpu-memory-utilization 0.95 \
+            --enable-chunked-prefill \
+            --enable-prefix-caching \
+            --async-scheduling >"$log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 240); do
+            if release/.venv/bin/python - <<'PY' >/dev/null 2>&1
+          import urllib.request
+          with urllib.request.urlopen("http://127.0.0.1:18080/health", timeout=2) as response:
+              assert response.status == 200
+          PY
+            then
+              break
+            fi
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              tail -200 "$log"
+              exit 1
+            fi
+            sleep 5
+          done
+          for repetition in 1 2 3; do
+            for batch in 1 4 64 320 512; do
+              release/.venv/bin/vllm bench serve \
+                --backend vllm \
+                --base-url http://127.0.0.1:18080 \
+                --model "$RWKV72_ARTIFACT" \
+                --served-model-name rwkv7-g1i-7.2b \
+                --dataset-name random \
+                --random-input-len 16 \
+                --random-output-len 32 \
+                --num-prompts "$batch" \
+                --num-warmups 1 \
+                --request-rate inf \
+                --max-concurrency "$batch" \
+                --temperature 0 \
+                --ignore-eos \
+                --save-result \
+                --save-detailed \
+                --result-dir "$evidence" \
+                --result-filename "vllm-b${batch}-r${repetition}.json"
+            done
+          done
+
+      - name: Record Albatross performance comparison
+        if: steps.scope.outputs.required == 'true'
+        run: |
+          set -euo pipefail
+          release/.venv/bin/python - "$RUNNER_TEMP/rwkv-gate" <<'PY'
+          import json
+          import re
+          import statistics
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          pattern = re.compile(
+              r"RESULT B=(\d+) T=(\d+).*tok_s_p50=([0-9.]+)"
+          )
+          reference = {}
+          for line in (root / "albatross-throughput.log").read_text().splitlines():
+              match = pattern.search(line)
+              if match:
+                  reference[(int(match[1]), int(match[2]))] = float(match[3])
+
+          report = {"batches": {}}
+          request_failures = []
+          for batch in (1, 4, 64, 320, 512):
+              prefills = []
+              decodes = []
+              for repetition in (1, 2, 3):
+                  result = json.loads(
+                      (root / f"vllm-b{batch}-r{repetition}.json").read_text()
+                  )
+                  if result["completed"] != batch or result.get("failed", 0):
+                      request_failures.append(
+                          f"B={batch} R={repetition}: incomplete requests"
+                      )
+                      continue
+                  first_token_latency = max(result["ttfts"])
+                  prefills.append(
+                      result["total_input_tokens"] / first_token_latency
+                  )
+                  decodes.append(
+                      result["total_output_tokens"]
+                      / (result["duration"] - first_token_latency)
+                  )
+              if len(prefills) != 3:
+                  continue
+              prefill = statistics.median(prefills)
+              decode = statistics.median(decodes)
+              ref_prefill = reference[(batch, 16)]
+              ref_decode = reference[(batch, 1)]
+              report["batches"][str(batch)] = {
+                  "vllm_prefill_tok_s": prefill,
+                  "albatross_prefill_tok_s": ref_prefill,
+                  "prefill_ratio": prefill / ref_prefill,
+                  "vllm_decode_tok_s": decode,
+                  "albatross_decode_tok_s": ref_decode,
+                  "decode_ratio": decode / ref_decode,
+              }
+          (root / "performance-comparison.json").write_text(
+              json.dumps(report, indent=2, sort_keys=True)
+          )
+          if request_failures:
+              raise SystemExit("\n".join(request_failures))
+          PY
+
+      - name: Package the exact successful release
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          artifact_root="/home/caizus/artifacts/vllm-rwkv/$GITHUB_SHA"
+          bundle="$artifact_root/vllm-rwkv-$GITHUB_SHA.tar.gz"
+          mkdir -p "$artifact_root"
+          test ! -e "$bundle"
+          printf '%s\n' "$GITHUB_SHA" > release/GIT_SHA
+          uv pip freeze --python release/.venv/bin/python > release/requirements.freeze
+          tar -czf "$bundle" -C release .venv GIT_SHA requirements.freeze
+          (
+            cd "$artifact_root"
+            sha256sum "$(basename "$bundle")" > "$(basename "$bundle").sha256"
+          )
+          mkdir -p artifacts/rwkv-production
+          cp "$RUNNER_TEMP/rwkv-gate/performance-comparison.json" \
+            artifacts/rwkv-production/
+          cp "$RUNNER_TEMP/rwkv-gate/albatross_tokens.json" \
+            artifacts/rwkv-production/
+          cp "$RUNNER_TEMP/rwkv-gate/vllm_tokens.json" \
+            artifacts/rwkv-production/
+          cp release/flashrwkv2-sm120.json artifacts/rwkv-production/
+          cp "$artifact_root/$(basename "$bundle").sha256" \
+            artifacts/rwkv-production/
+
+      - name: Upload release evidence
+        if: always() && github.event_name == 'push'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rwkv-production-evidence-${{ github.sha }}
+          path: artifacts/rwkv-production
+          if-no-files-found: error
+
+  deploy:
+    if: >-
+      always() &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      (needs.quality-gate.result == 'success' || needs.quality-gate.result == 'skipped')
+    needs: quality-gate
+    runs-on: [self-hosted, linux, x64, "${{ 'rwkv-pro6000' }}"]
+    timeout-minutes: 180
+    environment: production
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_JUMP_HOST: ${{ secrets.DEPLOY_JUMP_HOST }}
+      DEPLOY_JUMP_PORT: ${{ secrets.DEPLOY_JUMP_PORT }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event_name == 'push' && github.sha || 'rwkv' }}
+
+      - name: Configure deployment SSH identity
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_HOST"
+          test -n "$DEPLOY_PORT"
+          test -n "$DEPLOY_USER"
+          test -n "$DEPLOY_JUMP_HOST"
+          test -n "$DEPLOY_JUMP_PORT"
+          test -n "$DEPLOY_SSH_KEY"
+          test -n "$DEPLOY_KNOWN_HOSTS"
+          install -m 0700 -d "$RUNNER_TEMP/deploy-ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$RUNNER_TEMP/deploy-ssh/key"
+          chmod 0600 "$RUNNER_TEMP/deploy-ssh/key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$RUNNER_TEMP/deploy-ssh/known_hosts"
+          chmod 0600 "$RUNNER_TEMP/deploy-ssh/known_hosts"
+
+      - name: Deploy validated release or roll back
+        env:
+          REQUESTED_ACTION: ${{ github.event.inputs.action }}
+          REQUESTED_SHA: ${{ github.event.inputs.sha }}
+        run: |
+          set -euo pipefail
+          proxy_jump="$DEPLOY_USER@$DEPLOY_JUMP_HOST:$DEPLOY_JUMP_PORT"
+          ssh_args=(
+            -i "$RUNNER_TEMP/deploy-ssh/key"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o "UserKnownHostsFile=$RUNNER_TEMP/deploy-ssh/known_hosts"
+            -J "$proxy_jump"
+            -p "$DEPLOY_PORT"
+          )
+          target="$DEPLOY_USER@$DEPLOY_HOST"
+          scp_args=(
+            -i "$RUNNER_TEMP/deploy-ssh/key"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o "UserKnownHostsFile=$RUNNER_TEMP/deploy-ssh/known_hosts"
+            -o "ProxyJump=$proxy_jump"
+            -P "$DEPLOY_PORT"
+          )
+          scp "${scp_args[@]}" scripts/deploy_rwkv_production.sh \
+            "$target:/tmp/deploy_rwkv_production.sh"
+
+          if [[ "${{ github.event_name }}" == workflow_dispatch && \
+                "$REQUESTED_ACTION" == rollback ]]; then
+            ssh "${ssh_args[@]}" "$target" \
+              'sudo install -m 0755 /tmp/deploy_rwkv_production.sh /usr/local/sbin/deploy_rwkv_production && sudo /usr/local/sbin/deploy_rwkv_production rollback'
+            exit 0
+          fi
+
+          if [[ "${{ github.event_name }}" == push ]]; then
+            release_sha="$GITHUB_SHA"
+          else
+            release_sha="$REQUESTED_SHA"
+          fi
+          [[ $release_sha =~ ^[0-9a-f]{40}$ ]]
+          artifact_root="/home/caizus/artifacts/vllm-rwkv/$release_sha"
+          bundle="$artifact_root/vllm-rwkv-$release_sha.tar.gz"
+          checksum="$bundle.sha256"
+          test -f "$bundle"
+          test -f "$checksum"
+          scp "${scp_args[@]}" "$bundle" "$checksum" \
+            "$target:/tmp/"
+          bundle_name=$(basename "$bundle")
+          checksum_name=$(basename "$checksum")
+          ssh "${ssh_args[@]}" "$target" bash -s -- \
+            "$release_sha" "$bundle_name" "$checksum_name" <<'REMOTE'
+          set -euo pipefail
+          release_sha=$1
+          bundle_name=$2
+          checksum_name=$3
+          sudo install -m 0755 /tmp/deploy_rwkv_production.sh \
+            /usr/local/sbin/deploy_rwkv_production
+          sudo install -d -m 0755 /opt/rwkv/vllm/incoming
+          sudo mv "/tmp/$bundle_name" /opt/rwkv/vllm/incoming/
+          sudo mv "/tmp/$checksum_name" /opt/rwkv/vllm/incoming/
+          sudo /usr/local/sbin/deploy_rwkv_production deploy \
+            "$release_sha" \
+            "/opt/rwkv/vllm/incoming/$bundle_name" \
+            "/opt/rwkv/vllm/incoming/$checksum_name"
+          REMOTE
+
+      - name: Remove temporary SSH material
+        if: always()
+        run: rm -f "$RUNNER_TEMP/deploy-ssh/key" "$RUNNER_TEMP/deploy-ssh/known_hosts"

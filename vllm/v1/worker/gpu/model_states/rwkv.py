@@ -15,17 +15,74 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
-from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 
+class _RwkvSamplingGraph:
+    def __init__(
+        self,
+        model: nn.Module,
+        sample: Any,
+        penalties: torch.Tensor,
+        states: torch.Tensor,
+        capacity: int,
+    ) -> None:
+        device = penalties.device
+        hidden_size = model.lm_head.weight.shape[1]
+        self.hidden_states = torch.empty(
+            capacity, hidden_size, dtype=torch.float16, device=device
+        )
+        self.slot_indices = torch.arange(capacity, dtype=torch.int32, device=device)
+        self.presence_penalty = torch.zeros(capacity, device=device)
+        self.frequency_penalty = torch.zeros(capacity, device=device)
+        self.penalty_decay = torch.ones(capacity, device=device)
+        self.temperature = torch.zeros(capacity, device=device)
+        self.top_k = torch.full((capacity,), -1, dtype=torch.int32, device=device)
+        self.top_p = torch.ones(capacity, device=device)
+        self.num_active = torch.full((1,), capacity, dtype=torch.int32, device=device)
+
+        def forward() -> tuple[torch.Tensor, torch.Tensor]:
+            logits = model.compute_logits(self.hidden_states)
+            sampled = sample(
+                logits,
+                penalties,
+                states,
+                self.slot_indices,
+                presence_penalty=self.presence_penalty,
+                frequency_penalty=self.frequency_penalty,
+                penalty_decay=self.penalty_decay,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
+                sample_capacity=capacity,
+                num_active_samples=self.num_active,
+            )
+            return logits, sampled
+
+        capture_stream = torch.cuda.Stream(device=device)
+        capture_stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(capture_stream):
+            for _ in range(3):
+                self.logits, self.sampled = forward()
+        torch.cuda.current_stream(device).wait_stream(capture_stream)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph, stream=capture_stream):
+            self.logits, self.sampled = forward()
+
+
 class RwkvSampler(Sampler):
     """FlashRWKV2 Rapid-Sampling with state isolated by request slot."""
 
-    def __init__(self, sampler: Sampler) -> None:
+    def __init__(
+        self,
+        sampler: Sampler,
+        model: nn.Module,
+        capture_graphs: bool,
+    ) -> None:
         self.__dict__.update(sampler.__dict__)
         flashrwkv2 = _load_flashrwkv2()
         self._sample = flashrwkv2.infer_sampling_six_parameter_forward_varlen
@@ -51,6 +108,103 @@ class RwkvSampler(Sampler):
             tuple[int, tuple[torch.Tensor, torch.Tensor] | None]
         ] = []
         self._input_batch: InputBatch | None = None
+        self._sampling_graphs: dict[int, _RwkvSamplingGraph] = {}
+        if capture_graphs:
+            capacities = (1, 2, 4, 8, 16, 32, 64, 128, 256, 320, 512)
+            for capacity in capacities:
+                if capacity <= max_num_reqs:
+                    self._sampling_graphs[capacity] = _RwkvSamplingGraph(
+                        model,
+                        self._sample,
+                        self._rapid_penalties,
+                        self._rapid_sampling_states,
+                        capacity,
+                    )
+            if max_num_reqs not in self._sampling_graphs:
+                self._sampling_graphs[max_num_reqs] = _RwkvSamplingGraph(
+                    model,
+                    self._sample,
+                    self._rapid_penalties,
+                    self._rapid_sampling_states,
+                    max_num_reqs,
+                )
+
+    def sample_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+        grammar_output: Any | None,
+    ) -> SamplerOutput | None:
+        idx_mapping_np = input_batch.idx_mapping_np
+        if (
+            grammar_output is not None
+            or self.compute_nans
+            or self.get_logprobs_dims(idx_mapping_np) is not None
+            or np.any(self.needs_logits_processing[idx_mapping_np])
+            or not self._sampling_graphs
+        ):
+            return None
+
+        num_reqs = input_batch.num_reqs
+        finishes_prefill = (
+            input_batch.num_computed_prefill_tokens_np[:num_reqs]
+            + input_batch.num_scheduled_tokens[:num_reqs]
+            >= input_batch.prefill_len_np[:num_reqs]
+        )
+        active_rows_np = np.flatnonzero(finishes_prefill)
+        num_active = len(active_rows_np)
+        if num_active == 0:
+            return None
+        capacity = next(size for size in self._sampling_graphs if size >= num_active)
+        sampling_graph = self._sampling_graphs[capacity]
+        active_slots_np = idx_mapping_np[active_rows_np]
+        self._active_rows.np[:num_active] = active_rows_np
+        self._active_slots.np[:num_active] = active_slots_np
+        active_rows = self._active_rows.copy_to_uva(num_active)
+        active_slots = self._active_slots.copy_to_uva(num_active)
+        active_slots_i64 = input_batch.idx_mapping[active_rows]
+
+        sampling_graph.hidden_states[:num_active].copy_(
+            hidden_states.index_select(0, active_rows)
+        )
+        sampling_graph.slot_indices[:num_active].copy_(active_slots)
+        sampling_graph.presence_penalty[:num_active].copy_(
+            self._presence_penalty.gpu[active_slots_i64]
+        )
+        sampling_graph.frequency_penalty[:num_active].copy_(
+            self._frequency_penalty.gpu[active_slots_i64]
+        )
+        sampling_graph.penalty_decay[:num_active].copy_(
+            self._penalty_decay.gpu[active_slots_i64]
+        )
+        sampling_graph.temperature[:num_active].copy_(
+            self.sampling_states.temperature.gpu[active_slots_i64]
+        )
+        sampling_graph.top_k[:num_active].copy_(
+            self.sampling_states.top_k.gpu[active_slots_i64]
+        )
+        sampling_graph.top_p[:num_active].copy_(
+            self.sampling_states.top_p.gpu[active_slots_i64]
+        )
+        sampling_graph.num_active.fill_(num_active)
+        sampling_graph.graph.replay()
+
+        sampled = torch.zeros(num_reqs, dtype=torch.int64, device=hidden_states.device)
+        sampled[active_rows] = sampling_graph.sampled[:num_active].to(torch.int64)
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            input_batch.seq_lens.new_ones(num_reqs),
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.req_states.prefill_len.gpu,
+        )
+        return SamplerOutput(
+            sampled_token_ids=sampled.view(-1, 1),
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+        )
 
     def stage_request(self, req_idx: int, req_id: str) -> None:
         self._new_requests.append((req_idx, self._preserved_requests.pop(req_id, None)))
@@ -179,11 +333,6 @@ class RwkvSampler(Sampler):
         active_slots = self._active_slots.copy_to_uva(num_active)
         active_slots_i64 = idx_mapping[active_rows]
         active_logits = logits if num_active == num_reqs else logits[active_rows]
-        active_logits = torch.empty(
-            active_logits.shape,
-            dtype=torch.float32,
-            device=active_logits.device,
-        ).copy_(active_logits)
         active_logits = self._apply_logits_processors(
             active_logits,
             active_slots_i64,
@@ -230,10 +379,35 @@ class RwkvModelState(DefaultModelState):
         self._state_num_computed_tokens = np.zeros(self.max_num_reqs, dtype=np.int64)
         self._rwkv_group_id: int | None = None
         self._sampler: RwkvSampler | None = None
+        self._model = model
+        cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
+        self._capture_sampling_graphs = bool(
+            cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs()
+        )
 
     def custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
-        self._sampler = RwkvSampler(sampler)
+        self._sampler = RwkvSampler(
+            sampler,
+            self._model,
+            self._capture_sampling_graphs,
+        )
         return self._sampler, None
+
+    def custom_sample(
+        self,
+        model: nn.Module,
+        hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+        grammar_output: Any | None,
+    ) -> SamplerOutput | None:
+        del model
+        if self._sampler is None:
+            return None
+        return self._sampler.sample_hidden_states(
+            hidden_states,
+            input_batch,
+            grammar_output,
+        )
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
