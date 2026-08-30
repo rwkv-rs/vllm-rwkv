@@ -267,7 +267,7 @@ import torch
 result = json.loads(Path(sys.argv[1]).read_text())
 cache = Path(sys.argv[2]).resolve()
 library = Path(result["library"]).resolve()
-assert flashrwkv2.__version__ == "0.1.0a12"
+assert flashrwkv2.__version__ == "0.1.0a13"
 assert torch.cuda.get_device_capability() == (8, 9)
 assert result["status"] in {"compiled", "cached"}, result
 assert result["target"] == "sm89", result
