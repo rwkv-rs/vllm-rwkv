@@ -8,6 +8,14 @@ X-Frame-Options = "DENY"
 Referrer-Policy = "no-referrer"
 
 [[routes]]
+id = "health"
+path_prefix = "/health"
+action = "proxy"
+upstream = "http://127.0.0.1:18000"
+allowed_methods = ["GET"]
+buffer_response = false
+
+[[routes]]
 id = "openai-api"
 path_prefix = "/v1/"
 action = "proxy"
