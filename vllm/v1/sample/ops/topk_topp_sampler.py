@@ -11,6 +11,7 @@ from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import HAS_TRITON
+from vllm.version import is_reduced_rwkv_build
 
 if HAS_TRITON:
     from vllm.v1.sample.ops.topk_topp_triton import (
@@ -90,7 +91,7 @@ def flashinfer_sampler_supported() -> bool:
     post-top-k/top-p logits/logprobs for any request whose logprobs will be
     returned in this step, since FlashInfer doesn't expose those.
     """
-    if not current_platform.is_cuda():
+    if is_reduced_rwkv_build() or not current_platform.is_cuda():
         return False
     if not envs.VLLM_USE_FLASHINFER_SAMPLER:
         logger.info_once(
