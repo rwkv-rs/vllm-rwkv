@@ -146,6 +146,7 @@ jobs:
               scripts/deploy_rwkv_production.sh \
               setup.py \
               vllm/model_executor/layers/quantization/utils/w8a8_utils.py \
+              vllm/model_executor/models/rwkv.py \
               vllm/platforms/cuda.py \
               vllm/v1/attention/backends/fa_utils.py \
               vllm/v1/sample/ops/topk_topp_sampler.py \
