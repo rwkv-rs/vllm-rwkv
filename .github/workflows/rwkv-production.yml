@@ -541,6 +541,7 @@ jobs:
                 --temperature 0 \
                 --ignore-eos \
                 --save-result \
+                --save-detailed \
                 --result-dir "$evidence" \
                 --result-filename "vllm-b${batch}-r${repetition}.json"
             done
