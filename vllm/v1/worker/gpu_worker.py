@@ -62,7 +62,6 @@ from vllm.model_executor.model_loader.weight_checksum import (
     compute_tensor_digests,
     zero_weights,
 )
-from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.multimodal.gpu_ipc_memory import reserve_mm_ipc_gpu_memory
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import (
@@ -100,10 +99,19 @@ from vllm.v1.worker.startup_plan import (
 )
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
+from vllm.version import is_reduced_rwkv_build
 
 from ...model_executor.model_loader import TensorizerLoader
 from .gpu.cudagraph_utils import has_compiled_submodule
 from .gpu.warmup import warmup_kernels
+
+if is_reduced_rwkv_build():
+
+    def kernel_warmup(worker: "Worker", *, process_local_only: bool = False) -> None:
+        """Skip warmups for native operators omitted by the RWKV wheel."""
+
+else:
+    from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from .utils import request_memory
 
 logger = init_logger(__name__)

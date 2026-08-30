@@ -114,7 +114,7 @@ jobs:
           else
             changed="$(git diff --name-only "$BASE_SHA"...HEAD)"
             if grep -Eq \
-              '^(\.github/workflows/rwkv-production\.yml|setup\.py|csrc/|CMakeLists.txt|cmake/|requirements/rwkv\.txt|vllm/(platforms/cuda\.py|model_executor/models/rwkv\.py|sampling_params\.py|v1/attention/backends/rwkv_attn\.py|v1/worker/gpu/))' \
+              '^(\.github/workflows/rwkv-production\.yml|setup\.py|csrc/|CMakeLists.txt|cmake/|requirements/rwkv\.txt|vllm/(version\.py|platforms/cuda\.py|model_executor/(models/rwkv\.py|layers/quantization/utils/w8a8_utils\.py)|sampling_params\.py|v1/(attention/backends/(fa_utils|rwkv_attn)\.py|worker/(gpu/|gpu_worker\.py))))' \
               <<<"$changed"; then
               required=true
             else
@@ -142,8 +142,11 @@ jobs:
               requirements/rwkv.txt \
               scripts/deploy_rwkv_production.sh \
               setup.py \
+              vllm/model_executor/layers/quantization/utils/w8a8_utils.py \
               vllm/platforms/cuda.py \
-              vllm/v1/attention/backends/fa_utils.py
+              vllm/v1/attention/backends/fa_utils.py \
+              vllm/v1/worker/gpu_worker.py \
+              vllm/version.py
           .venv/bin/python -m pytest --import-mode=importlib -q \
             tests/models/rwkv/test_rwkv.py \
             tests/tool_parsers/test_rwkv_tool_parser.py \

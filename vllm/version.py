@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from functools import cache
+from importlib.metadata import PackageNotFoundError, version
+
 try:
     from ._version import __version__, __version_tuple__
 except Exception as e:
@@ -10,6 +13,15 @@ except Exception as e:
 
     __version__ = "dev"
     __version_tuple__ = (0, 0, __version__)
+
+
+@cache
+def is_reduced_rwkv_build() -> bool:
+    try:
+        distribution_version = version("vllm")
+    except PackageNotFoundError:
+        return False
+    return "rwkv" in distribution_version.partition("+")[2].split(".")
 
 
 def _prev_minor_version_was(version_str):
