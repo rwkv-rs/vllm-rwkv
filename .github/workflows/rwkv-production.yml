@@ -142,7 +142,8 @@ jobs:
               requirements/rwkv.txt \
               scripts/deploy_rwkv_production.sh \
               setup.py \
-              vllm/platforms/cuda.py
+              vllm/platforms/cuda.py \
+              vllm/v1/attention/backends/fa_utils.py
           .venv/bin/python -m pytest --import-mode=importlib -q \
             tests/models/rwkv/test_rwkv.py \
             tests/tool_parsers/test_rwkv_tool_parser.py \

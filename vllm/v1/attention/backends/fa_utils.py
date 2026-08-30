@@ -3,8 +3,6 @@
 
 from typing import Any
 
-from packaging.version import Version
-
 import vllm.envs as envs
 from vllm import __version__
 from vllm.logger import init_logger
@@ -22,10 +20,8 @@ FA4_HD256_PAGE_SIZE = 128
 # consistent behavior (similar to IS_AITER_FOUND in _aiter_ops.py).
 _ROCM_FLASH_ATTN_AVAILABLE = False
 
-_local_version = Version(__version__).local
-_is_reduced_rwkv_build = _local_version is not None and "rwkv" in _local_version.split(
-    "."
-)
+_local_version = __version__.partition("+")[2].split(".")
+_is_reduced_rwkv_build = "rwkv" in _local_version
 
 if current_platform.is_cuda() and _is_reduced_rwkv_build:
 
