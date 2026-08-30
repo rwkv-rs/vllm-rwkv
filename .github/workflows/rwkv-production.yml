@@ -212,8 +212,7 @@ jobs:
           print(f"vLLM={vllm.__version__} FlashRWKV2={flashrwkv2.__version__}")
           PY
           printf '%s\n' "$PWD/release/.venv/bin" >> "$GITHUB_PATH"
-          XDG_CACHE_HOME="$PWD/release/.cache" \
-            PATH="$PWD/release/.venv/bin:$PATH" \
+          PATH="$PWD/release/.venv/bin:$PATH" \
             PYTHONSAFEPATH=1 \
             release/.venv/bin/python -m flashrwkv2.compile \
             > release/flashrwkv2-sm120.json
@@ -221,8 +220,10 @@ jobs:
           import json
           from pathlib import Path
 
+          from torch.utils.cpp_extension import get_default_build_root
+
           result = json.loads(Path("release/flashrwkv2-sm120.json").read_text())
-          cache = Path("release/.cache/torch_extensions").resolve()
+          cache = Path(get_default_build_root()).resolve()
           library = Path(result["library"]).resolve()
           assert result["status"] in {"compiled", "cached"}, result
           assert result["target"] == "sm120", result
@@ -233,7 +234,6 @@ jobs:
       - name: Smoke-test the exact release environment
         run: |
           set -euo pipefail
-          export XDG_CACHE_HOME="$PWD/release/.cache"
           export PYTHONSAFEPATH=1
           unset VLLM_BUILD_PROFILE
           log="$RUNNER_TEMP/rwkv15-service.log"
@@ -393,7 +393,6 @@ jobs:
           }))
           PY
           env -u VLLM_BUILD_PROFILE \
-            XDG_CACHE_HOME="$PWD/release/.cache" \
             PYTHONSAFEPATH=1 \
             release/.venv/bin/python - "$RWKV72_ARTIFACT" "$evidence" <<'PY'
           import json
@@ -443,7 +442,6 @@ jobs:
         if: steps.scope.outputs.required == 'true'
         run: |
           set -euo pipefail
-          export XDG_CACHE_HOME="$PWD/release/.cache"
           export PYTHONSAFEPATH=1
           unset VLLM_BUILD_PROFILE
           evidence="$RUNNER_TEMP/rwkv-gate"
