@@ -977,6 +977,11 @@ class RwkvForCausalLMConfig(VerifyAndUpdateConfig):
         if cache_config.mamba_cache_mode == "all":
             raise ValueError("RWKV does not support Mamba cache mode 'all'")
 
+        head_dtype = getattr(model_config.hf_config, "head_dtype", None)
+        if head_dtype not in (None, "float32", torch.float32):
+            raise ValueError("RWKV Rapid-Sampling requires a float32 lm_head output")
+        model_config.hf_config.head_dtype = "float32"
+
         if cache_config.mamba_cache_dtype == "auto":
             cache_config.mamba_cache_dtype = "float16"
         elif cache_config.mamba_cache_dtype != "float16":
@@ -996,6 +1001,24 @@ class RwkvForCausalLMConfig(VerifyAndUpdateConfig):
             compilation_config.cudagraph_mode = (
                 CUDAGraphMode.NONE if model_config.enforce_eager else CUDAGraphMode.FULL
             )
+        if not model_config.enforce_eager:
+            max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            if compilation_config.cudagraph_capture_sizes is None:
+                if compilation_config.max_cudagraph_capture_size is None:
+                    compilation_config.max_cudagraph_capture_size = max_tokens
+                max_capture = min(
+                    compilation_config.max_cudagraph_capture_size,
+                    max_tokens,
+                )
+                capture_sizes = [1, 2, 4]
+                capture_sizes.extend(range(8, min(max_capture + 1, 256), 8))
+                if max_capture >= 256:
+                    capture_sizes.extend(range(256, min(max_capture + 1, 1024), 16))
+                if max_capture >= 1024:
+                    capture_sizes.extend(range(1024, max_capture + 1, 1024))
+                if max_capture not in capture_sizes:
+                    capture_sizes.append(max_capture)
+                compilation_config.cudagraph_capture_sizes = capture_sizes
 
 
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
