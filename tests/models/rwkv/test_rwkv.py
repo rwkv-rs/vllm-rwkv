@@ -11,7 +11,11 @@ import torch
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.exceptions import VLLMValidationError
 from vllm.model_executor.models.config import RwkvForCausalLMConfig
-from vllm.model_executor.models.rwkv import RwkvFeedForward, RwkvStateLayer
+from vllm.model_executor.models.rwkv import (
+    RwkvFeedForward,
+    RwkvModel,
+    RwkvStateLayer,
+)
 from vllm.sampling_params import SamplingParams
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.rwkv_attn import (
@@ -386,6 +390,43 @@ def test_feed_forward_prepares_value_weight_for_provider() -> None:
     assert torch.equal(feed_forward.value.weight, checkpoint_weight.T.contiguous())
 
 
+def test_model_folds_embedding_norm_after_loading(monkeypatch) -> None:
+    module = _fake_flashrwkv2()
+    module.infer_embedding_ln0_forward_varlen = (
+        lambda embedding, weight, bias, eps: torch.nn.functional.layer_norm(
+            embedding, (embedding.shape[-1],), weight, bias, eps
+        ).to(torch.float16)
+    )
+    monkeypatch.setitem(sys.modules, "flashrwkv2", module)
+    monkeypatch.setattr(
+        "vllm.model_executor.models.rwkv.get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True),
+    )
+    model = object.__new__(RwkvModel)
+    torch.nn.Module.__init__(model)
+    embedding = torch.arange(32, dtype=torch.bfloat16).view(8, 4)
+    model.embed_tokens = SimpleNamespace(weight=torch.nn.Parameter(embedding.clone()))
+    model.embedding_norm = torch.nn.LayerNorm(4, dtype=torch.bfloat16)
+    model.config = SimpleNamespace(layer_norm_epsilon=1e-5)
+    model.layers = torch.nn.ModuleList()
+    model.start_layer = 0
+    model.end_layer = 0
+    model._embedding_norm_folded = False
+    expected = torch.nn.functional.layer_norm(
+        embedding,
+        (4,),
+        model.embedding_norm.weight,
+        model.embedding_norm.bias,
+        model.config.layer_norm_epsilon,
+    ).to(torch.float16)
+
+    model.process_weights_after_loading()
+
+    assert model._embedding_norm_folded
+    assert model.embed_tokens.weight.dtype == torch.float16
+    assert torch.equal(model.embed_tokens.weight, expected)
+
+
 def test_align_state_advance_uses_execution_owned_token_counts() -> None:
     copies: list[tuple[torch.Tensor, torch.Tensor]] = []
     resets: list[torch.Tensor] = []
@@ -467,6 +508,7 @@ def test_align_state_advance_resets_new_request_destination() -> None:
 
 def _config() -> SimpleNamespace:
     model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(),
         dtype=torch.float16,
         architecture="RwkvForCausalLM",
         supports_mamba_prefix_caching=True,
@@ -501,13 +543,20 @@ def _config() -> SimpleNamespace:
         scheduler_config=SimpleNamespace(
             enable_chunked_prefill=True,
             async_scheduling=None,
+            max_num_batched_tokens=8192,
+            max_num_seqs=512,
         ),
         speculative_config=None,
         lora_config=None,
         quant_config=None,
         kv_transfer_config=None,
         mamba_config=SimpleNamespace(enable_stochastic_rounding=False),
-        compilation_config=SimpleNamespace(mode=None, cudagraph_mode=None),
+        compilation_config=SimpleNamespace(
+            mode=None,
+            cudagraph_mode=None,
+            max_cudagraph_capture_size=None,
+            cudagraph_capture_sizes=None,
+        ),
     )
 
 
@@ -522,6 +571,11 @@ def test_config_uses_fp16_state_and_full_graph_defaults() -> None:
     assert vllm_config.scheduler_config.async_scheduling is None
     assert vllm_config.compilation_config.mode == CompilationMode.NONE
     assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL
+    assert vllm_config.model_config.hf_config.head_dtype == "float32"
+    assert vllm_config.compilation_config.max_cudagraph_capture_size == 8192
+    assert 1024 in vllm_config.compilation_config.cudagraph_capture_sizes
+    assert 5120 in vllm_config.compilation_config.cudagraph_capture_sizes
+    assert 8192 in vllm_config.compilation_config.cudagraph_capture_sizes
 
 
 def test_config_accepts_fp32_wkv_state() -> None:
@@ -555,6 +609,27 @@ def test_config_rejects_tensor_parallelism() -> None:
         assert "tensor parallelism" in str(error)
     else:
         raise AssertionError("tensor parallelism must be rejected")
+
+
+def test_config_rejects_non_fp32_head_output() -> None:
+    vllm_config = _config()
+    vllm_config.model_config.hf_config.head_dtype = "model"
+    try:
+        RwkvForCausalLMConfig.verify_and_update_config(vllm_config)
+    except ValueError as error:
+        assert "float32 lm_head output" in str(error)
+    else:
+        raise AssertionError("RWKV must produce float32 logits directly")
+
+
+def test_config_preserves_explicit_cudagraph_sizes() -> None:
+    vllm_config = _config()
+    vllm_config.compilation_config.cudagraph_capture_sizes = [1, 32, 96]
+
+    RwkvForCausalLMConfig.verify_and_update_config(vllm_config)
+
+    assert vllm_config.compilation_config.max_cudagraph_capture_size is None
+    assert vllm_config.compilation_config.cudagraph_capture_sizes == [1, 32, 96]
 
 
 def test_config_rejects_unsupported_rapid_sampling_modes() -> None:
@@ -628,6 +703,90 @@ def test_rapid_sampler_preserves_preempted_request_state() -> None:
     sampler._preserved_requests["request"] = (state, penalties)
     sampler.remove_request("request")
     assert "request" not in sampler._preserved_requests
+
+
+def test_rapid_sampler_graph_compacts_completed_prefills(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.model_states.rwkv.get_num_sampled_and_rejected",
+        lambda *args: (
+            torch.tensor([1, 0, 1, 1], dtype=torch.int32),
+            torch.zeros(4, dtype=torch.int32),
+        ),
+    )
+    graph = SimpleNamespace(
+        hidden_states=torch.empty(4, 3),
+        slot_indices=torch.empty(4, dtype=torch.int32),
+        presence_penalty=torch.empty(4),
+        frequency_penalty=torch.empty(4),
+        penalty_decay=torch.empty(4),
+        temperature=torch.empty(4),
+        top_k=torch.empty(4, dtype=torch.int32),
+        top_p=torch.empty(4),
+        num_active=torch.empty(1, dtype=torch.int32),
+        sampled=torch.tensor([10, 11, 12, -1], dtype=torch.int32),
+        graph=SimpleNamespace(replay=lambda: None),
+    )
+    sampler = object.__new__(RwkvSampler)
+    sampler.compute_nans = False
+    sampler.get_logprobs_dims = lambda idx_mapping_np: None
+    sampler.needs_logits_processing = np.zeros(4, dtype=bool)
+    sampler._sampling_graphs = {4: graph}
+    active_rows = np.empty(4, dtype=np.int64)
+    active_slots = np.empty(4, dtype=np.int32)
+    sampler._active_rows = SimpleNamespace(
+        np=active_rows,
+        copy_to_uva=lambda size: torch.from_numpy(active_rows[:size]),
+    )
+    sampler._active_slots = SimpleNamespace(
+        np=active_slots,
+        copy_to_uva=lambda size: torch.from_numpy(active_slots[:size]),
+    )
+    sampler._presence_penalty = SimpleNamespace(gpu=torch.arange(4).float())
+    sampler._frequency_penalty = SimpleNamespace(gpu=torch.arange(4).float() + 4)
+    sampler._penalty_decay = SimpleNamespace(gpu=torch.arange(4).float() + 8)
+    sampler.sampling_states = SimpleNamespace(
+        temperature=SimpleNamespace(gpu=torch.arange(4).float() + 12),
+        top_k=SimpleNamespace(gpu=torch.arange(4, dtype=torch.int32) + 16),
+        top_p=SimpleNamespace(gpu=torch.arange(4).float() + 20),
+    )
+    sampler.req_states = SimpleNamespace(
+        prefill_len=SimpleNamespace(gpu=torch.tensor([2, 8, 4, 1]))
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=4,
+        idx_mapping_np=np.array([2, 1, 3, 0]),
+        idx_mapping=torch.tensor([2, 1, 3, 0]),
+        num_computed_prefill_tokens_np=np.array([1, 2, 3, 0]),
+        num_scheduled_tokens=np.array([1, 2, 1, 1]),
+        prefill_len_np=np.array([2, 8, 4, 1]),
+        seq_lens=torch.tensor([2, 4, 4, 1]),
+        cu_num_logits=torch.tensor([0, 1, 2, 3, 4]),
+    )
+    hidden_states = torch.arange(12, dtype=torch.float16).view(4, 3)
+
+    output = sampler.sample_hidden_states(hidden_states, input_batch, None)
+
+    assert output is not None
+    assert torch.equal(output.sampled_token_ids[:, 0], torch.tensor([10, 0, 11, 12]))
+    assert graph.num_active.item() == 3
+    assert torch.equal(graph.hidden_states[:3], hidden_states[[0, 2, 3]])
+    assert torch.equal(graph.slot_indices[:3], torch.tensor([2, 3, 0]))
+    assert torch.equal(graph.presence_penalty[:3], torch.tensor([2.0, 3.0, 0.0]))
+    assert torch.equal(graph.top_k[:3], torch.tensor([18, 19, 16]))
+
+
+def test_rapid_sampler_graph_defers_grammar_to_existing_path() -> None:
+    sampler = object.__new__(RwkvSampler)
+    sampler.compute_nans = False
+    sampler.get_logprobs_dims = lambda idx_mapping_np: None
+    sampler.needs_logits_processing = np.zeros(1, dtype=bool)
+    sampler._sampling_graphs = {1: object()}
+    input_batch = SimpleNamespace(idx_mapping_np=np.array([0]))
+
+    assert (
+        sampler.sample_hidden_states(torch.zeros(1, 1), input_batch, SimpleNamespace())
+        is None
+    )
 
 
 def test_config_accepts_async_scheduling() -> None:
