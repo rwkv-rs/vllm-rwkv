@@ -43,7 +43,7 @@ from .utils import (
     maybe_prefix,
 )
 
-_FLASHRWKV2_VERSION = "0.1.0a12"
+_FLASHRWKV2_VERSION = "0.1.0a13"
 _FLASHRWKV2_APIS = (
     "infer_cmix_forward_varlen",
     "infer_embedding_ln0_forward_varlen",

@@ -86,7 +86,7 @@ class _FakeStateHandle:
 
 def _fake_flashrwkv2() -> ModuleType:
     module: Any = ModuleType("flashrwkv2")
-    module.__version__ = "0.1.0a12"
+    module.__version__ = "0.1.0a13"
 
     def prepare_fp16(
         state_pool_size,
@@ -391,7 +391,7 @@ def test_feed_forward_prepares_value_weight_for_provider() -> None:
 
 
 def test_model_folds_embedding_norm_after_loading(monkeypatch) -> None:
-    module = _fake_flashrwkv2()
+    module: Any = _fake_flashrwkv2()
     module.infer_embedding_ln0_forward_varlen = (
         lambda embedding, weight, bias, eps: torch.nn.functional.layer_norm(
             embedding, (embedding.shape[-1],), weight, bias, eps
