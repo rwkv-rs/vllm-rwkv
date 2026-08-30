@@ -115,7 +115,7 @@ jobs:
           else
             changed="$(git diff --name-only "$BASE_SHA"...HEAD)"
             if grep -Eq \
-              '^(\.github/workflows/rwkv-production\.yml|setup\.py|csrc/|CMakeLists.txt|cmake/|requirements/rwkv\.txt|vllm/(version\.py|platforms/cuda\.py|model_executor/(models/rwkv\.py|layers/quantization/utils/w8a8_utils\.py)|sampling_params\.py|v1/(attention/backends/(fa_utils|rwkv_attn)\.py|sample/ops/topk_topp_sampler\.py|worker/(gpu/|gpu_worker\.py))))' \
+              '^(\.github/workflows/rwkv-production\.yml|setup\.py|csrc/|CMakeLists.txt|cmake/|requirements/rwkv\.txt|vllm/(version\.py|platforms/cuda\.py|model_executor/(models/rwkv\.py|layers/quantization/utils/w8a8_utils\.py)|sampling_params\.py|v1/(attention/backends/(fa_utils|rwkv_attn)\.py|sample/ops/topk_topp_sampler\.py|structured_output/__init__\.py|worker/(gpu/|gpu_worker\.py))))' \
               <<<"$changed"; then
               required=true
             else
@@ -152,6 +152,7 @@ jobs:
               vllm/sampling_params.py \
               vllm/v1/attention/backends/fa_utils.py \
               vllm/v1/sample/ops/topk_topp_sampler.py \
+              vllm/v1/structured_output/__init__.py \
               vllm/v1/worker/gpu_worker.py \
               vllm/version.py
           .venv/bin/python -m pytest --import-mode=importlib -q \
