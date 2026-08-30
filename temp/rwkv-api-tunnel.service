@@ -1,0 +1,18 @@
+[Unit]
+Description=RWKV API reverse tunnel to the public Pingora gateway
+After=network-online.target vllm-rwkv-api-router.service
+Wants=network-online.target vllm-rwkv-api-router.service
+
+[Service]
+Type=simple
+User=rwkv
+Group=rwkv
+ExecStart=/usr/bin/ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o IdentitiesOnly=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes -i /home/rwkv/.ssh/id_ed25519_rwkv_api_tunnel -R 127.0.0.1:18000:127.0.0.1:18000 rwkv-api-tunnel@192.236.189.109
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target
