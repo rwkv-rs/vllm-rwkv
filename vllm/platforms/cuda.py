@@ -19,10 +19,16 @@ from torch.distributed import PrefixStore, ProcessGroup
 from torch.distributed.distributed_c10d import is_nccl_available
 from typing_extensions import ParamSpec
 
+from vllm.version import is_reduced_rwkv_build
+
 # Import custom ops when the wheel contains them. The RWKV production profile
 # delegates all model and sampling kernels to FlashRWKV2.
-with contextlib.suppress(ImportError):
-    import vllm._C_stable_libtorch  # noqa
+if is_reduced_rwkv_build():
+    import vllm.rwkv7_ops  # noqa: F401
+else:
+    with contextlib.suppress(ImportError):
+        import vllm._C_stable_libtorch  # noqa
+
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.import_utils import import_pynvml
@@ -283,12 +289,15 @@ class CudaPlatformBase(Platform):
     @classmethod
     def import_kernels(cls) -> None:
         """Import CUDA kernel extensions (_C_stable_libtorch)."""
-        try:
-            import vllm._C_stable_libtorch  # noqa: F401
-        except ImportError as e:
-            logger.warning_once(
-                "Failed to import from vllm._C_stable_libtorch: %s", repr(e)
-            )
+        if is_reduced_rwkv_build():
+            import vllm.rwkv7_ops  # noqa: F401
+        else:
+            try:
+                import vllm._C_stable_libtorch  # noqa: F401
+            except ImportError as e:
+                logger.warning_once(
+                    "Failed to import from vllm._C_stable_libtorch: %s", repr(e)
+                )
         with contextlib.suppress(ImportError):
             import vllm._moe_C_stable_libtorch  # noqa: F401
 
