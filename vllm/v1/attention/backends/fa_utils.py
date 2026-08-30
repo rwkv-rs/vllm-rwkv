@@ -3,7 +3,10 @@
 
 from typing import Any
 
+from packaging.version import Version
+
 import vllm.envs as envs
+from vllm import __version__
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_quantized_kv_cache
@@ -19,9 +22,26 @@ FA4_HD256_PAGE_SIZE = 128
 # consistent behavior (similar to IS_AITER_FOUND in _aiter_ops.py).
 _ROCM_FLASH_ATTN_AVAILABLE = False
 
-if current_platform.is_cuda():
+_local_version = Version(__version__).local
+_is_reduced_rwkv_build = _local_version is not None and "rwkv" in _local_version.split(
+    "."
+)
+
+if current_platform.is_cuda() and _is_reduced_rwkv_build:
+
+    def _reduced_build_flash_attention_unavailable(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(
+            "FlashAttention is unavailable in this reduced RWKV build. "
+            "Install a full build of vLLM to use an attention backend."
+        )
+
+    reshape_and_cache_flash = _reduced_build_flash_attention_unavailable
+    flash_attn_varlen_func = _reduced_build_flash_attention_unavailable
+    compile_flash_attn_varlen_func_from_specs = None
+    get_scheduler_metadata = _reduced_build_flash_attention_unavailable
+elif current_platform.is_cuda():
     from vllm._custom_ops import reshape_and_cache_flash
-    from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
+    from vllm.vllm_flash_attn import (  # type: ignore[attr-defined,assignment]
         compile_flash_attn_varlen_func_from_specs,
         flash_attn_varlen_func,
         get_scheduler_metadata,

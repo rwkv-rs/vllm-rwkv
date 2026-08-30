@@ -202,19 +202,21 @@ jobs:
           uv pip install --python release/.venv/bin/python \
             dist/*.whl \
             --torch-backend=auto
-          release/.venv/bin/python - <<'PY'
+          PYTHONSAFEPATH=1 release/.venv/bin/python - <<'PY'
           import flashrwkv2
           import vllm
 
           assert flashrwkv2.__version__ == "0.1.0a12"
+          assert "rwkv" in vllm.__version__.split("+", 1)[1].split(".")
           print(f"vLLM={vllm.__version__} FlashRWKV2={flashrwkv2.__version__}")
           PY
           printf '%s\n' "$PWD/release/.venv/bin" >> "$GITHUB_PATH"
           XDG_CACHE_HOME="$PWD/release/.cache" \
             PATH="$PWD/release/.venv/bin:$PATH" \
+            PYTHONSAFEPATH=1 \
             release/.venv/bin/python -m flashrwkv2.compile \
             > release/flashrwkv2-sm120.json
-          release/.venv/bin/python - <<'PY'
+          PYTHONSAFEPATH=1 release/.venv/bin/python - <<'PY'
           import json
           from pathlib import Path
 
@@ -231,6 +233,8 @@ jobs:
         run: |
           set -euo pipefail
           export XDG_CACHE_HOME="$PWD/release/.cache"
+          export PYTHONSAFEPATH=1
+          unset VLLM_BUILD_PROFILE
           log="$RUNNER_TEMP/rwkv15-service.log"
           release/.venv/bin/vllm serve "$RWKV15_ARTIFACT" \
             --served-model-name rwkv7-g1i-1.5b \
@@ -387,7 +391,9 @@ jobs:
               "output_token_ids": generated,
           }))
           PY
-          XDG_CACHE_HOME="$PWD/release/.cache" \
+          env -u VLLM_BUILD_PROFILE \
+            XDG_CACHE_HOME="$PWD/release/.cache" \
+            PYTHONSAFEPATH=1 \
             release/.venv/bin/python - "$RWKV72_ARTIFACT" "$evidence" <<'PY'
           import json
           import sys
@@ -437,6 +443,8 @@ jobs:
         run: |
           set -euo pipefail
           export XDG_CACHE_HOME="$PWD/release/.cache"
+          export PYTHONSAFEPATH=1
+          unset VLLM_BUILD_PROFILE
           evidence="$RUNNER_TEMP/rwkv-gate"
           log="$evidence/vllm72-service.log"
           release/.venv/bin/vllm serve "$RWKV72_ARTIFACT" \
