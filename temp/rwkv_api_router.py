@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import argparse
 import hashlib
 import json
@@ -80,6 +83,26 @@ def create_app(api_key_sha256: bytes) -> FastAPI:
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/metrics")
+    async def metrics(request: Request, model: str | None = None) -> Response:
+        if not _authorized(request, api_key_sha256):
+            return JSONResponse(
+                {"error": {"message": "Unauthorized", "type": "authentication_error"}},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        if model is None:
+            return _error("Query parameter model is required", 400)
+        upstream = MODEL_UPSTREAMS.get(model)
+        if upstream is None:
+            return _error(f"Unknown model: {model}", 404)
+        response = await request.app.state.client.get(f"{upstream}/metrics")
+        return Response(
+            response.content,
+            status_code=response.status_code,
+            headers=_response_headers(response),
+        )
 
     @app.get("/v1/models")
     async def models(request: Request) -> Response:
