@@ -204,13 +204,14 @@ jobs:
 
           wheel = next(Path("dist").glob("*.whl"))
           with ZipFile(wheel) as archive:
-              native_members = [
+              native_members = sorted(
                   name
                   for name in archive.namelist()
                   if name.startswith("vllm/") and name.endswith(".so")
-              ]
-          assert len(native_members) == 1, native_members
-          assert "/rwkv7_ops." in native_members[0], native_members
+              )
+          assert len(native_members) == 2, native_members
+          assert "/cumem_allocator." in native_members[0], native_members
+          assert "/rwkv7_ops." in native_members[1], native_members
           PY
           uv venv --clear --relocatable --python 3.12 release/.venv
           uv pip install --python release/.venv/bin/python \
@@ -222,6 +223,7 @@ jobs:
           import flashrwkv2
           import torch
           import vllm
+          import vllm.cumem_allocator
           import vllm.rwkv7_ops
 
           assert flashrwkv2.__version__ == "0.1.0a13"
