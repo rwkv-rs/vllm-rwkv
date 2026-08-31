@@ -1439,7 +1439,10 @@ if _build_custom_ops():
 if VLLM_BUILD_PROFILE == "rwkv":
     if not _is_cuda():
         raise ValueError("VLLM_BUILD_PROFILE='rwkv' requires VLLM_TARGET_DEVICE='cuda'")
-    ext_modules = [CMakeExtension(name="vllm.rwkv7_ops")]
+    ext_modules = [
+        CMakeExtension(name="vllm.cumem_allocator"),
+        CMakeExtension(name="vllm.rwkv7_ops"),
+    ]
 
 package_data = {
     "vllm": [
