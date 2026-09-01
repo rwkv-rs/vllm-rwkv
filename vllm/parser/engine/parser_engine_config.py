@@ -100,6 +100,12 @@ class ParserEngineConfig:
     # Reject tool calls whose names are absent from the request tools.
     validate_tool_names: bool = False
 
+    # The tool body is an OpenAI-style JSON envelope:
+    # {"name": "...", "arguments": {...}}. Buffer it until TOOL_CALL_END,
+    # validate it once, then emit one complete call delta. This is useful for
+    # fenced formats whose name and arguments share one JSON payload.
+    json_tool_call_envelope: bool = False
+
     @cached_property
     def terminal_defs(self):
         from vllm.parser.engine.incremental_lexer import terminals_from_literals
