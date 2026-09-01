@@ -37,6 +37,7 @@ def _tool(name: str) -> ChatCompletionToolsParam:
 def _request(
     tools: list[ChatCompletionToolsParam] | None = None,
     tool_choice: Any = "auto",
+    parallel_tool_calls: bool | None = None,
 ) -> ChatCompletionRequest:
     kwargs: dict[str, Any] = {}
     if tools is not None:
@@ -44,6 +45,8 @@ def _request(
             tools=[tool.model_dump() for tool in tools],
             tool_choice=tool_choice,
         )
+    if parallel_tool_calls is not None:
+        kwargs["parallel_tool_calls"] = parallel_tool_calls
     return ChatCompletionRequest(
         model="rwkv-test",
         messages=[{"role": "user", "content": "hi"}],
@@ -87,6 +90,9 @@ def _stream(
         previous_text = current_text
         if delta is not None:
             deltas.append(delta)
+    finish = getattr(parser, "finish_streaming", None)
+    if finish is not None and (delta := finish()) is not None:
+        deltas.append(delta)
     return deltas
 
 
@@ -199,6 +205,113 @@ def test_streams_content_and_complete_tool_calls(chunk_size: int) -> None:
     assert len(tool_calls) == 1
     assert tool_calls[0].function is not None
     assert tool_calls[0].function.name == "get_weather"
+    assert json.loads(tool_calls[0].function.arguments or "") == {"city": "Paris"}
+
+
+@pytest.mark.parametrize("chunk_size", [1, 11, 10_000])
+def test_streams_each_parallel_call_once(chunk_size: int) -> None:
+    tools = [_tool("get_weather")]
+    request = _request(tools)
+    text = "\n".join(
+        [
+            _tool_call("get_weather", {"city": "Paris"}),
+            _tool_call("get_weather", {"city": "Berlin"}),
+        ]
+    )
+    parser = _parser(tools)
+
+    deltas = _stream(parser, text, request, chunk_size)
+    replay = parser.extract_tool_calls_streaming(
+        previous_text=text,
+        current_text=text,
+        delta_text="",
+        previous_token_ids=[],
+        current_token_ids=[],
+        delta_token_ids=[],
+        request=request,
+    )
+
+    tool_calls = [call for delta in deltas for call in (delta.tool_calls or [])]
+    assert [call.index for call in tool_calls] == [0, 1]
+    assert [call.function.name for call in tool_calls if call.function] == [
+        "get_weather",
+        "get_weather",
+    ]
+    assert [
+        json.loads(call.function.arguments or "")
+        for call in tool_calls
+        if call.function
+    ] == [{"city": "Paris"}, {"city": "Berlin"}]
+    assert replay is None
+
+
+def test_stream_payloads_are_parsed_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    tools = [_tool("get_weather")]
+    request = _request(tools)
+    parser = _parser(tools)
+    call_count = 64
+    text = "\n".join(
+        _tool_call("get_weather", {"city": str(index)}) for index in range(call_count)
+    )
+    engine = parser._parser_engine
+    parse_payload = engine._parse_json_tool_call_envelope
+    payload_parse_count = 0
+
+    def counted_parse_payload(payload: str):
+        nonlocal payload_parse_count
+        payload_parse_count += 1
+        return parse_payload(payload)
+
+    monkeypatch.setattr(
+        engine,
+        "_parse_json_tool_call_envelope",
+        counted_parse_payload,
+    )
+
+    deltas = _stream(parser, text, request, 1)
+
+    tool_calls = [call for delta in deltas for call in (delta.tool_calls or [])]
+    assert len(tool_calls) == call_count
+    assert payload_parse_count == call_count
+
+
+def test_stream_stops_after_first_complete_invalid_call() -> None:
+    tools = [_tool("get_weather")]
+    request = _request(tools)
+    parser = _parser(tools)
+    text = "\n".join(
+        [
+            _tool_call("get_weather", {"city": "Paris"}),
+            _tool_call("unknown", {"city": "London"}),
+            _tool_call("get_weather", {"city": "Berlin"}),
+        ]
+    )
+
+    deltas = _stream(parser, text, request, 7)
+
+    tool_calls = [call for delta in deltas for call in (delta.tool_calls or [])]
+    assert len(tool_calls) == 1
+    assert tool_calls[0].function is not None
+    assert json.loads(tool_calls[0].function.arguments or "") == {"city": "Paris"}
+
+
+def test_stream_honors_parallel_tool_calls_false() -> None:
+    tools = [_tool("get_weather")]
+    request = _request(tools, parallel_tool_calls=False)
+    parser = _parser(tools)
+    text = "\n".join(
+        [
+            _tool_call("get_weather", {"city": "Paris"}),
+            _tool_call("get_weather", {"city": "Berlin"}),
+        ]
+    )
+
+    deltas = _stream(parser, text, request, 5)
+
+    tool_calls = [call for delta in deltas for call in (delta.tool_calls or [])]
+    assert len(tool_calls) == 1
+    assert tool_calls[0].index == 0
+    assert tool_calls[0].function is not None
     assert json.loads(tool_calls[0].function.arguments or "") == {"city": "Paris"}
 
 

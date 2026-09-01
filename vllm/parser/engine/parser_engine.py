@@ -54,6 +54,8 @@ class ToolCallSlot:
         "name_sent",
         "string_keys",
         "streamed_json",
+        "arguments_normalized",
+        "finalized",
     )
 
     def __init__(self) -> None:
@@ -64,6 +66,8 @@ class ToolCallSlot:
         self.name_sent: bool = False
         self.string_keys: set[str] | None = None
         self.streamed_json: str = ""
+        self.arguments_normalized: bool = False
+        self.finalized: bool = False
 
     @property
     def args(self) -> str:
@@ -74,6 +78,11 @@ class ToolCallSlot:
     def append_args(self, value: str) -> None:
         self._args_parts.append(value)
         self._args_joined = None
+
+    def replace_args(self, value: str, *, normalized: bool = False) -> None:
+        self._args_parts = [value]
+        self._args_joined = value
+        self.arguments_normalized = normalized
 
 
 class ParserEngine(Parser):
@@ -123,10 +132,14 @@ class ParserEngine(Parser):
         self._deferred_reasoning: str = ""
         self._content_has_nonws: bool = False
         self._suppress_tool_calls: bool = False
+        self._tool_parsing_blocked: bool = False
+        self._selected_tool_name: str | None = None
+        self._parallel_tool_calls: bool = True
 
         self._arg_converter = parser_engine_config.arg_converter
         self._arg_structural_chars = parser_engine_config.arg_structural_chars
         self._stream_arg_deltas = parser_engine_config.stream_arg_deltas
+        self._json_tool_call_envelope = parser_engine_config.json_tool_call_envelope
         self._strip_trailing_reasoning_ws = (
             parser_engine_config.strip_trailing_reasoning_whitespace
         )
@@ -204,6 +217,7 @@ class ParserEngine(Parser):
         self._deferred_content = ""
         self._deferred_reasoning = ""
         self._content_has_nonws = False
+        self._tool_parsing_blocked = False
         self._prompt_streaming_prepared = False
 
     def adjust_request(
@@ -397,6 +411,8 @@ class ParserEngine(Parser):
     def _is_valid_tool_name(self, name: str) -> bool:
         if not self.parser_engine_config.validate_tool_names:
             return True
+        if self._selected_tool_name is not None and name != self._selected_tool_name:
+            return False
         if not self._tools:
             return True
         return find_tool_name(self._tools, name)
@@ -413,10 +429,24 @@ class ParserEngine(Parser):
         tools = getattr(request, "tools", None)
         if tools:
             self._tools = tools
-        if not self.skip_tool_parsing and not self._suppress_tool_calls:
-            tool_choice = getattr(request, "tool_choice", None)
-            if tool_choice == "none" and tools:
-                self._suppress_tool_calls = True
+        tool_choice = getattr(request, "tool_choice", None)
+        function = getattr(tool_choice, "function", None)
+        selected_name = getattr(function, "name", None)
+        if not isinstance(selected_name, str):
+            selected_name = getattr(tool_choice, "name", None)
+        self._selected_tool_name = (
+            selected_name if isinstance(selected_name, str) else None
+        )
+        self._parallel_tool_calls = (
+            getattr(request, "parallel_tool_calls", None) is not False
+        )
+        if (
+            not self.skip_tool_parsing
+            and not self._suppress_tool_calls
+            and tool_choice == "none"
+            and tools
+        ):
+            self._suppress_tool_calls = True
 
     def _strip_content_whitespace(
         self,
@@ -556,7 +586,10 @@ class ParserEngine(Parser):
             request=request,
         )
         finish_delta = self.finish_streaming()
-        return self._build_extracted_result(result, finish_delta)
+        extracted = self._build_extracted_result(result, finish_delta)
+        if self._json_tool_call_envelope and not extracted.tools_called:
+            extracted.content = model_output
+        return extracted
 
     def extract_tool_calls_from_content(
         self,
@@ -581,6 +614,8 @@ class ParserEngine(Parser):
                 tool_calls=tool_call_info.tool_calls,
                 content=parsed_content,
             )
+        if self._json_tool_call_envelope and not tool_call_info.tools_called:
+            tool_call_info.content = content
         return tool_call_info
 
     def extract_tool_calls_streaming(
@@ -728,19 +763,19 @@ class ParserEngine(Parser):
                 case EventType.REASONING_END:
                     self._reasoning_ended = True
                 case EventType.TOOL_CALL_START:
-                    if not suppress:
+                    if not suppress and not self._tool_parsing_blocked:
                         seen_tool_event = True
                         self._ensure_slot(event.tool_index)
                 case EventType.TOOL_NAME:
-                    if not suppress:
+                    if not suppress and not self._tool_parsing_blocked:
                         seen_tool_event = True
                         self._handle_tool_name(event)
                 case EventType.ARG_VALUE_CHUNK:
-                    if not suppress:
+                    if not suppress and not self._tool_parsing_blocked:
                         seen_tool_event = True
                         self._handle_arg_chunk(event, tool_call_deltas)
                 case EventType.TOOL_CALL_END:
-                    if not suppress:
+                    if not suppress and not self._tool_parsing_blocked:
                         seen_tool_event = True
                         self._handle_tool_end(event, tool_call_deltas)
                 case EventType.REASONING_START:
@@ -834,6 +869,9 @@ class ParserEngine(Parser):
         if event.value:
             slot.append_args(event.value)
 
+        if self._json_tool_call_envelope:
+            return
+
         if not slot.name_sent:
             if slot.name:
                 self._emit_name_delta(idx, deltas, slot.name)
@@ -859,6 +897,10 @@ class ParserEngine(Parser):
     ) -> None:
         idx = event.tool_index
         if idx >= len(self._tool_slots):
+            return
+
+        if self._json_tool_call_envelope:
+            self._handle_json_tool_call_end(idx, deltas)
             return
 
         remaining = self._flush_arg_converter(idx)
@@ -893,6 +935,68 @@ class ParserEngine(Parser):
                     function=DeltaFunctionCall(arguments=remaining),
                 )
             )
+
+    def _handle_json_tool_call_end(
+        self,
+        idx: int,
+        deltas: list[DeltaToolCall],
+    ) -> None:
+        """Validate and emit one buffered OpenAI-style JSON tool envelope."""
+        slot = self._tool_slots[idx]
+        if slot.finalized:
+            return
+        slot.finalized = True
+
+        parsed = self._parse_json_tool_call_envelope(slot.args)
+        if parsed is None:
+            slot.replace_args("")
+            self._tool_parsing_blocked = True
+            return
+
+        name, arguments = parsed
+        slot.name = name
+        slot.replace_args(arguments, normalized=True)
+        slot.name_sent = True
+        self._ensure_tool_id(slot, name)
+        deltas.append(
+            DeltaToolCall(
+                index=idx,
+                id=slot.id,
+                type="function",
+                function=DeltaFunctionCall(
+                    name=name,
+                    arguments=arguments,
+                ),
+            )
+        )
+        if not self._parallel_tool_calls:
+            self._tool_parsing_blocked = True
+
+    def _parse_json_tool_call_envelope(
+        self,
+        raw_payload: str,
+    ) -> tuple[str, str] | None:
+        try:
+            parsed = json.loads(raw_payload.strip())
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if not isinstance(parsed, dict):
+            return None
+
+        name = parsed.get("name")
+        if not isinstance(name, str) or not self._accept_tool_name(name):
+            return None
+
+        arguments = parsed.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return None
+        if not isinstance(arguments, dict):
+            return None
+
+        return name, json.dumps(arguments, ensure_ascii=False)
 
     # ── Tool-call delta coalescing ──────────────────────────────────────
 
@@ -1024,7 +1128,9 @@ class ParserEngine(Parser):
             name = slot.name.strip()
             raw_body = slot.args
 
-            if not name and raw_body.strip():
+            if slot.arguments_normalized:
+                args_json = raw_body or "{}"
+            elif not name and raw_body.strip():
                 name, args_json = self._extract_name_and_args(raw_body)
             elif raw_body.strip():
                 converter = self._arg_converter
