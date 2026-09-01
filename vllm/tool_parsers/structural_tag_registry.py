@@ -290,6 +290,7 @@ def get_hermes_structural_tag(
 
 
 _RWKV_TOOL_CALL_TRIGGER = "**Tool Call:**"
+_RWKV_TURN_STOPS = ("✿", "\nUser:", "\n### User")
 
 
 def _rwkv_tool_tags(tools: list[FunctionToolParam]) -> list[TagFormat]:
@@ -333,7 +334,7 @@ def get_rwkv_structural_tag(
     else:
         output = SequenceFormat(
             elements=[
-                AnyTextFormat(excludes=[_RWKV_TOOL_CALL_TRIGGER]),
+                AnyTextFormat(excludes=[_RWKV_TOOL_CALL_TRIGGER, *_RWKV_TURN_STOPS]),
                 TagsWithSeparatorFormat(
                     tags=tags,
                     separator="\n",
@@ -341,6 +342,13 @@ def get_rwkv_structural_tag(
                     stop_after_first=(
                         tool_choice == "forced" or not parallel_tool_calls
                     ),
+                ),
+                OptionalFormat(
+                    content=OrFormat(
+                        elements=[
+                            ConstStringFormat(value=stop) for stop in _RWKV_TURN_STOPS
+                        ]
+                    )
                 ),
             ]
         )

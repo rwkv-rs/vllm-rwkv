@@ -214,6 +214,22 @@ def test_rwkv_required_accepts_reasoning_and_parallel_calls():
     assert _is_grammar_accept_string(_rwkv_grammar("required"), body)
 
 
+@pytest.mark.parametrize("turn_stop", ["✿", "\nUser:", "\n### User"])
+def test_rwkv_parallel_calls_allow_native_turn_stop_after_call(turn_stop):
+    body = _rwkv_tool_call("get_weather", '{"city": "Paris"}')
+
+    assert _is_grammar_accept_string(_rwkv_grammar("required"), body + turn_stop)
+
+
+@pytest.mark.parametrize("turn_stop", ["✿", "\nUser:", "\n### User"])
+def test_rwkv_required_rejects_native_turn_stop_before_call(turn_stop):
+    assert not _is_grammar_accept_string(
+        _rwkv_grammar("required"),
+        "reasoning" + turn_stop,
+        require_termination=False,
+    )
+
+
 @pytest.mark.parametrize("tool_choice", ["auto", "required"])
 def test_rwkv_non_parallel_choice_stops_after_one_call(
     tool_choice,
