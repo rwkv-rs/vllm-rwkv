@@ -22,7 +22,7 @@ from vllm.transformers_utils.configs.rwkv7 import (
     rwkv7_internal_to_hf_weight_name,
     rwkv7_is_legacy_low_rank_weight_name,
 )
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.output import FinishedRequestData, NewRequestData
 from vllm.v1.engine.core import _supports_no_kv_cache_chunked_prefill
 from vllm.v1.worker.gpu.model_states.rwkv import (
     RWKV7ModelState,
@@ -83,6 +83,7 @@ def _new_request(
     req_id: str,
     *,
     prompt_token_ids: list[int] | None = None,
+    prefill_token_ids: list[int] | None = None,
     num_computed_tokens: int = 0,
     sampling_params: SamplingParams | None = None,
 ) -> NewRequestData:
@@ -95,6 +96,7 @@ def _new_request(
         block_ids=(),
         num_computed_tokens=num_computed_tokens,
         lora_request=None,
+        prefill_token_ids=prefill_token_ids,
     )
 
 
@@ -743,6 +745,137 @@ def test_rwkv7_state_ref_cache_is_bounded_and_supports_clone_drop(
     state.capture_state_ref("goal-d", 0)
     with pytest.raises(MemoryError, match="capacity exceeded"):
         state.capture_state_ref("goal-e", 0)
+
+
+def test_rwkv7_state_ref_restores_and_commits_request(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_RWKV_STATE_CACHE_MAX_BYTES", str(1 << 20))
+    state = _new_rwkv7_model_state(
+        max_num_reqs=2,
+        hidden_size=4,
+        head_size=2,
+        num_attention_heads=2,
+        enable_prefix_caching=True,
+    )
+    state.shift_state[:, :, 0].fill_(11)
+    state.wkv_state[:, 0].fill_(12)
+    state.elapsed[0].fill_(13)
+    state.capture_state_ref(
+        "parent",
+        0,
+        processed_token_count=13,
+        pending_tail_token_ids=(7, 8),
+        finish_reason="stop",
+    )
+    state.state_cache_action("prepare_read", "parent", "read-lease")
+    state.state_cache_action("prepare_write", "child")
+    sampling_params = SamplingParams(
+        max_tokens=1,
+        extra_args={
+            "rwkv_state_read_ref": "parent",
+            "rwkv_state_read_lease": "read-lease",
+            "rwkv_state_write_ref": "child",
+        },
+    )
+
+    state.add_request(
+        0,
+        _new_request(
+            "req",
+            prefill_token_ids=[7, 8, 9],
+            sampling_params=sampling_params,
+        ),
+    )
+
+    row = state.req_slot_to_row[0]
+    assert torch.all(state.shift_state[:, :, row] == 11)
+    assert torch.all(state.wkv_state[:, row] == 12)
+    assert state.elapsed[row].item() == 13
+    assert "req" not in state.prefix_cache_eligible_req_ids
+    state.shift_state[:, :, row].fill_(21)
+    state.wkv_state[:, row].fill_(22)
+    state.elapsed[row].fill_(16)
+
+    state.remove_request(
+        "req",
+        FinishedRequestData(
+            finish_reason="stop",
+            pending_tail_token_ids=(10,),
+        ),
+    )
+
+    record = state.state_cache_action("restore_metadata", "child")
+    assert record["parent_ref"] == "parent"
+    assert record["processed_token_count"] == 16
+    assert record["pending_tail_token_ids"] == [10]
+    state.state_cache_action("drop", "parent")
+    state.restore_state_ref("child", 1)
+    assert torch.all(state.shift_state[:, :, 1] == 21)
+    assert torch.all(state.wkv_state[:, 1] == 22)
+    assert state.elapsed[1].item() == 16
+
+
+@pytest.mark.parametrize(
+    "finished_data",
+    [None, FinishedRequestData(finish_reason="abort", pending_tail_token_ids=())],
+)
+def test_rwkv7_state_ref_rolls_back_noncommittable_request(
+    monkeypatch: pytest.MonkeyPatch,
+    finished_data: FinishedRequestData | None,
+):
+    monkeypatch.setenv("VLLM_RWKV_STATE_CACHE_MAX_BYTES", str(1 << 20))
+    state = _new_rwkv7_model_state()
+    state.state_cache_action("prepare_write", "unused")
+    state.add_request(
+        0,
+        _new_request(
+            "req",
+            sampling_params=SamplingParams(
+                max_tokens=1,
+                extra_args={"rwkv_state_write_ref": "unused"},
+            ),
+        ),
+    )
+
+    state.remove_request("req", finished_data)
+
+    assert not state.state_cache_action("inspect_if_exists", "unused")["exists"]
+    assert state.state_cache_action("capabilities")["reserved_bytes"] == 0
+
+
+def test_rwkv7_state_ref_rejects_missing_tail_without_consuming_lease(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_RWKV_STATE_CACHE_MAX_BYTES", str(1 << 20))
+    state = _new_rwkv7_model_state()
+    state.capture_state_ref(
+        "parent",
+        0,
+        pending_tail_token_ids=(7, 8),
+    )
+    state.state_cache_action("prepare_read", "parent", "read-lease")
+
+    with pytest.raises(ValueError, match="missing its pending tail"):
+        state.add_request(
+            0,
+            _new_request(
+                "req",
+                prefill_token_ids=[7, 9],
+                sampling_params=SamplingParams(
+                    max_tokens=1,
+                    extra_args={
+                        "rwkv_state_read_ref": "parent",
+                        "rwkv_state_read_lease": "read-lease",
+                    },
+                ),
+            ),
+        )
+
+    with pytest.raises(ValueError, match="in use"):
+        state.state_cache_action("drop", "parent")
+    state.state_cache_action("cancel_read", "parent", "read-lease")
+    state.state_cache_action("drop", "parent")
 
 
 def test_rwkv7_cached_recurrence_matches_full_prefill_continuation():

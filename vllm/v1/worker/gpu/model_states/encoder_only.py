@@ -14,7 +14,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
 )
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.output import FinishedRequestData, NewRequestData
 from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec, KVCacheConfig
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
@@ -109,8 +109,12 @@ class EncoderOnlyModelState(DefaultModelState):
                 >= token_type_start
             ).to(torch.int32)
 
-    def remove_request(self, req_id: str) -> None:
-        super().remove_request(req_id)
+    def remove_request(
+        self,
+        req_id: str,
+        finished_data: FinishedRequestData | None = None,
+    ) -> None:
+        super().remove_request(req_id, finished_data)
         self.token_type_ids.pop(req_id, None)
 
     def prepare_inputs(

@@ -162,6 +162,9 @@ def test_finish_request():
     for i, request in enumerate(requests):
         scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         assert request.request_id not in scheduler.requests
+        finished_data = scheduler.finished_req_data[request.request_id]
+        assert finished_data.finish_reason == "abort"
+        assert finished_data.pending_tail_token_ids == ()
         assert len(scheduler.waiting) == 9 - i
 
 
@@ -1050,6 +1053,9 @@ def test_stop_via_update_from_output():
     assert scheduler.running[0].request_id == requests[1].request_id
     assert requests[0].status == RequestStatus.FINISHED_STOPPED
     assert requests[0].request_id in scheduler.finished_req_ids
+    finished_data = scheduler.finished_req_data[requests[0].request_id]
+    assert finished_data.finish_reason == "stop"
+    assert finished_data.pending_tail_token_ids == (EOS_TOKEN_ID,)
     assert list(requests[0].output_token_ids) == [EOS_TOKEN_ID]
     assert list(requests[1].output_token_ids) == [10, 11]
 

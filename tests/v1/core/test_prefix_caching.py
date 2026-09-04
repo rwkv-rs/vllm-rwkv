@@ -6,6 +6,7 @@ import copy
 from collections.abc import Callable
 from math import lcm
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -129,6 +130,28 @@ def make_kv_cache_config(block_size: int, num_blocks: int) -> KVCacheConfig:
             )
         ],
     )
+
+
+def test_rwkv_state_restore_does_not_populate_prefix_cache() -> None:
+    request = Request(
+        request_id="state-request",
+        prompt_token_ids=[1, 2, 3, 4],
+        sampling_params=SamplingParams(
+            max_tokens=1,
+            extra_args={"rwkv_state_read_ref": "parent"},
+        ),
+        pooling_params=None,
+    )
+    manager = object.__new__(KVCacheManager)
+    manager.enable_caching = True
+    manager.coordinator = Mock()
+
+    assert request.skip_reading_prefix_cache
+    assert request.skip_writing_prefix_cache
+
+    manager.cache_blocks(request, 4)
+
+    manager.coordinator.cache_blocks.assert_not_called()
 
 
 def make_kv_cache_config_hybrid_model(
