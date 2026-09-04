@@ -56,6 +56,81 @@ than relabeling them as reduced artifacts.
 extension, and Rust frontend build paths. Set it to `rwkv` only when producing
 the capability-limited artifact described above.
 
+## Reuse recurrent state across chat turns
+
+RWKV State refs let clients continue a conversation without replaying its full
+token history. A ref is an immutable, process-local recurrent-state snapshot;
+it does not occupy a scheduler request slot. Set a positive byte limit before
+starting the server:
+
+```bash
+VLLM_RWKV_STATE_CACHE_MAX_BYTES=$((4 * 1024 * 1024 * 1024)) \
+  vllm serve <model> --dtype float16 --enable-chunked-prefill
+```
+
+Ask the server to create the initial ref:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "<model>",
+    "messages": [{"role": "user", "content": "Remember build 42."}],
+    "vllm_xargs": {"rwkv_state_write_ref": "auto"}
+  }'
+```
+
+The response, or the terminal streaming chunk, contains `rwkv_state_ref`. Send
+only the next message while reading the prior ref and writing a new one:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "<model>",
+    "messages": [{"role": "user", "content": "What build did I give you?"}],
+    "vllm_xargs": {
+      "rwkv_state_read_ref": "<previous-ref>",
+      "rwkv_state_write_ref": "auto"
+    }
+  }'
+```
+
+The server preserves the unprocessed terminal token, inserts the native RWKV
+turn boundary, and removes the repeated BOS token from each continuation delta.
+State-restored requests bypass prefix-cache reads and writes so recurrent state
+from the two mechanisms cannot be mixed.
+
+Refs can be inspected, cloned without copying their tensor storage, and dropped:
+
+```bash
+curl http://localhost:8000/v1/rwkv/state/capabilities
+curl http://localhost:8000/v1/rwkv/state/<state-ref>
+curl -X POST http://localhost:8000/v1/rwkv/state/<state-ref>/clone \
+  -H "Content-Type: application/json" \
+  -d '{"target_ref": "branch-1"}'
+curl -X DELETE http://localhost:8000/v1/rwkv/state/<state-ref>
+```
+
+Each State request supports one token input and one sampled sequence. Refs are
+lost on restart and currently reject data parallelism. Treat them as bearer
+capabilities, prefer server-generated `"auto"` refs, and delete unused refs to
+release GPU memory. A continuation delta plus its output must still fit
+`--max-model-len`; the ref removes history replay but does not change the
+per-request limit.
+
+Compare deterministic top-1 output against full-token replay before running
+longer quality evaluations. The benchmark warms both paths before collecting
+latency:
+
+```bash
+.venv/bin/python benchmarks/rwkv7/benchmark_stateful_chat.py \
+  --input-file benchmarks/rwkv7/stateful_chat_example.json \
+  --url http://127.0.0.1:8000 \
+  --require-exact-match \
+  --output rwkv-state-results.json
+```
+
 For clean comparison runs, use:
 
 ```bash
