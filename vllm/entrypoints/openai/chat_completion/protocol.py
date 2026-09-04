@@ -136,6 +136,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
         default=None, description="ECTransfer parameters."
     )
     metrics: PerRequestTimingMetrics | None = None
+    rwkv_state_ref: str | None = None
 
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
@@ -164,6 +165,7 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     # ``return_prompt_text=True`` on the request); only sent on the first chunk.
     prompt_text: str | None = None
     metrics: PerRequestTimingMetrics | None = None
+    rwkv_state_ref: str | None = None
 
 
 class ChatCompletionToolsParam(OpenAIBaseModel):
@@ -691,7 +693,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.ec_transfer_params:
             # Pass in ec_transfer_params via extra_args
             extra_args["ec_transfer_params"] = self.ec_transfer_params
-        return SamplingParams.from_optional(
+        sampling_params = SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,
             frequency_penalty=self.frequency_penalty,
@@ -730,6 +732,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
             skip_clone=True,  # Created fresh per request, safe to skip clone
             repetition_detection=self.repetition_detection,
         )
+        if extra_args.get("rwkv_state_read_ref"):
+            sampling_params.skip_reading_prefix_cache = True
+        return sampling_params
 
     @model_validator(mode="before")
     @classmethod

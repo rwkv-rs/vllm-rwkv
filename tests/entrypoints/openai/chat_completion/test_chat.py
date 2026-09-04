@@ -1012,6 +1012,23 @@ def test_chat_completion_request_n_parameter_default():
     assert sampling_params.n == 1, f"Expected n=1 (default), got n={sampling_params.n}"
 
 
+def test_rwkv_state_restore_disables_scheduler_prefix_cache():
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "delta"}],
+        max_tokens=10,
+        vllm_xargs={"rwkv_state_read_ref": "goal-parent"},
+    )
+
+    sampling_params = request.to_sampling_params(
+        max_tokens=10,
+        default_sampling_params={},
+    )
+
+    assert sampling_params.extra_args == {"rwkv_state_read_ref": "goal-parent"}
+    assert sampling_params.skip_reading_prefix_cache is True
+
+
 def test_chat_completion_request_accepts_model_specific_reasoning_effort():
     request = ChatCompletionRequest(
         model="test-model",

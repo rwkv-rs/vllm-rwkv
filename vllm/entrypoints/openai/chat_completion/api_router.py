@@ -4,7 +4,7 @@
 
 from http import HTTPStatus
 
-from fastapi import APIRouter, Depends, FastAPI, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from vllm.entrypoints.openai.chat_completion.batch_serving import OpenAIServingChatBatch
@@ -35,6 +35,66 @@ def chat(request: Request) -> OpenAIServingChat | None:
 
 def batch_chat(request: Request) -> OpenAIServingChatBatch | None:
     return request.app.state.openai_serving_chat_batch
+
+
+async def _rwkv_state_action(
+    raw_request: Request,
+    action: str,
+    state_ref: str = "",
+    target_ref: str = "",
+):
+    handler = chat(raw_request)
+    if handler is None:
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_IMPLEMENTED,
+            detail="Chat serving is unavailable",
+        )
+    try:
+        return await handler.rwkv_state_cache_action(action, state_ref, target_ref)
+    except Exception as error:
+        detail = str(error)
+        if isinstance(error, KeyError) or "Unknown RWKV State ref" in detail:
+            status_code = HTTPStatus.NOT_FOUND
+        elif (
+            isinstance(error, (ValueError, MemoryError))
+            or "RWKV State ref is in use" in detail
+            or "RWKV State ref already exists" in detail
+        ):
+            status_code = HTTPStatus.CONFLICT
+        elif isinstance(error, NotImplementedError):
+            status_code = HTTPStatus.NOT_IMPLEMENTED
+        else:
+            status_code = HTTPStatus.SERVICE_UNAVAILABLE
+        raise HTTPException(status_code=status_code, detail=detail) from error
+
+
+@router.get("/v1/rwkv/state/capabilities")
+async def rwkv_state_capabilities(raw_request: Request):
+    return await _rwkv_state_action(raw_request, "capabilities")
+
+
+@router.get("/v1/rwkv/state/{state_ref}")
+async def inspect_rwkv_state(state_ref: str, raw_request: Request):
+    return await _rwkv_state_action(raw_request, "inspect", state_ref)
+
+
+@router.post("/v1/rwkv/state/{state_ref}/clone")
+async def clone_rwkv_state(
+    state_ref: str,
+    payload: dict[str, str],
+    raw_request: Request,
+):
+    return await _rwkv_state_action(
+        raw_request,
+        "clone",
+        state_ref,
+        str(payload.get("target_ref") or ""),
+    )
+
+
+@router.delete("/v1/rwkv/state/{state_ref}")
+async def drop_rwkv_state(state_ref: str, raw_request: Request):
+    return await _rwkv_state_action(raw_request, "drop", state_ref)
 
 
 @router.post(
