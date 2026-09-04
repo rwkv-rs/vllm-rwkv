@@ -624,6 +624,7 @@ def _new_rwkv7_model_state(
             enable_prefix_caching=False,
             rwkv_recurrent_prefix_caching=enable_prefix_caching,
         ),
+        parallel_config=SimpleNamespace(data_parallel_size=1),
     )
     return RWKV7ModelState(
         vllm_config=vllm_config,
@@ -689,6 +690,59 @@ def test_rwkv7_prefix_state_cache_fails_closed_on_conflict_and_stale_identity():
         cache.get(_prefix_identity((1, 2), model_revision="new-model"))
     with pytest.raises(ValueError, match="stale backend configuration"):
         cache.get(_prefix_identity((1, 2), backend_revision="new-backend"))
+
+
+def test_rwkv7_state_ref_cache_is_bounded_and_supports_clone_drop(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_RWKV_STATE_CACHE_MAX_BYTES", "1")
+    state = _new_rwkv7_model_state(
+        max_num_reqs=2,
+        hidden_size=4,
+        head_size=2,
+        num_attention_heads=2,
+    )
+    snapshot_nbytes = state.state_snapshot_nbytes
+    state._state_cache_max_bytes = snapshot_nbytes * 2
+    state.shift_state[:, :, 0].fill_(11)
+    state.wkv_state[:, 0].fill_(12)
+    state.elapsed[0].fill_(13)
+
+    record = state.capture_state_ref(
+        "goal-a",
+        0,
+        processed_token_count=13,
+        pending_tail_token_ids=(7, 8),
+        finish_reason="stop",
+    )
+    assert record["nbytes"] == snapshot_nbytes
+    assert record["processed_token_count"] == 13
+    assert state.state_cache_action("clone", "goal-a", "goal-b")["parent_ref"] == (
+        "goal-a"
+    )
+    assert state.state_cache_action("capabilities")["used_bytes"] == snapshot_nbytes
+
+    state.shift_state[:, :, 1].zero_()
+    state.wkv_state[:, 1].zero_()
+    state.elapsed[1].zero_()
+    state.restore_state_ref("goal-b", 1)
+    assert torch.all(state.shift_state[:, :, 1] == 11)
+    assert torch.all(state.wkv_state[:, 1] == 12)
+    assert state.elapsed[1].item() == 13
+
+    state.state_cache_action("prepare_read", "goal-b", "lease-b")
+    with pytest.raises(ValueError, match="in use"):
+        state.state_cache_action("drop", "goal-b")
+    state.state_cache_action("cancel_read", "goal-b", "lease-b")
+    state.state_cache_action("drop", "goal-a")
+    assert state.state_cache_action("capabilities")["used_bytes"] == snapshot_nbytes
+    state.state_cache_action("drop", "goal-b")
+    assert state.state_cache_action("capabilities")["used_bytes"] == 0
+
+    state.capture_state_ref("goal-c", 0)
+    state.capture_state_ref("goal-d", 0)
+    with pytest.raises(MemoryError, match="capacity exceeded"):
+        state.capture_state_ref("goal-e", 0)
 
 
 def test_rwkv7_cached_recurrence_matches_full_prefill_continuation():

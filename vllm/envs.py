@@ -124,6 +124,7 @@ if TYPE_CHECKING:
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_RWKV7_WKV_MODE: str = "fp16"
+    VLLM_RWKV_STATE_CACHE_MAX_BYTES: int = 0
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1180,6 +1181,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # RWKV7 execution profile: fp16 throughput or fp32io16 high precision.
     "VLLM_RWKV7_WKV_MODE": lambda: os.getenv("VLLM_RWKV7_WKV_MODE", "fp16"),
+    # Process-local detached RWKV recurrent-state cache capacity in bytes.
+    "VLLM_RWKV_STATE_CACHE_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_RWKV_STATE_CACHE_MAX_BYTES", "0")
+    ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (
         os.getenv("VLLM_DISABLE_PYNCCL", "False").lower() in ("true", "1")

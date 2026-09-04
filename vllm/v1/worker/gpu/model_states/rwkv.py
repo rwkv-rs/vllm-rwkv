@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import regex as re
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
@@ -22,6 +25,8 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 DEFAULT_RWKV7_PREFIX_CACHE_CAPACITY = 8
+RWKV_STATE_CACHE_PROTOCOL = "vllm-rwkv.state-cache.v1"
+_STATE_REF_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 
 
 @dataclass(frozen=True)
@@ -62,6 +67,13 @@ class RWKV7PrefixStateSnapshot:
     wkv_state: torch.Tensor
     elapsed: int
 
+    @property
+    def nbytes(self) -> int:
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (self.shift_state, self.wkv_state)
+        )
+
     def clone(self) -> "RWKV7PrefixStateSnapshot":
         return RWKV7PrefixStateSnapshot(
             shift_state=self.shift_state.clone(),
@@ -79,6 +91,19 @@ class RWKV7PrefixStateSnapshot:
             and self.wkv_state.device == other.wkv_state.device
             and torch.equal(self.wkv_state, other.wkv_state)
         )
+
+
+@dataclass(frozen=True)
+class _RWKV7StateCacheEntry:
+    snapshot: RWKV7PrefixStateSnapshot
+    parent_ref: str | None
+    processed_token_count: int
+    pending_tail_token_ids: tuple[int, ...]
+    finish_reason: str
+
+    @property
+    def nbytes(self) -> int:
+        return self.snapshot.nbytes
 
 
 class RWKV7PrefixStateCache:
@@ -277,6 +302,21 @@ class RWKV7ModelState(ModelState):
             else None
         )
         self._prefix_identity_fields = self._build_prefix_identity_fields()
+        self._state_cache: dict[str, _RWKV7StateCacheEntry] = {}
+        self._state_snapshot_refcounts: dict[int, int] = {}
+        self._active_state_readers: dict[str, int] = {}
+        self._prepared_state_reads_by_lease: dict[str, str] = {}
+        self._prepared_state_bytes_by_ref: dict[str, int] = {}
+        self._state_cache_bytes = 0
+        self._reserved_state_cache_bytes = 0
+        self._state_cache_max_bytes = int(envs.VLLM_RWKV_STATE_CACHE_MAX_BYTES)
+        if self._state_cache_max_bytes < 0:
+            raise ValueError("VLLM_RWKV_STATE_CACHE_MAX_BYTES must not be negative")
+        if (
+            self._state_cache_max_bytes
+            and vllm_config.parallel_config.data_parallel_size > 1
+        ):
+            raise ValueError("RWKV State refs do not yet support data parallelism")
 
     def _reset_mappings(self) -> None:
         self.req_slot_owners = [None] * self.max_num_reqs
@@ -359,6 +399,15 @@ class RWKV7ModelState(ModelState):
         wkv_row.copy_(snapshot.wkv_state)
         self.elapsed[row].fill_(snapshot.elapsed)
 
+    def _snapshot_row(self, row: int) -> RWKV7PrefixStateSnapshot:
+        if row < 0 or row >= self.max_num_reqs:
+            raise ValueError(f"RWKV7 state row {row} is out of range")
+        return RWKV7PrefixStateSnapshot(
+            shift_state=self.shift_state[:, :, row].clone(),
+            wkv_state=self.wkv_state[:, row].clone(),
+            elapsed=int(self.elapsed[row].item()),
+        )
+
     def _cache_row(self, req_slot: int, prefix_length: int) -> None:
         cache = self.prefix_state_cache
         req_id = self.req_slot_owners[req_slot]
@@ -383,6 +432,287 @@ class RWKV7ModelState(ModelState):
                 elapsed=prefix_length,
             ),
         )
+
+    @property
+    def state_snapshot_nbytes(self) -> int:
+        shift_state = self.shift_state[:, :, 0]
+        wkv_state = self.wkv_state[:, 0]
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (shift_state, wkv_state)
+        )
+
+    @staticmethod
+    def _validate_state_ref(
+        value: object,
+        *,
+        field: str,
+        allow_empty: bool = False,
+    ) -> str:
+        if value is None and allow_empty:
+            return ""
+        if not isinstance(value, str):
+            raise ValueError(f"{field} must be a string")
+        state_ref = value.strip()
+        if not state_ref and allow_empty:
+            return ""
+        if not _STATE_REF_PATTERN.fullmatch(state_ref):
+            raise ValueError(f"{field} is invalid")
+        return state_ref
+
+    def _state_ref_record(self, state_ref: str) -> dict[str, Any]:
+        entry = self._state_cache[state_ref]
+        return {
+            "protocol": RWKV_STATE_CACHE_PROTOCOL,
+            "state_ref": state_ref,
+            "nbytes": entry.nbytes,
+            "parent_ref": entry.parent_ref,
+            "processed_token_count": entry.processed_token_count,
+            "pending_tail_token_count": len(entry.pending_tail_token_ids),
+            "finish_reason": entry.finish_reason,
+            "state_dtype": str(entry.snapshot.wkv_state.dtype),
+            "process_local": True,
+            "durable": False,
+            "scheduler_slots_reserved": 0,
+        }
+
+    def _state_ref_reader_count(self, state_ref: str) -> int:
+        prepared = sum(
+            prepared_ref == state_ref
+            for prepared_ref in self._prepared_state_reads_by_lease.values()
+        )
+        return self._active_state_readers.get(state_ref, 0) + prepared
+
+    def _reserve_state_ref(self) -> int:
+        if self._state_cache_max_bytes == 0:
+            raise RuntimeError(
+                "RWKV State refs are disabled; set "
+                "VLLM_RWKV_STATE_CACHE_MAX_BYTES to a positive byte limit"
+            )
+        required = self.state_snapshot_nbytes
+        if (
+            self._state_cache_bytes + self._reserved_state_cache_bytes + required
+            > self._state_cache_max_bytes
+        ):
+            raise MemoryError(
+                "RWKV State cache capacity exceeded before generation: "
+                f"used={self._state_cache_bytes}, "
+                f"reserved={self._reserved_state_cache_bytes}, "
+                f"required={required}, limit={self._state_cache_max_bytes}"
+            )
+        self._reserved_state_cache_bytes += required
+        return required
+
+    def _store_state_ref(
+        self,
+        state_ref: str,
+        entry: _RWKV7StateCacheEntry,
+        *,
+        reserved_nbytes: int = 0,
+    ) -> dict[str, Any]:
+        if state_ref in self._state_cache:
+            raise ValueError(f"RWKV State ref already exists: {state_ref}")
+        snapshot_key = id(entry.snapshot)
+        required = 0 if snapshot_key in self._state_snapshot_refcounts else entry.nbytes
+        unreserved = self._reserved_state_cache_bytes - reserved_nbytes
+        if (
+            self._state_cache_bytes + unreserved + required
+            > self._state_cache_max_bytes
+        ):
+            raise MemoryError(
+                "RWKV State cache capacity exceeded: "
+                f"used={self._state_cache_bytes}, reserved={unreserved}, "
+                f"required={required}, limit={self._state_cache_max_bytes}"
+            )
+        if reserved_nbytes:
+            self._reserved_state_cache_bytes -= reserved_nbytes
+        self._state_cache[state_ref] = entry
+        self._state_cache_bytes += required
+        self._state_snapshot_refcounts[snapshot_key] = (
+            self._state_snapshot_refcounts.get(snapshot_key, 0) + 1
+        )
+        return self._state_ref_record(state_ref)
+
+    def capture_state_ref(
+        self,
+        state_ref: str,
+        row: int,
+        *,
+        parent_ref: str | None = None,
+        processed_token_count: int = 0,
+        pending_tail_token_ids: Sequence[int] = (),
+        finish_reason: str = "snapshot",
+        reserved_nbytes: int = 0,
+    ) -> dict[str, Any]:
+        state_ref = self._validate_state_ref(state_ref, field="state_ref")
+        entry = _RWKV7StateCacheEntry(
+            snapshot=self._snapshot_row(row),
+            parent_ref=parent_ref,
+            processed_token_count=processed_token_count,
+            pending_tail_token_ids=tuple(pending_tail_token_ids),
+            finish_reason=finish_reason,
+        )
+        return self._store_state_ref(state_ref, entry, reserved_nbytes=reserved_nbytes)
+
+    def restore_state_ref(self, state_ref: str, row: int) -> None:
+        state_ref = self._validate_state_ref(state_ref, field="state_ref")
+        if state_ref not in self._state_cache:
+            raise KeyError(f"Unknown RWKV State ref: {state_ref}")
+        self._restore_row(row, self._state_cache[state_ref].snapshot)
+
+    def state_cache_action(
+        self,
+        action: str,
+        state_ref: str = "",
+        target_ref: str = "",
+    ) -> dict[str, Any]:
+        if action == "capabilities":
+            return {
+                "protocol": RWKV_STATE_CACHE_PROTOCOL,
+                "supported": True,
+                "enabled": self._state_cache_max_bytes > 0,
+                "process_local": True,
+                "durable": False,
+                "scheduler_slots_reserved_per_ref": 0,
+                "max_bytes": self._state_cache_max_bytes,
+                "used_bytes": self._state_cache_bytes,
+                "reserved_bytes": self._reserved_state_cache_bytes,
+                "snapshot_nbytes": self.state_snapshot_nbytes,
+                "state_count": len(self._state_cache),
+                "prepared_read_count": len(self._prepared_state_reads_by_lease),
+            }
+        state_ref = self._validate_state_ref(state_ref, field="state_ref")
+        if action == "inspect_if_exists":
+            if state_ref not in self._state_cache:
+                return {
+                    "protocol": RWKV_STATE_CACHE_PROTOCOL,
+                    "state_ref": state_ref,
+                    "exists": False,
+                }
+            return {**self._state_ref_record(state_ref), "exists": True}
+        if action == "prepare_read":
+            read_lease = self._validate_state_ref(target_ref, field="read_lease")
+            if state_ref not in self._state_cache:
+                raise KeyError(f"Unknown RWKV State ref: {state_ref}")
+            if read_lease in self._prepared_state_reads_by_lease:
+                raise ValueError(f"RWKV State read lease already exists: {read_lease}")
+            self._prepared_state_reads_by_lease[read_lease] = state_ref
+            return {
+                "protocol": RWKV_STATE_CACHE_PROTOCOL,
+                "state_ref": state_ref,
+                "read_lease": read_lease,
+                "ready": True,
+            }
+        if action == "cancel_read":
+            read_lease = self._validate_state_ref(target_ref, field="read_lease")
+            canceled = self._prepared_state_reads_by_lease.get(read_lease) == state_ref
+            if canceled:
+                del self._prepared_state_reads_by_lease[read_lease]
+            return {
+                "protocol": RWKV_STATE_CACHE_PROTOCOL,
+                "state_ref": state_ref,
+                "read_lease": read_lease,
+                "canceled": canceled,
+            }
+        if action == "prepare_write":
+            if (
+                state_ref in self._state_cache
+                or state_ref in self._prepared_state_bytes_by_ref
+            ):
+                raise ValueError(f"RWKV State ref already exists: {state_ref}")
+            reserved = self._reserve_state_ref()
+            self._prepared_state_bytes_by_ref[state_ref] = reserved
+            return {
+                "protocol": RWKV_STATE_CACHE_PROTOCOL,
+                "state_ref": state_ref,
+                "ready": True,
+                "reserved_bytes": reserved,
+            }
+        if action == "cancel_write":
+            reserved = self._prepared_state_bytes_by_ref.pop(state_ref, 0)
+            self._reserved_state_cache_bytes -= reserved
+            return {
+                "protocol": RWKV_STATE_CACHE_PROTOCOL,
+                "state_ref": state_ref,
+                "canceled": bool(reserved),
+                "reserved_bytes": self._reserved_state_cache_bytes,
+            }
+        if action == "drop_if_exists" and state_ref not in self._state_cache:
+            return {
+                "protocol": RWKV_STATE_CACHE_PROTOCOL,
+                "state_ref": state_ref,
+                "dropped": False,
+                "used_bytes": self._state_cache_bytes,
+            }
+        if state_ref not in self._state_cache:
+            raise KeyError(f"Unknown RWKV State ref: {state_ref}")
+        if action == "prepare_drop":
+            if self._state_ref_reader_count(state_ref):
+                raise ValueError(f"RWKV State ref is in use: {state_ref}")
+            return {
+                "protocol": RWKV_STATE_CACHE_PROTOCOL,
+                "state_ref": state_ref,
+                "ready": True,
+            }
+        if action == "prepare_clone":
+            target_ref = self._validate_state_ref(target_ref, field="target_ref")
+            if (
+                target_ref in self._state_cache
+                or target_ref in self._prepared_state_bytes_by_ref
+            ):
+                raise ValueError(f"RWKV State ref already exists: {target_ref}")
+            return {
+                "protocol": RWKV_STATE_CACHE_PROTOCOL,
+                "state_ref": state_ref,
+                "target_ref": target_ref,
+                "ready": True,
+            }
+        if action == "inspect":
+            return self._state_ref_record(state_ref)
+        if action in {"drop", "drop_if_exists"}:
+            if self._state_ref_reader_count(state_ref):
+                raise ValueError(f"RWKV State ref is in use: {state_ref}")
+            entry = self._state_cache.pop(state_ref)
+            snapshot_key = id(entry.snapshot)
+            refcount = self._state_snapshot_refcounts[snapshot_key] - 1
+            if refcount:
+                self._state_snapshot_refcounts[snapshot_key] = refcount
+            else:
+                del self._state_snapshot_refcounts[snapshot_key]
+                self._state_cache_bytes -= entry.nbytes
+            return {
+                "protocol": RWKV_STATE_CACHE_PROTOCOL,
+                "state_ref": state_ref,
+                "dropped": True,
+                "used_bytes": self._state_cache_bytes,
+            }
+        if action == "clone":
+            target_ref = self._validate_state_ref(target_ref, field="target_ref")
+            source = self._state_cache[state_ref]
+            entry = _RWKV7StateCacheEntry(
+                snapshot=source.snapshot,
+                parent_ref=state_ref,
+                processed_token_count=source.processed_token_count,
+                pending_tail_token_ids=source.pending_tail_token_ids,
+                finish_reason=source.finish_reason,
+            )
+            return self._store_state_ref(target_ref, entry)
+        if action == "restore_metadata":
+            entry = self._state_cache[state_ref]
+            return {
+                **self._state_ref_record(state_ref),
+                "pending_tail_token_ids": list(entry.pending_tail_token_ids),
+            }
+        raise ValueError(f"unsupported RWKV State cache action: {action}")
+
+    def _clear_state_cache(self) -> None:
+        self._state_cache.clear()
+        self._state_snapshot_refcounts.clear()
+        self._active_state_readers.clear()
+        self._prepared_state_reads_by_lease.clear()
+        self._prepared_state_bytes_by_ref.clear()
+        self._state_cache_bytes = 0
+        self._reserved_state_cache_bytes = 0
 
     def _state_slot_for_batch_entry(
         self,
@@ -667,6 +997,7 @@ class RWKV7ModelState(ModelState):
         self.elapsed.zero_()
         if self.prefix_state_cache is not None:
             self.prefix_state_cache.clear()
+        self._clear_state_cache()
         self.req_prefix_cache_hit_lengths = {
             req_id: 0 for req_id in self.req_id_to_index
         }

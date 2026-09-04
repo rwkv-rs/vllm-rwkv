@@ -877,6 +877,18 @@ class Worker(WorkerBase):
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 
+    def rwkv_state_cache_action(
+        self,
+        action: str,
+        state_ref: str = "",
+        target_ref: str = "",
+    ) -> dict[str, Any]:
+        model_state = getattr(self.model_runner, "model_state", None)
+        handler = getattr(model_state, "state_cache_action", None)
+        if handler is None:
+            raise NotImplementedError("loaded model does not support RWKV State refs")
+        return handler(action, state_ref, target_ref)
+
     def get_draft_model(self) -> nn.Module | None:
         return self.model_runner.get_draft_model()
 
