@@ -1,0 +1,10 @@
+[
+  {
+    "id": "memory",
+    "turns": [
+      "Remember this exact code for later: cedar-42-lantern. Reply only ACK.",
+      "What exact code did I ask you to remember? Reply with only the code.",
+      "Now repeat the same code backwards character by character."
+    ]
+  }
+]
