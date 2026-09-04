@@ -211,6 +211,7 @@ class Request:
         self.update_block_hashes()
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
+        self.skip_writing_prefix_cache = self.get_skip_writing_prefix_cache()
 
         # Used for streaming
         self.resumable = resumable
@@ -293,6 +294,12 @@ class Request:
     def get_skip_reading_prefix_cache(self) -> bool:
         if (
             self.sampling_params is not None
+            and self.sampling_params.extra_args
+            and self.sampling_params.extra_args.get("rwkv_state_read_ref")
+        ):
+            return True
+        if (
+            self.sampling_params is not None
             and self.sampling_params.skip_reading_prefix_cache is not None
         ):
             return self.sampling_params.skip_reading_prefix_cache
@@ -302,6 +309,13 @@ class Request:
         ):
             return self.pooling_params.skip_reading_prefix_cache
         return False
+
+    def get_skip_writing_prefix_cache(self) -> bool:
+        return bool(
+            self.sampling_params is not None
+            and self.sampling_params.extra_args
+            and self.sampling_params.extra_args.get("rwkv_state_read_ref")
+        )
 
     def is_finished(self) -> bool:
         return RequestStatus.is_finished(self.status)

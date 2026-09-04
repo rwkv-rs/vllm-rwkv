@@ -181,6 +181,12 @@ class CachedRequestData:
         )
 
 
+@dataclass(frozen=True)
+class FinishedRequestData:
+    finish_reason: str
+    pending_tail_token_ids: tuple[int, ...]
+
+
 @dataclass
 class ScheduledEncoderInputStats:
     """Stats for encoder inputs scheduled in one iteration."""
@@ -225,6 +231,10 @@ class SchedulerOutput:
     # list of mm_hash strings associated with the encoder outputs to be
     # freed from the encoder cache.
     free_encoder_mm_hashes: list[str]
+
+    # Metadata needed by model-owned state that is finalized when a request
+    # leaves the worker. Absent entries must be treated as non-committable.
+    finished_req_data: dict[str, FinishedRequestData] | None = None
 
     scheduled_encoder_input_stats: ScheduledEncoderInputStats | None = None
 

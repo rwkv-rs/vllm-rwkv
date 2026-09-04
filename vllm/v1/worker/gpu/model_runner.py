@@ -53,7 +53,11 @@ from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
-from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.core.sched.output import (
+    FinishedRequestData,
+    GrammarOutput,
+    SchedulerOutput,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
@@ -801,10 +805,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return cuda_graph_size
 
-    def _remove_request(self, req_id: str) -> bool:
+    def _remove_request(
+        self,
+        req_id: str,
+        finished_data: FinishedRequestData | None = None,
+    ) -> bool:
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
-        self.model_state.remove_request(req_id)
+        self.model_state.remove_request(req_id, finished_data)
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
             return False
@@ -824,8 +832,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         preempted_req_ids = scheduler_output.preempted_req_ids
         if preempted_req_ids:
             finished_req_ids = finished_req_ids.union(preempted_req_ids)
+        finished_req_data = scheduler_output.finished_req_data or {}
         for req_id in finished_req_ids:
-            self._remove_request(req_id)
+            self._remove_request(req_id, finished_req_data.get(req_id))
 
     def free_states(self, scheduler_output: SchedulerOutput) -> None:
         if self.encoder_cache is not None:

@@ -41,6 +41,7 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
+    FinishedRequestData,
     GrammarOutput,
     NewRequestData,
     ScheduledEncoderInputStats,
@@ -197,6 +198,7 @@ class Scheduler(SchedulerInterface):
         # requests so that they can free the cached states for those requests.
         # This is flushed at the end of each scheduling step.
         self.finished_req_ids: set[str] = set()
+        self.finished_req_data: dict[str, FinishedRequestData] = {}
 
         # IDs of requests preempted since the last call to schedule().
         self.reset_preempted_req_ids: set[str] = set()
@@ -1244,6 +1246,7 @@ class Scheduler(SchedulerInterface):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            finished_req_data=self.finished_req_data,
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             kv_cache_block_copies=pending_kv_cache_block_copies,
             partial_tail_offloads=pending_partial_tail_offloads,
@@ -1385,6 +1388,7 @@ class Scheduler(SchedulerInterface):
         # NOTE: We shouldn't just clear() here because it will also affect
         # the scheduler output.
         self.finished_req_ids = set()
+        self.finished_req_data = {}
         self.reset_preempted_req_ids = set()
 
     def _update_request_as_session(
@@ -2340,6 +2344,18 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
+        finish_reason = request.get_finished_reason()
+        if finish_reason is not None:
+            finish_reason_str = str(finish_reason)
+            pending_tail_token_ids: tuple[int, ...] = ()
+            if finish_reason_str in {"stop", "length", "repetition"}:
+                pending_tail_token_ids = tuple(
+                    request.all_token_ids[request.num_computed_tokens :]
+                )
+            self.finished_req_data[request_id] = FinishedRequestData(
+                finish_reason=finish_reason_str,
+                pending_tail_token_ids=pending_tail_token_ids,
+            )
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
 

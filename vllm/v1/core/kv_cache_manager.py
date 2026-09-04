@@ -765,7 +765,7 @@ class KVCacheManager:
             num_computed_tokens: The number of computed tokens, including tokens
                 that are already cached and tokens to be cached.
         """
-        if self.enable_caching:
+        if self.enable_caching and not request.skip_writing_prefix_cache:
             self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(

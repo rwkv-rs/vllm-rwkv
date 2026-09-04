@@ -14,7 +14,7 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.tasks import GenerationTask
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.output import FinishedRequestData, NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
@@ -26,7 +26,11 @@ logger = init_logger(__name__)
 
 DEFAULT_RWKV7_PREFIX_CACHE_CAPACITY = 8
 RWKV_STATE_CACHE_PROTOCOL = "vllm-rwkv.state-cache.v1"
+RWKV_STATE_READ_REF_ARG = "rwkv_state_read_ref"
+RWKV_STATE_READ_LEASE_ARG = "rwkv_state_read_lease"
+RWKV_STATE_WRITE_REF_ARG = "rwkv_state_write_ref"
 _STATE_REF_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_COMMIT_FINISH_REASONS = frozenset({"stop", "length", "repetition"})
 
 
 @dataclass(frozen=True)
@@ -309,6 +313,9 @@ class RWKV7ModelState(ModelState):
         self._prepared_state_bytes_by_ref: dict[str, int] = {}
         self._state_cache_bytes = 0
         self._reserved_state_cache_bytes = 0
+        self._pending_write_ref_by_id: dict[str, str] = {}
+        self._reserved_state_bytes_by_req_id: dict[str, int] = {}
+        self._parent_state_ref_by_req_id: dict[str, str] = {}
         self._state_cache_max_bytes = int(envs.VLLM_RWKV_STATE_CACHE_MAX_BYTES)
         if self._state_cache_max_bytes < 0:
             raise ValueError("VLLM_RWKV_STATE_CACHE_MAX_BYTES must not be negative")
@@ -617,6 +624,7 @@ class RWKV7ModelState(ModelState):
         if action == "prepare_write":
             if (
                 state_ref in self._state_cache
+                or state_ref in self._pending_write_ref_by_id.values()
                 or state_ref in self._prepared_state_bytes_by_ref
             ):
                 raise ValueError(f"RWKV State ref already exists: {state_ref}")
@@ -658,6 +666,7 @@ class RWKV7ModelState(ModelState):
             target_ref = self._validate_state_ref(target_ref, field="target_ref")
             if (
                 target_ref in self._state_cache
+                or target_ref in self._pending_write_ref_by_id.values()
                 or target_ref in self._prepared_state_bytes_by_ref
             ):
                 raise ValueError(f"RWKV State ref already exists: {target_ref}")
@@ -711,6 +720,9 @@ class RWKV7ModelState(ModelState):
         self._active_state_readers.clear()
         self._prepared_state_reads_by_lease.clear()
         self._prepared_state_bytes_by_ref.clear()
+        self._pending_write_ref_by_id.clear()
+        self._reserved_state_bytes_by_req_id.clear()
+        self._parent_state_ref_by_req_id.clear()
         self._state_cache_bytes = 0
         self._reserved_state_cache_bytes = 0
 
@@ -875,11 +887,58 @@ class RWKV7ModelState(ModelState):
         if not self.free_rows:
             raise RuntimeError("RWKV7 state pool is full")
 
-        prompt_token_ids = tuple(new_req_data.prompt_token_ids or ())
         sampling_params = new_req_data.sampling_params
+        extra_args = sampling_params.extra_args if sampling_params is not None else None
+        extra_args = extra_args or {}
+        read_ref = self._validate_state_ref(
+            extra_args.get(RWKV_STATE_READ_REF_ARG),
+            field=RWKV_STATE_READ_REF_ARG,
+            allow_empty=True,
+        )
+        read_lease = self._validate_state_ref(
+            extra_args.get(RWKV_STATE_READ_LEASE_ARG),
+            field=RWKV_STATE_READ_LEASE_ARG,
+            allow_empty=True,
+        )
+        write_ref = self._validate_state_ref(
+            extra_args.get(RWKV_STATE_WRITE_REF_ARG),
+            field=RWKV_STATE_WRITE_REF_ARG,
+            allow_empty=True,
+        )
+        if (read_ref or write_ref) and self._state_cache_max_bytes == 0:
+            raise RuntimeError(
+                "RWKV State refs are disabled; set "
+                "VLLM_RWKV_STATE_CACHE_MAX_BYTES to a positive byte limit"
+            )
+        if read_lease and not read_ref:
+            raise ValueError("rwkv_state_read_lease requires rwkv_state_read_ref")
+        read_entry = self._state_cache.get(read_ref) if read_ref else None
+        if read_ref:
+            if read_entry is None:
+                raise KeyError(f"Unknown RWKV State ref: {read_ref}")
+            if read_lease:
+                prepared_ref = self._prepared_state_reads_by_lease.get(read_lease)
+                if prepared_ref != read_ref:
+                    raise ValueError("RWKV State read lease is missing or mismatched")
+            pending_tail = read_entry.pending_tail_token_ids
+            prefill_token_ids = new_req_data.prefill_token_ids or ()
+            if tuple(prefill_token_ids[: len(pending_tail)]) != pending_tail:
+                raise ValueError(
+                    "RWKV State restore input is missing its pending tail tokens"
+                )
+        if write_ref:
+            if write_ref == read_ref:
+                raise ValueError("RWKV State read/write refs must be different")
+            if write_ref in self._state_cache or write_ref in (
+                self._pending_write_ref_by_id.values()
+            ):
+                raise ValueError(f"RWKV State ref already exists: {write_ref}")
+
+        prompt_token_ids = tuple(new_req_data.prompt_token_ids or ())
         prefix_state_cache = self.prefix_state_cache
         cache_eligible = bool(
             prefix_state_cache is not None
+            and not read_ref
             and prompt_token_ids
             and (
                 sampling_params is None
@@ -906,6 +965,13 @@ class RWKV7ModelState(ModelState):
         row = min(self.free_rows)
         if self.row_to_req_slot[row] != -1:
             raise RuntimeError(f"RWKV7 free state row {row} still has an owner")
+        reserved = 0
+        used_prepared_reservation = False
+        if write_ref:
+            reserved = self._prepared_state_bytes_by_ref.pop(write_ref, 0)
+            used_prepared_reservation = bool(reserved)
+            if not reserved:
+                reserved = self._reserve_state_ref()
         self.free_rows.remove(row)
         self.req_id_to_index[req_id] = req_index
         self.req_slot_owners[req_index] = req_id
@@ -913,7 +979,9 @@ class RWKV7ModelState(ModelState):
         self.row_to_req_slot[row] = req_index
         self._zero_row(row)
         try:
-            if cached_snapshot is not None:
+            if read_entry is not None:
+                self._restore_row(row, read_entry.snapshot)
+            elif cached_snapshot is not None:
                 self._restore_row(row, cached_snapshot)
         except Exception:
             self.req_id_to_index.pop(req_id)
@@ -922,13 +990,32 @@ class RWKV7ModelState(ModelState):
             self.row_to_req_slot[row] = -1
             self.free_rows.add(row)
             self._zero_row(row)
+            if reserved:
+                if used_prepared_reservation:
+                    self._prepared_state_bytes_by_ref[write_ref] = reserved
+                else:
+                    self._reserved_state_cache_bytes -= reserved
             raise
         self.req_prompt_token_ids[req_id] = prompt_token_ids
         self.req_prefix_cache_hit_lengths[req_id] = cache_hit_length
         if cache_eligible:
             self.prefix_cache_eligible_req_ids.add(req_id)
+        if read_ref:
+            if read_lease:
+                del self._prepared_state_reads_by_lease[read_lease]
+            self._active_state_readers[read_ref] = (
+                self._active_state_readers.get(read_ref, 0) + 1
+            )
+            self._parent_state_ref_by_req_id[req_id] = read_ref
+        if write_ref:
+            self._pending_write_ref_by_id[req_id] = write_ref
+            self._reserved_state_bytes_by_req_id[req_id] = reserved
 
-    def remove_request(self, req_id: str) -> None:
+    def remove_request(
+        self,
+        req_id: str,
+        finished_data: FinishedRequestData | None = None,
+    ) -> None:
         req_index = self.req_id_to_index.get(req_id)
         if req_index is None:
             return
@@ -940,6 +1027,40 @@ class RWKV7ModelState(ModelState):
         row = self.req_slot_to_row[req_index]
         if row == -1:
             raise RuntimeError(f"RWKV state for request id {req_id!r} missing")
+        write_ref = self._pending_write_ref_by_id.pop(req_id, "")
+        reserved = self._reserved_state_bytes_by_req_id.pop(req_id, 0)
+        parent_ref = self._parent_state_ref_by_req_id.pop(req_id, "")
+        if parent_ref:
+            active_readers = self._active_state_readers.get(parent_ref, 0) - 1
+            if active_readers > 0:
+                self._active_state_readers[parent_ref] = active_readers
+            else:
+                self._active_state_readers.pop(parent_ref, None)
+        finish_reason = None if finished_data is None else finished_data.finish_reason
+        if (
+            write_ref
+            and finished_data is not None
+            and finish_reason in _COMMIT_FINISH_REASONS
+            and reserved
+        ):
+            try:
+                self.capture_state_ref(
+                    write_ref,
+                    row,
+                    parent_ref=parent_ref or None,
+                    processed_token_count=int(self.elapsed[row].item()),
+                    pending_tail_token_ids=finished_data.pending_tail_token_ids,
+                    finish_reason=finish_reason,
+                    reserved_nbytes=reserved,
+                )
+            except Exception:
+                self._reserved_state_cache_bytes -= reserved
+                reserved = 0
+                raise
+            else:
+                reserved = 0
+        if reserved:
+            self._reserved_state_cache_bytes -= reserved
         self.req_id_to_index.pop(req_id)
         if req_index in self.decode_req_slots:
             self._remove_decode_row(req_index, row)

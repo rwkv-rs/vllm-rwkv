@@ -10,7 +10,7 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.tasks import GenerationTask
 from vllm.v1.attention.backend import AttentionCGSupport
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.output import FinishedRequestData, NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
@@ -90,7 +90,11 @@ class ModelState(ABC):
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         return None
 
-    def remove_request(self, req_id: str) -> None:
+    def remove_request(
+        self,
+        req_id: str,
+        finished_data: FinishedRequestData | None = None,
+    ) -> None:
         return None
 
     def apply_staged_writes(self) -> None:
