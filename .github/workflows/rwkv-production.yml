@@ -66,16 +66,16 @@ jobs:
       CUDA_HOME: /usr/local/cuda
       CUDA_PATH: /usr/local/cuda
       LD_LIBRARY_PATH: /usr/local/cuda/lib64
-      HTTP_PROXY: http://127.0.0.1:58011
-      HTTPS_PROXY: http://127.0.0.1:58011
+      HTTP_PROXY: http://127.0.0.1:7890
+      HTTPS_PROXY: http://127.0.0.1:7890
       NO_PROXY: 127.0.0.1,localhost
       UV_LINK_MODE: copy
       MAX_JOBS: "8"
       TORCH_CUDA_ARCH_LIST: "8.9 12.0"
       VLLM_BUILD_PROFILE: rwkv
-      RWKV15_ARTIFACT: /home/caizus/Weights/RWKV/hf/rwkv7-g1i-1.5b-20260805-ctx16384
-      RWKV72_ARTIFACT: /home/caizus/Weights/RWKV/hf/rwkv7-g1i-7.2b-20260805-ctx16384
-      RWKV72_PTH: /home/caizus/Weights/RWKV/rwkv7/pth/rwkv7-g1i-7.2b-20260805-ctx16384.pth
+      RWKV15_ARTIFACT: /home/caizus/Weights/RWKV/hf/rwkv7-g1j-1.5b-20260831-ctx16384
+      RWKV72_ARTIFACT: /home/caizus/Weights/RWKV/hf/rwkv7-g1f-7.2b-20260414-ctx16384
+      RWKV72_PTH: /mnt/raid0_8t/rwkv7-g1/rwkv7-g1f-7.2b-20260414-ctx8192.pth
       ALBATROSS_ENTRY: /home/caizus/Projects/MachineLearning/Albatross-vllm-rwkv-benchmark/faster3a_2607/rwkv7_fast_v3a.py
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -145,6 +145,7 @@ jobs:
               requirements/rwkv.txt \
               scripts/deploy_rwkv_production.sh \
               setup.py \
+              temp/rwkv_api_router.py \
               tests/v1/structured_output/test_validation.py \
               vllm/model_executor/layers/quantization/utils/w8a8_utils.py \
               vllm/model_executor/models/rwkv.py \
@@ -623,7 +624,9 @@ jobs:
           test ! -e "$bundle"
           printf '%s\n' "$GITHUB_SHA" > release/GIT_SHA
           uv pip freeze --python release/.venv/bin/python > release/requirements.freeze
-          tar -czf "$bundle" -C release .venv GIT_SHA requirements.freeze
+          tar -czf "$bundle" \
+            -C release .venv GIT_SHA requirements.freeze \
+            -C "$GITHUB_WORKSPACE" temp/rwkv_api_router.py
           (
             cd "$artifact_root"
             sha256sum "$(basename "$bundle")" > "$(basename "$bundle").sha256"
@@ -657,7 +660,6 @@ jobs:
     timeout-minutes: 180
     environment: production
     env:
-      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
       DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
       DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
       DEPLOY_JUMP_HOST: ${{ secrets.DEPLOY_JUMP_HOST }}
@@ -672,7 +674,6 @@ jobs:
       - name: Configure deployment SSH identity
         run: |
           set -euo pipefail
-          test -n "$DEPLOY_HOST"
           test -n "$DEPLOY_PORT"
           test -n "$DEPLOY_USER"
           test -n "$DEPLOY_JUMP_HOST"
@@ -692,52 +693,42 @@ jobs:
         run: |
           set -euo pipefail
           proxy_jump="$DEPLOY_USER@$DEPLOY_JUMP_HOST:$DEPLOY_JUMP_PORT"
-          ssh_args=(
-            -i "$RUNNER_TEMP/deploy-ssh/key"
-            -o BatchMode=yes
-            -o IdentitiesOnly=yes
-            -o StrictHostKeyChecking=yes
-            -o "UserKnownHostsFile=$RUNNER_TEMP/deploy-ssh/known_hosts"
-            -J "$proxy_jump"
-            -p "$DEPLOY_PORT"
-          )
-          target="$DEPLOY_USER@$DEPLOY_HOST"
-          scp_args=(
-            -i "$RUNNER_TEMP/deploy-ssh/key"
-            -o BatchMode=yes
-            -o IdentitiesOnly=yes
-            -o StrictHostKeyChecking=yes
-            -o "UserKnownHostsFile=$RUNNER_TEMP/deploy-ssh/known_hosts"
-            -o "ProxyJump=$proxy_jump"
-            -P "$DEPLOY_PORT"
-          )
-          scp "${scp_args[@]}" scripts/deploy_rwkv_production.sh \
-            "$target:/tmp/deploy_rwkv_production.sh"
 
-          if [[ "${{ github.event_name }}" == workflow_dispatch && \
-                "$REQUESTED_ACTION" == rollback ]]; then
-            ssh "${ssh_args[@]}" "$target" \
-              'sudo install -m 0755 /tmp/deploy_rwkv_production.sh /usr/local/sbin/deploy_rwkv_production && sudo /usr/local/sbin/deploy_rwkv_production rollback'
-            exit 0
-          fi
+          run_target() {
+            local action=$1
+            local host=$2
+            local target="$DEPLOY_USER@$host"
+            local -a ssh_args=(
+              -i "$RUNNER_TEMP/deploy-ssh/key"
+              -o BatchMode=yes
+              -o IdentitiesOnly=yes
+              -o StrictHostKeyChecking=yes
+              -o "UserKnownHostsFile=$RUNNER_TEMP/deploy-ssh/known_hosts"
+              -J "$proxy_jump"
+              -p "$DEPLOY_PORT"
+            )
+            local -a scp_args=(
+              -i "$RUNNER_TEMP/deploy-ssh/key"
+              -o BatchMode=yes
+              -o IdentitiesOnly=yes
+              -o StrictHostKeyChecking=yes
+              -o "UserKnownHostsFile=$RUNNER_TEMP/deploy-ssh/known_hosts"
+              -o "ProxyJump=$proxy_jump"
+              -P "$DEPLOY_PORT"
+            )
 
-          if [[ "${{ github.event_name }}" == push ]]; then
-            release_sha="$GITHUB_SHA"
-          else
-            release_sha="$REQUESTED_SHA"
-          fi
-          [[ $release_sha =~ ^[0-9a-f]{40}$ ]]
-          artifact_root="/home/caizus/artifacts/vllm-rwkv/$release_sha"
-          bundle="$artifact_root/vllm-rwkv-$release_sha.tar.gz"
-          checksum="$bundle.sha256"
-          test -f "$bundle"
-          test -f "$checksum"
-          scp "${scp_args[@]}" "$bundle" "$checksum" \
-            "$target:/tmp/"
-          bundle_name=$(basename "$bundle")
-          checksum_name=$(basename "$checksum")
-          ssh "${ssh_args[@]}" "$target" bash -s -- \
-            "$release_sha" "$bundle_name" "$checksum_name" <<'REMOTE'
+            scp "${scp_args[@]}" scripts/deploy_rwkv_production.sh \
+              "$target:/tmp/deploy_rwkv_production.sh" || return 1
+            if [[ $action == rollback ]]; then
+              ssh "${ssh_args[@]}" "$target" \
+                'sudo install -m 0755 /tmp/deploy_rwkv_production.sh /usr/local/sbin/deploy_rwkv_production && sudo /usr/local/sbin/deploy_rwkv_production rollback' || return 1
+              return
+            fi
+
+            scp "${scp_args[@]}" "$bundle" "$checksum" "$target:/tmp/" ||
+              return 1
+            if ! ssh "${ssh_args[@]}" "$target" bash -s -- \
+              "$release_sha" "$bundle_name" "$checksum_name" <<'REMOTE'
           set -euo pipefail
           release_sha=$1
           bundle_name=$2
@@ -752,6 +743,39 @@ jobs:
             "/opt/rwkv/vllm/incoming/$bundle_name" \
             "/opt/rwkv/vllm/incoming/$checksum_name"
           REMOTE
+            then
+              return 1
+            fi
+          }
+
+          readonly small_host=192.168.0.129
+          readonly large_host=192.168.0.157
+          if [[ "${{ github.event_name }}" == workflow_dispatch && \
+                "$REQUESTED_ACTION" == rollback ]]; then
+            run_target rollback "$large_host"
+            run_target rollback "$small_host"
+            exit 0
+          fi
+
+          if [[ "${{ github.event_name }}" == push ]]; then
+            release_sha="$GITHUB_SHA"
+          else
+            release_sha="$REQUESTED_SHA"
+          fi
+          [[ $release_sha =~ ^[0-9a-f]{40}$ ]]
+          artifact_root="/home/caizus/artifacts/vllm-rwkv/$release_sha"
+          bundle="$artifact_root/vllm-rwkv-$release_sha.tar.gz"
+          checksum="$bundle.sha256"
+          test -f "$bundle"
+          test -f "$checksum"
+          bundle_name=$(basename "$bundle")
+          checksum_name=$(basename "$checksum")
+
+          run_target deploy "$small_host"
+          if ! run_target deploy "$large_host"; then
+            run_target rollback "$small_host" || true
+            exit 1
+          fi
 
       - name: Remove temporary SSH material
         if: always()
