@@ -6,15 +6,22 @@ readonly releases_dir="$root_dir/releases"
 readonly incoming_dir="$root_dir/incoming"
 readonly current_link="$root_dir/current"
 readonly previous_link="$root_dir/previous"
+readonly previous_state_dir="$root_dir/previous-state"
 readonly models_dir=/srv/rwkv/models
+readonly systemd_dir=/etc/systemd/system
+readonly router_file=/usr/local/libexec/rwkv_api_router.py
+readonly router_service=vllm-rwkv-api-router.service
 readonly minimum_free_kib=$((50 * 1024 * 1024))
-
-readonly -a services=(
+readonly -a all_services=(
   vllm-rwkv-1_5b.service
   vllm-rwkv-2_9b.service
   vllm-rwkv-7_2b.service
   vllm-rwkv-13_3b.service
 )
+deployment_role=
+listen_host=
+declare -a services=()
+declare -a ports=()
 
 die() {
   echo "error: $*" >&2
@@ -40,28 +47,63 @@ atomic_link() {
 check_host() {
   local free_kib
   local cuda_version
+  local expected_cuda_version
+  local expected_gpu_name
+  local expected_toolkit_version
+  local gpu_name
   local toolkit_version
+  local -a gpu_names=()
 
   [[ $(uname -m) == x86_64 ]] || die "production host must be x86_64"
   mapfile -t gpu_names < <(
     nvidia-smi --query-gpu=name --format=csv,noheader
   )
   [[ ${#gpu_names[@]} -eq 4 ]] || die "expected exactly four GPUs"
-  for gpu_name in "${gpu_names[@]}"; do
-    [[ $gpu_name == "NVIDIA GeForce RTX 4090 D" ]] ||
-      die "unexpected GPU: $gpu_name"
-  done
-
-  cuda_version=$(nvidia-smi | sed -n 's/.*CUDA Version: \([0-9.]*\).*/\1/p' | head -1)
-  [[ $cuda_version == 13.1 ]] || die "expected CUDA 13.1 driver, got $cuda_version"
+  cuda_version=$(
+    nvidia-smi |
+      sed -En 's/.*CUDA (UMD )?Version: ([0-9.]+).*/\2/p' |
+      head -1
+  )
   [[ -x /usr/local/cuda/bin/nvcc ]] || die "CUDA toolkit nvcc is missing"
   toolkit_version=$(
     /usr/local/cuda/bin/nvcc --version |
       sed -n 's/.*release \([0-9.]*\),.*/\1/p' |
       tail -1
   )
-  [[ $toolkit_version == 13.1 ]] ||
-    die "expected CUDA 13.1 toolkit, got $toolkit_version"
+  case ${gpu_names[0]} in
+  "NVIDIA GeForce RTX 4090 D")
+    deployment_role=large
+    expected_gpu_name="NVIDIA GeForce RTX 4090 D"
+    expected_cuda_version=13.1
+    expected_toolkit_version=13.1
+    listen_host=127.0.0.1
+    services=(vllm-rwkv-13_3b.service)
+    ports=(18004)
+    ;;
+  "NVIDIA GeForce RTX 4090")
+    deployment_role=small
+    expected_gpu_name="NVIDIA GeForce RTX 4090"
+    expected_cuda_version=13.2
+    expected_toolkit_version=13.0
+    listen_host=0.0.0.0
+    services=(
+      vllm-rwkv-1_5b.service
+      vllm-rwkv-2_9b.service
+      vllm-rwkv-7_2b.service
+    )
+    ports=(18001 18002 18003)
+    ;;
+  *)
+    die "unexpected GPU layout: ${gpu_names[*]}"
+    ;;
+  esac
+  for gpu_name in "${gpu_names[@]}"; do
+    [[ $gpu_name == "$expected_gpu_name" ]] || die "unexpected GPU: $gpu_name"
+  done
+  [[ $cuda_version == "$expected_cuda_version" ]] ||
+    die "expected CUDA $expected_cuda_version driver, got $cuda_version"
+  [[ $toolkit_version == "$expected_toolkit_version" ]] ||
+    die "expected CUDA $expected_toolkit_version toolkit, got $toolkit_version"
   command -v c++ >/dev/null || die "C++ compiler is missing"
 
   mkdir -p "$releases_dir" "$incoming_dir"
@@ -77,6 +119,7 @@ check_model() {
   local actual_shards
 
   [[ -f $path/config.json ]] || die "$model is missing config.json"
+  [[ -f $path/PROVENANCE.md ]] || die "$model is missing PROVENANCE.md"
   [[ -f $path/model.safetensors.index.json ]] ||
     die "$model is missing model.safetensors.index.json"
   [[ -f $path/tokenizer_config.json ]] || die "$model is missing tokenizer_config.json"
@@ -88,18 +131,24 @@ check_model() {
   actual_shards=$(find "$path" -maxdepth 1 -type f -name 'model-*.safetensors' | wc -l)
   [[ $actual_shards -eq $shard_count ]] ||
     die "$model has $actual_shards safetensor shards; expected $shard_count"
+  (
+    cd "$path"
+    awk '
+      /^```text$/ { checksums = 1; next }
+      /^```$/ && checksums { exit }
+      checksums { print }
+    ' PROVENANCE.md | sha256sum --check --strict
+  )
 }
 
 check_models() {
-  [[ -f $models_dir/SHA256SUMS ]] || die "$models_dir/SHA256SUMS is missing"
-  (
-    cd "$models_dir"
-    sha256sum --check --strict SHA256SUMS
-  )
-  check_model rwkv7-g1i-1.5b-20260805-ctx16384 2
-  check_model rwkv7-g1i-2.9b-20260805-ctx16384 3
-  check_model rwkv7-g1i-7.2b-20260805-ctx16384 6
-  check_model rwkv7-g1i-13.3b-20260805-ctx16384 11
+  if [[ $deployment_role == large ]]; then
+    check_model rwkv7-g1j-13.3b-20260831-ctx16384 11
+  else
+    check_model rwkv7-g1j-1.5b-20260831-ctx16384 2
+    check_model rwkv7-g1j-2.9b-20260831-ctx16384 3
+    check_model rwkv7-g1j-7.2b-20260831-ctx16384 6
+  fi
 }
 
 write_unit() {
@@ -111,10 +160,9 @@ write_unit() {
   local served_name=$6
   local port=$7
   local max_num_seqs=$8
-  local memory_utilization=$9
-  local parallel_args=${10:-}
+  local data_parallel_size=$9
 
-  install -m 0644 /dev/stdin "/etc/systemd/system/$service" <<EOF
+  install -m 0644 /dev/stdin "$systemd_dir/$service" <<EOF
 [Unit]
 Description=$description
 After=network-online.target
@@ -132,19 +180,19 @@ Environment=XDG_CACHE_HOME=$release/.cache
 Environment=PATH=$release/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=$release/.venv/bin/vllm serve $models_dir/$model \\
   --served-model-name $served_name \\
-  --host 127.0.0.1 \\
+  --host $listen_host \\
   --port $port \\
   --dtype float16 \\
   --mamba-ssm-cache-dtype float16 \\
   --max-model-len 16384 \\
   --max-num-seqs $max_num_seqs \\
-  --gpu-memory-utilization $memory_utilization \\
+  --gpu-memory-utilization 0.90 \\
+  --data-parallel-size $data_parallel_size \\
   --enable-chunked-prefill \\
-  --enable-prefix-caching \\
   --async-scheduling \\
   --structured-outputs-config.backend xgrammar \\
   --enable-auto-tool-choice \\
-  --tool-call-parser rwkv$parallel_args
+  --tool-call-parser rwkv
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=180
@@ -158,36 +206,50 @@ EOF
 install_units() {
   local release=$1
 
-  write_unit \
-    "$release" \
-    vllm-rwkv-1_5b.service \
-    "RWKV7 g1i 1.5B vLLM service" \
-    0 rwkv7-g1i-1.5b-20260805-ctx16384 rwkv7-g1i-1.5b \
-    18001 1024 0.32
-  write_unit \
-    "$release" \
-    vllm-rwkv-2_9b.service \
-    "RWKV7 g1i 2.9B vLLM service" \
-    0 rwkv7-g1i-2.9b-20260805-ctx16384 rwkv7-g1i-2.9b \
-    18002 1024 0.52
-  write_unit \
-    "$release" \
-    vllm-rwkv-7_2b.service \
-    "RWKV7 g1i 7.2B vLLM service" \
-    1 rwkv7-g1i-7.2b-20260805-ctx16384 rwkv7-g1i-7.2b \
-    18003 960 0.90
-  write_unit \
-    "$release" \
-    vllm-rwkv-13_3b.service \
-    "RWKV7 g1i 13.3B vLLM PP2 service" \
-    2,3 rwkv7-g1i-13.3b-20260805-ctx16384 rwkv7-g1i-13.3b \
-    18004 320 0.90 " --pipeline-parallel-size 2"
-  systemctl daemon-reload
-  systemctl enable "${services[@]}"
+  if [[ $deployment_role == large ]]; then
+    write_unit \
+      "$release" \
+      vllm-rwkv-13_3b.service \
+      "RWKV7 g1j 13.3B vLLM DP4 service" \
+      0,1,2,3 rwkv7-g1j-13.3b-20260831-ctx16384 rwkv7-g1j-13.3b \
+      18004 320 4 || return 1
+  else
+    write_unit \
+      "$release" \
+      vllm-rwkv-1_5b.service \
+      "RWKV7 g1j 1.5B vLLM service" \
+      0 rwkv7-g1j-1.5b-20260831-ctx16384 rwkv7-g1j-1.5b \
+      18001 1024 1 || return 1
+    write_unit \
+      "$release" \
+      vllm-rwkv-2_9b.service \
+      "RWKV7 g1j 2.9B vLLM service" \
+      1 rwkv7-g1j-2.9b-20260831-ctx16384 rwkv7-g1j-2.9b \
+      18002 1024 1 || return 1
+    write_unit \
+      "$release" \
+      vllm-rwkv-7_2b.service \
+      "RWKV7 g1j 7.2B vLLM DP2 service" \
+      2,3 rwkv7-g1j-7.2b-20260831-ctx16384 rwkv7-g1j-7.2b \
+      18003 256 2 || return 1
+  fi
+  systemctl daemon-reload || return 1
+  systemctl disable "${all_services[@]}" >/dev/null 2>&1 || true
+  systemctl enable "${services[@]}" || return 1
 }
 
 stop_services() {
-  systemctl stop "${services[@]}" || true
+  systemctl stop "${all_services[@]}" || true
+}
+
+service_port() {
+  case $1 in
+  vllm-rwkv-1_5b.service) echo 18001 ;;
+  vllm-rwkv-2_9b.service) echo 18002 ;;
+  vllm-rwkv-7_2b.service) echo 18003 ;;
+  vllm-rwkv-13_3b.service) echo 18004 ;;
+  *) return 1 ;;
+  esac
 }
 
 probe_service() {
@@ -216,7 +278,6 @@ PY
 
 start_services() {
   local index
-  local -a ports=(18001 18002 18003 18004)
 
   for index in "${!services[@]}"; do
     systemctl start "${services[$index]}"
@@ -228,12 +289,121 @@ start_services() {
   done
 }
 
-restore_release() {
+probe_router() {
+  probe_service 18000
+}
+
+install_release_router() {
   local release=$1
+
+  [[ $deployment_role == large ]] || return 0
+  if [[ ! -f $release/temp/rwkv_api_router.py ]]; then
+    echo "error: release is missing temp/rwkv_api_router.py" >&2
+    return 1
+  fi
+  install -o root -g root -m 0755 \
+    "$release/temp/rwkv_api_router.py" "$router_file" || return 1
+  systemctl restart "$router_service" || return 1
+  probe_router
+}
+
+activate_release() {
+  local release=$1
+
+  install_units "$release" || return 1
   stop_services
-  install_units "$release"
-  atomic_link "$release" "$current_link"
-  start_services || die "failed to restore release $release"
+  atomic_link "$release" "$current_link" || return 1
+  start_services || return 1
+  install_release_router "$release"
+}
+
+snapshot_deployment_state() {
+  local state_dir=$1
+  local release
+  local service
+
+  install -d -m 0700 "$state_dir/units"
+  : >"$state_dir/enabled"
+  : >"$state_dir/active"
+  release=$(readlink -f "$current_link" 2>/dev/null || true)
+  printf '%s\n' "$release" >"$state_dir/release"
+  for service in "${all_services[@]}"; do
+    if [[ -f $systemd_dir/$service ]]; then
+      cp -a "$systemd_dir/$service" "$state_dir/units/$service"
+    fi
+    if systemctl is-enabled --quiet "$service" 2>/dev/null; then
+      printf '%s\n' "$service" >>"$state_dir/enabled"
+    fi
+    if systemctl is-active --quiet "$service"; then
+      printf '%s\n' "$service" >>"$state_dir/active"
+    fi
+  done
+  if [[ $deployment_role == large && -f $router_file ]]; then
+    cp -a "$router_file" "$state_dir/rwkv_api_router.py"
+  fi
+  if [[ $deployment_role == large ]] &&
+    systemctl is-active --quiet "$router_service"; then
+    touch "$state_dir/router-active"
+  fi
+}
+
+restore_deployment_state() {
+  local state_dir=$1
+  local port
+  local release
+  local service
+
+  stop_services
+  if [[ $deployment_role == large ]]; then
+    systemctl stop "$router_service" || true
+  fi
+  for service in "${all_services[@]}"; do
+    if [[ -f $state_dir/units/$service ]]; then
+      install -o root -g root -m 0644 \
+        "$state_dir/units/$service" "$systemd_dir/$service" || return 1
+    else
+      rm -f -- "$systemd_dir/$service"
+    fi
+  done
+  systemctl daemon-reload || return 1
+  systemctl disable "${all_services[@]}" >/dev/null 2>&1 || true
+  while IFS= read -r service; do
+    if [[ -n $service ]]; then
+      systemctl enable "$service" || return 1
+    fi
+  done <"$state_dir/enabled"
+
+  release=$(<"$state_dir/release")
+  if [[ -n $release ]]; then
+    atomic_link "$release" "$current_link" || return 1
+  else
+    rm -f -- "$current_link"
+  fi
+  if [[ $deployment_role == large && -f $state_dir/rwkv_api_router.py ]]; then
+    install -o root -g root -m 0755 \
+      "$state_dir/rwkv_api_router.py" "$router_file" || return 1
+  fi
+
+  while IFS= read -r service; do
+    [[ -n $service ]] || continue
+    systemctl start "$service" || return 1
+    port=$(service_port "$service")
+    probe_service "$port" || return 1
+  done <"$state_dir/active"
+  if [[ -f $state_dir/router-active ]]; then
+    systemctl start "$router_service" || return 1
+    probe_router || return 1
+  fi
+}
+
+save_previous_state() {
+  local state_dir=$1
+  local next_state_dir="$previous_state_dir.next"
+
+  rm -rf -- "$next_state_dir"
+  mv "$state_dir" "$next_state_dir"
+  rm -rf -- "$previous_state_dir"
+  mv "$next_state_dir" "$previous_state_dir"
 }
 
 prepare_flashrwkv2() {
@@ -338,48 +508,54 @@ deploy_release() {
   local bundle=$2
   local checksum_file=$3
   local release
-  local old_release
+  local state_dir
 
   validate_sha "$sha"
   check_host
   check_models
   release=$(stage_release "$sha" "$bundle" "$checksum_file")
-  old_release=$(readlink -f "$current_link" 2>/dev/null || true)
-  install_units "$release"
-  stop_services
-  atomic_link "$release" "$current_link"
-
-  if ! start_services; then
-    if [[ -n $old_release ]]; then
-      restore_release "$old_release"
-    else
-      stop_services
+  state_dir=$(mktemp -d "$incoming_dir/deployment-state.XXXXXX")
+  snapshot_deployment_state "$state_dir"
+  if ! activate_release "$release"; then
+    if ! restore_deployment_state "$state_dir"; then
+      die "release $sha failed and the previous deployment could not be restored"
     fi
-    die "release $sha failed health checks and was rolled back"
+    rm -rf -- "$state_dir"
+    die "release $sha failed health checks and the previous deployment was restored"
   fi
 
-  if [[ -n $old_release && $old_release != "$release" ]]; then
-    atomic_link "$old_release" "$previous_link"
+  if [[ -n $(<"$state_dir/release") ]]; then
+    atomic_link "$(<"$state_dir/release")" "$previous_link"
+  else
+    rm -f -- "$previous_link"
   fi
+  save_previous_state "$state_dir"
   prune_releases
   echo "deployed $sha"
 }
 
 rollback_release() {
-  local old_current
-  local target
+  local current_state_dir
 
   require_root
   check_host
-  check_models
-  old_current=$(readlink -f "$current_link" 2>/dev/null || true)
-  target=$(readlink -f "$previous_link" 2>/dev/null || true)
-  [[ -n $old_current ]] || die "current release is missing"
-  [[ -n $target ]] || die "previous release is missing"
-  [[ -x $target/.venv/bin/vllm ]] || die "previous release is invalid"
-  restore_release "$target"
-  atomic_link "$old_current" "$previous_link"
-  echo "rolled back to $(basename "$target")"
+  [[ -d $previous_state_dir ]] || die "previous deployment state is missing"
+  current_state_dir=$(mktemp -d "$incoming_dir/deployment-state.XXXXXX")
+  snapshot_deployment_state "$current_state_dir"
+  if ! restore_deployment_state "$previous_state_dir"; then
+    restore_deployment_state "$current_state_dir" ||
+      die "rollback failed and the current deployment could not be restored"
+    rm -rf -- "$current_state_dir"
+    die "rollback failed; the current deployment was restored"
+  fi
+  if [[ -n $(<"$current_state_dir/release") ]]; then
+    atomic_link "$(<"$current_state_dir/release")" "$previous_link"
+  else
+    rm -f -- "$previous_link"
+  fi
+  save_previous_state "$current_state_dir"
+  prune_releases
+  echo "rolled back deployment"
 }
 
 usage() {

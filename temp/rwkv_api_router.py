@@ -17,10 +17,10 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 MODEL_UPSTREAMS = {
-    "rwkv7-g1i-1.5b": "http://127.0.0.1:18001",
-    "rwkv7-g1i-2.9b": "http://127.0.0.1:18002",
-    "rwkv7-g1i-7.2b": "http://127.0.0.1:18003",
-    "rwkv7-g1i-13.3b": "http://127.0.0.1:18004",
+    "rwkv7-g1j-1.5b": "http://192.168.0.129:18001",
+    "rwkv7-g1j-2.9b": "http://192.168.0.129:18002",
+    "rwkv7-g1j-7.2b": "http://192.168.0.129:18003",
+    "rwkv7-g1j-13.3b": "http://127.0.0.1:18004",
 }
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 HOP_BY_HOP_HEADERS = {

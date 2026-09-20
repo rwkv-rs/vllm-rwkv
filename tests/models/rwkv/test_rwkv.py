@@ -6,6 +6,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import numpy as np
+import pytest
 import torch
 
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
@@ -15,6 +16,7 @@ from vllm.model_executor.models.rwkv import (
     RwkvFeedForward,
     RwkvModel,
     RwkvStateLayer,
+    _load_flashrwkv2,
 )
 from vllm.sampling_params import SamplingParams
 from vllm.v1.attention.backend import AttentionCGSupport
@@ -130,6 +132,13 @@ def _fake_flashrwkv2() -> ModuleType:
     ):
         setattr(module, name, lambda *args, **kwargs: None)
     return module
+
+
+@pytest.fixture(autouse=True)
+def _clear_flashrwkv2_cache():
+    _load_flashrwkv2.cache_clear()
+    yield
+    _load_flashrwkv2.cache_clear()
 
 
 def _state_vllm_config(state_dtype: str = "float16") -> SimpleNamespace:
