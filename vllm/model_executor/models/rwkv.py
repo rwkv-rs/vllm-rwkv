@@ -3,6 +3,7 @@
 """Native RWKV-7 inference backed exclusively by FlashRWKV2."""
 
 from collections.abc import Iterable, Sequence
+from functools import cache
 from itertools import islice
 from typing import Any
 
@@ -61,6 +62,7 @@ _FLASHRWKV2_APIS = (
 )
 
 
+@cache
 def _load_flashrwkv2() -> Any:
     try:
         import flashrwkv2
