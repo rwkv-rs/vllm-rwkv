@@ -668,6 +668,8 @@ jobs:
     runs-on: [self-hosted, linux, x64, "${{ 'rwkv-pro6000' }}"]
     timeout-minutes: 180
     environment: production
+    env:
+      DEPLOY_SSH_CONFIG: /home/caizus/.ssh/config
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -676,8 +678,10 @@ jobs:
       - name: Verify configured deployment SSH aliases
         run: |
           set -euo pipefail
+          test -r "$DEPLOY_SSH_CONFIG"
           for host in rwkv-szx-4090x4-ip129 rwkv-szx-4090dx4-ip157; do
-            ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$host" true
+            ssh -F "$DEPLOY_SSH_CONFIG" \
+              -o BatchMode=yes -o StrictHostKeyChecking=yes "$host" true
           done
 
       - name: Deploy validated release or roll back
@@ -690,11 +694,13 @@ jobs:
             local action=$1
             local target=$2
             local -a ssh_args=(
+              -F "$DEPLOY_SSH_CONFIG"
               -o BatchMode=yes
               -o IdentitiesOnly=yes
               -o StrictHostKeyChecking=yes
             )
             local -a scp_args=(
+              -F "$DEPLOY_SSH_CONFIG"
               -o BatchMode=yes
               -o IdentitiesOnly=yes
               -o StrictHostKeyChecking=yes
