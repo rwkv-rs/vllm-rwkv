@@ -184,7 +184,7 @@ ExecStart=$release/.venv/bin/vllm serve $models_dir/$model \\
   --port $port \\
   --dtype float16 \\
   --mamba-ssm-cache-dtype float16 \\
-  --max-model-len 16384 \\
+  --max-model-len 32768 \\
   --max-num-seqs $max_num_seqs \\
   --gpu-memory-utilization 0.90 \\
   --data-parallel-size $data_parallel_size \\
