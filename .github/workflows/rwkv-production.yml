@@ -659,32 +659,17 @@ jobs:
     runs-on: [self-hosted, linux, x64, "${{ 'rwkv-pro6000' }}"]
     timeout-minutes: 180
     environment: production
-    env:
-      DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
-      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-      DEPLOY_JUMP_HOST: ${{ secrets.DEPLOY_JUMP_HOST }}
-      DEPLOY_JUMP_PORT: ${{ secrets.DEPLOY_JUMP_PORT }}
-      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-      DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event_name == 'push' && github.sha || 'rwkv' }}
 
-      - name: Configure deployment SSH identity
+      - name: Verify configured deployment SSH aliases
         run: |
           set -euo pipefail
-          test -n "$DEPLOY_PORT"
-          test -n "$DEPLOY_USER"
-          test -n "$DEPLOY_JUMP_HOST"
-          test -n "$DEPLOY_JUMP_PORT"
-          test -n "$DEPLOY_SSH_KEY"
-          test -n "$DEPLOY_KNOWN_HOSTS"
-          install -m 0700 -d "$RUNNER_TEMP/deploy-ssh"
-          printf '%s\n' "$DEPLOY_SSH_KEY" > "$RUNNER_TEMP/deploy-ssh/key"
-          chmod 0600 "$RUNNER_TEMP/deploy-ssh/key"
-          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$RUNNER_TEMP/deploy-ssh/known_hosts"
-          chmod 0600 "$RUNNER_TEMP/deploy-ssh/known_hosts"
+          for host in rwkv-szx-4090x4-ip129 rwkv-szx-4090dx4-ip157; do
+            ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$host" true
+          done
 
       - name: Deploy validated release or roll back
         env:
@@ -692,29 +677,18 @@ jobs:
           REQUESTED_SHA: ${{ github.event.inputs.sha }}
         run: |
           set -euo pipefail
-          proxy_jump="$DEPLOY_USER@$DEPLOY_JUMP_HOST:$DEPLOY_JUMP_PORT"
-
           run_target() {
             local action=$1
-            local host=$2
-            local target="$DEPLOY_USER@$host"
+            local target=$2
             local -a ssh_args=(
-              -i "$RUNNER_TEMP/deploy-ssh/key"
               -o BatchMode=yes
               -o IdentitiesOnly=yes
               -o StrictHostKeyChecking=yes
-              -o "UserKnownHostsFile=$RUNNER_TEMP/deploy-ssh/known_hosts"
-              -J "$proxy_jump"
-              -p "$DEPLOY_PORT"
             )
             local -a scp_args=(
-              -i "$RUNNER_TEMP/deploy-ssh/key"
               -o BatchMode=yes
               -o IdentitiesOnly=yes
               -o StrictHostKeyChecking=yes
-              -o "UserKnownHostsFile=$RUNNER_TEMP/deploy-ssh/known_hosts"
-              -o "ProxyJump=$proxy_jump"
-              -P "$DEPLOY_PORT"
             )
 
             scp "${scp_args[@]}" tools/deploy_rwkv_production.sh \
@@ -748,8 +722,8 @@ jobs:
             fi
           }
 
-          readonly small_host=192.168.0.129
-          readonly large_host=192.168.0.157
+          readonly small_host=rwkv-szx-4090x4-ip129
+          readonly large_host=rwkv-szx-4090dx4-ip157
           if [[ "${{ github.event_name }}" == workflow_dispatch && \
                 "$REQUESTED_ACTION" == rollback ]]; then
             run_target rollback "$large_host"
