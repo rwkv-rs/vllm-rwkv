@@ -5,7 +5,7 @@
 from collections.abc import Iterable, Sequence
 from functools import cache
 from itertools import islice
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 from torch import nn
@@ -33,7 +33,6 @@ from vllm.v1.attention.backends.rwkv_attn import (
     RwkvStateSpec,
     get_rwkv_metadata,
 )
-from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from .utils import (
     AutoWeightsLoader,
@@ -45,6 +44,24 @@ from .utils import (
 )
 
 _FLASHRWKV2_VERSION = "0.1.0a13"
+
+
+class _FlashRWKVStateHandle(Protocol):
+    @property
+    def memory_layout(self) -> dict[str, int]: ...
+
+    def reset_slots_(self, indices: torch.Tensor) -> None: ...
+
+    def copy_slots_(
+        self,
+        source: "_FlashRWKVStateHandle",
+        source_indices: torch.Tensor,
+        destination_indices: torch.Tensor,
+    ) -> None: ...
+
+    def materialize_slots_(self, indices: torch.Tensor) -> None: ...
+
+
 _FLASHRWKV2_APIS = (
     "infer_cmix_forward_varlen",
     "infer_embedding_ln0_forward_varlen",
@@ -131,7 +148,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         self._tmix_shift_pool: torch.Tensor | None = None
         self._cmix_shift_pool: torch.Tensor | None = None
         self._wkv_state_pool: torch.Tensor | None = None
-        self._wkv_handles: list[object] = []
+        self._wkv_handles: list[_FlashRWKVStateHandle] = []
         self._live_graph_tickets: list[object] = []
         self.kv_cache = torch.tensor([])
 
@@ -144,7 +161,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         self,
         state_pool_size: int,
         device: torch.device,
-    ) -> object:
+    ) -> _FlashRWKVStateHandle:
         flashrwkv2 = _load_flashrwkv2()
         if self.state_dtype == torch.float32:
             state = torch.zeros(
@@ -218,7 +235,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
             ),
         )
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> RwkvStateSpec:
         if self._spec is None:
             self._spec = self._build_spec(vllm_config)
         return self._spec
