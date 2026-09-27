@@ -18,6 +18,9 @@ from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
+from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
+from vllm.v1.worker.gpu.sample.logits_processor.interface import LogitsContext
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
@@ -91,7 +94,8 @@ class RwkvSampler(Sampler):
         vocab_size = self.sampling_states.vocab_size
         device = self.req_states.device
 
-        cast(Any, self.penalties_state).output_bin_counts = None
+        self._logit_bias_state = cast(LogitBiasState, self.logits_processors[0])
+        self._bad_words_state = cast(BadWordsState, self.logits_processors[2])
         self._rapid_penalties = torch.zeros(
             max_num_reqs, vocab_size, dtype=torch.float32, device=device
         )
@@ -220,12 +224,10 @@ class RwkvSampler(Sampler):
         if req_id not in self.req_states.req_id_to_index:
             self._preserved_requests.pop(req_id, None)
 
-    def add_request(
-        self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
-    ) -> None:
+    def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         self.sampling_states.add_request(req_idx, sampling_params)
-        self.logit_bias_state.add_request(req_idx, prompt_len, sampling_params)
-        self.bad_words_state.add_request(req_idx, sampling_params)
+        self._logit_bias_state.add_request(req_idx, sampling_params)
+        self._bad_words_state.add_request(req_idx, sampling_params)
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
         self.thinking_budget_state.add_request(req_idx, sampling_params)
 
@@ -233,8 +235,8 @@ class RwkvSampler(Sampler):
         self._frequency_penalty.np[req_idx] = sampling_params.frequency_penalty
         self._penalty_decay.np[req_idx] = sampling_params.penalty_decay
         self.needs_logits_processing[req_idx] = (
-            self.logit_bias_state.use_logit_bias[req_idx]
-            or self.bad_words_state.num_bad_words.np[req_idx] > 0
+            self._logit_bias_state.use_logit_bias[req_idx]
+            or self._bad_words_state.num_bad_words.np[req_idx] > 0
             or (
                 self.thinking_budget_state.enabled
                 and self.thinking_budget_state.use_thinking_budget[req_idx]
@@ -243,8 +245,8 @@ class RwkvSampler(Sampler):
 
     def apply_staged_writes(self) -> None:
         self.sampling_states.apply_staged_writes()
-        self.logit_bias_state.apply_staged_writes()
-        self.bad_words_state.apply_staged_writes()
+        self._logit_bias_state.apply_staged_writes()
+        self._bad_words_state.apply_staged_writes()
         self.logprob_token_ids_state.apply_staged_writes()
         self.thinking_budget_state.apply_staged_writes()
         self._presence_penalty.copy_to_uva()
@@ -279,22 +281,23 @@ class RwkvSampler(Sampler):
         pos: torch.Tensor,
         input_ids: torch.Tensor,
         local_pos: torch.Tensor,
+        seq_lens_upper_bound_np: np.ndarray,
     ) -> torch.Tensor:
         if not np.any(self.needs_logits_processing[slots_np]):
             return logits
 
-        self.logit_bias_state.apply_logit_bias(logits, slots, slots_np, pos)
-        self.bad_words_state.apply_bad_words(
-            logits, slots, slots_np, input_ids, local_pos
+        ctx = LogitsContext(
+            expanded_idx_mapping=slots,
+            idx_mapping=slots,
+            idx_mapping_np=slots_np,
+            expanded_local_pos=local_pos,
+            input_ids=input_ids,
+            pos=pos,
+            seq_lens_upper_bound_np=seq_lens_upper_bound_np,
         )
-        self.thinking_budget_state.apply(
-            logits,
-            slots,
-            slots,
-            slots_np,
-            input_ids,
-            local_pos,
-        )
+        logits = self._logit_bias_state.apply(logits, ctx)
+        logits = self._bad_words_state.apply(logits, ctx)
+        self.thinking_budget_state.apply(logits, ctx)
         return logits
 
     def sample(
@@ -306,6 +309,7 @@ class RwkvSampler(Sampler):
         pos: torch.Tensor,
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
+        seq_lens_upper_bound_np: np.ndarray,
         return_logprobs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         del return_logprobs
@@ -340,6 +344,7 @@ class RwkvSampler(Sampler):
             pos[active_rows],
             input_ids[active_rows],
             expanded_local_pos[active_rows],
+            seq_lens_upper_bound_np[active_rows_np],
         )
         sampled_active = self._sample(
             active_logits,
