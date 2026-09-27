@@ -4,15 +4,14 @@ on:
   pull_request:
     branches: [rwkv]
     types: [opened, synchronize, reopened, labeled]
-  push:
-    branches: [rwkv]
   workflow_dispatch:
     inputs:
       action:
-        description: Deploy an existing validated SHA or roll back
+        description: Release, deploy an existing validated SHA, or roll back
         required: true
         type: choice
         options:
+          - release
           - redeploy
           - rollback
       sha:
@@ -54,9 +53,11 @@ jobs:
             }
 
   quality-gate:
+    # The GPU gate is opt-in: only a manually requested stable release runs it.
     if: >-
       always() &&
-      github.event_name != 'workflow_dispatch' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.action == 'release' &&
       (needs.authorize.result == 'success' || needs.authorize.result == 'skipped')
     needs: authorize
     runs-on: [self-hosted, linux, x64, "${{ 'rwkv-pro6000' }}"]
@@ -110,7 +111,8 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           set -euo pipefail
-          if [[ "${{ github.event_name }}" == push ]]; then
+          if [[ "${{ github.event_name }}" == workflow_dispatch &&
+                "${{ github.event.inputs.action }}" == release ]]; then
             required=true
           else
             changed="$(git diff --name-only "$BASE_SHA"...HEAD)"
@@ -615,7 +617,9 @@ jobs:
           PY
 
       - name: Package the exact successful release
-        if: github.event_name == 'push'
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.action == 'release'
         run: |
           set -euo pipefail
           artifact_root="/home/caizus/artifacts/vllm-rwkv/$GITHUB_SHA"
@@ -643,7 +647,9 @@ jobs:
             artifacts/rwkv-production/
 
       - name: Upload release evidence
-        if: always() && github.event_name == 'push'
+        if: >-
+          always() && github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.action == 'release'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rwkv-production-evidence-${{ github.sha }}
@@ -653,7 +659,10 @@ jobs:
   deploy:
     if: >-
       always() &&
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.event_name == 'workflow_dispatch' &&
+      (github.event.inputs.action == 'release' ||
+       github.event.inputs.action == 'redeploy' ||
+       github.event.inputs.action == 'rollback') &&
       (needs.quality-gate.result == 'success' || needs.quality-gate.result == 'skipped')
     needs: quality-gate
     runs-on: [self-hosted, linux, x64, "${{ 'rwkv-pro6000' }}"]
@@ -731,7 +740,7 @@ jobs:
             exit 0
           fi
 
-          if [[ "${{ github.event_name }}" == push ]]; then
+          if [[ "$REQUESTED_ACTION" == release ]]; then
             release_sha="$GITHUB_SHA"
           else
             release_sha="$REQUESTED_SHA"
