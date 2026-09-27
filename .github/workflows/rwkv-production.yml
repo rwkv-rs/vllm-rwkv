@@ -275,7 +275,7 @@ jobs:
             --port 18080 \
             --dtype float16 \
             --mamba-ssm-cache-dtype float16 \
-            --max-model-len 16384 \
+            --max-model-len 32768 \
             --max-num-seqs 4 \
             --gpu-memory-utilization 0.70 \
             --enable-chunked-prefill \
@@ -510,7 +510,7 @@ jobs:
             --port 18080 \
             --dtype float16 \
             --mamba-ssm-cache-dtype float16 \
-            --max-model-len 16384 \
+            --max-model-len 32768 \
             --max-num-seqs 512 \
             --gpu-memory-utilization 0.95 \
             --enable-chunked-prefill \
