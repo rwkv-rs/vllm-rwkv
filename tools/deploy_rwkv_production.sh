@@ -176,6 +176,7 @@ WorkingDirectory=$release
 Environment=HOME=/home/rwkv
 Environment=CUDA_VISIBLE_DEVICES=$devices
 Environment=PYTHONUNBUFFERED=1
+Environment=VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 Environment=XDG_CACHE_HOME=$release/.cache
 Environment=PATH=$release/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=$release/.venv/bin/vllm serve $models_dir/$model \\
