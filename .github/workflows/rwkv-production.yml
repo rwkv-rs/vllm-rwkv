@@ -143,7 +143,7 @@ jobs:
               CMakeLists.txt \
               csrc/libtorch_stable/rwkv7/rwkv7_registration.cpp \
               requirements/rwkv.txt \
-              scripts/deploy_rwkv_production.sh \
+              tools/deploy_rwkv_production.sh \
               setup.py \
               temp/rwkv_api_router.py \
               tests/v1/structured_output/test_validation.py \
@@ -717,7 +717,7 @@ jobs:
               -P "$DEPLOY_PORT"
             )
 
-            scp "${scp_args[@]}" scripts/deploy_rwkv_production.sh \
+            scp "${scp_args[@]}" tools/deploy_rwkv_production.sh \
               "$target:/tmp/deploy_rwkv_production.sh" || return 1
             if [[ $action == rollback ]]; then
               ssh "${ssh_args[@]}" "$target" \

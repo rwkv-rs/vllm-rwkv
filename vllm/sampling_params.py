@@ -1422,6 +1422,10 @@ class SamplingParams(
             # match a special token. The xgrammar backend declares no special
             # tokens for Mistral tokenizers, so a regex like `.` can match
             # `[TOOL_CALLS]` or `[INST]` as plain text.
+            from vllm.v1.structured_output.backend_guidance import (
+                validate_guidance_grammar,
+            )
+
             validate_guidance_grammar(self, tokenizer=_get_llg_tokenizer(tokenizer))
             self.structured_outputs._backend = "guidance"
             self.structured_outputs._backend_was_auto = True
