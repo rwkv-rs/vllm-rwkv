@@ -1203,18 +1203,8 @@ class SamplingParams(
                 "structured_outputs.structural_tag cannot be an empty string"
             )
 
-        from vllm.v1.structured_output.backend_guidance import (
-            has_guidance_unsupported_json_features,
-            validate_guidance_grammar,
-        )
-        from vllm.v1.structured_output.backend_lm_format_enforcer import (
-            validate_structured_output_request_lm_format_enforcer,
-        )
-        from vllm.v1.structured_output.backend_outlines import (
-            validate_structured_output_request_outlines,
-        )
-        from vllm.v1.structured_output.backend_xgrammar import validate_xgrammar_grammar
         from vllm.v1.structured_output.utils import grammar_is_likely_lark
+
         if backend.startswith("xgrammar"):
             # xgrammar with no fallback
             from vllm.v1.structured_output.backend_xgrammar import (
@@ -1275,6 +1265,10 @@ class SamplingParams(
             # match a special token. The xgrammar backend declares no special
             # tokens for Mistral tokenizers, so a regex like `.` can match
             # `[TOOL_CALLS]` or `[INST]` as plain text.
+            from vllm.v1.structured_output.backend_guidance import (
+                validate_guidance_grammar,
+            )
+
             validate_guidance_grammar(self, tokenizer=_get_llg_tokenizer(tokenizer))
             self.structured_outputs._backend = "guidance"
             self.structured_outputs._backend_was_auto = True
