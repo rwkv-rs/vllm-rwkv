@@ -4,6 +4,8 @@ on:
   pull_request:
     branches: [rwkv]
     types: [opened, synchronize, reopened, labeled]
+  push:
+    branches: [rwkv]
   workflow_dispatch:
     inputs:
       action:
@@ -53,11 +55,13 @@ jobs:
             }
 
   quality-gate:
-    # The GPU gate is opt-in: only a manually requested stable release runs it.
+    # Merged PRs build and deploy without the expensive model gate. A stable
+    # release runs the complete validation suite before deployment.
     if: >-
       always() &&
-      github.event_name == 'workflow_dispatch' &&
-      github.event.inputs.action == 'release' &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.event.inputs.action == 'release')) &&
       (needs.authorize.result == 'success' || needs.authorize.result == 'skipped')
     needs: authorize
     runs-on: [self-hosted, linux, x64, "${{ 'rwkv-pro6000' }}"]
@@ -618,8 +622,9 @@ jobs:
 
       - name: Package the exact successful release
         if: >-
-          github.event_name == 'workflow_dispatch' &&
-          github.event.inputs.action == 'release'
+          github.event_name == 'push' ||
+          (github.event_name == 'workflow_dispatch' &&
+           github.event.inputs.action == 'release')
         run: |
           set -euo pipefail
           artifact_root="/home/caizus/artifacts/vllm-rwkv/$GITHUB_SHA"
@@ -636,12 +641,14 @@ jobs:
             sha256sum "$(basename "$bundle")" > "$(basename "$bundle").sha256"
           )
           mkdir -p artifacts/rwkv-production
-          cp "$RUNNER_TEMP/rwkv-gate/performance-comparison.json" \
-            artifacts/rwkv-production/
-          cp "$RUNNER_TEMP/rwkv-gate/albatross_tokens.json" \
-            artifacts/rwkv-production/
-          cp "$RUNNER_TEMP/rwkv-gate/vllm_tokens.json" \
-            artifacts/rwkv-production/
+          if [[ "${{ github.event_name }}" == workflow_dispatch ]]; then
+            cp "$RUNNER_TEMP/rwkv-gate/performance-comparison.json" \
+              artifacts/rwkv-production/
+            cp "$RUNNER_TEMP/rwkv-gate/albatross_tokens.json" \
+              artifacts/rwkv-production/
+            cp "$RUNNER_TEMP/rwkv-gate/vllm_tokens.json" \
+              artifacts/rwkv-production/
+          fi
           cp release/flashrwkv2-sm120.json artifacts/rwkv-production/
           cp "$artifact_root/$(basename "$bundle").sha256" \
             artifacts/rwkv-production/
@@ -659,10 +666,11 @@ jobs:
   deploy:
     if: >-
       always() &&
-      github.event_name == 'workflow_dispatch' &&
-      (github.event.inputs.action == 'release' ||
-       github.event.inputs.action == 'redeploy' ||
-       github.event.inputs.action == 'rollback') &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' &&
+        (github.event.inputs.action == 'release' ||
+         github.event.inputs.action == 'redeploy' ||
+         github.event.inputs.action == 'rollback'))) &&
       (needs.quality-gate.result == 'success' || needs.quality-gate.result == 'skipped')
     needs: quality-gate
     runs-on: [self-hosted, linux, x64, "${{ 'rwkv-pro6000' }}"]
@@ -746,7 +754,8 @@ jobs:
             exit 0
           fi
 
-          if [[ "$REQUESTED_ACTION" == release ]]; then
+          if [[ "${{ github.event_name }}" == push ||
+                "$REQUESTED_ACTION" == release ]]; then
             release_sha="$GITHUB_SHA"
           else
             release_sha="$REQUESTED_SHA"
