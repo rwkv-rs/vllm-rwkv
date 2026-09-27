@@ -23,21 +23,21 @@ from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
     ChatTemplateContentFormatOption,
 )
-from vllm.entrypoints.openai.engine.protocol import (
+from vllm.entrypoints.generate.base.protocol import (
     AnyResponseFormat,
     DeltaMessage,
     FunctionCall,
     FunctionDefinition,
-    OpenAIBaseModel,
     PerRequestMetrics,
     StopParam,
     StreamOptions,
     ToolCall,
-    UsageInfo,
     structured_outputs_from_response_format,
+    validate_cache_salt,
     validate_structural_tag_response_format,
     validate_structured_outputs_structural_tag,
 )
+from vllm.entrypoints.serve.engine.protocol import OpenAIBaseModel, UsageInfo
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
@@ -215,7 +215,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: list[ChatCompletionMessageParam]
     model: str | None = None
-    frequency_penalty: float | None = 0.0
+    frequency_penalty: float | None = None
     logit_bias: dict[str, float] | None = None
     logprobs: bool | None = False
     top_logprobs: int | None = 0
@@ -226,7 +226,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     )
     max_completion_tokens: int | None = None
     n: int | None = 1
-    presence_penalty: float | None = 0.0
+    presence_penalty: float | None = None
     response_format: AnyResponseFormat | None = None
     seed: int | None = Field(None, ge=_INT64_MIN, le=_INT64_MAX)
     stop: StopParam = []
@@ -268,6 +268,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     min_p: float | None = None
     repetition_penalty: float | None = None
     penalty_decay: float | None = Field(default=None, ge=0.0, le=1.0)
+    watermarking: bool = True
     length_penalty: float = 1.0
     stop_token_ids: list[int] | None = []
     include_stop_str_in_output: bool = False
@@ -453,18 +454,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ),
     )
 
-    return_assistant_tokens_mask: bool = Field(
-        default=False,
-        description=(
-            "If true, the /render response will include an "
-            "``assistant_tokens_mask`` field — a per-token list of 0/1 "
-            "values indicating which tokens were assistant-generated. "
-            "Requires the chat template to use ``{% generation %}`` "
-            "tags.  When the template does not support it, "
-            "``assistant_tokens_mask`` will be ``null``."
-        ),
-    )
-
     cache_salt: str | None = Field(
         default=None,
         min_length=1,
@@ -520,6 +509,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
     )
 
     # --8<-- [end:chat-completion-extra-params]
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_cache_salt_support(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        validate_cache_salt(data.get("cache_salt"))
+        return data
 
     @model_validator(mode="before")
     @classmethod
@@ -597,7 +594,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 extra_kwargs,
             ),
             media_io_kwargs=self.media_io_kwargs,
-            return_assistant_tokens_mask=bool(self.return_assistant_tokens_mask),
             # No-tools requests default to tool_choice="none" at the API
             # layer. Collapse that default before rendering, so K3 emits a
             # model-visible tool-choice instruction only for requests with a
@@ -629,6 +625,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # Default sampling parameters for chat completion requests
     _DEFAULT_SAMPLING_PARAMS: dict = {
         "repetition_penalty": 1.0,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "penalty_decay": 1.0,
         "temperature": 1.0,
         "top_p": 1.0,
         "top_k": 0,
@@ -651,6 +650,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             temperature=temperature,
             length_penalty=self.length_penalty,
             include_stop_str_in_output=self.include_stop_str_in_output,
+            skip_special_tokens=self.skip_special_tokens,
         )
 
     def extract_structured_outputs(self) -> StructuredOutputsParams | None:
@@ -665,36 +665,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
         max_tokens: int,
         default_sampling_params: dict,
     ) -> SamplingParams:
-        # Default parameters
-        if (repetition_penalty := self.repetition_penalty) is None:
-            repetition_penalty = default_sampling_params.get(
-                "repetition_penalty",
-                self._DEFAULT_SAMPLING_PARAMS["repetition_penalty"],
+        # Priority: user -> server default -> OpenAI default
+        sampling_params = {
+            name: (
+                value
+                if (value := getattr(self, name)) is not None
+                else default_sampling_params.get(name, default)
             )
-        if (temperature := self.temperature) is None:
-            temperature = default_sampling_params.get(
-                "temperature", self._DEFAULT_SAMPLING_PARAMS["temperature"]
-            )
-        if (top_p := self.top_p) is None:
-            top_p = default_sampling_params.get(
-                "top_p", self._DEFAULT_SAMPLING_PARAMS["top_p"]
-            )
-        if (top_k := self.top_k) is None:
-            top_k = default_sampling_params.get(
-                "top_k", self._DEFAULT_SAMPLING_PARAMS["top_k"]
-            )
-        if (min_p := self.min_p) is None:
-            min_p = default_sampling_params.get(
-                "min_p", self._DEFAULT_SAMPLING_PARAMS["min_p"]
-            )
-        presence_penalty = self.presence_penalty
-        if "presence_penalty" not in self.model_fields_set:
-            presence_penalty = default_sampling_params.get("presence_penalty", 0.0)
-        frequency_penalty = self.frequency_penalty
-        if "frequency_penalty" not in self.model_fields_set:
-            frequency_penalty = default_sampling_params.get("frequency_penalty", 0.0)
-        if (penalty_decay := self.penalty_decay) is None:
-            penalty_decay = default_sampling_params.get("penalty_decay", 1.0)
+            for name, default in self._DEFAULT_SAMPLING_PARAMS.items()
+        }
 
         # Merge server-default stop_token_ids (e.g., model-specific tokens
         # like </call> for gpt-oss) with any request-specified ones
@@ -730,14 +709,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
             extra_args["ec_transfer_params"] = self.ec_transfer_params
         return SamplingParams.from_optional(
             n=self.n,
-            presence_penalty=presence_penalty,
-            frequency_penalty=frequency_penalty,
-            repetition_penalty=repetition_penalty,
-            penalty_decay=penalty_decay,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            min_p=min_p,
+            **sampling_params,
+            watermarking=self.watermarking,
             seed=self.seed,
             stop=stop,
             stop_token_ids=stop_token_ids,

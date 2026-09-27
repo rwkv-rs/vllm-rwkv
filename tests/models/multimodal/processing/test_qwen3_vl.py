@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from vllm.config import ModelConfig
+from vllm.config.multimodal import MultiModalDummyOptions
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from ...registry import HF_EXAMPLE_MODELS
@@ -140,6 +141,50 @@ def test_processor_multi_video(
         assert video_phs[i].offset >= prev_end, (
             f"Placeholder {i} overlaps with placeholder {i - 1}"
         )
+
+
+# Qwen3-VL / Qwen3.8 "Long Video Understanding" pixel budget from the
+# model card. Used to check --mm-processor-kwargs scoping (#52834).
+_LONG_VIDEO_SIZE = {"longest_edge": 469762048, "shortest_edge": 4096}
+
+
+def _probe_mm_token_budgets(
+    model_id: str, mm_processor_kwargs: dict[str, Any] | None
+) -> tuple[int, int]:
+    ctx = build_model_context(
+        model_id,
+        mm_processor_kwargs=mm_processor_kwargs,
+        limit_mm_per_prompt={"image": 1, "video": 1},
+    )
+    info = MULTIMODAL_REGISTRY.create_processor(ctx.model_config).info
+    video = info.get_max_video_tokens(
+        seq_len=500000, mm_counts={"video": 1, "image": 1}
+    )
+    return video, info.get_max_image_tokens()
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("model_id", [MODEL_ID])
+def test_processor_kwargs_videos_kwargs_does_not_leak_into_image_budget(
+    model_id: str,
+) -> None:
+    """``videos_kwargs.size`` must raise only the video token budget.
+
+    A flat ``size`` override still applies to both modalities (the previous
+    shared-namespace behavior). Regression for #52834.
+    """
+    stock_video, stock_image = _probe_mm_token_budgets(model_id, None)
+    scoped_video, scoped_image = _probe_mm_token_budgets(
+        model_id, {"videos_kwargs": {"size": _LONG_VIDEO_SIZE}}
+    )
+    flat_video, flat_image = _probe_mm_token_budgets(
+        model_id, {"size": _LONG_VIDEO_SIZE}
+    )
+
+    assert scoped_video == flat_video
+    assert scoped_video > stock_video
+    assert scoped_image == stock_image
+    assert flat_image > stock_image
 
 
 @pytest.mark.parametrize("model_id", [MODEL_ID])
@@ -295,7 +340,9 @@ def test_dummy_video_spreads_budget_when_frame_cap_enabled(model_id: str) -> Non
         limit_mm_per_prompt={"image": 0, "video": 1},
     )
     capped = MULTIMODAL_REGISTRY.create_processor(capped_ctx.model_config)
-    capped_dummy = capped.dummy_inputs.get_dummy_mm_data(1024, {"video": 1}, {})
+    capped_dummy = capped.dummy_inputs.get_dummy_mm_data(
+        1024, {"video": 1}, MultiModalDummyOptions()
+    )
     capped_frames = capped_dummy["video"][0][0].shape[0]
     assert capped_frames == 16, (
         f"Expected the dummy to spread the budget over 16 frames, got {capped_frames}"
@@ -307,7 +354,9 @@ def test_dummy_video_spreads_budget_when_frame_cap_enabled(model_id: str) -> Non
         limit_mm_per_prompt={"image": 0, "video": 1},
     )
     uncapped = MULTIMODAL_REGISTRY.create_processor(uncapped_ctx.model_config)
-    uncapped_dummy = uncapped.dummy_inputs.get_dummy_mm_data(1024, {"video": 1}, {})
+    uncapped_dummy = uncapped.dummy_inputs.get_dummy_mm_data(
+        1024, {"video": 1}, MultiModalDummyOptions()
+    )
     uncapped_frames = uncapped_dummy["video"][0][0].shape[0]
     assert uncapped_frames == 2, (
         f"Expected the uncapped dummy to keep 2 frames, got {uncapped_frames}"
