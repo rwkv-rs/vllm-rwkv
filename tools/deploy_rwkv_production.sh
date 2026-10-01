@@ -143,11 +143,11 @@ check_model() {
 
 check_models() {
   if [[ $deployment_role == large ]]; then
-    check_model rwkv7-g1j-13.3b-20260831-ctx16384 11
+    check_model rwkv7-g1k-13.3b-20260930-ctx25600 11
   else
-    check_model rwkv7-g1j-1.5b-20260831-ctx16384 2
-    check_model rwkv7-g1j-2.9b-20260831-ctx16384 3
-    check_model rwkv7-g1j-7.2b-20260831-ctx16384 6
+    check_model rwkv7-g1k-1.5b-20260930-ctx25600 2
+    check_model rwkv7-g1k-2.9b-20260930-ctx25600 3
+    check_model rwkv7-g1k-7.2b-20260930-ctx25600 6
   fi
 }
 
@@ -211,27 +211,27 @@ install_units() {
     write_unit \
       "$release" \
       vllm-rwkv-13_3b.service \
-      "RWKV7 g1j 13.3B vLLM DP4 service" \
-      0,1,2,3 rwkv7-g1j-13.3b-20260831-ctx16384 rwkv7-g1j-13.3b \
+      "RWKV7 g1k 13.3B vLLM DP4 service" \
+      0,1,2,3 rwkv7-g1k-13.3b-20260930-ctx25600 rwkv7-g1k-13.3b \
       18004 320 4 || return 1
   else
     write_unit \
       "$release" \
       vllm-rwkv-1_5b.service \
-      "RWKV7 g1j 1.5B vLLM service" \
-      0 rwkv7-g1j-1.5b-20260831-ctx16384 rwkv7-g1j-1.5b \
+      "RWKV7 g1k 1.5B vLLM service" \
+      0 rwkv7-g1k-1.5b-20260930-ctx25600 rwkv7-g1k-1.5b \
       18001 1024 1 || return 1
     write_unit \
       "$release" \
       vllm-rwkv-2_9b.service \
-      "RWKV7 g1j 2.9B vLLM service" \
-      1 rwkv7-g1j-2.9b-20260831-ctx16384 rwkv7-g1j-2.9b \
+      "RWKV7 g1k 2.9B vLLM service" \
+      1 rwkv7-g1k-2.9b-20260930-ctx25600 rwkv7-g1k-2.9b \
       18002 1024 1 || return 1
     write_unit \
       "$release" \
       vllm-rwkv-7_2b.service \
-      "RWKV7 g1j 7.2B vLLM DP2 service" \
-      2,3 rwkv7-g1j-7.2b-20260831-ctx16384 rwkv7-g1j-7.2b \
+      "RWKV7 g1k 7.2B vLLM DP2 service" \
+      2,3 rwkv7-g1k-7.2b-20260930-ctx25600 rwkv7-g1k-7.2b \
       18003 256 2 || return 1
   fi
   systemctl daemon-reload || return 1
