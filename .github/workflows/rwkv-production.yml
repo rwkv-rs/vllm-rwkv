@@ -79,8 +79,8 @@ jobs:
       TORCH_CUDA_ARCH_LIST: "8.9 12.0"
       VLLM_BUILD_PROFILE: rwkv
       VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-      RWKV15_ARTIFACT: /home/caizus/Weights/RWKV/hf/rwkv7-g1j-1.5b-20260831-ctx16384
-      RWKV72_ARTIFACT: /home/caizus/Weights/RWKV/hf/rwkv7-g1f-7.2b-20260414-ctx16384
+      RWKV15_ARTIFACT: /home/caizus/Weights/RWKV/hf/rwkv7-g1k-1.5b-20260930-ctx25600
+      RWKV72_ARTIFACT: /home/caizus/Weights/RWKV/hf/rwkv7-g1k-7.2b-20260930-ctx25600
       RWKV72_PTH: /mnt/raid0_8t/rwkv7-g1/rwkv7-g1f-7.2b-20260414-ctx8192.pth
       ALBATROSS_ENTRY: /home/caizus/Projects/MachineLearning/Albatross-vllm-rwkv-benchmark/faster3a_2607/rwkv7_fast_v3a.py
     steps:
@@ -271,7 +271,7 @@ jobs:
           unset VLLM_BUILD_PROFILE
           log="$RUNNER_TEMP/rwkv15-service.log"
           release/.venv/bin/vllm serve "$RWKV15_ARTIFACT" \
-            --served-model-name rwkv7-g1i-1.5b \
+            --served-model-name rwkv7-g1k-1.5b \
             --host 127.0.0.1 \
             --port 18080 \
             --dtype float16 \
@@ -323,35 +323,35 @@ jobs:
                   raise
 
           chat = post("/v1/chat/completions", {
-              "model": "rwkv7-g1i-1.5b",
+              "model": "rwkv7-g1k-1.5b",
               "messages": [{"role": "user", "content": "Reply with OK."}],
               "temperature": 0,
               "max_tokens": 8,
           })
           assert chat["choices"]
           responses = post("/v1/responses", {
-              "model": "rwkv7-g1i-1.5b",
+              "model": "rwkv7-g1k-1.5b",
               "input": "Reply with OK.",
               "temperature": 0,
               "max_output_tokens": 8,
           })
           assert responses["output"]
           completions = post("/v1/completions", {
-              "model": "rwkv7-g1i-1.5b",
+              "model": "rwkv7-g1k-1.5b",
               "prompt": "Reply with OK.",
               "temperature": 0,
               "max_tokens": 8,
           })
           assert completions["choices"]
           fake_think = post("/v1/chat/completions", {
-              "model": "rwkv7-g1i-1.5b",
+              "model": "rwkv7-g1k-1.5b",
               "messages": [{"role": "user", "content": "Reply with OK."}],
               "chat_template_kwargs": {"rwkv_generation_prompt": "fake_think"},
               "max_tokens": 8,
           })
           assert fake_think["choices"]
           tools = post("/v1/chat/completions", {
-              "model": "rwkv7-g1i-1.5b",
+              "model": "rwkv7-g1k-1.5b",
               "messages": [{"role": "user", "content": "Reply with OK."}],
               "tools": [{
                   "type": "function",
@@ -366,7 +366,7 @@ jobs:
           })
           assert tools["choices"]
           structured = post("/v1/chat/completions", {
-              "model": "rwkv7-g1i-1.5b",
+              "model": "rwkv7-g1k-1.5b",
               "messages": [{"role": "user", "content": "Reply with OK."}],
               "structured_outputs": {"choice": ["OK"]},
               "temperature": 0,
@@ -374,7 +374,7 @@ jobs:
           })
           assert structured["choices"][0]["message"]["content"] == "OK"
           json_schema = post("/v1/chat/completions", {
-              "model": "rwkv7-g1i-1.5b",
+              "model": "rwkv7-g1k-1.5b",
               "messages": [{
                   "role": "user",
                   "content": "Return a JSON object with the boolean field ok.",
@@ -395,7 +395,7 @@ jobs:
           stream_request = urllib.request.Request(
               "http://127.0.0.1:18080/v1/chat/completions",
               data=json.dumps({
-                  "model": "rwkv7-g1i-1.5b",
+                  "model": "rwkv7-g1k-1.5b",
                   "messages": [{"role": "user", "content": "Reply with OK."}],
                   "temperature": 0,
                   "max_tokens": 8,
@@ -506,7 +506,7 @@ jobs:
           evidence="$RUNNER_TEMP/rwkv-gate"
           log="$evidence/vllm72-service.log"
           release/.venv/bin/vllm serve "$RWKV72_ARTIFACT" \
-            --served-model-name rwkv7-g1i-7.2b \
+            --served-model-name rwkv7-g1k-7.2b \
             --host 127.0.0.1 \
             --port 18080 \
             --dtype float16 \
@@ -540,7 +540,7 @@ jobs:
                 --backend vllm \
                 --base-url http://127.0.0.1:18080 \
                 --model "$RWKV72_ARTIFACT" \
-                --served-model-name rwkv7-g1i-7.2b \
+                --served-model-name rwkv7-g1k-7.2b \
                 --dataset-name random \
                 --random-input-len 16 \
                 --random-output-len 32 \
