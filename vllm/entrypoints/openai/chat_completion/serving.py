@@ -55,7 +55,7 @@ from vllm.entrypoints.serve.utils.tool_calls_utils import (
     maybe_filter_parallel_tool_calls,
 )
 from vllm.exceptions import GenerationError
-from vllm.inputs import EngineInput, MultiModalPlaceholders
+from vllm.inputs import EngineInput, MultiModalPlaceholders, TokensInput
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.outputs import RequestOutput
@@ -64,6 +64,7 @@ from vllm.parser.abstract_parser import Parser
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
+from vllm.utils import random_uuid
 from vllm.utils.collection_utils import as_list
 from vllm.utils.serial_utils import numpy2base64
 
@@ -113,6 +114,53 @@ def _make_completion_tokens_details(
     reasoning_tokens: int,
 ) -> CompletionTokenUsageInfo:
     return CompletionTokenUsageInfo(reasoning_tokens=reasoning_tokens)
+
+
+def _promote_rwkv_state_stop_strings(
+    request: ChatCompletionRequest,
+    default_sampling_params: dict[str, Any],
+    tokenizer: TokenizerLike,
+) -> None:
+    stop = request.stop
+    default_stop = default_sampling_params.get("stop")
+    stop_strings = [stop] if isinstance(stop, str) else list(stop or ())
+    stop_strings.extend(
+        [default_stop] if isinstance(default_stop, str) else list(default_stop or ())
+    )
+    promoted_ids = []
+    for stop_string in dict.fromkeys(stop_strings):
+        token_ids = tokenizer.encode(stop_string, add_special_tokens=False)
+        if len(token_ids) == 1:
+            promoted_ids.append(token_ids[0])
+    request.stop_token_ids = list(
+        dict.fromkeys([*(request.stop_token_ids or ()), *promoted_ids])
+    )
+
+
+def _rwkv_state_turn_boundary_token_ids(
+    request: ChatCompletionRequest,
+    chat_template_kwargs: dict[str, Any],
+    tokenizer: TokenizerLike,
+    *,
+    finish_reason: str,
+) -> list[int]:
+    prompt_style = chat_template_kwargs.get("rwkv_prompt_template", "bot")
+    uses_tools = (
+        bool(request.tools)
+        or prompt_style == "function_calling"
+        or any(
+            message.get("role") == "tool" or bool(message.get("tool_calls"))
+            for message in request.messages
+        )
+    )
+    if uses_tools:
+        boundary = "\n"
+    elif prompt_style == "assistant":
+        boundary = "\n\n"
+    else:
+        needs_terminator = finish_reason in {"length", "repetition"}
+        boundary = ("✿" if needs_terminator else "") + "\n"
+    return tokenizer.encode(boundary, add_special_tokens=False)
 
 
 class OpenAIServingChat(GenerateBaseServing):
@@ -187,6 +235,190 @@ class OpenAIServingChat(GenerateBaseServing):
         # Please use the Responses API instead.
         self.supports_code_interpreter = False
         self.python_tool = None
+
+    async def rwkv_state_cache_action(
+        self,
+        action: str,
+        state_ref: str = "",
+        target_ref: str = "",
+    ) -> dict[str, Any]:
+        """Apply one process-local RWKV State primitive on every model worker."""
+        if action in {"clone", "drop"}:
+            await self.engine_client.collective_rpc(
+                "rwkv_state_cache_action",
+                args=(f"prepare_{action}", state_ref, target_ref),
+            )
+        try:
+            results = await self.engine_client.collective_rpc(
+                "rwkv_state_cache_action",
+                args=(action, state_ref, target_ref),
+            )
+        except Exception:
+            if action in {"clone", "prepare_read", "prepare_write"}:
+                if action == "clone":
+                    rollback_args = ("drop_if_exists", target_ref, "")
+                elif action == "prepare_read":
+                    rollback_args = ("cancel_read", state_ref, target_ref)
+                else:
+                    rollback_args = ("cancel_write", state_ref, "")
+                try:
+                    await self.engine_client.collective_rpc(
+                        "rwkv_state_cache_action",
+                        args=rollback_args,
+                    )
+                except Exception:
+                    logger.exception("Failed to roll back a partial RWKV State action")
+            raise
+        if not results:
+            raise RuntimeError("RWKV State cache action returned no worker result")
+        return {
+            "protocol": "vllm-rwkv.state-cache.v1",
+            "action": action,
+            "workers": results,
+        }
+
+    async def _prepend_rwkv_state_tail(
+        self,
+        request: ChatCompletionRequest,
+        engine_inputs: list[EngineInput],
+        chat_template_kwargs: dict[str, Any],
+        tokenizer: TokenizerLike,
+    ) -> str | None:
+        extra_args = request.vllm_xargs or {}
+        state_ref_value = extra_args.get("rwkv_state_read_ref")
+        write_ref_value = extra_args.get("rwkv_state_write_ref")
+        if state_ref_value is not None and not isinstance(state_ref_value, str):
+            raise ValueError("rwkv_state_read_ref must be a string")
+        if write_ref_value is not None and not isinstance(write_ref_value, str):
+            raise ValueError("rwkv_state_write_ref must be a string")
+        state_ref = state_ref_value.strip() if state_ref_value else None
+        write_ref = write_ref_value.strip() if write_ref_value else None
+        normalized_extra_args = {
+            key: value
+            for key, value in extra_args.items()
+            if key != "rwkv_state_read_lease"
+        }
+        if state_ref_value is not None:
+            normalized_extra_args["rwkv_state_read_ref"] = state_ref or ""
+        if write_ref_value is not None:
+            normalized_extra_args["rwkv_state_write_ref"] = write_ref or ""
+        if (
+            state_ref_value is not None
+            or write_ref_value is not None
+            or "rwkv_state_read_lease" in extra_args
+        ):
+            request.vllm_xargs = normalized_extra_args
+        if not state_ref and not write_ref:
+            return None
+        if request.n not in (None, 1) or request.use_beam_search:
+            raise ValueError("RWKV State requests require one sampled sequence")
+        if len(engine_inputs) != 1 or engine_inputs[0]["type"] != "token":
+            raise ValueError("RWKV State requests support one token input only")
+        engine_input = cast(TokensInput, engine_inputs[0])
+        if write_ref == "auto":
+            write_ref = f"rwkv-{random_uuid()}"
+            request.vllm_xargs = {
+                **normalized_extra_args,
+                "rwkv_state_write_ref": write_ref,
+            }
+        if state_ref and write_ref == state_ref:
+            raise ValueError("RWKV State read/write refs must be different")
+        if not state_ref:
+            return write_ref
+        result = await self.rwkv_state_cache_action("restore_metadata", state_ref)
+        worker_results = result["workers"]
+        tails = {
+            tuple(worker_result["pending_tail_token_ids"])
+            for worker_result in worker_results
+        }
+        if len(tails) != 1:
+            raise RuntimeError("RWKV State tail differs across model workers")
+        finish_reasons = {
+            str(worker_result["finish_reason"]) for worker_result in worker_results
+        }
+        if len(finish_reasons) != 1:
+            raise RuntimeError("RWKV State finish reason differs across model workers")
+        read_lease = f"rwkv-read-{random_uuid()}"
+        request.vllm_xargs = {
+            **(request.vllm_xargs or {}),
+            "rwkv_state_read_lease": read_lease,
+        }
+        (pending_tail,) = tails
+        (finish_reason,) = finish_reasons
+        boundary_token_ids = _rwkv_state_turn_boundary_token_ids(
+            request,
+            chat_template_kwargs,
+            tokenizer,
+            finish_reason=finish_reason,
+        )
+        engine_input["prompt_token_ids"] = [
+            *pending_tail,
+            *boundary_token_ids,
+            *engine_input["prompt_token_ids"],
+        ]
+        engine_input.pop("prompt_token_offsets", None)
+        return write_ref
+
+    async def _cleanup_rwkv_state_request(
+        self,
+        read_ref: str | None,
+        read_lease: str | None,
+        write_ref: str | None,
+    ) -> None:
+        if read_ref is not None and read_lease is not None:
+            try:
+                await self.rwkv_state_cache_action("cancel_read", read_ref, read_lease)
+            except Exception:
+                logger.exception("Failed to cancel RWKV State read lease")
+        if write_ref is not None:
+            try:
+                await self.rwkv_state_cache_action("cancel_write", write_ref)
+            except Exception:
+                logger.exception("Failed to cancel RWKV State write reservation")
+
+    async def _acquire_rwkv_state_request(
+        self,
+        read_ref: str | None,
+        read_lease: str | None,
+        write_ref: str | None,
+    ) -> None:
+        try:
+            if read_ref is not None:
+                if read_lease is None:
+                    raise RuntimeError("RWKV State read lease was not created")
+                await self.rwkv_state_cache_action("prepare_read", read_ref, read_lease)
+            if write_ref is not None:
+                await self.rwkv_state_cache_action("prepare_write", write_ref)
+        except Exception:
+            await self._cleanup_rwkv_state_request(read_ref, read_lease, write_ref)
+            raise
+
+    async def _rwkv_state_stream_with_cleanup(
+        self,
+        stream: AsyncIterator[str],
+        read_ref: str | None,
+        read_lease: str | None,
+        write_ref: str | None,
+    ) -> AsyncGenerator[str, None]:
+        try:
+            async for chunk in stream:
+                yield chunk
+        finally:
+            await self._cleanup_rwkv_state_request(read_ref, read_lease, write_ref)
+
+    async def _confirm_rwkv_state_ref(self, state_ref: str) -> None:
+        for _ in range(100):
+            result = await self.rwkv_state_cache_action("inspect_if_exists", state_ref)
+            if not all(worker.get("exists") for worker in result["workers"]):
+                await asyncio.sleep(0.01)
+                continue
+            worker_refs = {
+                worker_result.get("state_ref") for worker_result in result["workers"]
+            }
+            if worker_refs != {state_ref}:
+                raise RuntimeError("RWKV State ref differs across model workers")
+            return
+        raise RuntimeError(f"RWKV State ref was not committed: {state_ref}")
 
     def _effective_chat_template_kwargs(
         self, request: ChatCompletionRequest
@@ -312,6 +544,28 @@ class OpenAIServingChat(GenerateBaseServing):
             return result
 
         conversation, engine_inputs = result
+        try:
+            rwkv_state_write_ref = await self._prepend_rwkv_state_tail(
+                request,
+                engine_inputs,
+                chat_template_kwargs,
+                tokenizer,
+            )
+        except (KeyError, ValueError, RuntimeError) as error:
+            return self.create_error_response(str(error))
+        rwkv_state_args = request.vllm_xargs or {}
+        rwkv_state_read_ref = cast(
+            str | None, rwkv_state_args.get("rwkv_state_read_ref") or None
+        )
+        rwkv_state_read_lease = cast(
+            str | None, rwkv_state_args.get("rwkv_state_read_lease") or None
+        )
+        if rwkv_state_write_ref is not None:
+            _promote_rwkv_state_stop_strings(
+                request,
+                request_sampling_defaults,
+                tokenizer,
+            )
 
         request_id = (
             f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
@@ -407,8 +661,17 @@ class OpenAIServingChat(GenerateBaseServing):
         assert len(generators) == 1
         (result_generator,) = generators
 
+        try:
+            await self._acquire_rwkv_state_request(
+                rwkv_state_read_ref,
+                rwkv_state_read_lease,
+                rwkv_state_write_ref,
+            )
+        except Exception as error:
+            return self.create_error_response(str(error))
+
         if request.stream:
-            return self.chat_completion_stream_generator(
+            stream = self.chat_completion_stream_generator(
                 request,
                 result_generator,
                 request_id,
@@ -418,19 +681,36 @@ class OpenAIServingChat(GenerateBaseServing):
                 request_metadata,
                 chat_template_kwargs=chat_template_kwargs,
                 mm_token_counts=mm_token_counts,
+                rwkv_state_write_ref=rwkv_state_write_ref,
             )
+            if rwkv_state_read_ref is not None or rwkv_state_write_ref is not None:
+                return self._rwkv_state_stream_with_cleanup(
+                    stream,
+                    rwkv_state_read_ref,
+                    rwkv_state_read_lease,
+                    rwkv_state_write_ref,
+                )
+            return stream
 
-        return await self.chat_completion_full_generator(
-            request,
-            result_generator,
-            request_id,
-            model_name,
-            conversation,
-            tokenizer,
-            request_metadata,
-            parser=parser,
-            mm_token_counts=mm_token_counts,
-        )
+        try:
+            return await self.chat_completion_full_generator(
+                request,
+                result_generator,
+                request_id,
+                model_name,
+                conversation,
+                tokenizer,
+                request_metadata,
+                parser=parser,
+                mm_token_counts=mm_token_counts,
+                rwkv_state_write_ref=rwkv_state_write_ref,
+            )
+        finally:
+            await self._cleanup_rwkv_state_request(
+                rwkv_state_read_ref,
+                rwkv_state_read_lease,
+                rwkv_state_write_ref,
+            )
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
         if request.add_generation_prompt:
@@ -476,6 +756,7 @@ class OpenAIServingChat(GenerateBaseServing):
         request_metadata: RequestResponseMetadata,
         chat_template_kwargs: dict[str, Any] | None = None,
         mm_token_counts: dict[str, int] | None = None,
+        rwkv_state_write_ref: str | None = None,
     ) -> AsyncGenerator[str, None]:
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
@@ -793,6 +1074,9 @@ class OpenAIServingChat(GenerateBaseServing):
 
                         finish_reason_sent[i] = True
 
+                        if rwkv_state_write_ref is not None:
+                            await self._confirm_rwkv_state_ref(rwkv_state_write_ref)
+
                     choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
                     chunk = ChatCompletionStreamResponse(
                         id=request_id,
@@ -801,6 +1085,12 @@ class OpenAIServingChat(GenerateBaseServing):
                         choices=[choice_data],
                         model=model_name,
                     )
+                    if (
+                        rwkv_state_write_ref is not None
+                        and choice_data.finish_reason is not None
+                        and not include_usage
+                    ):
+                        chunk.rwkv_state_ref = rwkv_state_write_ref
                     # Stamp the fingerprint on terminal chunks only (those with
                     # finish_reason set). When ``include_usage`` is on, the
                     # trailing usage chunk below overrides this as the true
@@ -889,6 +1179,8 @@ class OpenAIServingChat(GenerateBaseServing):
                     system_fingerprint=self.system_fingerprint,
                     metrics=stream_per_request_metrics,
                 )
+                if rwkv_state_write_ref is not None:
+                    final_usage_chunk.rwkv_state_ref = rwkv_state_write_ref
                 final_usage_data = final_usage_chunk.model_dump_json(
                     exclude_unset=True, exclude_none=True
                 )
@@ -945,6 +1237,7 @@ class OpenAIServingChat(GenerateBaseServing):
         request_metadata: RequestResponseMetadata,
         parser: Parser | None = None,
         mm_token_counts: dict[str, int] | None = None,
+        rwkv_state_write_ref: str | None = None,
     ) -> ErrorResponse | ChatCompletionResponse:
         created_time = int(time.time())
         final_res: RequestOutput | None = None
@@ -1131,6 +1424,9 @@ class OpenAIServingChat(GenerateBaseServing):
 
             choices.append(choice_data)
 
+        if rwkv_state_write_ref is not None:
+            await self._confirm_rwkv_state_ref(rwkv_state_write_ref)
+
         if request.echo:
             last_msg_content: str | list[dict[str, str]] = ""
             if (
@@ -1206,6 +1502,8 @@ class OpenAIServingChat(GenerateBaseServing):
             ec_transfer_params=final_res.ec_transfer_params,
             metrics=per_request_metrics,
         )
+        if rwkv_state_write_ref is not None:
+            response.rwkv_state_ref = rwkv_state_write_ref
 
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:

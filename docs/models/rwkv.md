@@ -53,6 +53,91 @@ Continuous batching, asynchronous scheduling, prefix sharing and copy-on-write,
 structured outputs, and the OpenAI-compatible Chat and Responses APIs use the
 standard vLLM paths.
 
+## Reuse recurrent state across chat requests
+
+RWKV State refs let a client continue a chat without sending the complete
+conversation on every request. The ref stores a process-local recurrent-state
+snapshot; it does not consume a scheduler request slot. Enable the cache with a
+positive byte limit before starting the server:
+
+```bash
+VLLM_RWKV_STATE_CACHE_MAX_BYTES=$((4 * 1024 * 1024 * 1024)) \
+  vllm serve <model> \
+  --dtype float16 \
+  --enable-chunked-prefill
+```
+
+Ask the server to generate an unguessable ref for the initial turn:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "<model>",
+    "messages": [{"role": "user", "content": "Remember that my build is 42."}],
+    "vllm_xargs": {"rwkv_state_write_ref": "auto"}
+  }'
+```
+
+The normal response and the terminal streaming chunk include
+`rwkv_state_ref`. To continue, send only newly appended messages, restore that
+ref, and write a new ref:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "<model>",
+    "messages": [{"role": "user", "content": "What is my build number?"}],
+    "vllm_xargs": {
+      "rwkv_state_read_ref": "<previous-rwkv_state_ref>",
+      "rwkv_state_write_ref": "auto"
+    }
+  }'
+```
+
+For the canonical artifact template, the server inserts the inter-turn
+boundary before each restored delta. A naturally stopped bot turn contributes
+its pending stop token followed by a newline; a length- or repetition-limited
+turn is closed with `✿` followed by a newline. The `assistant` and
+`function_calling` prompt styles use their corresponding newline separators.
+
+State refs are immutable. Keep the old ref to branch a conversation, clone it
+without copying its snapshot, or delete it when it is no longer needed:
+
+```bash
+curl http://localhost:8000/v1/rwkv/state/capabilities
+curl http://localhost:8000/v1/rwkv/state/<state-ref>
+curl -X POST http://localhost:8000/v1/rwkv/state/<state-ref>/clone \
+  -H "Content-Type: application/json" \
+  -d '{"target_ref": "branch-1"}'
+curl -X DELETE http://localhost:8000/v1/rwkv/state/<state-ref>
+```
+
+Each State request supports one text-token input and one sampled sequence.
+State refs are held only by the serving process, are lost on restart, and do
+not currently support data parallelism. A continuation's new prompt plus
+output must still fit `--max-model-len`; the ref removes replay of earlier
+turns, not the per-request limit. Prefix-cache reads and writes are disabled
+when a State ref is restored so the two state sources cannot be mixed or leak
+into ordinary prefix-cache entries.
+
+Quiesce active requests before reloading or transferring model weights. These
+operations invalidate existing State refs and pending read/write reservations
+before changing the target model, including when the weight update later fails.
+Updating a separate speculative draft model does not invalidate target-model refs.
+
+Treat refs as bearer capabilities. Prefer `"auto"`, do not expose the State
+management endpoints without the same access controls as generation, and drop
+unused refs to release memory. State reuse extends computational history but
+does not by itself establish model quality beyond the model's evaluated
+context distribution.
+
+Snapshot restoration preserves the provider's state representation. It does not
+guarantee bitwise equivalence between different prefill chunk sizes: provider
+rounding and reduction order can still affect logits and generated tokens. Check
+the intended workload with the equivalence benchmark before relying on state reuse.
+
 ## Decoding defaults
 
 RWKV samples through FlashRWKV2 Rapid-Sampling. The model artifact must publish
