@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import sys
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -86,6 +87,20 @@ class _FakeStateHandle:
 
     def materialize_slots_(self, indices: torch.Tensor) -> None:
         self.materialized.append(indices.clone())
+
+    def clone_slots(self, indices: torch.Tensor) -> "_FakeStateHandle":
+        indices = indices.long()
+        clone = object.__new__(_FakeStateHandle)
+        clone.state = self.state.index_select(0, indices).clone()
+        clone.elapsed = (
+            self.elapsed.index_select(0, indices).clone()
+            if self.elapsed is not None
+            else None
+        )
+        clone.materialized = []
+        clone.bytes_per_slot = self.bytes_per_slot
+        clone.fixed_workspace_nbytes = self.fixed_workspace_nbytes
+        return clone
 
 
 def _fake_flashrwkv2() -> ModuleType:
@@ -249,6 +264,90 @@ def test_fp32_state_uses_caller_backed_cache_tensor(monkeypatch) -> None:
     assert handle.state.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
 
 
+def test_state_snapshot_roundtrip_is_independent_of_scheduler_slots(
+    monkeypatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "flashrwkv2", _fake_flashrwkv2())
+    vllm_config = _state_vllm_config()
+    state_layer = RwkvStateLayer(vllm_config, 2, "model.layers.0.rwkv_state")
+    spec = state_layer.get_kv_cache_spec(vllm_config)
+    raw = torch.zeros((3, 1, 1, spec.page_size_bytes), dtype=torch.int8)
+    state_layer.bind_kv_cache(raw)
+
+    for layer_idx in range(2):
+        tmix, handle, cmix = state_layer.get_layer_state(layer_idx)
+        tmix[1].fill_(11 + layer_idx)
+        handle.state[1].fill_(21 + layer_idx)
+        assert handle.elapsed is not None
+        handle.elapsed[1].fill_(31 + layer_idx)
+        cmix[1].fill_(41 + layer_idx)
+
+    snapshot = state_layer.capture_state_slot(1)
+    state_layer.reset_state_slots([1, 2])
+    state_layer.restore_state_slot(snapshot, 2)
+
+    assert snapshot.nbytes > 0
+    assert snapshot.nbytes == state_layer.state_snapshot_nbytes
+    for layer_idx in range(2):
+        tmix, handle, cmix = state_layer.get_layer_state(layer_idx)
+        assert torch.all(tmix[2] == 11 + layer_idx)
+        assert torch.all(handle.state[2] == 21 + layer_idx)
+        assert torch.all(handle.elapsed[2] == 31 + layer_idx)
+        assert torch.all(cmix[2] == 41 + layer_idx)
+        assert torch.count_nonzero(tmix[1]) == 0
+
+
+@pytest.mark.parametrize("state_dtype", ["float16", "float32"])
+def test_state_ref_cache_is_bounded_and_supports_clone_drop(
+    monkeypatch, state_dtype
+) -> None:
+    monkeypatch.setitem(sys.modules, "flashrwkv2", _fake_flashrwkv2())
+    vllm_config = _state_vllm_config(state_dtype)
+    state_layer = RwkvStateLayer(vllm_config, 1, "model.layers.0.rwkv_state")
+    spec = state_layer.get_kv_cache_spec(vllm_config)
+    raw = torch.zeros((2, 1, 1, spec.page_size_bytes), dtype=torch.int8)
+    state_layer.bind_kv_cache(raw)
+    model_state = object.__new__(RwkvModelState)
+    model_state._state_layer = state_layer
+    model_state._state_cache = {}
+    model_state._state_snapshot_refcounts = {}
+    model_state._active_state_readers = {}
+    model_state._prepared_state_reads_by_lease = {}
+    model_state._state_cache_bytes = 0
+    model_state._reserved_state_cache_bytes = 0
+    model_state._state_cache_max_bytes = 1 << 30
+
+    captured = model_state.capture_state_ref("goal-a", 0)
+    model_state.state_cache_action("prepare_read", "goal-a", "lease-a")
+    model_state.state_cache_action("prepare_read", "goal-a", "lease-b")
+    with pytest.raises(ValueError, match="in use"):
+        model_state.state_cache_action("drop", "goal-a")
+    canceled = model_state.state_cache_action("cancel_read", "goal-a", "lease-a")
+    assert canceled["canceled"] is True
+    with pytest.raises(ValueError, match="in use"):
+        model_state.state_cache_action("drop", "goal-a")
+    model_state.state_cache_action("cancel_read", "goal-a", "lease-b")
+    cloned = model_state.state_cache_action("clone", "goal-a", "goal-b")
+    inspected = model_state.state_cache_action("inspect", "goal-b")
+    dropped = model_state.state_cache_action("drop", "goal-a")
+
+    assert captured["state_ref"] == "goal-a"
+    assert captured["state_dtype"] == str(getattr(torch, state_dtype))
+    assert cloned["state_ref"] == inspected["state_ref"] == "goal-b"
+    assert inspected["state_dtype"] == captured["state_dtype"]
+    assert model_state._state_cache_bytes == inspected["nbytes"]
+    assert dropped["dropped"] is True
+    assert (
+        model_state.state_cache_action("inspect_if_exists", "goal-a")["exists"] is False
+    )
+    with pytest.raises(KeyError, match="goal-a"):
+        model_state.state_cache_action("inspect", "goal-a")
+
+    model_state._state_cache_max_bytes = inspected["nbytes"] * 2 - 1
+    with pytest.raises(MemoryError, match="capacity"):
+        model_state.capture_state_ref("goal-c", 1)
+
+
 def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:
     builder = object.__new__(RwkvAttentionMetadataBuilder)
     builder._device = torch.device("cpu")
@@ -403,8 +502,8 @@ def test_feed_forward_prepares_value_weight_for_provider() -> None:
 
 def test_model_folds_embedding_norm_after_loading(monkeypatch) -> None:
     module: Any = _fake_flashrwkv2()
-    module.infer_embedding_ln0_forward_varlen = (
-        lambda embedding, weight, bias, eps: torch.nn.functional.layer_norm(
+    module.infer_embedding_ln0_forward_varlen = lambda embedding, weight, bias, eps: (
+        torch.nn.functional.layer_norm(
             embedding, (embedding.shape[-1],), weight, bias, eps
         ).to(torch.float16)
     )
@@ -929,3 +1028,102 @@ def test_config_accepts_async_scheduling() -> None:
     vllm_config.scheduler_config.async_scheduling = True
     RwkvForCausalLMConfig.verify_and_update_config(vllm_config)
     assert vllm_config.scheduler_config.async_scheduling
+
+
+@pytest.mark.skipif(
+    not os.environ.get("VLLM_RWKV_TEST_MODEL"),
+    reason="Set VLLM_RWKV_TEST_MODEL to a local RWKV artifact for GPU evaluation",
+)
+@pytest.mark.parametrize("state_dtype", ["float16", "float32"])
+def test_real_model_state_restore_preserves_continuation(tmp_path, state_dtype) -> None:
+    """Restoring a snapshot must preserve logits for the same continuation calls."""
+    from transformers import AutoTokenizer
+
+    from vllm.config import set_current_vllm_config
+    from vllm.distributed import (
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.forward_context import set_forward_context
+    from vllm.model_executor.model_loader import get_model
+
+    model_path = os.environ["VLLM_RWKV_TEST_MODEL"]
+    config = EngineArgs(
+        model=model_path,
+        dtype="float16",
+        mamba_ssm_cache_dtype=state_dtype,
+        enforce_eager=True,
+        max_num_seqs=3,
+        max_model_len=1024,
+        max_num_batched_tokens=256,
+        enable_prefix_caching=False,
+    ).create_engine_config()
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        with set_current_vllm_config(config), torch.inference_mode():
+            init_distributed_environment(
+                world_size=1,
+                rank=0,
+                distributed_init_method=f"file://{tmp_path / 'rendezvous'}",
+                local_rank=0,
+                backend="nccl",
+            )
+            initialize_model_parallel(1, 1)
+            model = get_model(vllm_config=config)
+            state = model.get_rwkv_state_layer()
+            spec = state.get_kv_cache_spec(config)
+            raw = torch.zeros(
+                3 * spec.page_size_bytes, dtype=torch.uint8, device="cuda"
+            )
+            state.bind_kv_cache(raw)
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
+            prompt = tokenizer.encode(
+                "User: Remember project 42 and the color blue.\n\nAssistant:"
+            )
+            delta = tokenizer.encode("User: What is the project number?\n\nAssistant:")
+
+            def forward(tokens, slot):
+                ids = torch.tensor(tokens, dtype=torch.long, device="cuda")
+                count = ids.numel()
+                metadata = RwkvAttentionMetadata(
+                    cu_seqlens=torch.tensor(
+                        [0, count], dtype=torch.int32, device="cuda"
+                    ),
+                    state_indices=torch.tensor(
+                        [slot], dtype=torch.int32, device="cuda"
+                    ),
+                    batch_size=1,
+                    max_seqlen=count,
+                    token_capacity=count,
+                    sequence_capacity=1,
+                    max_seqlen_capacity=count,
+                )
+                with set_forward_context(metadata, config, num_tokens=count):
+                    hidden = model(ids, torch.arange(count, device="cuda"))
+                    return model.compute_logits(hidden[-1:]).clone()
+
+            for length in (1, 20, 64, 129):
+                state.reset_state_slots([0, 1, 2])
+                forward((prompt * 129)[:length], 0)
+                snapshot = state.capture_state_slot(0)
+                expected = forward(delta, 0)
+                forward(prompt[::-1], 1)
+                state.restore_state_slot(snapshot, 1)
+                restored = forward(delta, 1)
+                torch.testing.assert_close(restored, expected, rtol=0, atol=0)
+                for _ in range(4):
+                    token = expected.argmax(-1).tolist()
+                    expected = forward(token, 0)
+                    restored = forward(token, 1)
+                    torch.testing.assert_close(restored, expected, rtol=0, atol=0)
+                state.restore_state_slot(snapshot, 2)
+                expected = forward(delta, 2)
+                state.restore_state_slot(snapshot, 0)
+                torch.testing.assert_close(forward(delta, 0), expected, rtol=0, atol=0)
+    finally:
+        torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
+        cleanup_dist_env_and_memory()

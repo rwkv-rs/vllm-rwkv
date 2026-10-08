@@ -3,6 +3,7 @@
 """Native RWKV-7 inference backed exclusively by FlashRWKV2."""
 
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from functools import cache
 from itertools import islice
 from typing import Any, Protocol
@@ -115,6 +116,25 @@ def _validate_config(config: Any) -> None:
         raise ValueError("RWKV intermediate_size must equal 4 * hidden_size")
     if config.tie_word_embeddings:
         raise ValueError("RWKV requires untied embedding and LM-head weights")
+
+
+@dataclass(frozen=True)
+class RwkvStateSnapshot:
+    """One compact process-local recurrent State, detached from scheduler slots."""
+
+    tmix_shift: torch.Tensor
+    wkv_handles: tuple[_FlashRWKVStateHandle, ...]
+    cmix_shift: torch.Tensor
+
+    @property
+    def nbytes(self) -> int:
+        tensor_bytes = (
+            self.tmix_shift.numel() * self.tmix_shift.element_size()
+            + self.cmix_shift.numel() * self.cmix_shift.element_size()
+        )
+        return tensor_bytes + sum(
+            int(handle.memory_layout["total_nbytes"]) for handle in self.wkv_handles
+        )
 
 
 class RwkvStateLayer(nn.Module, AttentionLayerBase):
@@ -413,6 +433,82 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         indices = self._slot_tensor(slot_ids)
         for handle in self._wkv_handles:
             handle.materialize_slots_(indices)
+
+    @property
+    def state_snapshot_nbytes(self) -> int:
+        """Return the exact allocation size of one detached State snapshot."""
+        if self._tmix_shift_pool is None or self._cmix_shift_pool is None:
+            raise RuntimeError("RWKV State cache is not bound")
+        shift_bytes = (
+            self.num_local_layers
+            * self.hidden_size
+            * (
+                self._tmix_shift_pool.element_size()
+                + self._cmix_shift_pool.element_size()
+            )
+        )
+        return shift_bytes + sum(
+            int(handle.memory_layout["bytes_per_slot"])
+            + int(handle.memory_layout["fixed_workspace_nbytes"])
+            for handle in self._wkv_handles
+        )
+
+    def capture_state_slot(
+        self, slot_id: int | Sequence[int] | torch.Tensor
+    ) -> RwkvStateSnapshot:
+        indices = self._slot_tensor([slot_id] if isinstance(slot_id, int) else slot_id)
+        if indices.numel() != 1:
+            raise ValueError("RWKV State snapshot requires exactly one source slot")
+        self.materialize_state_slots(indices)
+        long_indices = indices.long()
+        assert self._tmix_shift_pool is not None
+        assert self._cmix_shift_pool is not None
+        handles: list[_FlashRWKVStateHandle] = []
+        for handle in self._wkv_handles:
+            clone_slots = getattr(handle, "clone_slots", None)
+            if clone_slots is None:
+                raise RuntimeError(
+                    "FlashRWKV2 State handle does not support compact clone_slots"
+                )
+            handles.append(clone_slots(indices))
+        return RwkvStateSnapshot(
+            tmix_shift=self._tmix_shift_pool.index_select(1, long_indices).clone(),
+            wkv_handles=tuple(handles),
+            cmix_shift=self._cmix_shift_pool.index_select(1, long_indices).clone(),
+        )
+
+    def restore_state_slot(
+        self,
+        snapshot: RwkvStateSnapshot,
+        slot_id: int | Sequence[int] | torch.Tensor,
+    ) -> None:
+        destination = self._slot_tensor(
+            [slot_id] if isinstance(slot_id, int) else slot_id
+        )
+        if destination.numel() != 1:
+            raise ValueError("RWKV State restore requires exactly one destination slot")
+        if len(snapshot.wkv_handles) != self.num_local_layers:
+            raise ValueError("RWKV State snapshot layer count mismatch")
+        assert self._tmix_shift_pool is not None
+        assert self._cmix_shift_pool is not None
+        expected_shape = (self.num_local_layers, 1, self.hidden_size)
+        if (
+            tuple(snapshot.tmix_shift.shape) != expected_shape
+            or tuple(snapshot.cmix_shift.shape) != expected_shape
+            or snapshot.tmix_shift.dtype != self._tmix_shift_pool.dtype
+            or snapshot.cmix_shift.dtype != self._cmix_shift_pool.dtype
+            or snapshot.tmix_shift.device != self._tmix_shift_pool.device
+            or snapshot.cmix_shift.device != self._cmix_shift_pool.device
+        ):
+            raise ValueError("RWKV State snapshot shift layout mismatch")
+        destination_long = destination.long()
+        self._tmix_shift_pool.index_copy_(1, destination_long, snapshot.tmix_shift)
+        self._cmix_shift_pool.index_copy_(1, destination_long, snapshot.cmix_shift)
+        source = torch.zeros_like(destination)
+        for handle, saved_handle in zip(
+            self._wkv_handles, snapshot.wkv_handles, strict=True
+        ):
+            handle.copy_slots_(saved_handle, source, destination)
 
     def _prepare_live_ticket(self, metadata: RwkvAttentionMetadata) -> object:
         flashrwkv2 = _load_flashrwkv2()
