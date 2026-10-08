@@ -133,6 +133,26 @@ unused refs to release memory. State reuse extends computational history but
 does not by itself establish model quality beyond the model's evaluated
 context distribution.
 
+Validate recurrent-state equivalence by comparing exact full-token replay and
+State-chain generation with greedy decoding. The full path replays the token IDs
+rendered for each chat delta, canonical turn boundaries, and prior output token
+IDs, avoiding chat-template round-trip changes. The input is a JSON list such as
+`[{"id":"memory","turns":["Remember 42","What number did I give you?"]}]`:
+
+```bash
+.venv/bin/python benchmarks/rwkv7/benchmark_stateful_chat.py \
+  --input-file benchmarks/rwkv7/stateful_chat_example.json \
+  --url http://127.0.0.1:8000 \
+  --require-exact-match \
+  --output rwkv-state-results.json
+```
+
+The report compares generated token IDs and records the first divergent turn,
+exact-match rate, prompt tokens, prompt-token savings, and mean latency for both
+paths. Run this equivalence gate before using longer quality evaluations such as
+MRCR. Separately evaluate response quality; exact state equivalence verifies
+execution continuity, not the model's ability to use very old information.
+
 Snapshot restoration preserves the provider's state representation. It does not
 guarantee bitwise equivalence between different prefill chunk sizes: provider
 rounding and reduction order can still affect logits and generated tokens. Check
