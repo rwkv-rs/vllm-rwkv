@@ -15,7 +15,7 @@ from vllm import envs
 from vllm.config import VllmConfig
 from vllm.model_executor.models.rwkv import RwkvStateSnapshot, _load_flashrwkv2
 from vllm.sampling_params import SamplingParams
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.output import FinishedRequestData, NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
@@ -32,6 +32,7 @@ RWKV_STATE_READ_REF_ARG = "rwkv_state_read_ref"
 RWKV_STATE_READ_LEASE_ARG = "rwkv_state_read_lease"
 RWKV_STATE_WRITE_REF_ARG = "rwkv_state_write_ref"
 _STATE_REF_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_COMMIT_FINISH_REASONS = frozenset({"stop", "length", "repetition"})
 
 
 @dataclass(frozen=True)
@@ -426,8 +427,21 @@ class RwkvModelState(DefaultModelState):
             and vllm_config.parallel_config.data_parallel_size > 1
         ):
             raise ValueError("RWKV State refs do not yet support data parallelism")
+        self._req_index_by_id: dict[str, int] = {}
+        self._pending_read_ref_by_index: dict[int, str] = {}
         self._pending_write_ref_by_id: dict[str, str] = {}
         self._prepared_state_bytes_by_ref: dict[str, int] = {}
+        self._reserved_state_bytes_by_req_id: dict[str, int] = {}
+        self._base_processed_tokens_by_req_id: dict[str, int] = {}
+        self._parent_state_ref_by_req_id: dict[str, str] = {}
+        self._preempted_req_ids: set[str] = set()
+        self._active_state_slots = torch.full(
+            (self.max_num_reqs,),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._has_active_state_slot = np.zeros(self.max_num_reqs, dtype=np.bool_)
         cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
         self._capture_sampling_graphs = bool(
             cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs()
@@ -459,6 +473,79 @@ class RwkvModelState(DefaultModelState):
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
+        sampling_params = new_req_data.sampling_params
+        extra_args = sampling_params.extra_args if sampling_params is not None else None
+        extra_args = extra_args or {}
+        read_ref = self._validate_state_ref(
+            extra_args.get(RWKV_STATE_READ_REF_ARG),
+            field=RWKV_STATE_READ_REF_ARG,
+            allow_empty=True,
+        )
+        read_lease = self._validate_state_ref(
+            extra_args.get(RWKV_STATE_READ_LEASE_ARG),
+            field=RWKV_STATE_READ_LEASE_ARG,
+            allow_empty=True,
+        )
+        write_ref = self._validate_state_ref(
+            extra_args.get(RWKV_STATE_WRITE_REF_ARG),
+            field=RWKV_STATE_WRITE_REF_ARG,
+            allow_empty=True,
+        )
+        resuming = new_req_data.req_id in self._preempted_req_ids
+        if resuming and (
+            read_ref != self._parent_state_ref_by_req_id.get(new_req_data.req_id, "")
+            or write_ref != self._pending_write_ref_by_id.get(new_req_data.req_id, "")
+        ):
+            raise ValueError("RWKV State refs changed while the request was preempted")
+        if (read_ref or write_ref) and self._state_cache_max_bytes == 0:
+            raise RuntimeError(
+                "RWKV State refs are disabled; set "
+                "VLLM_RWKV_STATE_CACHE_MAX_BYTES to a positive byte limit"
+            )
+        if read_lease and not read_ref:
+            raise ValueError("rwkv_state_read_lease requires rwkv_state_read_ref")
+        if read_ref:
+            if read_ref not in self._state_cache:
+                raise KeyError(f"Unknown RWKV State ref: {read_ref}")
+            if read_lease and not resuming:
+                prepared_ref = self._prepared_state_reads_by_lease.get(read_lease)
+                if prepared_ref != read_ref:
+                    raise ValueError("RWKV State read lease is missing or mismatched")
+            pending_tail = self._state_cache[read_ref].pending_tail_token_ids
+            prefill_token_ids = new_req_data.prefill_token_ids or ()
+            if tuple(prefill_token_ids[: len(pending_tail)]) != pending_tail:
+                raise ValueError(
+                    "RWKV State restore input is missing its pending tail tokens"
+                )
+        if write_ref and not resuming:
+            if write_ref == read_ref:
+                raise ValueError("RWKV State read/write refs must be different")
+            if write_ref in self._state_cache or write_ref in (
+                self._pending_write_ref_by_id.values()
+            ):
+                raise ValueError(f"RWKV State ref already exists: {write_ref}")
+            required = self._prepared_state_bytes_by_ref.pop(write_ref, 0)
+            if not required:
+                required = self._reserve_state_ref()
+            self._reserved_state_bytes_by_req_id[new_req_data.req_id] = required
+            self._pending_write_ref_by_id[new_req_data.req_id] = write_ref
+        if read_ref:
+            if read_lease and not resuming:
+                del self._prepared_state_reads_by_lease[read_lease]
+            if new_req_data.num_computed_tokens == 0:
+                self._pending_read_ref_by_index[req_index] = read_ref
+            if not resuming:
+                self._active_state_readers[read_ref] = (
+                    self._active_state_readers.get(read_ref, 0) + 1
+                )
+                self._base_processed_tokens_by_req_id[new_req_data.req_id] = (
+                    self._state_cache[read_ref].processed_token_count
+                )
+                self._parent_state_ref_by_req_id[new_req_data.req_id] = read_ref
+        self._preempted_req_ids.discard(new_req_data.req_id)
+        self._req_index_by_id[new_req_data.req_id] = req_index
+        self._active_state_slots[req_index] = -1
+        self._has_active_state_slot[req_index] = False
         if self._sampler is not None:
             self._sampler.stage_request(req_index, new_req_data.req_id)
         self._state_block_columns[req_index] = (
@@ -467,11 +554,69 @@ class RwkvModelState(DefaultModelState):
         self._state_num_computed_tokens[req_index] = new_req_data.num_computed_tokens
 
     def preempt_request(self, req_id: str) -> None:
+        self._preempted_req_ids.add(req_id)
         if self._sampler is not None:
             self._sampler.preempt_request(req_id)
 
-    def remove_request(self, req_id: str) -> None:
-        super().remove_request(req_id)
+    def remove_request(
+        self,
+        req_id: str,
+        finished_data: FinishedRequestData | None = None,
+    ) -> None:
+        finish_reason = None if finished_data is None else finished_data.finish_reason
+        pending_tail_token_ids = (
+            () if finished_data is None else finished_data.pending_tail_token_ids
+        )
+        req_index = self._req_index_by_id.pop(req_id, None)
+        preempted = req_id in self._preempted_req_ids and finished_data is None
+        write_ref = ""
+        reserved = 0
+        parent_ref = ""
+        if not preempted:
+            self._preempted_req_ids.discard(req_id)
+            write_ref = self._pending_write_ref_by_id.pop(req_id, "")
+            reserved = self._reserved_state_bytes_by_req_id.pop(req_id, 0)
+            parent_ref = self._parent_state_ref_by_req_id.pop(req_id, "")
+        if parent_ref:
+            active_readers = self._active_state_readers[parent_ref] - 1
+            if active_readers:
+                self._active_state_readers[parent_ref] = active_readers
+            else:
+                del self._active_state_readers[parent_ref]
+        if req_index is not None:
+            self._pending_read_ref_by_index.pop(req_index, None)
+            if (
+                write_ref
+                and not preempted
+                and finish_reason in _COMMIT_FINISH_REASONS
+                and self._has_active_state_slot[req_index]
+            ):
+                processed_token_count = self._base_processed_tokens_by_req_id.get(
+                    req_id, 0
+                ) + int(self._state_num_computed_tokens[req_index])
+                try:
+                    self.capture_state_ref(
+                        write_ref,
+                        self._active_state_slots[req_index : req_index + 1],
+                        parent_ref=parent_ref or None,
+                        processed_token_count=processed_token_count,
+                        pending_tail_token_ids=pending_tail_token_ids,
+                        finish_reason=finish_reason,
+                        reserved_nbytes=reserved,
+                    )
+                except Exception:
+                    self._reserved_state_cache_bytes -= reserved
+                    reserved = 0
+                    raise
+                else:
+                    reserved = 0
+            self._active_state_slots[req_index] = -1
+            self._has_active_state_slot[req_index] = False
+        if not preempted:
+            self._base_processed_tokens_by_req_id.pop(req_id, None)
+        if reserved:
+            self._reserved_state_cache_bytes -= reserved
+        super().remove_request(req_id, finished_data)
         if self._sampler is not None:
             self._sampler.remove_request(req_id)
 
@@ -736,6 +881,20 @@ class RwkvModelState(DefaultModelState):
             }
         raise ValueError(f"unsupported RWKV State cache action: {action}")
 
+    def clear_state_cache(self) -> None:
+        """Invalidate detached state before changing model weights."""
+        if not self._state_cache_max_bytes:
+            return
+        if self._req_index_by_id or self._preempted_req_ids:
+            raise RuntimeError("Quiesce RWKV requests before updating model weights")
+        self._state_cache.clear()
+        self._state_snapshot_refcounts.clear()
+        self._active_state_readers.clear()
+        self._prepared_state_reads_by_lease.clear()
+        self._prepared_state_bytes_by_ref.clear()
+        self._state_cache_bytes = 0
+        self._reserved_state_cache_bytes = 0
+
     def reset_kv_cache_blocks(self, block_ids: Sequence[int]) -> bool:
         self._state_layer.reset_state_slots(block_ids)
         return True
@@ -763,7 +922,13 @@ class RwkvModelState(DefaultModelState):
         kv_cache_config: KVCacheConfig,
         num_computed_tokens: torch.Tensor,
     ) -> None:
-        if not self._align_mode or input_batch.num_reqs == 0:
+        if input_batch.num_reqs == 0:
+            return
+        if (
+            not self._align_mode
+            and not self._pending_read_ref_by_index
+            and not self._pending_write_ref_by_id
+        ):
             return
 
         num_reqs = input_batch.num_reqs
@@ -775,14 +940,30 @@ class RwkvModelState(DefaultModelState):
         block_table = block_tables[self._get_rwkv_group_id(kv_cache_config)]
         reset_rows_np = np.flatnonzero(old_columns < 0)
         if reset_rows_np.size:
-            reset_rows = torch.as_tensor(
-                reset_rows_np, dtype=torch.int64, device=self.device
-            )
-            reset_columns = torch.as_tensor(
-                new_columns[reset_rows_np], dtype=torch.int64, device=self.device
-            )
-            reset_indices = block_table[reset_rows, reset_columns].contiguous()
-            self._state_layer.reset_state_slots(reset_indices)
+            zero_rows: list[int] = []
+            for row in reset_rows_np.tolist():
+                req_index = int(req_indices[row])
+                state_ref = getattr(self, "_pending_read_ref_by_index", {}).pop(
+                    req_index, ""
+                )
+                destination = (
+                    block_table[row, int(new_columns[row])].reshape(1).contiguous()
+                )
+                if state_ref:
+                    self._state_layer.restore_state_slot(
+                        self._state_cache[state_ref].snapshot, destination
+                    )
+                else:
+                    zero_rows.append(row)
+            if zero_rows:
+                reset_rows = torch.as_tensor(
+                    zero_rows, dtype=torch.int64, device=self.device
+                )
+                reset_columns = torch.as_tensor(
+                    new_columns[zero_rows], dtype=torch.int64, device=self.device
+                )
+                reset_indices = block_table[reset_rows, reset_columns].contiguous()
+                self._state_layer.reset_state_slots(reset_indices)
         row_indices_np = np.flatnonzero(
             (old_columns >= 0) & (old_columns != new_columns)
         )
@@ -801,6 +982,17 @@ class RwkvModelState(DefaultModelState):
                 row_indices, destination_columns
             ].contiguous()
             self._state_layer.copy_state_slots(source_indices, destination_indices)
+        if hasattr(self, "_active_state_slots"):
+            rows = torch.arange(num_reqs, dtype=torch.int64, device=self.device)
+            columns = torch.as_tensor(
+                new_columns, dtype=torch.int64, device=self.device
+            )
+            active_slots = block_table[rows, columns].contiguous()
+            request_indices = torch.as_tensor(
+                req_indices, dtype=torch.int64, device=self.device
+            )
+            self._active_state_slots.index_copy_(0, request_indices, active_slots)
+            self._has_active_state_slot[req_indices] = True
         self._state_block_columns[req_indices] = new_columns
         self._state_num_computed_tokens[req_indices] = computed + query_lens
         del num_computed_tokens

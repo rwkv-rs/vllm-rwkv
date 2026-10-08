@@ -7,6 +7,8 @@ delegates to the configured weight transfer engine and tracks whether an update
 session is active. These tests verify that delegation and the session guard.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
@@ -80,6 +82,42 @@ def test_reload_weights_sets_current_config():
     Worker.reload_weights(worker)
 
     assert model_runner.seen_config is worker.vllm_config
+
+
+@pytest.mark.parametrize("update_kind", ["reload", "transfer", "draft"])
+@pytest.mark.parametrize("active_requests", [False, True])
+def test_weight_updates_invalidate_rwkv_state_before_mutation(
+    update_kind, active_requests
+):
+    engine = _RecordingEngine()
+    engine.supports_draft_weight_update = True
+    worker = _make_worker(engine)
+    worker._set_draft_weight_update_target = lambda: None
+    cleared = []
+
+    def clear_state_cache():
+        assert worker.model_runner.seen_config is None
+        assert not engine.started
+        if active_requests:
+            raise RuntimeError("Quiesce RWKV requests before updating model weights")
+        cleared.append(True)
+
+    worker.model_runner.model_state = SimpleNamespace(
+        clear_state_cache=clear_state_cache
+    )
+    update = {
+        "reload": worker.reload_weights,
+        "transfer": worker.start_weight_update,
+        "draft": worker.start_draft_weight_update,
+    }[update_kind]
+    if active_requests and update_kind != "draft":
+        with pytest.raises(RuntimeError, match="Quiesce"):
+            update()
+        assert worker.model_runner.seen_config is None
+        assert not engine.started
+    else:
+        update()
+        assert cleared == ([] if update_kind == "draft" else [True])
 
 
 def test_reload_parameter_lookup_preserves_lora_module_names():

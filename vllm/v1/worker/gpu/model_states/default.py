@@ -7,7 +7,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.output import FinishedRequestData, NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
@@ -81,7 +81,11 @@ class DefaultModelState(ModelState):
         if self.prompt_embeds_state is not None:
             self.prompt_embeds_state.add_request(req_index, new_req_data)
 
-    def remove_request(self, req_id: str) -> None:
+    def remove_request(
+        self,
+        req_id: str,
+        finished_data: FinishedRequestData | None = None,
+    ) -> None:
         if self.prompt_embeds_state is not None:
             self.prompt_embeds_state.remove_request(req_id)
 

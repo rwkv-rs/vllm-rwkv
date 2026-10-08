@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 import torch
 
-from vllm.v1.core.sched.output import GrammarOutput
+from vllm.v1.core.sched.output import FinishedRequestData, GrammarOutput
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample import batch_shard
 from vllm.v1.worker.gpu.sample.batch_shard import (
@@ -608,18 +608,29 @@ def test_finish_requests_frees_slots_in_sorted_order():
     whose iteration order is per-process hash-randomized."""
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
-    removed: list[str] = []
+    removed: list[tuple[str, FinishedRequestData | None]] = []
     preempted: list[str] = []
     fake_runner = SimpleNamespace(
-        _remove_request=removed.append,
+        _remove_request=lambda req_id, data=None: removed.append((req_id, data)),
         pooling_runner=None,
         model_state=SimpleNamespace(preempt_request=preempted.append),
     )
+    finished_data = FinishedRequestData(
+        finish_reason="stop",
+        pending_tail_token_ids=(42,),
+    )
     scheduler_output = SimpleNamespace(
         finished_req_ids={"req-b", "req-c", "req-a"},
+        finished_req_data={"req-b": finished_data},
         preempted_req_ids={"req-e", "req-d"},
     )
     GPUModelRunner.finish_requests(fake_runner, scheduler_output)
-    assert removed == sorted(removed)
-    assert set(removed) == {"req-a", "req-b", "req-c", "req-d", "req-e"}
+    assert [req_id for req_id, _ in removed] == sorted(req_id for req_id, _ in removed)
+    assert dict(removed) == {
+        "req-a": None,
+        "req-b": finished_data,
+        "req-c": None,
+        "req-d": None,
+        "req-e": None,
+    }
     assert preempted == ["req-d", "req-e"]

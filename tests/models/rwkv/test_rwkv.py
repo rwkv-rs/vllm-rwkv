@@ -27,6 +27,7 @@ from vllm.v1.attention.backends.rwkv_attn import (
     RwkvAttentionMetadata,
     RwkvAttentionMetadataBuilder,
 )
+from vllm.v1.core.sched.output import FinishedRequestData
 from vllm.v1.worker.gpu.model_states.rwkv import RwkvModelState, RwkvSampler
 
 
@@ -346,6 +347,295 @@ def test_state_ref_cache_is_bounded_and_supports_clone_drop(
     model_state._state_cache_max_bytes = inspected["nbytes"] * 2 - 1
     with pytest.raises(MemoryError, match="capacity"):
         model_state.capture_state_ref("goal-c", 1)
+
+
+@pytest.mark.parametrize("block_size", [16, 16384], ids=["align", "none"])
+def test_state_ref_restore_happens_before_first_delta_forward(block_size) -> None:
+    restored: list[tuple[object, torch.Tensor]] = []
+    resets: list[torch.Tensor] = []
+    snapshot = SimpleNamespace(nbytes=10)
+    state_layer = SimpleNamespace(
+        prefix="model.layers.0.rwkv_state",
+        restore_state_slot=lambda value, slot: restored.append((value, slot.clone())),
+        reset_state_slots=lambda slots: resets.append(slots.clone()),
+        copy_state_slots=lambda source, destination: None,
+    )
+    model_state = object.__new__(RwkvModelState)
+    model_state._align_mode = block_size == 16
+    model_state._pending_write_ref_by_id = {}
+    model_state._block_size = block_size
+    model_state._state_block_columns = np.array([-1], dtype=np.int32)
+    model_state._state_num_computed_tokens = np.array([0], dtype=np.int64)
+    model_state._state_layer = state_layer
+    model_state._rwkv_group_id = 0
+    model_state._pending_read_ref_by_index = {0: "parent"}
+    model_state._active_state_slots = torch.full((1,), -1, dtype=torch.int32)
+    model_state._has_active_state_slot = np.zeros(1, dtype=np.bool_)
+    model_state._state_cache = {"parent": SimpleNamespace(snapshot=snapshot)}
+    model_state.device = torch.device("cpu")
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        idx_mapping_np=np.array([0]),
+        num_scheduled_tokens=np.array([3], dtype=np.int32),
+    )
+
+    model_state.preprocess_state(
+        input_batch,
+        (torch.tensor([[7]], dtype=torch.int32),),
+        SimpleNamespace(kv_cache_groups=[]),
+        torch.empty(0),
+    )
+
+    assert not resets
+    assert restored and restored[0][0] is snapshot
+    assert torch.equal(restored[0][1], torch.tensor([7], dtype=torch.int32))
+    assert model_state._has_active_state_slot[0]
+
+
+def test_state_cache_invalidation_requires_quiescence_and_releases_refs() -> None:
+    model_state = object.__new__(RwkvModelState)
+    model_state._state_layer = SimpleNamespace(state_snapshot_nbytes=16)
+    model_state._state_cache_max_bytes = 64
+    model_state._state_cache = {"saved": object()}
+    model_state._state_snapshot_refcounts = {1: 1}
+    model_state._active_state_readers = {}
+    model_state._prepared_state_reads_by_lease = {"lease": "saved"}
+    model_state._prepared_state_bytes_by_ref = {"next": 16}
+    model_state._state_cache_bytes = 16
+    model_state._reserved_state_cache_bytes = 16
+    model_state._req_index_by_id = {"running": 0}
+    model_state._preempted_req_ids = set()
+
+    with pytest.raises(RuntimeError, match="Quiesce"):
+        model_state.clear_state_cache()
+    assert "saved" in model_state._state_cache
+
+    model_state._req_index_by_id.clear()
+    model_state._preempted_req_ids.add("waiting")
+    with pytest.raises(RuntimeError, match="Quiesce"):
+        model_state.clear_state_cache()
+    model_state._preempted_req_ids.clear()
+    model_state.clear_state_cache()
+
+    assert not model_state.state_cache_action("inspect_if_exists", "saved")["exists"]
+    capabilities = model_state.state_cache_action("capabilities")
+    for field in ("state_count", "used_bytes", "reserved_bytes", "prepared_read_count"):
+        assert capabilities[field] == 0
+    assert not model_state.state_cache_action("cancel_write", "next")["canceled"]
+    assert not model_state.state_cache_action("cancel_read", "saved", "lease")[
+        "canceled"
+    ]
+
+
+def test_request_state_refs_restore_then_capture_a_new_atomic_ref(monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "flashrwkv2", _fake_flashrwkv2())
+    vllm_config = _state_vllm_config()
+    state_layer = RwkvStateLayer(vllm_config, 1, "model.layers.0.rwkv_state")
+    spec = state_layer.get_kv_cache_spec(vllm_config)
+    raw = torch.zeros((2, 1, 1, spec.page_size_bytes), dtype=torch.int8)
+    state_layer.bind_kv_cache(raw)
+    tmix, handle, cmix = state_layer.get_layer_state(0)
+    tmix[0].fill_(1)
+    handle.state[0].fill_(2)
+    cmix[0].fill_(3)
+
+    model_state = object.__new__(RwkvModelState)
+    model_state.prompt_embeds_state = None
+    model_state.rope_state = None
+    model_state._sampler = None
+    model_state._state_layer = state_layer
+    model_state._align_mode = True
+    model_state._block_size = 16
+    model_state._state_block_columns = np.array([-1], dtype=np.int32)
+    model_state._state_num_computed_tokens = np.array([0], dtype=np.int64)
+    model_state._rwkv_group_id = 0
+    model_state._state_cache = {}
+    model_state._state_snapshot_refcounts = {}
+    model_state._active_state_readers = {}
+    model_state._prepared_state_reads_by_lease = {}
+    model_state._state_cache_bytes = 0
+    model_state._reserved_state_cache_bytes = 0
+    model_state._state_cache_max_bytes = 1 << 30
+    model_state._req_index_by_id = {}
+    model_state._pending_read_ref_by_index = {}
+    model_state._pending_write_ref_by_id = {}
+    model_state._prepared_state_bytes_by_ref = {}
+    model_state._reserved_state_bytes_by_req_id = {}
+    model_state._base_processed_tokens_by_req_id = {}
+    model_state._parent_state_ref_by_req_id = {}
+    model_state._preempted_req_ids = set()
+    model_state._active_state_slots = torch.full((1,), -1, dtype=torch.int32)
+    model_state._has_active_state_slot = np.zeros(1, dtype=np.bool_)
+    model_state.device = torch.device("cpu")
+    model_state.capture_state_ref("goal-parent", 0)
+    state_layer.reset_state_slots([1])
+    model_state.state_cache_action("prepare_read", "goal-parent", "request-1-lease")
+    with pytest.raises(ValueError, match="in use"):
+        model_state.state_cache_action("drop", "goal-parent")
+    request = SimpleNamespace(
+        req_id="request-1",
+        num_computed_tokens=0,
+        prefill_token_ids=[1, 2, 3],
+        sampling_params=SimpleNamespace(
+            extra_args={
+                "rwkv_state_read_ref": "goal-parent",
+                "rwkv_state_read_lease": "request-1-lease",
+                "rwkv_state_write_ref": "goal-child",
+            }
+        ),
+    )
+
+    model_state.add_request(0, request)
+    with pytest.raises(ValueError, match="in use"):
+        model_state.state_cache_action("drop", "goal-parent")
+    model_state.preprocess_state(
+        SimpleNamespace(
+            num_reqs=1,
+            idx_mapping_np=np.array([0]),
+            num_scheduled_tokens=np.array([3], dtype=np.int32),
+        ),
+        (torch.tensor([[1]], dtype=torch.int32),),
+        SimpleNamespace(kv_cache_groups=[]),
+        torch.empty(0),
+    )
+    reserved = model_state._reserved_state_cache_bytes
+    model_state.preempt_request(request.req_id)
+    model_state.remove_request(request.req_id)
+    with pytest.raises(ValueError, match="in use"):
+        model_state.state_cache_action("drop", "goal-parent")
+    assert model_state._reserved_state_cache_bytes == reserved
+    model_state.add_request(0, request)
+    model_state.preprocess_state(
+        SimpleNamespace(
+            num_reqs=1,
+            idx_mapping_np=np.array([0]),
+            num_scheduled_tokens=np.array([3], dtype=np.int32),
+        ),
+        (torch.tensor([[1]], dtype=torch.int32),),
+        SimpleNamespace(kv_cache_groups=[]),
+        torch.empty(0),
+    )
+    assert model_state._reserved_state_cache_bytes == reserved
+    tmix[1].add_(10)
+    handle.state[1].add_(20)
+    cmix[1].add_(30)
+    model_state.remove_request(
+        "request-1",
+        FinishedRequestData(
+            finish_reason="stop",
+            pending_tail_token_ids=(99,),
+        ),
+    )
+
+    assert (
+        model_state.state_cache_action("inspect", "goal-parent")[
+            "scheduler_slots_reserved"
+        ]
+        == 0
+    )
+    assert (
+        model_state.state_cache_action("inspect", "goal-child")[
+            "scheduler_slots_reserved"
+        ]
+        == 0
+    )
+    state_layer.reset_state_slots([0])
+    child = model_state._state_cache["goal-child"]
+    assert child.parent_ref == "goal-parent"
+    assert child.processed_token_count == 3
+    assert child.pending_tail_token_ids == (99,)
+    assert model_state._reserved_state_cache_bytes == 0
+    state_layer.restore_state_slot(child.snapshot, 0)
+    assert torch.all(tmix[0] == 11)
+    assert torch.all(handle.state[0] == 22)
+    assert torch.all(cmix[0] == 33)
+
+    missing_tail_request = SimpleNamespace(
+        req_id="request-2",
+        num_computed_tokens=0,
+        prefill_token_ids=[100],
+        sampling_params=SimpleNamespace(
+            extra_args={"rwkv_state_read_ref": "goal-child"}
+        ),
+    )
+    with pytest.raises(ValueError, match="missing its pending tail"):
+        model_state.add_request(0, missing_tail_request)
+
+    resumed_request = SimpleNamespace(
+        req_id="request-3",
+        num_computed_tokens=1,
+        prefill_token_ids=[99, 100],
+        sampling_params=SimpleNamespace(
+            extra_args={"rwkv_state_read_ref": "goal-child"}
+        ),
+    )
+    model_state.add_request(0, resumed_request)
+    assert 0 not in model_state._pending_read_ref_by_index
+
+
+def test_state_write_reserves_capacity_and_abort_does_not_commit(monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "flashrwkv2", _fake_flashrwkv2())
+    vllm_config = _state_vllm_config()
+    state_layer = RwkvStateLayer(vllm_config, 1, "model.layers.0.rwkv_state")
+    spec = state_layer.get_kv_cache_spec(vllm_config)
+    raw = torch.zeros((1, 1, 1, spec.page_size_bytes), dtype=torch.int8)
+    state_layer.bind_kv_cache(raw)
+    model_state = object.__new__(RwkvModelState)
+    model_state.prompt_embeds_state = None
+    model_state.rope_state = None
+    model_state._sampler = None
+    model_state._state_layer = state_layer
+    model_state._align_mode = True
+    model_state._block_size = 16
+    model_state._state_block_columns = np.array([-1], dtype=np.int32)
+    model_state._state_num_computed_tokens = np.array([0], dtype=np.int64)
+    model_state._state_cache = {}
+    model_state._state_snapshot_refcounts = {}
+    model_state._active_state_readers = {}
+    model_state._prepared_state_reads_by_lease = {}
+    model_state._state_cache_bytes = 0
+    model_state._reserved_state_cache_bytes = 0
+    model_state._state_cache_max_bytes = state_layer.state_snapshot_nbytes
+    model_state._req_index_by_id = {}
+    model_state._pending_read_ref_by_index = {}
+    model_state._pending_write_ref_by_id = {}
+    model_state._prepared_state_bytes_by_ref = {}
+    model_state._reserved_state_bytes_by_req_id = {}
+    model_state._base_processed_tokens_by_req_id = {}
+    model_state._parent_state_ref_by_req_id = {}
+    model_state._preempted_req_ids = set()
+    model_state._active_state_slots = torch.full((1,), -1, dtype=torch.int32)
+    model_state._has_active_state_slot = np.zeros(1, dtype=np.bool_)
+    model_state.device = torch.device("cpu")
+    request = SimpleNamespace(
+        req_id="request-abort",
+        num_computed_tokens=0,
+        sampling_params=SimpleNamespace(
+            extra_args={"rwkv_state_write_ref": "must-not-exist"}
+        ),
+    )
+
+    prepared = model_state.state_cache_action("prepare_write", "must-not-exist")
+    assert prepared["ready"] is True
+    assert model_state._reserved_state_cache_bytes == state_layer.state_snapshot_nbytes
+
+    model_state.add_request(0, request)
+
+    assert model_state._reserved_state_cache_bytes == state_layer.state_snapshot_nbytes
+    model_state.preempt_request("request-abort")
+    model_state.remove_request("request-abort")
+    assert model_state._reserved_state_cache_bytes == state_layer.state_snapshot_nbytes
+    model_state.remove_request(
+        "request-abort",
+        FinishedRequestData(finish_reason="abort", pending_tail_token_ids=()),
+    )
+    assert model_state._reserved_state_cache_bytes == 0
+    assert "must-not-exist" not in model_state._state_cache
+
+    model_state.state_cache_action("prepare_write", "canceled-write")
+    canceled = model_state.state_cache_action("cancel_write", "canceled-write")
+    assert canceled["canceled"] is True
+    assert model_state._reserved_state_cache_bytes == 0
 
 
 def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:

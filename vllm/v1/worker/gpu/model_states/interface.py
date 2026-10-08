@@ -15,7 +15,7 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.tasks import GenerationTask
 from vllm.v1.attention.backend import AttentionCGSupport
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.output import FinishedRequestData, NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -123,7 +123,11 @@ class ModelState(ABC):
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         return None
 
-    def remove_request(self, req_id: str) -> None:
+    def remove_request(
+        self,
+        req_id: str,
+        finished_data: FinishedRequestData | None = None,
+    ) -> None:
         return None
 
     def preempt_request(self, req_id: str) -> None:
