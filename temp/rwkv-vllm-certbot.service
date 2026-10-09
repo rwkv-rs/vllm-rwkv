@@ -1,0 +1,13 @@
+[Unit]
+Description=Renew the vllm.rwkvos.com TLS certificate
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/caizus/Projects/MachineLearning/vllm-rwkv/.venv/bin/python \
+  /home/caizus/Projects/MachineLearning/vllm-rwkv/.venv/bin/certbot \
+  renew --cert-name vllm.rwkvos.com --quiet \
+  --deploy-hook "/usr/sbin/nginx -t && /usr/bin/systemctl reload nginx"
+NoNewPrivileges=true
+PrivateTmp=true
