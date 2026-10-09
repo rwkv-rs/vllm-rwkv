@@ -1,0 +1,29 @@
+[Unit]
+Description=RWKV model reverse tunnels to vllm.rwkvos.com
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rwkv
+Group=rwkv
+ExecStart=/usr/bin/ssh -N \
+  -o BatchMode=yes -o ExitOnForwardFailure=yes -o IdentitiesOnly=yes \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+  -o StrictHostKeyChecking=yes \
+  -o UserKnownHostsFile=/home/rwkv/.ssh/known_hosts_vllm_rwkvos \
+  -i /home/rwkv/.ssh/id_ed25519_rwkv_vllm_tunnel \
+  -R 127.0.0.1:28001:192.168.0.129:18001 \
+  -R 127.0.0.1:28002:192.168.0.129:18002 \
+  -R 127.0.0.1:28003:192.168.0.129:18003 \
+  -R 127.0.0.1:28004:127.0.0.1:18004 \
+  rwkv-api-tunnel@47.107.93.180
+LimitNOFILE=65536
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

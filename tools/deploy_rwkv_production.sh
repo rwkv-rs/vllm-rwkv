@@ -9,8 +9,9 @@ readonly previous_link="$root_dir/previous"
 readonly previous_state_dir="$root_dir/previous-state"
 readonly models_dir=/srv/rwkv/models
 readonly systemd_dir=/etc/systemd/system
-readonly router_file=/usr/local/libexec/rwkv_api_router.py
+readonly router_file=/usr/local/libexec/rwkv-api-router
 readonly router_service=vllm-rwkv-api-router.service
+readonly router_site=/etc/nginx/conf.d/vllm.rwkvos.com.conf
 readonly minimum_free_kib=$((50 * 1024 * 1024))
 readonly -a all_services=(
   vllm-rwkv-1_5b.service
@@ -55,6 +56,10 @@ check_host() {
   local -a gpu_names=()
 
   [[ $(uname -m) == x86_64 ]] || die "production host must be x86_64"
+  if [[ $deployment_role == frontend ]]; then
+    mkdir -p "$releases_dir" "$incoming_dir"
+    return
+  fi
   mapfile -t gpu_names < <(
     nvidia-smi --query-gpu=name --format=csv,noheader
   )
@@ -142,6 +147,7 @@ check_model() {
 }
 
 check_models() {
+  [[ $deployment_role != frontend ]] || return 0
   if [[ $deployment_role == large ]]; then
     check_model rwkv7-g1k-13.3b-20260930-ctx25600 11
   else
@@ -258,6 +264,17 @@ probe_service() {
   local deadline=$((SECONDS + 1200))
   local python="$current_link/.venv/bin/python"
 
+  if [[ $deployment_role == frontend ]]; then
+    deadline=$((SECONDS + 30))
+    while ((SECONDS < deadline)); do
+      if curl -fsS --noproxy '*' --connect-timeout 2 --max-time 2 \
+        "http://127.0.0.1:$port/health" >/dev/null; then
+        return 0
+      fi
+      sleep 1
+    done
+    return 1
+  fi
   while ((SECONDS < deadline)); do
     if "$python" - "$port" <<'PY' >/dev/null 2>&1
 import sys
@@ -297,20 +314,37 @@ probe_router() {
 install_release_router() {
   local release=$1
 
-  [[ $deployment_role == large ]] || return 0
-  if [[ ! -f $release/temp/rwkv_api_router.py ]]; then
-    echo "error: release is missing temp/rwkv_api_router.py" >&2
+  [[ $deployment_role == frontend ]] || return 0
+  if [[ ! -x $release/bin/rwkv-api-router ||
+        ! -f $release/temp/$router_service ||
+        ! -f $release/temp/vllm.rwkvos.com.conf ]]; then
+    echo "error: release is missing the RWKV API router binary or unit" >&2
     return 1
   fi
   install -o root -g root -m 0755 \
-    "$release/temp/rwkv_api_router.py" "$router_file" || return 1
+    "$release/bin/rwkv-api-router" "$router_file" || return 1
+  install -o root -g root -m 0644 \
+    "$release/temp/$router_service" "$systemd_dir/$router_service" || return 1
+  systemctl daemon-reload || return 1
+  systemctl enable "$router_service" || return 1
   systemctl restart "$router_service" || return 1
-  probe_router
+  probe_router || return 1
+  if ! cmp -s "$release/temp/vllm.rwkvos.com.conf" "$router_site"; then
+    install -o root -g root -m 0644 \
+      "$release/temp/vllm.rwkvos.com.conf" "$router_site" || return 1
+    nginx -t || return 1
+    systemctl reload nginx || return 1
+  fi
 }
 
 activate_release() {
   local release=$1
 
+  if [[ $deployment_role == frontend ]]; then
+    atomic_link "$release" "$current_link" || return 1
+    install_release_router "$release"
+    return
+  fi
   install_units "$release" || return 1
   stop_services
   atomic_link "$release" "$current_link" || return 1
@@ -328,21 +362,34 @@ snapshot_deployment_state() {
   : >"$state_dir/active"
   release=$(readlink -f "$current_link" 2>/dev/null || true)
   printf '%s\n' "$release" >"$state_dir/release"
-  for service in "${all_services[@]}"; do
-    if [[ -f $systemd_dir/$service ]]; then
-      cp -a "$systemd_dir/$service" "$state_dir/units/$service"
-    fi
-    if systemctl is-enabled --quiet "$service" 2>/dev/null; then
-      printf '%s\n' "$service" >>"$state_dir/enabled"
-    fi
-    if systemctl is-active --quiet "$service"; then
-      printf '%s\n' "$service" >>"$state_dir/active"
-    fi
-  done
-  if [[ $deployment_role == large && -f $router_file ]]; then
-    cp -a "$router_file" "$state_dir/rwkv_api_router.py"
+  if [[ $deployment_role != frontend ]]; then
+    for service in "${all_services[@]}"; do
+      if [[ -f $systemd_dir/$service ]]; then
+        cp -a "$systemd_dir/$service" "$state_dir/units/$service"
+      fi
+      if systemctl is-enabled --quiet "$service" 2>/dev/null; then
+        printf '%s\n' "$service" >>"$state_dir/enabled"
+      fi
+      if systemctl is-active --quiet "$service"; then
+        printf '%s\n' "$service" >>"$state_dir/active"
+      fi
+    done
   fi
-  if [[ $deployment_role == large ]] &&
+  if [[ $deployment_role == frontend ]]; then
+    if [[ -f $router_site ]]; then
+      cp -a "$router_site" "$state_dir/vllm.rwkvos.com.conf"
+    fi
+    if systemctl is-enabled --quiet "$router_service" 2>/dev/null; then
+      touch "$state_dir/router-enabled"
+    fi
+    if [[ -f $router_file ]]; then
+      cp -a "$router_file" "$state_dir/rwkv-api-router"
+    fi
+    if [[ -f $systemd_dir/$router_service ]]; then
+      cp -a "$systemd_dir/$router_service" "$state_dir/units/$router_service"
+    fi
+  fi
+  if [[ $deployment_role == frontend ]] &&
     systemctl is-active --quiet "$router_service"; then
     touch "$state_dir/router-active"
   fi
@@ -354,20 +401,31 @@ restore_deployment_state() {
   local release
   local service
 
-  stop_services
-  if [[ $deployment_role == large ]]; then
+  if [[ $deployment_role == frontend ]]; then
     systemctl stop "$router_service" || true
+  else
+    stop_services
+    for service in "${all_services[@]}"; do
+      if [[ -f $state_dir/units/$service ]]; then
+        install -o root -g root -m 0644 \
+          "$state_dir/units/$service" "$systemd_dir/$service" || return 1
+      else
+        rm -f -- "$systemd_dir/$service"
+      fi
+    done
   fi
-  for service in "${all_services[@]}"; do
-    if [[ -f $state_dir/units/$service ]]; then
+  if [[ $deployment_role == frontend ]]; then
+    if [[ -f $state_dir/units/$router_service ]]; then
       install -o root -g root -m 0644 \
-        "$state_dir/units/$service" "$systemd_dir/$service" || return 1
+        "$state_dir/units/$router_service" "$systemd_dir/$router_service" || return 1
     else
-      rm -f -- "$systemd_dir/$service"
+      rm -f -- "$systemd_dir/$router_service"
     fi
-  done
+  fi
   systemctl daemon-reload || return 1
-  systemctl disable "${all_services[@]}" >/dev/null 2>&1 || true
+  if [[ $deployment_role != frontend ]]; then
+    systemctl disable "${all_services[@]}" >/dev/null 2>&1 || true
+  fi
   while IFS= read -r service; do
     if [[ -n $service ]]; then
       systemctl enable "$service" || return 1
@@ -380,9 +438,30 @@ restore_deployment_state() {
   else
     rm -f -- "$current_link"
   fi
-  if [[ $deployment_role == large && -f $state_dir/rwkv_api_router.py ]]; then
-    install -o root -g root -m 0755 \
-      "$state_dir/rwkv_api_router.py" "$router_file" || return 1
+  if [[ $deployment_role == frontend ]]; then
+    if [[ -f $state_dir/router-enabled ]]; then
+      systemctl enable "$router_service" || return 1
+    else
+      systemctl disable "$router_service" >/dev/null 2>&1 || true
+    fi
+    if [[ -f $state_dir/rwkv-api-router ]]; then
+      install -o root -g root -m 0755 \
+        "$state_dir/rwkv-api-router" "$router_file" || return 1
+    else
+      rm -f -- "$router_file"
+    fi
+    if [[ -f $state_dir/vllm.rwkvos.com.conf ]]; then
+      if ! cmp -s "$state_dir/vllm.rwkvos.com.conf" "$router_site"; then
+        install -o root -g root -m 0644 \
+          "$state_dir/vllm.rwkvos.com.conf" "$router_site" || return 1
+        nginx -t || return 1
+        systemctl reload nginx || return 1
+      fi
+    elif [[ -f $router_site ]]; then
+      rm -f -- "$router_site"
+      nginx -t || return 1
+      systemctl reload nginx || return 1
+    fi
   fi
 
   while IFS= read -r service; do
@@ -391,7 +470,7 @@ restore_deployment_state() {
     port=$(service_port "$service")
     probe_service "$port" || return 1
   done <"$state_dir/active"
-  if [[ -f $state_dir/router-active ]]; then
+  if [[ $deployment_role == frontend && -f $state_dir/router-active ]]; then
     systemctl start "$router_service" || return 1
     probe_router || return 1
   fi
@@ -466,8 +545,10 @@ stage_release() {
   if [[ -d $release ]]; then
     [[ $(<"$release/GIT_SHA") == "$sha" ]] ||
       die "existing release has the wrong GIT_SHA"
-    prepare_flashrwkv2 "$release" ||
-      die "FlashRWKV2 SM89 compilation failed for existing release $sha"
+    if [[ $deployment_role != frontend ]]; then
+      prepare_flashrwkv2 "$release" ||
+        die "FlashRWKV2 SM89 compilation failed for existing release $sha"
+    fi
     echo "$release"
     return
   fi
@@ -475,14 +556,20 @@ stage_release() {
   [[ ! -e $staging ]] || die "staging path already exists: $staging"
   mkdir "$staging"
   tar -xzf "$bundle" -C "$staging"
-  [[ -x $staging/.venv/bin/vllm ]] || die "bundle is missing .venv/bin/vllm"
-  [[ -x $staging/.venv/bin/python ]] || die "bundle is missing .venv/bin/python"
+  if [[ $deployment_role == frontend ]]; then
+    [[ -x $staging/bin/rwkv-api-router ]] || die "bundle is missing the router binary"
+    [[ -f $staging/temp/$router_service ]] || die "bundle is missing the router unit"
+    [[ -f $staging/temp/vllm.rwkvos.com.conf ]] || die "bundle is missing the router site"
+  else
+    [[ -x $staging/.venv/bin/vllm ]] || die "bundle is missing .venv/bin/vllm"
+    [[ -x $staging/.venv/bin/python ]] || die "bundle is missing .venv/bin/python"
+  fi
   [[ -f $staging/GIT_SHA ]] || die "bundle is missing GIT_SHA"
   [[ $(<"$staging/GIT_SHA") == "$sha" ]] || die "bundle SHA does not match $sha"
   chown -R root:root "$staging"
   chmod -R a+rX "$staging"
   mv "$staging" "$release"
-  if ! prepare_flashrwkv2 "$release"; then
+  if [[ $deployment_role != frontend ]] && ! prepare_flashrwkv2 "$release"; then
     rm -rf -- "$release"
     die "FlashRWKV2 SM89 compilation failed for release $sha"
   fi
@@ -564,6 +651,8 @@ usage() {
 usage:
   $0 deploy <40-char-sha> <bundle.tar.gz> <bundle.tar.gz.sha256>
   $0 rollback
+  $0 deploy-router <40-char-sha> <bundle.tar.gz> <bundle.tar.gz.sha256>
+  $0 rollback-router
 EOF
   exit 2
 }
@@ -571,12 +660,14 @@ EOF
 main() {
   require_root
   case ${1:-} in
-    deploy)
+    deploy | deploy-router)
       [[ $# -eq 4 ]] || usage
+      [[ $1 != deploy-router ]] || deployment_role=frontend
       deploy_release "$2" "$3" "$4"
       ;;
-    rollback)
+    rollback | rollback-router)
       [[ $# -eq 1 ]] || usage
+      [[ $1 != rollback-router ]] || deployment_role=frontend
       rollback_release
       ;;
     *) usage ;;

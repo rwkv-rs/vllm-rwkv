@@ -16,6 +16,15 @@ on:
           - release
           - redeploy
           - rollback
+      target:
+        description: Production components to release, redeploy, or roll back
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - models
+          - router
       sha:
         description: Validated 40-character SHA for redeploy
         required: false
@@ -54,16 +63,102 @@ jobs:
               );
             }
 
-  quality-gate:
-    # Merged PRs build and deploy without the expensive model gate. A stable
-    # release runs the complete validation suite before deployment.
+  scope:
+    runs-on: ubuntu-latest
+    outputs:
+      models: ${{ steps.scope.outputs.models }}
+      router: ${{ steps.scope.outputs.router }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - name: Detect production components
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          TARGET: ${{ github.event.inputs.target }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == workflow_dispatch ]]; then
+            models=true
+            router=true
+            [[ $TARGET != router ]] || models=false
+            [[ $TARGET != models ]] || router=false
+          else
+            changed="$(git diff --name-only "$BASE_SHA" HEAD)"
+            models=false
+            router=false
+            if grep -Eq '^(vllm/|csrc/|cmake/|requirements/|setup\.py$|pyproject\.toml$|CMakeLists\.txt$)' <<<"$changed"; then
+              models=true
+            fi
+            if grep -Eq '^(\.github/workflows/rwkv-production\.yml$|tools/deploy_rwkv_production\.sh$|temp/(rwkv-api-router/|rwkv_api_router\.py$|api\.rwkv\.rs\.toml$|rwkv-(api|vllm)-tunnel\.service$|rwkv-vllm-certbot\.(service|timer)$|sshd-rwkv-api-tunnel\.conf$|vllm-rwkv-api-router\.service$|vllm\.rwkvos\.com\.conf$))' <<<"$changed"; then
+              router=true
+            fi
+          fi
+          echo "models=$models" >> "$GITHUB_OUTPUT"
+          echo "router=$router" >> "$GITHUB_OUTPUT"
+
+  router:
     if: >-
-      always() &&
+      always() && needs.scope.result == 'success' &&
+      needs.scope.outputs.router == 'true' &&
+      (github.event_name == 'push' || github.event_name == 'pull_request' ||
+       (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'release')) &&
+      (needs.authorize.result == 'success' || needs.authorize.result == 'skipped')
+    needs: [authorize, scope]
+    runs-on: [self-hosted, linux, x64, "${{ 'rwkv-pro6000' }}"]
+    timeout-minutes: 30
+    env:
+      HTTP_PROXY: http://127.0.0.1:7890
+      HTTPS_PROXY: http://127.0.0.1:7890
+      NO_PROXY: 127.0.0.1,localhost
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Configure Rust tooling
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Check gateway and deployment sources
+        run: |
+          uv tool run --from pre-commit==4.5.1 \
+            pre-commit run --hook-stage manual --files \
+              .github/workflows/rwkv-production.yml tools/deploy_rwkv_production.sh \
+              temp/rwkv-api-router/Cargo.toml temp/rwkv-api-router/Cargo.lock \
+              temp/rwkv-api-router/src/main.rs temp/vllm-rwkv-api-router.service \
+              temp/rwkv-vllm-tunnel.service temp/rwkv-vllm-certbot.service \
+              temp/rwkv-vllm-certbot.timer temp/sshd-rwkv-api-tunnel.conf \
+              temp/vllm.rwkvos.com.conf
+      - name: Build and test the RWKV API router
+        run: |
+          set -euo pipefail
+          ulimit -n 65536
+          timeout 60s cargo fmt --manifest-path temp/rwkv-api-router/Cargo.toml -- --check
+          timeout 300s cargo clippy --locked --manifest-path temp/rwkv-api-router/Cargo.toml --all-targets -- -D warnings
+          timeout 300s cargo test --locked --manifest-path temp/rwkv-api-router/Cargo.toml
+          timeout 300s cargo build --release --locked --manifest-path temp/rwkv-api-router/Cargo.toml
+      - name: Package the exact successful router
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          artifact_root="/home/caizus/artifacts/vllm-rwkv/$GITHUB_SHA"
+          bundle="$artifact_root/rwkv-api-router-$GITHUB_SHA.tar.gz"
+          release="$RUNNER_TEMP/rwkv-router-release"
+          mkdir -p "$artifact_root" "$release"
+          test ! -e "$bundle"
+          printf '%s\n' "$GITHUB_SHA" > "$release/GIT_SHA"
+          install -Dm 0755 temp/rwkv-api-router/target/release/rwkv-api-router "$release/bin/rwkv-api-router"
+          install -Dm 0644 temp/vllm-rwkv-api-router.service "$release/temp/vllm-rwkv-api-router.service"
+          install -Dm 0644 temp/vllm.rwkvos.com.conf "$release/temp/vllm.rwkvos.com.conf"
+          tar -czf "$bundle" -C "$release" GIT_SHA bin temp
+          (cd "$artifact_root" && sha256sum "$(basename "$bundle")" > "$(basename "$bundle").sha256")
+
+  models:
+    # Gateway-only revisions do not rebuild or restart the GPU model services.
+    if: >-
+      always() && needs.scope.outputs.models == 'true' &&
       (github.event_name == 'push' ||
        (github.event_name == 'workflow_dispatch' &&
         github.event.inputs.action == 'release')) &&
       (needs.authorize.result == 'success' || needs.authorize.result == 'skipped')
-    needs: authorize
+    needs: [authorize, scope]
     runs-on: [self-hosted, linux, x64, "${{ 'rwkv-pro6000' }}"]
     timeout-minutes: 360
     env:
@@ -152,7 +247,15 @@ jobs:
               requirements/rwkv.txt \
               tools/deploy_rwkv_production.sh \
               setup.py \
-              temp/rwkv_api_router.py \
+              temp/rwkv-api-router/Cargo.toml \
+              temp/rwkv-api-router/Cargo.lock \
+              temp/rwkv-api-router/src/main.rs \
+              temp/vllm-rwkv-api-router.service \
+              temp/rwkv-vllm-tunnel.service \
+              temp/rwkv-vllm-certbot.service \
+              temp/rwkv-vllm-certbot.timer \
+              temp/sshd-rwkv-api-tunnel.conf \
+              temp/vllm.rwkvos.com.conf \
               tests/v1/structured_output/test_validation.py \
               vllm/model_executor/layers/quantization/utils/w8a8_utils.py \
               vllm/model_executor/models/rwkv.py \
@@ -634,9 +737,7 @@ jobs:
           test ! -e "$bundle"
           printf '%s\n' "$GITHUB_SHA" > release/GIT_SHA
           uv pip freeze --python release/.venv/bin/python > release/requirements.freeze
-          tar -czf "$bundle" \
-            -C release .venv GIT_SHA requirements.freeze \
-            -C "$GITHUB_WORKSPACE" temp/rwkv_api_router.py
+          tar -czf "$bundle" -C release .venv GIT_SHA requirements.freeze
           (
             cd "$artifact_root"
             sha256sum "$(basename "$bundle")" > "$(basename "$bundle").sha256"
@@ -664,6 +765,35 @@ jobs:
           path: artifacts/rwkv-production
           if-no-files-found: error
 
+  quality-gate:
+    if: always()
+    needs: [authorize, scope, router, models]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful component checks
+        env:
+          AUTHORIZATION: ${{ needs.authorize.result }}
+          SCOPE: ${{ needs.scope.result }}
+          MODELS_REQUIRED: ${{ needs.scope.outputs.models }}
+          ROUTER_REQUIRED: ${{ needs.scope.outputs.router }}
+          MODELS_RESULT: ${{ needs.models.result }}
+          ROUTER_RESULT: ${{ needs.router.result }}
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.inputs.action }}
+        run: |
+          set -euo pipefail
+          [[ $AUTHORIZATION == success || $AUTHORIZATION == skipped ]]
+          [[ $SCOPE == success ]]
+          if [[ $EVENT == workflow_dispatch && $ACTION != release ]]; then
+            exit 0
+          fi
+          if [[ $ROUTER_REQUIRED == true ]]; then
+            [[ $ROUTER_RESULT == success ]]
+          fi
+          if [[ $MODELS_REQUIRED == true && $EVENT != pull_request ]]; then
+            [[ $MODELS_RESULT == success ]]
+          fi
+
   deploy:
     if: >-
       always() &&
@@ -672,8 +802,9 @@ jobs:
         (github.event.inputs.action == 'release' ||
          github.event.inputs.action == 'redeploy' ||
          github.event.inputs.action == 'rollback'))) &&
-      (needs.quality-gate.result == 'success' || needs.quality-gate.result == 'skipped')
-    needs: quality-gate
+      (needs.scope.outputs.models == 'true' || needs.scope.outputs.router == 'true') &&
+      needs.quality-gate.result == 'success'
+    needs: [scope, quality-gate, router]
     runs-on: [self-hosted, linux, x64, "${{ 'rwkv-pro6000' }}"]
     timeout-minutes: 180
     environment: production
@@ -684,38 +815,54 @@ jobs:
       DEPLOY_JUMP_PORT: ${{ secrets.DEPLOY_JUMP_PORT }}
       DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
       DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+      FRONTEND_DEPLOY_SSH_KEY: ${{ secrets.FRONTEND_DEPLOY_SSH_KEY }}
+      FRONTEND_DEPLOY_KNOWN_HOSTS: ${{ secrets.FRONTEND_DEPLOY_KNOWN_HOSTS }}
+      DEPLOY_MODELS: ${{ needs.scope.outputs.models }}
+      DEPLOY_ROUTER: ${{ needs.scope.outputs.router }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ github.event_name == 'push' && github.sha || 'rwkv' }}
+          ref: ${{ (github.event_name == 'push' || github.event.inputs.action == 'release') && github.sha || 'rwkv' }}
 
       - name: Configure deployment SSH identity
         run: |
           set -euo pipefail
-          test -n "$DEPLOY_PORT"
-          test -n "$DEPLOY_USER"
-          test -n "$DEPLOY_JUMP_HOST"
-          test -n "$DEPLOY_JUMP_PORT"
-          test -n "$DEPLOY_SSH_KEY"
-          test -n "$DEPLOY_KNOWN_HOSTS"
           install -m 0700 -d "$RUNNER_TEMP/deploy-ssh"
-          printf '%s\n' "$DEPLOY_SSH_KEY" > "$RUNNER_TEMP/deploy-ssh/key"
-          chmod 0600 "$RUNNER_TEMP/deploy-ssh/key"
-          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$RUNNER_TEMP/deploy-ssh/known_hosts"
-          chmod 0600 "$RUNNER_TEMP/deploy-ssh/known_hosts"
-          proxy_command="ssh -F /dev/null -i $RUNNER_TEMP/deploy-ssh/key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/deploy-ssh/known_hosts -p $DEPLOY_JUMP_PORT -W %h:%p $DEPLOY_USER@$DEPLOY_JUMP_HOST"
-          ssh -F /dev/null -i "$RUNNER_TEMP/deploy-ssh/key" \
-            -o BatchMode=yes -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes \
-            -o "UserKnownHostsFile=$RUNNER_TEMP/deploy-ssh/known_hosts" \
-            -o "ProxyCommand=$proxy_command" -p "$DEPLOY_PORT" \
-            "$DEPLOY_USER@192.168.0.129" true
-          ssh -F /dev/null -i "$RUNNER_TEMP/deploy-ssh/key" \
-            -o BatchMode=yes -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes \
-            -o "UserKnownHostsFile=$RUNNER_TEMP/deploy-ssh/known_hosts" \
-            -o "ProxyCommand=$proxy_command" -p "$DEPLOY_PORT" \
-            "$DEPLOY_USER@192.168.0.157" true
+          if [[ $DEPLOY_MODELS == true ]]; then
+            test -n "$DEPLOY_PORT"
+            test -n "$DEPLOY_USER"
+            test -n "$DEPLOY_JUMP_HOST"
+            test -n "$DEPLOY_JUMP_PORT"
+            test -n "$DEPLOY_SSH_KEY"
+            test -n "$DEPLOY_KNOWN_HOSTS"
+            printf '%s\n' "$DEPLOY_SSH_KEY" > "$RUNNER_TEMP/deploy-ssh/key"
+            printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$RUNNER_TEMP/deploy-ssh/known_hosts"
+            chmod 0600 "$RUNNER_TEMP/deploy-ssh/key" "$RUNNER_TEMP/deploy-ssh/known_hosts"
+            proxy_command="ssh -F /dev/null -i $RUNNER_TEMP/deploy-ssh/key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/deploy-ssh/known_hosts -p $DEPLOY_JUMP_PORT -W %h:%p $DEPLOY_USER@$DEPLOY_JUMP_HOST"
+            ssh -F /dev/null -i "$RUNNER_TEMP/deploy-ssh/key" \
+              -o BatchMode=yes -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes \
+              -o "UserKnownHostsFile=$RUNNER_TEMP/deploy-ssh/known_hosts" \
+              -o "ProxyCommand=$proxy_command" -p "$DEPLOY_PORT" \
+              "$DEPLOY_USER@192.168.0.129" true
+            ssh -F /dev/null -i "$RUNNER_TEMP/deploy-ssh/key" \
+              -o BatchMode=yes -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes \
+              -o "UserKnownHostsFile=$RUNNER_TEMP/deploy-ssh/known_hosts" \
+              -o "ProxyCommand=$proxy_command" -p "$DEPLOY_PORT" \
+              "$DEPLOY_USER@192.168.0.157" true
+          fi
+          if [[ $DEPLOY_ROUTER == true ]]; then
+            test -n "$FRONTEND_DEPLOY_SSH_KEY"
+            test -n "$FRONTEND_DEPLOY_KNOWN_HOSTS"
+            printf '%s\n' "$FRONTEND_DEPLOY_SSH_KEY" > "$RUNNER_TEMP/deploy-ssh/frontend-key"
+            printf '%s\n' "$FRONTEND_DEPLOY_KNOWN_HOSTS" > "$RUNNER_TEMP/deploy-ssh/frontend-known_hosts"
+            chmod 0600 "$RUNNER_TEMP/deploy-ssh/frontend-key" "$RUNNER_TEMP/deploy-ssh/frontend-known_hosts"
+            ssh -F /dev/null -i "$RUNNER_TEMP/deploy-ssh/frontend-key" \
+              -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+              -o "UserKnownHostsFile=$RUNNER_TEMP/deploy-ssh/frontend-known_hosts" \
+              caizus@47.107.93.180 true
+          fi
 
       - name: Deploy validated release or roll back
         env:
@@ -727,6 +874,7 @@ jobs:
             local action=$1
             local host=$2
             local target="$DEPLOY_USER@$host"
+            local deployment_command=$action
             local proxy_command="ssh -F /dev/null -i $RUNNER_TEMP/deploy-ssh/key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/deploy-ssh/known_hosts -p $DEPLOY_JUMP_PORT -W %h:%p $DEPLOY_USER@$DEPLOY_JUMP_HOST"
             local -a ssh_args=(
               -F /dev/null
@@ -749,28 +897,54 @@ jobs:
               -P "$DEPLOY_PORT"
             )
 
+            if [[ $host == "$frontend_host" ]]; then
+              target="caizus@$host"
+              deployment_command="$action-router"
+              ssh_args=(
+                -F /dev/null -i "$RUNNER_TEMP/deploy-ssh/frontend-key"
+                -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes
+                -o "UserKnownHostsFile=$RUNNER_TEMP/deploy-ssh/frontend-known_hosts"
+                -p 22
+              )
+              scp_args=(
+                -F /dev/null -i "$RUNNER_TEMP/deploy-ssh/frontend-key"
+                -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes
+                -o "UserKnownHostsFile=$RUNNER_TEMP/deploy-ssh/frontend-known_hosts"
+                -P 22
+              )
+            fi
             scp "${scp_args[@]}" tools/deploy_rwkv_production.sh \
               "$target:/tmp/deploy_rwkv_production.sh" || return 1
             if [[ $action == rollback ]]; then
-              ssh "${ssh_args[@]}" "$target" \
-                'sudo install -m 0755 /tmp/deploy_rwkv_production.sh /usr/local/sbin/deploy_rwkv_production && sudo /usr/local/sbin/deploy_rwkv_production rollback' || return 1
+              ssh "${ssh_args[@]}" "$target" bash -s -- "$deployment_command" <<'REMOTE' || return 1
+          set -euo pipefail
+          sudo install -m 0755 /tmp/deploy_rwkv_production.sh /usr/local/sbin/deploy_rwkv_production
+          sudo /usr/local/sbin/deploy_rwkv_production "$1"
+          REMOTE
               return
             fi
 
-            scp "${scp_args[@]}" "$bundle" "$checksum" "$target:/tmp/" ||
+            local target_bundle=$bundle
+            if [[ $host == "$frontend_host" ]]; then
+              target_bundle=$router_bundle
+            fi
+            local target_checksum="$target_bundle.sha256"
+            scp "${scp_args[@]}" "$target_bundle" "$target_checksum" "$target:/tmp/" ||
               return 1
             if ! ssh "${ssh_args[@]}" "$target" bash -s -- \
-              "$release_sha" "$bundle_name" "$checksum_name" <<'REMOTE'
+              "$release_sha" "$(basename "$target_bundle")" \
+              "$(basename "$target_checksum")" "$deployment_command" <<'REMOTE'
           set -euo pipefail
           release_sha=$1
           bundle_name=$2
           checksum_name=$3
+          deployment_command=$4
           sudo install -m 0755 /tmp/deploy_rwkv_production.sh \
             /usr/local/sbin/deploy_rwkv_production
           sudo install -d -m 0755 /opt/rwkv/vllm/incoming
           sudo mv "/tmp/$bundle_name" /opt/rwkv/vllm/incoming/
           sudo mv "/tmp/$checksum_name" /opt/rwkv/vllm/incoming/
-          sudo /usr/local/sbin/deploy_rwkv_production deploy \
+          sudo /usr/local/sbin/deploy_rwkv_production "$deployment_command" \
             "$release_sha" \
             "/opt/rwkv/vllm/incoming/$bundle_name" \
             "/opt/rwkv/vllm/incoming/$checksum_name"
@@ -778,14 +952,25 @@ jobs:
             then
               return 1
             fi
+            if [[ $host == "$frontend_host" ]] &&
+              ! curl --noproxy '*' -fsS --connect-timeout 5 --max-time 15 https://vllm.rwkvos.com/health; then
+              run_target rollback "$frontend_host" || true
+              return 1
+            fi
           }
 
           readonly small_host=192.168.0.129
           readonly large_host=192.168.0.157
+          readonly frontend_host=47.107.93.180
           if [[ "${{ github.event_name }}" == workflow_dispatch && \
                 "$REQUESTED_ACTION" == rollback ]]; then
-            run_target rollback "$large_host"
-            run_target rollback "$small_host"
+            if [[ $DEPLOY_ROUTER == true ]]; then
+              run_target rollback "$frontend_host"
+            fi
+            if [[ $DEPLOY_MODELS == true ]]; then
+              run_target rollback "$large_host"
+              run_target rollback "$small_host"
+            fi
             exit 0
           fi
 
@@ -798,18 +983,33 @@ jobs:
           [[ $release_sha =~ ^[0-9a-f]{40}$ ]]
           artifact_root="/home/caizus/artifacts/vllm-rwkv/$release_sha"
           bundle="$artifact_root/vllm-rwkv-$release_sha.tar.gz"
-          checksum="$bundle.sha256"
-          test -f "$bundle"
-          test -f "$checksum"
-          bundle_name=$(basename "$bundle")
-          checksum_name=$(basename "$checksum")
+          router_bundle="$artifact_root/rwkv-api-router-$release_sha.tar.gz"
+          if [[ $DEPLOY_MODELS == true ]]; then
+            test -f "$bundle"
+            test -f "$bundle.sha256"
+          fi
+          if [[ $DEPLOY_ROUTER == true ]]; then
+            test -f "$router_bundle"
+            test -f "$router_bundle.sha256"
+          fi
 
-          run_target deploy "$small_host"
-          if ! run_target deploy "$large_host"; then
-            run_target rollback "$small_host" || true
+          if [[ $DEPLOY_MODELS == true ]]; then
+            run_target deploy "$small_host"
+            if ! run_target deploy "$large_host"; then
+              run_target rollback "$small_host" || true
+              exit 1
+            fi
+          fi
+          if [[ $DEPLOY_ROUTER == true ]] && ! run_target deploy "$frontend_host"; then
+            if [[ $DEPLOY_MODELS == true ]]; then
+              run_target rollback "$large_host" || true
+              run_target rollback "$small_host" || true
+            fi
             exit 1
           fi
 
       - name: Remove temporary SSH material
         if: always()
-        run: rm -f "$RUNNER_TEMP/deploy-ssh/key" "$RUNNER_TEMP/deploy-ssh/known_hosts"
+        run: |
+          rm -f "$RUNNER_TEMP/deploy-ssh/key" "$RUNNER_TEMP/deploy-ssh/known_hosts" \
+            "$RUNNER_TEMP/deploy-ssh/frontend-key" "$RUNNER_TEMP/deploy-ssh/frontend-known_hosts"
