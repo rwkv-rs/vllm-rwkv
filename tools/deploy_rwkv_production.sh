@@ -9,7 +9,7 @@ readonly previous_link="$root_dir/previous"
 readonly previous_state_dir="$root_dir/previous-state"
 readonly models_dir=/srv/rwkv/models
 readonly systemd_dir=/etc/systemd/system
-readonly router_file=/usr/local/libexec/rwkv_api_router.py
+readonly router_file=/usr/local/libexec/rwkv-api-router
 readonly router_service=vllm-rwkv-api-router.service
 readonly minimum_free_kib=$((50 * 1024 * 1024))
 readonly -a all_services=(
@@ -298,12 +298,16 @@ install_release_router() {
   local release=$1
 
   [[ $deployment_role == large ]] || return 0
-  if [[ ! -f $release/temp/rwkv_api_router.py ]]; then
-    echo "error: release is missing temp/rwkv_api_router.py" >&2
+  if [[ ! -x $release/bin/rwkv-api-router ||
+        ! -f $release/temp/$router_service ]]; then
+    echo "error: release is missing the RWKV API router binary or unit" >&2
     return 1
   fi
   install -o root -g root -m 0755 \
-    "$release/temp/rwkv_api_router.py" "$router_file" || return 1
+    "$release/bin/rwkv-api-router" "$router_file" || return 1
+  install -o root -g root -m 0644 \
+    "$release/temp/$router_service" "$systemd_dir/$router_service" || return 1
+  systemctl daemon-reload || return 1
   systemctl restart "$router_service" || return 1
   probe_router
 }
@@ -339,8 +343,13 @@ snapshot_deployment_state() {
       printf '%s\n' "$service" >>"$state_dir/active"
     fi
   done
-  if [[ $deployment_role == large && -f $router_file ]]; then
-    cp -a "$router_file" "$state_dir/rwkv_api_router.py"
+  if [[ $deployment_role == large ]]; then
+    if [[ -f $router_file ]]; then
+      cp -a "$router_file" "$state_dir/rwkv-api-router"
+    fi
+    if [[ -f $systemd_dir/$router_service ]]; then
+      cp -a "$systemd_dir/$router_service" "$state_dir/units/$router_service"
+    fi
   fi
   if [[ $deployment_role == large ]] &&
     systemctl is-active --quiet "$router_service"; then
@@ -366,6 +375,14 @@ restore_deployment_state() {
       rm -f -- "$systemd_dir/$service"
     fi
   done
+  if [[ $deployment_role == large ]]; then
+    if [[ -f $state_dir/units/$router_service ]]; then
+      install -o root -g root -m 0644 \
+        "$state_dir/units/$router_service" "$systemd_dir/$router_service" || return 1
+    else
+      rm -f -- "$systemd_dir/$router_service"
+    fi
+  fi
   systemctl daemon-reload || return 1
   systemctl disable "${all_services[@]}" >/dev/null 2>&1 || true
   while IFS= read -r service; do
@@ -380,9 +397,13 @@ restore_deployment_state() {
   else
     rm -f -- "$current_link"
   fi
-  if [[ $deployment_role == large && -f $state_dir/rwkv_api_router.py ]]; then
-    install -o root -g root -m 0755 \
-      "$state_dir/rwkv_api_router.py" "$router_file" || return 1
+  if [[ $deployment_role == large ]]; then
+    if [[ -f $state_dir/rwkv-api-router ]]; then
+      install -o root -g root -m 0755 \
+        "$state_dir/rwkv-api-router" "$router_file" || return 1
+    else
+      rm -f -- "$router_file"
+    fi
   fi
 
   while IFS= read -r service; do

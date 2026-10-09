@@ -152,7 +152,10 @@ jobs:
               requirements/rwkv.txt \
               tools/deploy_rwkv_production.sh \
               setup.py \
-              temp/rwkv_api_router.py \
+              temp/rwkv-api-router/Cargo.toml \
+              temp/rwkv-api-router/Cargo.lock \
+              temp/rwkv-api-router/src/main.rs \
+              temp/vllm-rwkv-api-router.service \
               tests/v1/structured_output/test_validation.py \
               vllm/model_executor/layers/quantization/utils/w8a8_utils.py \
               vllm/model_executor/models/rwkv.py \
@@ -199,6 +202,15 @@ jobs:
           )
           assert defaults["profile"] == "tools"
           PY
+
+      - name: Build and test the RWKV API router
+        run: |
+          set -euo pipefail
+          ulimit -n 65536
+          timeout 60s cargo fmt --manifest-path temp/rwkv-api-router/Cargo.toml -- --check
+          timeout 300s cargo clippy --locked --manifest-path temp/rwkv-api-router/Cargo.toml --all-targets -- -D warnings
+          timeout 300s cargo test --locked --manifest-path temp/rwkv-api-router/Cargo.toml
+          timeout 300s cargo build --release --locked --manifest-path temp/rwkv-api-router/Cargo.toml
 
       - name: Build the reduced RWKV wheel
         run: |
@@ -634,9 +646,13 @@ jobs:
           test ! -e "$bundle"
           printf '%s\n' "$GITHUB_SHA" > release/GIT_SHA
           uv pip freeze --python release/.venv/bin/python > release/requirements.freeze
+          install -Dm 0755 temp/rwkv-api-router/target/release/rwkv-api-router \
+            release/bin/rwkv-api-router
+          install -Dm 0644 temp/vllm-rwkv-api-router.service \
+            release/temp/vllm-rwkv-api-router.service
           tar -czf "$bundle" \
             -C release .venv GIT_SHA requirements.freeze \
-            -C "$GITHUB_WORKSPACE" temp/rwkv_api_router.py
+            bin/rwkv-api-router temp/vllm-rwkv-api-router.service
           (
             cd "$artifact_root"
             sha256sum "$(basename "$bundle")" > "$(basename "$bundle").sha256"
