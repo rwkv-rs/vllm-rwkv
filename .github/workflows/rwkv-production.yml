@@ -150,7 +150,7 @@ jobs:
           tar -czf "$bundle" -C "$release" GIT_SHA bin temp
           (cd "$artifact_root" && sha256sum "$(basename "$bundle")" > "$(basename "$bundle").sha256")
 
-  quality-gate:
+  models:
     # Gateway-only revisions do not rebuild or restart the GPU model services.
     if: >-
       always() && needs.scope.outputs.models == 'true' &&
@@ -765,6 +765,35 @@ jobs:
           path: artifacts/rwkv-production
           if-no-files-found: error
 
+  quality-gate:
+    if: always()
+    needs: [authorize, scope, router, models]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful component checks
+        env:
+          AUTHORIZATION: ${{ needs.authorize.result }}
+          SCOPE: ${{ needs.scope.result }}
+          MODELS_REQUIRED: ${{ needs.scope.outputs.models }}
+          ROUTER_REQUIRED: ${{ needs.scope.outputs.router }}
+          MODELS_RESULT: ${{ needs.models.result }}
+          ROUTER_RESULT: ${{ needs.router.result }}
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.inputs.action }}
+        run: |
+          set -euo pipefail
+          [[ $AUTHORIZATION == success || $AUTHORIZATION == skipped ]]
+          [[ $SCOPE == success ]]
+          if [[ $EVENT == workflow_dispatch && $ACTION != release ]]; then
+            exit 0
+          fi
+          if [[ $ROUTER_REQUIRED == true ]]; then
+            [[ $ROUTER_RESULT == success ]]
+          fi
+          if [[ $MODELS_REQUIRED == true && $EVENT != pull_request ]]; then
+            [[ $MODELS_RESULT == success ]]
+          fi
+
   deploy:
     if: >-
       always() &&
@@ -774,8 +803,7 @@ jobs:
          github.event.inputs.action == 'redeploy' ||
          github.event.inputs.action == 'rollback'))) &&
       (needs.scope.outputs.models == 'true' || needs.scope.outputs.router == 'true') &&
-      (needs.quality-gate.result == 'success' || needs.quality-gate.result == 'skipped') &&
-      (needs.router.result == 'success' || needs.router.result == 'skipped')
+      needs.quality-gate.result == 'success'
     needs: [scope, quality-gate, router]
     runs-on: [self-hosted, linux, x64, "${{ 'rwkv-pro6000' }}"]
     timeout-minutes: 180
