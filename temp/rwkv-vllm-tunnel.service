@@ -18,6 +18,7 @@ ExecStart=/usr/bin/ssh -N \
   -R 127.0.0.1:28003:192.168.0.129:18003 \
   -R 127.0.0.1:28004:127.0.0.1:18004 \
   rwkv-api-tunnel@47.107.93.180
+LimitNOFILE=65536
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
