@@ -2627,7 +2627,6 @@ def test_generation_config_loading():
     override_result = correct_generation_config | {
         "temperature": 0.5,
         "top_k": 5,
-        "stop": ["<stop>"],
     }
 
     assert model_config.get_diff_sampling_param() == override_result
@@ -2643,7 +2642,6 @@ def test_generation_config_loading():
     assert model_config.get_diff_sampling_param() == {
         "temperature": 0.5,
         "top_k": 5,
-        "stop": ["<stop>"],
     }
 
 

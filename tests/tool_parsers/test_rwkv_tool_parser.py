@@ -11,6 +11,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionToolsParam,
 )
+from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.tool_parsers import ToolParser, ToolParserManager
 
 
@@ -217,3 +218,24 @@ def test_required_and_named_keep_native_format(tool_choice: Any) -> None:
 
     assert adjusted.structured_outputs is None
     assert not type(_parser(tools)).supports_required_and_named
+
+
+@pytest.mark.parametrize(
+    "tool_choice", ["required", {"type": "function", "name": "get_weather"}]
+)
+def test_responses_required_and_named_keep_native_format(tool_choice: Any) -> None:
+    tools = [_tool("get_weather")]
+    request = ResponsesRequest(
+        model="rwkv-test",
+        input="hi",
+        tool_choice=tool_choice,
+        tools=[
+            {
+                "type": "function",
+                "name": "get_weather",
+                "parameters": {"type": "object"},
+            }
+        ],
+    )
+    assert _parser(tools).adjust_request(request) is request
+    assert request.structured_outputs is None

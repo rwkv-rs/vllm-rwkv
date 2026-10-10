@@ -1288,10 +1288,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
 
-            # Streaming input update: request already exists from a prior
-            # chunk. Remove old state so it can be cleanly re-added below
-            # with the updated prompt_token_ids and mm_features.
-            self._remove_request(req_id)
+            # Streaming input updates replace an existing request slot.
+            if req_id in self.req_states.req_id_to_index:
+                self._remove_request(req_id)
 
             prompt_len = new_req_data.prompt_len
             sampling_params = new_req_data.sampling_params

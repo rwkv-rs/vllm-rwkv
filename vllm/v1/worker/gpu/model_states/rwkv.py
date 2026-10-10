@@ -87,6 +87,10 @@ class RwkvSampler(Sampler):
         capture_graphs: bool,
     ) -> None:
         self.__dict__.update(sampler.__dict__)
+        if self.logits_processors[3:]:
+            raise ValueError(
+                "RWKV Rapid-Sampling does not support custom logits processors"
+            )
         flashrwkv2 = _load_flashrwkv2()
         self._sample = flashrwkv2.infer_sampling_six_parameter_forward_varlen
         self._setup_sampling_states = flashrwkv2.setup_sampling_states
@@ -286,6 +290,7 @@ class RwkvSampler(Sampler):
         if not np.any(self.needs_logits_processing[slots_np]):
             return logits
 
+        logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
         ctx = LogitsContext(
             expanded_idx_mapping=slots,
             idx_mapping=slots,
