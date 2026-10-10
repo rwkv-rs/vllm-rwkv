@@ -581,6 +581,8 @@ timeout 7200s uv pip install --python .venv/bin/python \
   --requirements requirements/rwkv.txt --torch-backend=auto
 timeout 7200s uv pip install --python .venv/bin/python \
   --no-build-isolation --no-deps --editable .
+timeout 120s uv run --no-project --python .venv/bin/python \
+  vllm serve --help >/dev/null
 uv pip freeze --python .venv/bin/python > requirements.freeze
 BUILD
   chown -R root:root "$release"
