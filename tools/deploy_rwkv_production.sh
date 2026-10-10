@@ -486,7 +486,8 @@ save_previous_state() {
   mv "$next_state_dir" "$previous_state_dir"
 }
 
-prepare_flashrwkv2() {
+prepare_flashrwkv2() (
+  cd /home/rwkv
   local release=$1
   local cache_root="$release/.cache"
   local cache_dir="$cache_root/torch_extensions"
@@ -526,7 +527,7 @@ assert library.is_file(), library
 PY
   install -o root -g root -m 0644 "$temporary_result" "$result"
   rm -f "$temporary_result"
-}
+)
 
 stage_source_release() (
   set -euo pipefail
