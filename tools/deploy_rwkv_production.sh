@@ -557,10 +557,11 @@ stage_source_release() (
     VLLM_BUILD_PROFILE=rwkv VLLM_TARGET_DEVICE=cuda \
     VLLM_USE_PRECOMPILED=0 VLLM_USE_PRECOMPILED_RUST=0 \
     TORCH_CUDA_ARCH_LIST=8.9 MAX_JOBS=8 UV_LINK_MODE=copy \
-    bash -s -- "$release" "$sha" <<'BUILD'
+    bash -s -- "$release" "$sha" "$current_link" <<'BUILD'
 set -euo pipefail
 release=$1
 sha=$2
+reference=$3
 if ! command -v uv >/dev/null; then
   curl -LsSf --connect-timeout 10 --max-time 120 https://astral.sh/uv/install.sh | sh
 fi
@@ -569,8 +570,8 @@ if ! command -v cargo >/dev/null; then
     sh -s -- -y --profile minimal --default-toolchain stable
 fi
 cd "$release"
-git init .
-git remote add origin https://github.com/rwkv-rs/vllm-rwkv.git
+timeout 1800s git clone --no-checkout --reference-if-able "$reference" \
+  --dissociate https://github.com/rwkv-rs/vllm-rwkv.git .
 timeout 1800s git fetch --tags origin "$sha"
 git checkout --detach FETCH_HEAD
 [[ $(git rev-parse HEAD) == "$sha" ]]
