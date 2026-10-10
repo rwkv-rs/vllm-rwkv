@@ -528,7 +528,66 @@ PY
   rm -f "$temporary_result"
 }
 
-stage_release() {
+stage_source_release() (
+  set -euo pipefail
+  local sha=$1
+  local release="$releases_dir/$sha-source"
+
+  if [[ -d $release ]]; then
+    [[ $(<"$release/GIT_SHA") == "$sha" ]] ||
+      die "existing release has the wrong GIT_SHA"
+    prepare_flashrwkv2 "$release"
+    return
+  fi
+
+  : "${HTTPS_PROXY:?set HTTPS_PROXY to the deployment download proxy}"
+  export HTTP_PROXY="$HTTPS_PROXY"
+  export http_proxy="$HTTPS_PROXY" https_proxy="$HTTPS_PROXY"
+  export NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost
+  unset ALL_PROXY all_proxy
+  export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.proxy GIT_CONFIG_VALUE_0="$HTTPS_PROXY"
+  install -d -o rwkv -g rwkv -m 0755 "$release"
+  trap 'status=$?; if ((status)); then rm -rf -- "$release"; fi' EXIT
+  runuser -u rwkv -- env \
+    HOME=/home/rwkv \
+    PATH="/home/rwkv/.local/bin:/home/rwkv/.cargo/bin:/usr/local/cuda/bin:$PATH" \
+    CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64 \
+    VLLM_BUILD_PROFILE=rwkv VLLM_TARGET_DEVICE=cuda \
+    VLLM_USE_PRECOMPILED=0 VLLM_USE_PRECOMPILED_RUST=0 \
+    TORCH_CUDA_ARCH_LIST=8.9 MAX_JOBS=8 UV_LINK_MODE=copy \
+    bash -s -- "$release" "$sha" <<'BUILD'
+set -euo pipefail
+release=$1
+sha=$2
+if ! command -v uv >/dev/null; then
+  curl -LsSf --connect-timeout 10 --max-time 120 https://astral.sh/uv/install.sh | sh
+fi
+if ! command -v cargo >/dev/null; then
+  curl -LsSf --connect-timeout 10 --max-time 120 https://sh.rustup.rs |
+    sh -s -- -y --profile minimal --default-toolchain stable
+fi
+cd "$release"
+git init .
+git remote add origin https://github.com/rwkv-rs/vllm-rwkv.git
+timeout 1800s git fetch --tags origin "$sha"
+git checkout --detach FETCH_HEAD
+[[ $(git rev-parse HEAD) == "$sha" ]]
+uv venv --python 3.12 --managed-python .venv
+timeout 7200s uv pip install --python .venv/bin/python \
+  --requirements requirements/build/cuda.txt \
+  --requirements requirements/rwkv.txt --torch-backend=auto
+timeout 7200s uv pip install --python .venv/bin/python \
+  --no-build-isolation --no-deps --editable .
+uv pip freeze --python .venv/bin/python > requirements.freeze
+BUILD
+  chown -R root:root "$release"
+  chmod -R a+rX "$release"
+  prepare_flashrwkv2 "$release"
+  printf '%s\n' "$sha" > "$release/GIT_SHA"
+)
+
+stage_router_release() {
   local sha=$1
   local bundle=$2
   local checksum_file=$3
@@ -545,35 +604,20 @@ stage_release() {
   if [[ -d $release ]]; then
     [[ $(<"$release/GIT_SHA") == "$sha" ]] ||
       die "existing release has the wrong GIT_SHA"
-    if [[ $deployment_role != frontend ]]; then
-      prepare_flashrwkv2 "$release" ||
-        die "FlashRWKV2 SM89 compilation failed for existing release $sha"
-    fi
-    echo "$release"
     return
   fi
 
   [[ ! -e $staging ]] || die "staging path already exists: $staging"
   mkdir "$staging"
   tar -xzf "$bundle" -C "$staging"
-  if [[ $deployment_role == frontend ]]; then
-    [[ -x $staging/bin/rwkv-api-router ]] || die "bundle is missing the router binary"
-    [[ -f $staging/temp/$router_service ]] || die "bundle is missing the router unit"
-    [[ -f $staging/temp/vllm.rwkvos.com.conf ]] || die "bundle is missing the router site"
-  else
-    [[ -x $staging/.venv/bin/vllm ]] || die "bundle is missing .venv/bin/vllm"
-    [[ -x $staging/.venv/bin/python ]] || die "bundle is missing .venv/bin/python"
-  fi
+  [[ -x $staging/bin/rwkv-api-router ]] || die "bundle is missing the router binary"
+  [[ -f $staging/temp/$router_service ]] || die "bundle is missing the router unit"
+  [[ -f $staging/temp/vllm.rwkvos.com.conf ]] || die "bundle is missing the router site"
   [[ -f $staging/GIT_SHA ]] || die "bundle is missing GIT_SHA"
   [[ $(<"$staging/GIT_SHA") == "$sha" ]] || die "bundle SHA does not match $sha"
   chown -R root:root "$staging"
   chmod -R a+rX "$staging"
   mv "$staging" "$release"
-  if [[ $deployment_role != frontend ]] && ! prepare_flashrwkv2 "$release"; then
-    rm -rf -- "$release"
-    die "FlashRWKV2 SM89 compilation failed for release $sha"
-  fi
-  echo "$release"
 }
 
 prune_releases() {
@@ -585,7 +629,7 @@ prune_releases() {
   previous=$(readlink -f "$previous_link" 2>/dev/null || true)
   while IFS= read -r release; do
     [[ $release == "$current" || $release == "$previous" ]] && continue
-    [[ $(basename "$release") =~ ^[0-9a-f]{40}$ ]] ||
+    [[ $(basename "$release") =~ ^[0-9a-f]{40}(-source)?$ ]] ||
       die "refusing to remove unexpected release path: $release"
     rm -rf -- "$release"
   done < <(find "$releases_dir" -mindepth 1 -maxdepth 1 -type d -not -name '.*' | sort)
@@ -593,15 +637,18 @@ prune_releases() {
 
 deploy_release() {
   local sha=$1
-  local bundle=$2
-  local checksum_file=$3
-  local release
+  local release="$releases_dir/$sha"
   local state_dir
 
   validate_sha "$sha"
   check_host
   check_models
-  release=$(stage_release "$sha" "$bundle" "$checksum_file")
+  if [[ $deployment_role == frontend ]]; then
+    stage_router_release "$sha" "$2" "$3"
+  else
+    release="$releases_dir/$sha-source"
+    stage_source_release "$sha"
+  fi
   state_dir=$(mktemp -d "$incoming_dir/deployment-state.XXXXXX")
   snapshot_deployment_state "$state_dir"
   if ! activate_release "$release"; then
@@ -649,7 +696,7 @@ rollback_release() {
 usage() {
   cat >&2 <<EOF
 usage:
-  $0 deploy <40-char-sha> <bundle.tar.gz> <bundle.tar.gz.sha256>
+  HTTPS_PROXY=<proxy-url> $0 deploy <40-char-sha>
   $0 rollback
   $0 deploy-router <40-char-sha> <bundle.tar.gz> <bundle.tar.gz.sha256>
   $0 rollback-router
@@ -660,9 +707,13 @@ EOF
 main() {
   require_root
   case ${1:-} in
-    deploy | deploy-router)
+    deploy)
+      [[ $# -eq 2 ]] || usage
+      deploy_release "$2"
+      ;;
+    deploy-router)
       [[ $# -eq 4 ]] || usage
-      [[ $1 != deploy-router ]] || deployment_role=frontend
+      deployment_role=frontend
       deploy_release "$2" "$3" "$4"
       ;;
     rollback | rollback-router)
