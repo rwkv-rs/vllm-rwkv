@@ -70,7 +70,6 @@ from vllm.v1.kv_cache_interface import (
     HiSparseResidentSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
-    KVCacheLayout,
     KVCacheSpec,
     KVCacheSpecKind,
     KVCacheTensor,
@@ -2847,11 +2846,12 @@ def test_provider_owned_kv_memory_is_counted_but_not_backed():
         dtypes=(torch.float32,),
     )
     vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=None),
         cache_config=SimpleNamespace(
             get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBNHC,
             num_gpu_blocks_override=None,
             prefix_cache_retention_interval=None,
-        )
+        ),
     )
     groups = [KVCacheGroupSpec(["layer_1"], spec)]
 
@@ -2870,7 +2870,11 @@ def test_provider_owned_kv_memory_is_counted_but_not_backed():
             block_stride=16,
         )
     ]
-    assert kv_cache_utils._pool_bytes_per_block(groups) == 80
+    assert kv_cache_utils._pool_bytes_per_block(vllm_config, groups) == 80
+    assert kv_cache_utils._pool_fixed_memory_bytes(groups) == 128
+
+    groups.append(KVCacheGroupSpec(["host_layer"], spec, host_resident=True))
+    assert kv_cache_utils._pool_bytes_per_block(vllm_config, groups) == 80
     assert kv_cache_utils._pool_fixed_memory_bytes(groups) == 128
 
 

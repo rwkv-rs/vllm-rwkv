@@ -1365,6 +1365,9 @@ def get_vllm_version() -> str:
     # wheels (e.g. CPU, TPU) without modifying the source.
     if env_version := os.getenv("VLLM_VERSION_OVERRIDE"):
         print(f"Overriding VLLM version with {env_version} from VLLM_VERSION_OVERRIDE")
+        if VLLM_BUILD_PROFILE == "rwkv":
+            sep = "+" if "+" not in env_version else "."
+            env_version += f"{sep}rwkv"
         os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
         return get_version(
             write_to="vllm/_version.py",

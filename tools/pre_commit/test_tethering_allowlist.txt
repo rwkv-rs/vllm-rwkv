@@ -48,6 +48,9 @@ tests/kernels/test_shuffle_rows.py  # explicitly --ignore'd in kernels.yaml with
 tests/lora/test_deepseekv2_tp.py  # --ignore'd from sharded LoRA run; no dedicated *_tp job
 tests/lora/test_qwen3moe_tp.py  # --ignore'd from sharded LoRA run; no dedicated *_tp job
 
+# tests/models/ - community RWKV CI uses its dedicated runtime profile.
+tests/models/rwkv/test_rwkv.py  # run by .github/workflows/rwkv-production.yml, not upstream Buildkite
+
 # tests/v1/ - the v1 subtree is otherwise covered by many `pytest v1/...` jobs.
 tests/v1/ec_connector/integration/test_epd_correctness.py  # run_epd_correctness_test.sh exists but no Buildkite job invokes it
 tests/v1/ec_connector/integration/test_nixl_failure.py  # 2-GPU + NIXL E/PD integration test (#55290); no Buildkite job collects ec_connector/integration/

@@ -1174,10 +1174,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert new_req_data.prefill_token_ids is not None
             req_id = new_req_data.req_id
 
-            # Streaming input update: request already exists from a prior
-            # chunk. Remove old state so it can be cleanly re-added below
-            # with the updated prompt_token_ids and mm_features.
-            self._remove_request(req_id)
+            # Streaming input updates replace an existing request slot.
+            if req_id in self.req_states.req_id_to_index:
+                self._remove_request(req_id)
 
             prompt_len = new_req_data.prompt_len
             sampling_params = new_req_data.sampling_params
@@ -1767,7 +1766,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         if batch_req_state is not None:
             num_toks = batch_req_state.num_tokens
-            if batch_req_state.has_prefill:
+            if (
+                batch_req_state.has_prefill
+                and not self.model_state.requires_cudagraph_max_query_len
+            ):
                 # Varlen decode graphs replay decodes only, and their bound
                 # alone would admit a short prefill.
                 max_query_len = None

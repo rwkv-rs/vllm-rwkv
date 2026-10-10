@@ -1869,14 +1869,14 @@ class ModelConfig:
             "repetition_penalty",
             "presence_penalty",
             "frequency_penalty",
-            "penalty_decay",
             "temperature",
             "top_k",
             "top_p",
             "min_p",
             "max_new_tokens",
-            "stop_strings",
         ]
+        if self.hf_config.model_type == "rwkv":
+            available_params.extend(["penalty_decay", "stop_strings"])
         if any(p in config for p in available_params):
             diff_sampling_param = {
                 p: config.get(p) for p in available_params if config.get(p) is not None

@@ -302,9 +302,6 @@ class SamplingParams(
     """Penalizes new tokens based on whether they appear in the prompt and the
     generated text so far. Values > 1 encourage the model to use new tokens,
     while values < 1 encourage the model to repeat tokens."""
-    penalty_decay: float = 1.0
-    """Decay applied to model-specific additive token penalties after each
-    sampled token. One disables decay."""
     temperature: float = 1.0
     """Controls the randomness of the sampling. Lower values make the model
     more deterministic, while higher values make the model more random. Zero
@@ -448,13 +445,16 @@ class SamplingParams(
     token IDs during decoding instead of sampling randomly. Real logprobs are
     still computed. Conflict checking is performed at the engine level."""
 
+    penalty_decay: float = 1.0
+    """Decay applied to model-specific additive token penalties after each
+    sampled token. One disables decay."""
+
     @staticmethod
     def from_optional(
         n: int | None = 1,
         presence_penalty: float | None = 0.0,
         frequency_penalty: float | None = 0.0,
         repetition_penalty: float | None = 1.0,
-        penalty_decay: float | None = 1.0,
         temperature: float | None = 1.0,
         watermarking: bool | None = None,
         top_p: float | None = 1.0,
@@ -488,6 +488,7 @@ class SamplingParams(
         routed_experts_prompt_start: int = 0,
         # Debugging / RL-specific parameters.
         trace_decode_token_ids: list[int] | None = None,
+        penalty_decay: float | None = 1.0,
     ) -> "SamplingParams":
         if logit_bias is not None:
             # Fast path uses a dict comprehension; on failure we iterate once
