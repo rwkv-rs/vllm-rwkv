@@ -70,7 +70,7 @@ impl AppState {
         connector.set_nodelay(true);
         let client = Client::builder(TokioExecutor::new())
             .pool_timer(TokioTimer::new())
-            .pool_idle_timeout(Duration::from_secs(60))
+            .pool_idle_timeout(Duration::from_secs(3))
             .pool_max_idle_per_host(4096)
             .build(connector);
         Self {
@@ -808,6 +808,47 @@ mod tests {
             );
         }
         assert_eq!(peers[0], peers[1]);
+    }
+
+    #[tokio::test]
+    async fn idle_upstream_connections_expire_before_the_server_keep_alive_timeout() {
+        let upstream = TestServer::start(Router::new().route(
+            "/v1/chat/completions",
+            post(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.to_string() }),
+        ))
+        .await;
+        let app = upstream.app();
+        let response = app.clone().oneshot(completion_request()).await.unwrap();
+        let first_peer = to_bytes(response.into_body(), MAX_REQUEST_BYTES)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        let response = app.oneshot(completion_request()).await.unwrap();
+        let second_peer = to_bytes(response.into_body(), MAX_REQUEST_BYTES)
+            .await
+            .unwrap();
+        assert_ne!(first_peer, second_peer);
+    }
+
+    #[tokio::test]
+    async fn non_streaming_responses_can_take_longer_than_the_pool_idle_timeout() {
+        let upstream = TestServer::start(Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                Json(json!({"choices": [{"message": {"content": "complete"}}]}))
+            }),
+        ))
+        .await;
+        let response = timeout(TEST_TIMEOUT, upstream.app().oneshot(completion_request()))
+            .await
+            .expect("active request was interrupted")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await["choices"][0]["message"]["content"],
+            "complete"
+        );
     }
 
     #[tokio::test]
