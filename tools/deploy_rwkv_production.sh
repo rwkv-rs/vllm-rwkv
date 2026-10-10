@@ -176,10 +176,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=rwkv
-Group=rwkv
+User=caizus
+Group=caizus
 WorkingDirectory=$release
-Environment=HOME=/home/rwkv
+Environment=HOME=/home/caizus
 Environment=CUDA_VISIBLE_DEVICES=$devices
 Environment=PYTHONUNBUFFERED=1
 Environment=VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
@@ -487,17 +487,17 @@ save_previous_state() {
 }
 
 prepare_flashrwkv2() (
-  cd /home/rwkv
+  cd /home/caizus
   local release=$1
   local cache_root="$release/.cache"
   local cache_dir="$cache_root/torch_extensions"
   local result="$release/flashrwkv2-sm89.json"
   local temporary_result
 
-  install -d -o rwkv -g rwkv -m 0755 "$cache_root"
+  install -d -o caizus -g caizus -m 0755 "$cache_root"
   temporary_result=$(mktemp "$incoming_dir/flashrwkv2-sm89.XXXXXX")
-  if ! runuser -u rwkv -- env \
-    HOME=/home/rwkv \
+  if ! runuser -u caizus -- env \
+    HOME=/home/caizus \
     CUDA_HOME=/usr/local/cuda \
     CUDA_PATH=/usr/local/cuda \
     CUDA_VISIBLE_DEVICES=0 \
@@ -547,11 +547,11 @@ stage_source_release() (
   export NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost
   unset ALL_PROXY all_proxy
   export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.proxy GIT_CONFIG_VALUE_0="$HTTPS_PROXY"
-  install -d -o rwkv -g rwkv -m 0755 "$release"
+  install -d -o caizus -g caizus -m 0755 "$release"
   trap 'status=$?; if ((status)); then rm -rf -- "$release"; fi' EXIT
-  runuser -u rwkv -- env \
-    HOME=/home/rwkv \
-    PATH="/home/rwkv/.local/bin:/home/rwkv/.cargo/bin:/usr/local/cuda/bin:$PATH" \
+  runuser -u caizus -- env \
+    HOME=/home/caizus \
+    PATH="/home/caizus/.local/bin:/home/caizus/.cargo/bin:/usr/local/cuda/bin:$PATH" \
     CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64 \
     VLLM_BUILD_PROFILE=rwkv VLLM_TARGET_DEVICE=cuda \
