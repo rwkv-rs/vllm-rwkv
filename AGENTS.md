@@ -159,7 +159,7 @@ vulnerability process.
 
 This project is the RWKV community's authoritative vLLM adaptation repository. It needs to complete RWKV adaptation for upstream in accordance with mainstream community practices (refer to the **functional design** and **code style** of models with Linear RNN Layer, such as Qwen3.5 and Kimi-K3 in vLLM).
 
-Code principle: For every file/type/function/variable, a similar implementation must be found as a prototype. If that prototype carries a model name, replace it with `RWKV` or another case variant; otherwise keep the same name.
+Code principle: For every file/type/function/variable, a similar implementation must be found as a prototype. If that prototype carries a model name, replace it with `RWKV` or another case variant; otherwise keep the same name. Using branch statements without affecting existing functionality.
 
 Process principle: Strictly follow <https://docs.vllm.ai/en/latest/contributing>. Any development step should follow the instructions in the official documentation.
 
