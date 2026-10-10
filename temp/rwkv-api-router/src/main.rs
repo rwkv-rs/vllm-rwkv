@@ -27,7 +27,7 @@ use clap::Parser;
 use futures::future::try_join_all;
 use http_body_util::{Full, LengthLimitError};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use hyper_util::rt::{TokioExecutor, TokioTimer};
+use hyper_util::rt::TokioExecutor;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -69,9 +69,7 @@ impl AppState {
         connector.set_connect_timeout(Some(Duration::from_secs(5)));
         connector.set_nodelay(true);
         let client = Client::builder(TokioExecutor::new())
-            .pool_timer(TokioTimer::new())
-            .pool_idle_timeout(Duration::from_secs(3))
-            .pool_max_idle_per_host(4096)
+            .pool_max_idle_per_host(0)
             .build(connector);
         Self {
             client,
@@ -222,7 +220,7 @@ async fn forward(
     request.headers_mut().remove(AUTHORIZATION);
     request.headers_mut().remove(HOST);
     let mut response = state.client.request(request).await.map_err(|err| {
-        eprintln!("upstream request failed: {err:?}");
+        eprintln!("upstream request to {upstream} failed: {err:?}");
         error(StatusCode::BAD_GATEWAY, "Upstream request failed")
     })?;
     strip_hop_by_hop(response.headers_mut());
@@ -791,7 +789,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_requests_reuse_the_upstream_tcp_connection() {
+    async fn completed_requests_do_not_reuse_the_upstream_tcp_connection() {
         let upstream = TestServer::start(Router::new().route(
             "/v1/chat/completions",
             post(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.to_string() }),
@@ -807,31 +805,11 @@ mod tests {
                     .unwrap(),
             );
         }
-        assert_eq!(peers[0], peers[1]);
+        assert_ne!(peers[0], peers[1]);
     }
 
     #[tokio::test]
-    async fn idle_upstream_connections_expire_before_the_server_keep_alive_timeout() {
-        let upstream = TestServer::start(Router::new().route(
-            "/v1/chat/completions",
-            post(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.to_string() }),
-        ))
-        .await;
-        let app = upstream.app();
-        let response = app.clone().oneshot(completion_request()).await.unwrap();
-        let first_peer = to_bytes(response.into_body(), MAX_REQUEST_BYTES)
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(3500)).await;
-        let response = app.oneshot(completion_request()).await.unwrap();
-        let second_peer = to_bytes(response.into_body(), MAX_REQUEST_BYTES)
-            .await
-            .unwrap();
-        assert_ne!(first_peer, second_peer);
-    }
-
-    #[tokio::test]
-    async fn non_streaming_responses_can_take_longer_than_the_pool_idle_timeout() {
+    async fn non_streaming_responses_can_wait_for_generation() {
         let upstream = TestServer::start(Router::new().route(
             "/v1/chat/completions",
             post(|| async {
