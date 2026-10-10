@@ -4,12 +4,14 @@
 import sys
 from types import ModuleType, SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 import torch
 
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.config.model import ModelConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.model_executor.models.config import RwkvForCausalLMConfig
 from vllm.model_executor.models.rwkv import (
@@ -699,8 +701,36 @@ def test_rapid_sampler_preserves_preempted_request_state() -> None:
     sampler.remove_request("request")
     assert "request" in sampler._preserved_requests
 
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
     sampler.req_states.req_id_to_index.clear()
-    sampler.stage_request(0, "request")
+    sampler.req_states.add_request = lambda **kwargs: (
+        sampler.req_states.req_id_to_index.update({kwargs["req_id"]: 0})
+    )
+    sampler.req_states.apply_staged_writes = lambda: None
+    runner = MagicMock(spec=GPUModelRunner)
+    runner.req_states = sampler.req_states
+    runner.model_state = SimpleNamespace(
+        add_request=lambda idx, data: sampler.stage_request(idx, data.req_id),
+        apply_staged_writes=lambda: None,
+    )
+    runner._remove_request.side_effect = lambda req_id: sampler.remove_request(req_id)
+    runner.sampler = None
+    runner.block_tables = runner.lora_state = MagicMock()
+    runner.is_last_pp_rank = False
+    for name in ("adaptive_verification", "pooling_runner", "encoder_cache"):
+        setattr(runner, name, None)
+    request = SimpleNamespace(
+        req_id="request",
+        prefill_token_ids=[1],
+        prompt_len=1,
+        sampling_params=None,
+        num_computed_tokens=0,
+        block_ids=[],
+        lora_request=None,
+    )
+    GPUModelRunner.add_requests(runner, SimpleNamespace(scheduled_new_reqs=[request]))
+    runner._remove_request.assert_not_called()
     assert "request" not in sampler._preserved_requests
     assert len(sampler._new_requests) == 1
     req_idx, preserved = sampler._new_requests[0]
@@ -709,6 +739,25 @@ def test_rapid_sampler_preserves_preempted_request_state() -> None:
     assert preserved[0] is state
     assert preserved[1] is penalties
 
+    writes = SimpleNamespace(apply_staged_writes=lambda: None, copy_to_uva=lambda: None)
+    for name in (
+        "sampling_states",
+        "_logit_bias_state",
+        "_bad_words_state",
+        "logprob_token_ids_state",
+        "thinking_budget_state",
+        "_presence_penalty",
+        "_frequency_penalty",
+        "_penalty_decay",
+    ):
+        setattr(sampler, name, writes)
+    sampler.apply_staged_writes()
+    assert torch.equal(sampler._rapid_sampling_states[0], state)
+    assert torch.equal(sampler._rapid_penalties[0], penalties)
+    assert not sampler._rapid_sampling_states[1].any()
+    assert not sampler._rapid_penalties[1].any()
+
+    sampler.req_states.req_id_to_index.clear()
     sampler._preserved_requests["request"] = (state, penalties)
     sampler.remove_request("request")
     assert "request" not in sampler._preserved_requests
@@ -796,6 +845,83 @@ def test_rapid_sampler_graph_defers_grammar_to_existing_path() -> None:
         sampler.sample_hidden_states(torch.zeros(1, 1), input_batch, SimpleNamespace())
         is None
     )
+
+
+@pytest.mark.parametrize("factory", [SamplingParams, SamplingParams.from_optional])
+def test_penalty_decay_preserves_positional_sampling_arguments(factory) -> None:
+    params = factory(1, 0.0, 0.0, 1.0, 0.5)
+    assert params.temperature == 0.5
+    assert params.penalty_decay == 1.0
+    assert factory(penalty_decay=0.9).penalty_decay == 0.9
+
+
+@pytest.mark.parametrize("model_type", ["rwkv", "qwen2"])
+def test_rwkv_generation_defaults_do_not_leak_to_other_models(model_type) -> None:
+    model_config = SimpleNamespace(
+        generation_config="vllm",
+        override_generation_config={"stop_strings": ["END"], "penalty_decay": 0.9},
+        hf_config=SimpleNamespace(model_type=model_type),
+    )
+    expected = {"stop": ["END"], "penalty_decay": 0.9} if model_type == "rwkv" else {}
+    assert ModelConfig.get_diff_sampling_param(model_config) == expected
+
+
+def test_rapid_sampler_rejects_loaded_custom_processors() -> None:
+    sampler = SimpleNamespace(logits_processors=[object() for _ in range(4)])
+    with pytest.raises(ValueError, match="custom logits processors"):
+        RwkvSampler(sampler, torch.nn.Identity(), capture_graphs=False)
+
+
+@pytest.mark.parametrize("mixed_prefill", [False, True])
+def test_rapid_sampler_processing_preserves_raw_logits(mixed_prefill) -> None:
+    sampler = object.__new__(RwkvSampler)
+    slots = np.arange(2)
+    for name, dtype in (("_active_rows", np.int64), ("_active_slots", np.int32)):
+        buffer = np.empty(2, dtype=dtype)
+        setattr(
+            sampler,
+            name,
+            SimpleNamespace(
+                np=buffer,
+                copy_to_uva=lambda size, buf=buffer: torch.from_numpy(buf[:size]),
+            ),
+        )
+    values = SimpleNamespace(gpu=torch.ones(2))
+    sampler._presence_penalty = sampler._frequency_penalty = values
+    sampler._penalty_decay = values
+    sampler.sampling_states = SimpleNamespace(
+        temperature=values, top_k=values, top_p=values
+    )
+    sampler.needs_logits_processing = np.ones(2, dtype=bool)
+    sampler._logit_bias_state = SimpleNamespace(
+        apply=lambda logits, ctx: logits.add_(torch.tensor([0.0, 10.0]))
+    )
+    sampler._bad_words_state = SimpleNamespace(apply=lambda logits, ctx: logits)
+    sampler.thinking_budget_state = SimpleNamespace(apply=lambda logits, ctx: None)
+    sampler._sample = lambda logits, *args, **kwargs: logits.argmax(dim=-1)
+    sampler._rapid_penalties = sampler._rapid_sampling_states = torch.zeros(2, 2)
+    sampler._input_batch = SimpleNamespace(
+        num_reqs=2,
+        num_computed_prefill_tokens_np=np.zeros(2),
+        num_scheduled_tokens=np.ones(2),
+        prefill_len_np=np.array([1, 2 if mixed_prefill else 1]),
+    )
+    logits = torch.tensor([[3.0, 1.0], [4.0, 2.0]])
+    raw = logits.clone()
+    sampled, returned = sampler.sample(
+        logits,
+        torch.from_numpy(slots),
+        torch.from_numpy(slots),
+        slots,
+        torch.zeros(2, dtype=torch.int64),
+        torch.zeros(2, dtype=torch.int64),
+        torch.zeros(2, dtype=torch.int64),
+        np.ones(2),
+        return_logprobs=True,
+    )
+    assert torch.equal(sampled, torch.tensor([1, 0 if mixed_prefill else 1]))
+    assert torch.equal(logits, raw)
+    assert torch.equal(returned, raw)
 
 
 def test_config_accepts_async_scheduling() -> None:
