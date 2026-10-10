@@ -2178,9 +2178,19 @@ def test_provider_owned_kv_memory_is_counted_but_not_backed():
             block_stride=16,
         )
     ]
+    builder = kv_cache_planning.DefaultKVCacheConfigBuilder()
     assert (
         kv_cache_planning._pool_bytes_per_block_from_builder(
-            kv_cache_planning.DefaultKVCacheConfigBuilder(), vllm_config, groups
+            builder, vllm_config, groups
+        )
+        == 80
+    )
+    assert kv_cache_planning._pool_fixed_memory_bytes(groups) == 128
+
+    groups.append(KVCacheGroupSpec(["host_layer"], spec, host_resident=True))
+    assert (
+        kv_cache_planning._pool_bytes_per_block_from_builder(
+            builder, vllm_config, groups
         )
         == 80
     )

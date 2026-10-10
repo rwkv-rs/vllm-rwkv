@@ -21,7 +21,6 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
 )
-from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import Tool, ToolParser
 from vllm.tool_parsers.utils import partial_tag_overlap
@@ -48,19 +47,6 @@ class RwkvToolParser(ToolParser):
     ) -> None:
         super().__init__(tokenizer, tools)
         self._sent_content_idx = 0
-
-    def adjust_request(
-        self,
-        request: ChatCompletionRequest | ResponsesRequest,
-    ) -> ChatCompletionRequest | ResponsesRequest:
-        if request.tools:
-            tool_choice = request.tool_choice
-            if tool_choice == "required" or isinstance(
-                tool_choice,
-                (ChatCompletionNamedToolChoiceParam, ToolChoiceFunction),
-            ):
-                return request
-        return super().adjust_request(request)
 
     def _allowed_tool_names(self) -> set[str]:
         names: set[str] = set()

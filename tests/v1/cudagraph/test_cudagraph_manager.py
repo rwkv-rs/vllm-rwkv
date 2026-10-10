@@ -164,6 +164,39 @@ def test_query_sensitive_full_graphs_separate_decode_and_prefill(monkeypatch):
     assert prefill.uniform_token_count is None
 
 
+@pytest.mark.parametrize("num_reqs,num_tokens", [(1, 2), (2, 3)])
+def test_rwkv_runner_preserves_prefill_query_bound(monkeypatch, num_reqs, num_tokens):
+    from vllm.v1.worker.gpu import model_runner
+
+    runner = MagicMock(spec=model_runner.GPUModelRunner)
+    runner.model_state = SimpleNamespace(requires_cudagraph_max_query_len=True)
+    runner.gather_batch_req_state.return_value = (
+        SimpleNamespace(num_tokens=num_tokens, has_prefill=True),
+        None,
+    )
+    runner.pcp_manager = runner.lora_config = runner.ubatch_runner = None
+    runner.cudagraph_manager = runner.parallel_config = MagicMock()
+    runner.is_encoder_decoder = False
+    runner.dp_size, runner.dp_rank, runner.decode_query_len = 1, 0, 1
+    observed = []
+
+    def dispatch(*args, **kwargs):
+        observed.append(kwargs["max_query_len"])
+        raise RuntimeError("stop after graph dispatch")
+
+    monkeypatch.setattr(model_runner, "dispatch_cg_and_sync_dp", dispatch)
+    scheduled = {str(i): 2 if i == 0 else 1 for i in range(num_reqs)}
+    with pytest.raises(RuntimeError, match="stop after graph dispatch"):
+        model_runner.GPUModelRunner.execute_model(
+            runner,
+            SimpleNamespace(
+                num_scheduled_tokens=scheduled, total_num_scheduled_tokens=num_tokens
+            ),
+            dummy_run=True,
+        )
+    assert observed == [2]
+
+
 def test_piecewise_capture_uses_pcp_dummy_slot_mappings():
     num_reqs = 32
     num_tokens = 56
