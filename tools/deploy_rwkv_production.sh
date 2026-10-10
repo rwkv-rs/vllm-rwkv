@@ -133,7 +133,7 @@ check_model() {
     die "$model is missing fake_think_generation_config.json"
   [[ -f $path/tools_generation_config.json ]] ||
     die "$model is missing tools_generation_config.json"
-  actual_shards=$(find "$path" -maxdepth 1 -type f -name 'model-*.safetensors' | wc -l)
+  actual_shards=$(find -H "$path" -maxdepth 1 -type f -name 'model-*.safetensors' | wc -l)
   [[ $actual_shards -eq $shard_count ]] ||
     die "$model has $actual_shards safetensor shards; expected $shard_count"
   (
