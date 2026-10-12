@@ -37,6 +37,9 @@ def test_payloads_replay_tokens_or_send_only_state_delta() -> None:
     }
     assert full["return_token_ids"] is True
     assert state["return_token_ids"] is True
+    for payload in (full, state):
+        assert payload["temperature"] == 1.0
+        assert payload["top_k"] == 1
 
 
 def test_summary_reports_first_divergence_and_prompt_savings() -> None:

@@ -544,7 +544,6 @@ class RwkvModelState(DefaultModelState):
                 self._parent_state_ref_by_req_id[new_req_data.req_id] = read_ref
         self._preempted_req_ids.discard(new_req_data.req_id)
         self._req_index_by_id[new_req_data.req_id] = req_index
-        self._active_state_slots[req_index] = -1
         self._has_active_state_slot[req_index] = False
         if self._sampler is not None:
             self._sampler.stage_request(req_index, new_req_data.req_id)
@@ -610,7 +609,6 @@ class RwkvModelState(DefaultModelState):
                     raise
                 else:
                     reserved = 0
-            self._active_state_slots[req_index] = -1
             self._has_active_state_slot[req_index] = False
         if not preempted:
             self._base_processed_tokens_by_req_id.pop(req_id, None)
@@ -939,31 +937,30 @@ class RwkvModelState(DefaultModelState):
         new_columns = (computed + query_lens - 1) // self._block_size
         block_table = block_tables[self._get_rwkv_group_id(kv_cache_config)]
         reset_rows_np = np.flatnonzero(old_columns < 0)
-        if reset_rows_np.size:
+        if reset_rows_np.size and self._pending_read_ref_by_index:
             zero_rows: list[int] = []
             for row in reset_rows_np.tolist():
                 req_index = int(req_indices[row])
-                state_ref = getattr(self, "_pending_read_ref_by_index", {}).pop(
-                    req_index, ""
-                )
-                destination = (
-                    block_table[row, int(new_columns[row])].reshape(1).contiguous()
-                )
+                state_ref = self._pending_read_ref_by_index.pop(req_index, "")
                 if state_ref:
+                    destination = (
+                        block_table[row, int(new_columns[row])].reshape(1).contiguous()
+                    )
                     self._state_layer.restore_state_slot(
                         self._state_cache[state_ref].snapshot, destination
                     )
                 else:
                     zero_rows.append(row)
-            if zero_rows:
-                reset_rows = torch.as_tensor(
-                    zero_rows, dtype=torch.int64, device=self.device
-                )
-                reset_columns = torch.as_tensor(
-                    new_columns[zero_rows], dtype=torch.int64, device=self.device
-                )
-                reset_indices = block_table[reset_rows, reset_columns].contiguous()
-                self._state_layer.reset_state_slots(reset_indices)
+            reset_rows_np = np.asarray(zero_rows, dtype=np.int64)
+        if reset_rows_np.size:
+            reset_rows = torch.as_tensor(
+                reset_rows_np, dtype=torch.int64, device=self.device
+            )
+            reset_columns = torch.as_tensor(
+                new_columns[reset_rows_np], dtype=torch.int64, device=self.device
+            )
+            reset_indices = block_table[reset_rows, reset_columns].contiguous()
+            self._state_layer.reset_state_slots(reset_indices)
         row_indices_np = np.flatnonzero(
             (old_columns >= 0) & (old_columns != new_columns)
         )
@@ -982,7 +979,7 @@ class RwkvModelState(DefaultModelState):
                 row_indices, destination_columns
             ].contiguous()
             self._state_layer.copy_state_slots(source_indices, destination_indices)
-        if hasattr(self, "_active_state_slots"):
+        if self._pending_write_ref_by_id:
             rows = torch.arange(num_reqs, dtype=torch.int64, device=self.device)
             columns = torch.as_tensor(
                 new_columns, dtype=torch.int64, device=self.device

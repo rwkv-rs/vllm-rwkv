@@ -389,7 +389,6 @@ def test_state_ref_restore_happens_before_first_delta_forward(block_size) -> Non
     assert not resets
     assert restored and restored[0][0] is snapshot
     assert torch.equal(restored[0][1], torch.tensor([7], dtype=torch.int32))
-    assert model_state._has_active_state_slot[0]
 
 
 def test_state_cache_invalidation_requires_quiescence_and_releases_refs() -> None:
@@ -838,6 +837,8 @@ def test_align_state_advance_uses_execution_owned_token_counts() -> None:
         reset_state_slots=lambda slots: resets.append(slots.clone()),
     )
     model_state = object.__new__(RwkvModelState)
+    model_state._pending_read_ref_by_index = {}
+    model_state._pending_write_ref_by_id = {}
     model_state._align_mode = True
     model_state._block_size = 16
     model_state._state_block_columns = np.array([0, 0], dtype=np.int32)
@@ -878,6 +879,8 @@ def test_align_state_advance_resets_new_request_destination() -> None:
         reset_state_slots=lambda slots: resets.append(slots.clone()),
     )
     model_state = object.__new__(RwkvModelState)
+    model_state._pending_read_ref_by_index = {}
+    model_state._pending_write_ref_by_id = {}
     model_state._align_mode = True
     model_state._block_size = 16
     model_state._state_block_columns = np.array([-1], dtype=np.int32)

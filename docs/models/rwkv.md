@@ -23,27 +23,26 @@ The requirements file fixes the validated `transformers-rwkv` and
 
 ## Serve a model
 
-RWKV uses FP16 weights and FP16 recurrent state by default. Chunked prefill is
-required, and prefix caching uses vLLM's state-aligned cache blocks.
+Use this server for normal chat, tool calls, and recurrent-state continuation:
 
 ```bash
-vllm serve <model> \
-  --dtype float16 \
-  --mamba-ssm-cache-dtype float16 \
-  --enable-chunked-prefill \
-  --enable-prefix-caching
-```
-
-Use FP32 recurrent state with FP16 operator input and output (FP32IO16) when
-additional state precision is required:
-
-```bash
-vllm serve <model> \
+VLLM_RWKV_STATE_CACHE_MAX_BYTES=1073741824 \
+  uv run --no-sync vllm serve <model> \
+  --host 127.0.0.1 \
   --dtype float16 \
   --mamba-ssm-cache-dtype float32 \
   --enable-chunked-prefill \
-  --enable-prefix-caching
+  --enable-prefix-caching \
+  --enable-auto-tool-choice \
+  --tool-call-parser rwkv
 ```
+
+This reserves a maximum of 1 GiB for detached snapshots, allocated as refs are
+created. Size the budget and `--max-num-seqs` for the available GPU memory.
+The command uses FP32 recurrent state; model weights and operator inputs/outputs
+remain FP16. The artifact supplies the context limit; each new
+request must fit that limit, including its output. Ordinary requests without
+state-ref arguments retain the standard serving behavior.
 
 RWKV defaults to `CompilationMode.NONE` and full CUDA Graph capture so that
 TorchDynamo does not decompose the external fused operators. Use
@@ -57,15 +56,7 @@ standard vLLM paths.
 
 RWKV State refs let a client continue a chat without sending the complete
 conversation on every request. The ref stores a process-local recurrent-state
-snapshot; it does not consume a scheduler request slot. Enable the cache with a
-positive byte limit before starting the server:
-
-```bash
-VLLM_RWKV_STATE_CACHE_MAX_BYTES=$((4 * 1024 * 1024 * 1024)) \
-  vllm serve <model> \
-  --dtype float16 \
-  --enable-chunked-prefill
-```
+snapshot; it does not consume a scheduler request slot. The startup command above enables the cache with a positive byte limit.
 
 Ask the server to generate an unguessable ref for the initial turn:
 
@@ -158,6 +149,17 @@ guarantee bitwise equivalence between different prefill chunk sizes: provider
 rounding and reduction order can still affect logits and generated tokens. Check
 the intended workload with the equivalence benchmark before relying on state reuse.
 
+## Numerical validation boundary
+
+Compare capture/restore with identical continuation token shapes to isolate
+state loading. Cross-chunk comparisons also change the provider's GEMM and
+reduction paths. An earlier local 1.5B diagnostic measured a maximum logit
+difference of about 0.2643 for 37 tokens versus 20+17, even when state restore
+was exact. This is not a probability difference or a universal error bound.
+This state API does not claim to fix provider-level cross-shape rounding or
+make different chunk sizes bitwise identical. It preserves model weights,
+formulas, and state layout.
+
 ## Decoding defaults
 
 RWKV samples through FlashRWKV2 Rapid-Sampling. The model artifact must publish
@@ -185,32 +187,16 @@ token state. `--generation-config vllm` explicitly disables artifact profiles.
 
 ## Pipeline parallelism
 
-Single GPU and two-stage pipeline parallelism are supported. For PP2, run one
-stage per GPU:
-
-```bash
-vllm serve <model> \
-  --dtype float16 \
-  --pipeline-parallel-size 2 \
-  --enable-chunked-prefill
-```
-
-The first stage owns embedding and LN0. The second stage owns the final norm and
-LM head. `hidden_states`, `residual`, and `v_first` are transferred between the
-stages.
+Single GPU and two-stage pipeline parallelism are supported. For two stages,
+add `--pipeline-parallel-size 2` to the same startup command. The first stage
+owns embedding and LN0; the second owns the final norm and LM head.
+`hidden_states`, `residual`, and `v_first` are transferred between the stages.
 
 ## Tool calling
 
 The canonical artifact chat template emits `**Tool Call:**` followed by fenced
-JSON. Load that template directly from the artifact and select the RWKV parser:
-
-```bash
-vllm serve <model> \
-  --dtype float16 \
-  --enable-chunked-prefill \
-  --enable-auto-tool-choice \
-  --tool-call-parser rwkv
-```
+JSON. The startup command above loads that template from the artifact and
+selects the RWKV tool parser. Do not pass a copied chat template.
 
 The parser supports streaming and non-streaming requests with automatic,
 required, or named tool choice. Do not pass a copied chat template.

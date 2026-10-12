@@ -45,7 +45,8 @@ def build_state_payload(
     payload: dict[str, Any] = {
         "model": model,
         "messages": [{"role": "user", "content": user_content}],
-        "temperature": 0.0,
+        "temperature": 1.0,
+        "top_k": 1,
         "max_tokens": max_tokens,
         "return_token_ids": True,
         "vllm_xargs": {
@@ -66,7 +67,8 @@ def build_replay_payload(
     payload: dict[str, Any] = {
         "model": model,
         "prompt": prompt_token_ids,
-        "temperature": 0.0,
+        "temperature": 1.0,
+        "top_k": 1,
         "max_tokens": max_tokens,
         "return_token_ids": True,
     }
