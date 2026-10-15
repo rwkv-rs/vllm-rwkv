@@ -306,7 +306,7 @@ jobs:
 
             if [[ $host != "$frontend_host" ]]; then
               ssh "${ssh_args[@]}" \
-                -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+                -o ServerAliveInterval=30 -o ServerAliveCountMax=20 \
                 "$target" bash -s -- "$release_sha" "$host" <<'REMOTE' || return 1
           set -euo pipefail
           download_proxy=http://127.0.0.1:7890
