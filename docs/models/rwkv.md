@@ -19,7 +19,7 @@ uv pip install -r requirements/rwkv.txt
 ```
 
 The requirements file fixes the validated `transformers-rwkv` and
-`tokenizers-rwkv` commits and `FlashRWKV2==0.1.0a14`.
+`tokenizers-rwkv` commits and `FlashRWKV2==0.1.0a15`.
 
 ## Serve a model
 
