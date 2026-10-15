@@ -43,7 +43,7 @@ from .utils import (
     maybe_prefix,
 )
 
-_FLASHRWKV2_VERSION = "0.1.0a13"
+_FLASHRWKV2_VERSION = "0.1.0a15"
 
 
 class _FlashRWKVStateHandle(Protocol):
