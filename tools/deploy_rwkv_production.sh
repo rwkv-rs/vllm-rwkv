@@ -570,8 +570,15 @@ if ! command -v cargo >/dev/null; then
     sh -s -- -y --profile minimal --default-toolchain stable
 fi
 cd "$release"
-timeout 1800s git clone --no-checkout --reference-if-able "$reference" \
-  --dissociate https://github.com/rwkv-rs/vllm-rwkv.git .
+for attempt in 1 2 3; do
+  if timeout 1800s git clone --no-checkout --reference-if-able "$reference" \
+    --dissociate https://github.com/rwkv-rs/vllm-rwkv.git .; then
+    break
+  fi
+  echo "Git source clone attempt $attempt/3 failed" >&2
+  ((attempt < 3)) || exit 1
+  sleep $((attempt * 2))
+done
 timeout 1800s git fetch --tags origin "$sha"
 git checkout --detach FETCH_HEAD
 [[ $(git rev-parse HEAD) == "$sha" ]]
