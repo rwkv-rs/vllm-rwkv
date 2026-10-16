@@ -328,6 +328,7 @@ if TYPE_CHECKING:
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
+    VLLM_RWKV_STATE_CACHE_MAX_BYTES: int = 0
     VLLM_ENABLE_HPC_OPS: bool = False
 
 
@@ -1169,6 +1170,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         None
         if "VLLM_PLUGINS" not in os.environ
         else os.environ["VLLM_PLUGINS"].split(",")
+    ),
+    # Process-local GPU snapshots detached from active scheduler request slots.
+    # Zero disables cross-request RWKV State refs.
+    "VLLM_RWKV_STATE_CACHE_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_RWKV_STATE_CACHE_MAX_BYTES", "0")
     ),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and

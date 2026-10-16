@@ -63,7 +63,11 @@ from vllm.tasks import SupportedTask
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
-from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.core.sched.output import (
+    FinishedRequestData,
+    GrammarOutput,
+    SchedulerOutput,
+)
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
@@ -1120,10 +1124,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return cuda_graph_size
 
-    def _remove_request(self, req_id: str) -> bool:
+    def _remove_request(
+        self,
+        req_id: str,
+        finished_data: FinishedRequestData | None = None,
+    ) -> bool:
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
-        self.model_state.remove_request(req_id)
+        self.model_state.remove_request(req_id, finished_data)
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
             return False
@@ -1148,11 +1156,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             for req_id in sorted(preempted_req_ids):
                 self.model_state.preempt_request(req_id)
             finished_req_ids = finished_req_ids.union(preempted_req_ids)
+        finished_req_data = scheduler_output.finished_req_data or {}
         # Sorted so every TP rank frees request slots in the same order.
         # Features like batch-sharded sampling derive rank request ownership
         # from the slot index.
         for req_id in sorted(finished_req_ids):
-            self._remove_request(req_id)
+            self._remove_request(req_id, finished_req_data.get(req_id))
 
     def free_states(self, scheduler_output: SchedulerOutput) -> None:
         if self.encoder_cache is not None:
@@ -1247,10 +1256,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
-            block_ids = scheduler_output.new_block_ids_to_zero
-            if not self.model_state.reset_kv_cache_blocks(block_ids):
+            block_ids_to_zero = scheduler_output.new_block_ids_to_zero
+            if not self.model_state.reset_kv_cache_blocks(block_ids_to_zero):
                 assert self.kv_block_zeroer is not None
-                self.kv_block_zeroer.zero_block_ids(block_ids)
+                self.kv_block_zeroer.zero_block_ids(block_ids_to_zero)
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
         # zeroing new blocks and before the forward pass reads them.
@@ -1826,10 +1835,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output, batch_req_state, batch_desc, num_active_loras
             )
             block_tables, slot_mappings = self.prepare_attn(input_batch)
-            # Mamba "align" pre-copy: migrate recurrent state across block
-            # boundaries before the forward. Runs only on real batches, and
-            # before model_state.prepare_attn gathers num_accepted_tokens so the
-            # boundary reset is visible to the attention metadata.
+            # Preprocess model-owned recurrent state before attention metadata
+            # gathers num_accepted_tokens.
             self.model_state.preprocess_state(
                 input_batch,
                 block_tables,

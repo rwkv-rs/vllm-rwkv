@@ -49,7 +49,6 @@ tests/lora/test_deepseekv2_tp.py  # --ignore'd from sharded LoRA run; no dedicat
 tests/lora/test_qwen3moe_tp.py  # --ignore'd from sharded LoRA run; no dedicated *_tp job
 
 # tests/models/ - community RWKV CI uses its dedicated runtime profile.
-tests/models/rwkv/test_rwkv.py  # run by .github/workflows/rwkv-production.yml, not upstream Buildkite
 
 # tests/v1/ - the v1 subtree is otherwise covered by many `pytest v1/...` jobs.
 tests/v1/ec_connector/integration/test_epd_correctness.py  # run_epd_correctness_test.sh exists but no Buildkite job invokes it

@@ -1029,6 +1029,23 @@ def test_null_top_logprobs_is_same_as_omitted(request_cls, messages):
     assert request.top_logprobs == 0
 
 
+def test_rwkv_state_restore_disables_scheduler_prefix_cache():
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "delta"}],
+        max_tokens=10,
+        vllm_xargs={"rwkv_state_read_ref": "goal-parent"},
+    )
+
+    sampling_params = request.to_sampling_params(
+        max_tokens=10,
+        default_sampling_params={},
+    )
+
+    assert sampling_params.extra_args == {"rwkv_state_read_ref": "goal-parent"}
+    assert sampling_params.skip_reading_prefix_cache is True
+
+
 def test_chat_completion_request_uses_rapid_sampling_defaults():
     defaults = {
         "presence_penalty": 1.0,

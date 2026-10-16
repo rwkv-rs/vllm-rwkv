@@ -10,10 +10,12 @@ steps:
   - vllm/
   - "!vllm/distributed/kv_transfer/"
   - tests/models/language
+  - tests/models/rwkv
   commands:
     # Test standard language models, excluding a subset of slow tests
     - pip freeze | grep -E 'torch'
     - pytest -v -s models/language -m 'core_model and (not slow_test)'
+    - pytest -v -s models/rwkv/test_rwkv.py
   mirror:
     amd:
       label: ":amd: (MI355 DPX) Language Models (Standard)"

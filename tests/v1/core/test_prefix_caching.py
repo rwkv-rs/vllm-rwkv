@@ -1598,6 +1598,36 @@ def test_hisparse_external_import_survives_capacity_retry():
     assert len(hot) == 2
 
 
+@pytest.mark.parametrize("restore_state", [False, True])
+def test_rwkv_state_restore_does_not_populate_prefix_cache(restore_state: bool) -> None:
+    block_size = 2
+    prompt_token_ids = [1, 2, 3, 4, 5]
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 8),
+        max_model_len=32,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    sampling_params = SamplingParams(
+        max_tokens=1,
+        extra_args={"rwkv_state_read_ref": "parent"} if restore_state else None,
+    )
+    request = Request(
+        request_id="state-request",
+        prompt_token_ids=prompt_token_ids,
+        sampling_params=sampling_params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(block_size, sha256),
+    )
+    assert manager.allocate_slots(request, len(prompt_token_ids)) is not None
+    manager.cache_blocks(request, len(prompt_token_ids))
+    manager.free(request)
+
+    ordinary_request = make_request("ordinary", prompt_token_ids, block_size, sha256)
+    _, num_cached_tokens, _ = manager.get_computed_blocks(ordinary_request)
+    assert num_cached_tokens == (0 if restore_state else 4)
+
+
 def make_kv_cache_config_hybrid_model(
     block_size: int,
     num_blocks: int,

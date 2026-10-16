@@ -603,6 +603,7 @@ class Worker(WorkerBase):
 
     def reload_weights(self, *args, **kwargs) -> None:
         with set_current_vllm_config(self.vllm_config):
+            self._clear_rwkv_state_cache()
             self.model_runner.reload_weights(*args, **kwargs)
 
     @torch.inference_mode()
@@ -1104,6 +1105,24 @@ class Worker(WorkerBase):
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 
+    def rwkv_state_cache_action(
+        self,
+        action: str,
+        state_ref: str = "",
+        target_ref: str = "",
+    ) -> dict[str, Any]:
+        model_state = getattr(self.model_runner, "model_state", None)
+        handler = getattr(model_state, "state_cache_action", None)
+        if handler is None:
+            raise NotImplementedError("loaded model does not support RWKV State refs")
+        return handler(action, state_ref, target_ref)
+
+    def _clear_rwkv_state_cache(self) -> None:
+        model_state = getattr(self.model_runner, "model_state", None)
+        handler = getattr(model_state, "clear_state_cache", None)
+        if handler is not None:
+            handler()
+
     def get_draft_model(self) -> nn.Module | None:
         return self.model_runner.get_draft_model()
 
@@ -1503,6 +1522,8 @@ class Worker(WorkerBase):
                 "active. Call finish_weight_update first."
             )
 
+        if not is_draft:
+            self._clear_rwkv_state_cache()
         try:
             if is_draft:
                 self._set_draft_weight_update_target()

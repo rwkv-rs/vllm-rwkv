@@ -59,6 +59,7 @@ from vllm.model_executor.models.utils import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.v1.core.sched.output import FinishedRequestData
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
@@ -963,7 +964,11 @@ class DiffusionGemmaModelState(ModelState):
             prompt_len = len(new_req_data.prompt_token_ids)
             self.diffusion_states.prompt_len[req_index].fill_(prompt_len)
 
-    def remove_request(self, req_id: str) -> None:
+    def remove_request(
+        self,
+        req_id: str,
+        finished_data: FinishedRequestData | None = None,
+    ) -> None:
         idx = self._req_id_to_index.pop(req_id, None)
         if idx is not None:
             self.diffusion_states.remove_request(idx)
