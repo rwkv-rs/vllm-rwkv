@@ -189,8 +189,8 @@ ExecStart=$release/.venv/bin/vllm serve $models_dir/$model \\
   --served-model-name $served_name \\
   --host $listen_host \\
   --port $port \\
-  --dtype float16 \\
-  --mamba-ssm-cache-dtype float16 \\
+  --dtype bfloat16 \\
+  --mamba-ssm-cache-dtype float32 \\
   --max-model-len 32768 \\
   --max-num-seqs $max_num_seqs \\
   --gpu-memory-utilization 0.90 \\
@@ -518,7 +518,7 @@ import torch
 result = json.loads(Path(sys.argv[1]).read_text())
 cache = Path(sys.argv[2]).resolve()
 library = Path(result["library"]).resolve()
-assert flashrwkv2.__version__ == "0.1.0a15"
+assert flashrwkv2.__version__ == "0.1.0a16"
 assert torch.cuda.get_device_capability() == (8, 9)
 assert result["status"] in {"compiled", "cached"}, result
 assert result["target"] == "sm89", result

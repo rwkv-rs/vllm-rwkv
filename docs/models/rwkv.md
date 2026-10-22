@@ -19,27 +19,17 @@ uv pip install -r requirements/rwkv.txt
 ```
 
 The requirements file fixes the validated `transformers-rwkv` and
-`tokenizers-rwkv` commits and `FlashRWKV2==0.1.0a15`.
+`tokenizers-rwkv` commits and `FlashRWKV2==0.1.0a16`.
 
 ## Serve a model
 
-RWKV uses FP16 weights and FP16 recurrent state by default. Chunked prefill is
-required, and prefix caching uses vLLM's state-aligned cache blocks.
+RWKV uses BF16 weights, activations, and shift state with FP32 accumulation,
+WKV recurrent state, and head logits. Chunked prefill is required, and prefix
+caching uses vLLM's state-aligned cache blocks.
 
 ```bash
 vllm serve <model> \
-  --dtype float16 \
-  --mamba-ssm-cache-dtype float16 \
-  --enable-chunked-prefill \
-  --enable-prefix-caching
-```
-
-Use FP32 recurrent state with FP16 operator input and output (FP32IO16) when
-additional state precision is required:
-
-```bash
-vllm serve <model> \
-  --dtype float16 \
+  --dtype bfloat16 \
   --mamba-ssm-cache-dtype float32 \
   --enable-chunked-prefill \
   --enable-prefix-caching
@@ -85,7 +75,7 @@ stage per GPU:
 
 ```bash
 vllm serve <model> \
-  --dtype float16 \
+  --dtype bfloat16 \
   --pipeline-parallel-size 2 \
   --enable-chunked-prefill
 ```
@@ -101,7 +91,7 @@ JSON. Load that template directly from the artifact and select the RWKV parser:
 
 ```bash
 vllm serve <model> \
-  --dtype float16 \
+  --dtype bfloat16 \
   --enable-chunked-prefill \
   --enable-auto-tool-choice \
   --tool-call-parser rwkv
