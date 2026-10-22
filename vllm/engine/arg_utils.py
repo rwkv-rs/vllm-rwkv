@@ -2975,7 +2975,10 @@ class EngineArgs:
         self, model_config: ModelConfig
     ) -> None:
         default_chunked_prefill = model_config.is_chunked_prefill_supported
-        default_prefix_caching = model_config.is_prefix_caching_supported
+        default_prefix_caching = (
+            model_config.is_prefix_caching_supported
+            and model_config.architecture != "RwkvForCausalLM"
+        )
 
         if self.enable_chunked_prefill is None:
             self.enable_chunked_prefill = default_chunked_prefill

@@ -35,10 +35,10 @@ use subtle::ConstantTimeEq;
 use tokio::net::{TcpListener, TcpStream};
 
 const MODEL_UPSTREAMS: &[(&str, &str)] = &[
-    ("rwkv7-g1k-1.5b", "http://192.168.0.129:18001"),
-    ("rwkv7-g1k-2.9b", "http://192.168.0.129:18002"),
-    ("rwkv7-g1k-7.2b", "http://192.168.0.129:18003"),
-    ("rwkv7-g1k-13.3b", "http://127.0.0.1:18004"),
+    ("rwkv7-g1l-1.5b", "http://192.168.0.129:18001"),
+    ("rwkv7-g1l-2.9b", "http://192.168.0.129:18002"),
+    ("rwkv7-g1l-7.2b", "http://192.168.0.129:18003"),
+    ("rwkv7-g1l-13.3b", "http://127.0.0.1:18004"),
 ];
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
@@ -422,7 +422,7 @@ mod tests {
 
     use super::*;
 
-    const MODEL: &str = "rwkv7-g1k-7.2b";
+    const MODEL: &str = "rwkv7-g1l-7.2b";
     const TOKEN: &str = "test-secret";
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -643,7 +643,7 @@ mod tests {
         ))
         .await;
         let body = Bytes::from_static(
-            br#"{ "metadata": {"model": "unknown"}, "model": "rwkv7-g1k-\u0037.2b", "prompt": "hello" }"#,
+            br#"{ "metadata": {"model": "unknown"}, "model": "rwkv7-g1l-\u0037.2b", "prompt": "hello" }"#,
         );
         let mut req = request(
             Method::PATCH,

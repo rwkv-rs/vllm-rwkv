@@ -149,11 +149,11 @@ check_model() {
 check_models() {
   [[ $deployment_role != frontend ]] || return 0
   if [[ $deployment_role == large ]]; then
-    check_model rwkv7-g1k-13.3b-20260930-ctx25600 11
+    check_model rwkv-g1l-13b-temp-5497 22
   else
-    check_model rwkv7-g1k-1.5b-20260930-ctx25600 2
-    check_model rwkv7-g1k-2.9b-20260930-ctx25600 3
-    check_model rwkv7-g1k-7.2b-20260930-ctx25600 6
+    check_model rwkv-g1l-1b-temp-6331 3
+    check_model rwkv-g1l-3b-temp-5764 5
+    check_model rwkv-g1l-7b-temp-3797 12
   fi
 }
 
@@ -189,13 +189,15 @@ ExecStart=$release/.venv/bin/vllm serve $models_dir/$model \\
   --served-model-name $served_name \\
   --host $listen_host \\
   --port $port \\
-  --dtype float16 \\
-  --mamba-ssm-cache-dtype float16 \\
+  --dtype bfloat16 \\
+  --mamba-ssm-cache-dtype float32 \\
   --max-model-len 32768 \\
+  --max-num-batched-tokens 1024 \\
   --max-num-seqs $max_num_seqs \\
   --gpu-memory-utilization 0.90 \\
   --data-parallel-size $data_parallel_size \\
   --enable-chunked-prefill \\
+  --no-enable-prefix-caching \\
   --async-scheduling \\
   --structured-outputs-config.backend xgrammar \\
   --enable-auto-tool-choice \\
@@ -217,28 +219,28 @@ install_units() {
     write_unit \
       "$release" \
       vllm-rwkv-13_3b.service \
-      "RWKV7 g1k 13.3B vLLM DP4 service" \
-      0,1,2,3 rwkv7-g1k-13.3b-20260930-ctx25600 rwkv7-g1k-13.3b \
-      18004 320 4 || return 1
+      "RWKV7 g1l 13.3B vLLM DP4 service" \
+      0,1,2,3 rwkv-g1l-13b-temp-5497 rwkv7-g1l-13.3b \
+      18004 256 4 || return 1
   else
     write_unit \
       "$release" \
       vllm-rwkv-1_5b.service \
-      "RWKV7 g1k 1.5B vLLM service" \
-      0 rwkv7-g1k-1.5b-20260930-ctx25600 rwkv7-g1k-1.5b \
+      "RWKV7 g1l 1.5B vLLM service" \
+      0 rwkv-g1l-1b-temp-6331 rwkv7-g1l-1.5b \
       18001 1024 1 || return 1
     write_unit \
       "$release" \
       vllm-rwkv-2_9b.service \
-      "RWKV7 g1k 2.9B vLLM service" \
-      1 rwkv7-g1k-2.9b-20260930-ctx25600 rwkv7-g1k-2.9b \
-      18002 1024 1 || return 1
+      "RWKV7 g1l 2.9B vLLM service" \
+      1 rwkv-g1l-3b-temp-5764 rwkv7-g1l-2.9b \
+      18002 512 1 || return 1
     write_unit \
       "$release" \
       vllm-rwkv-7_2b.service \
-      "RWKV7 g1k 7.2B vLLM DP2 service" \
-      2,3 rwkv7-g1k-7.2b-20260930-ctx25600 rwkv7-g1k-7.2b \
-      18003 256 2 || return 1
+      "RWKV7 g1l 7.2B vLLM DP2 service" \
+      2,3 rwkv-g1l-7b-temp-3797 rwkv7-g1l-7.2b \
+      18003 128 2 || return 1
   fi
   systemctl daemon-reload || return 1
   systemctl disable "${all_services[@]}" >/dev/null 2>&1 || true
@@ -518,7 +520,7 @@ import torch
 result = json.loads(Path(sys.argv[1]).read_text())
 cache = Path(sys.argv[2]).resolve()
 library = Path(result["library"]).resolve()
-assert flashrwkv2.__version__ == "0.1.0a15"
+assert flashrwkv2.__version__ == "0.1.0a16"
 assert torch.cuda.get_device_capability() == (8, 9)
 assert result["status"] in {"compiled", "cached"}, result
 assert result["target"] == "sm89", result

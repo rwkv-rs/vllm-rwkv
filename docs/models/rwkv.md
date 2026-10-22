@@ -19,39 +19,77 @@ uv pip install -r requirements/rwkv.txt
 ```
 
 The requirements file fixes the validated `transformers-rwkv` and
-`tokenizers-rwkv` commits and `FlashRWKV2==0.1.0a15`.
+`tokenizers-rwkv` commits and `FlashRWKV2==0.1.0a16`.
 
 ## Serve a model
 
-RWKV uses FP16 weights and FP16 recurrent state by default. Chunked prefill is
-required, and prefix caching uses vLLM's state-aligned cache blocks.
+RWKV uses BF16 weights, activations, and shift state with FP32 accumulation,
+WKV recurrent state, and head logits. Chunked prefill is required. Prefix
+caching is disabled by default, so each request updates one recurrent state.
+The default FP32 recurrence follows the training precision contract.
 
 ```bash
 vllm serve <model> \
-  --dtype float16 \
-  --mamba-ssm-cache-dtype float16 \
-  --enable-chunked-prefill \
-  --enable-prefix-caching
-```
-
-Use FP32 recurrent state with FP16 operator input and output (FP32IO16) when
-additional state precision is required:
-
-```bash
-vllm serve <model> \
-  --dtype float16 \
+  --dtype bfloat16 \
   --mamba-ssm-cache-dtype float32 \
   --enable-chunked-prefill \
-  --enable-prefix-caching
+  --no-enable-prefix-caching
 ```
+
+For optional lower-memory inference, explicitly pass
+`--mamba-ssm-cache-dtype float16`. This retains BF16 token inputs/outputs and
+shift state, FP32 arithmetic and head logits, and rounds the WKV state to FP16
+after every token. It follows a different numerical trajectory from FP32
+training and can change logits and generated tokens. Prefill and decode use
+the same per-token state rounding. This option does not change training
+precision or the default FP32 deployment capacity plan below.
 
 RWKV defaults to `CompilationMode.NONE` and full CUDA Graph capture so that
 TorchDynamo does not decompose the external fused operators. Use
 `--enforce-eager` only for diagnostics.
 
-Continuous batching, asynchronous scheduling, prefix sharing and copy-on-write,
-structured outputs, and the OpenAI-compatible Chat and Responses APIs use the
-standard vLLM paths.
+To opt into prefix sharing and copy-on-write, pass `--enable-prefix-caching`.
+This uses vLLM's state-aligned cache blocks and copies recurrent state at block
+boundaries.
+
+Continuous batching, asynchronous scheduling, structured outputs, and the
+OpenAI-compatible Chat and Responses APIs use the standard vLLM paths.
+
+## Production deployment
+
+The `RWKV production` workflow uses `tools/deploy_rwkv_production.sh` to build
+each source revision in its own release directory and `.venv`. Both model
+hosts retain their existing g1l artifacts and served model names. No weight
+conversion or download is required for the a16 upgrade.
+
+The deployment commands use BF16 weights, FP32 WKV state, prefix caching off,
+and a 1024-token batch budget. Full CUDA Graphs use that token budget as their
+maximum capture size. The per-GPU sequence limits account for the larger WKV
+state. The small-model host has 24 GB GPUs and the large-model host has 48 GB
+GPUs:
+
+| Model | GPUs | Max sequences per GPU | BF16 weights + active state (GiB) |
+| --- | ---: | ---: | ---: |
+| g1l 1.5B | 1 | 1024 | 15.03 |
+| g1l 2.9B | 1 | 512 | 15.65 |
+| g1l 7.2B | 2, data parallel | 128 | 17.47 |
+| g1l 13.3B | 4, data parallel | 256 | 40.20 |
+
+The memory column is a lower bound from the installed artifacts. For `L`
+layers, hidden size `C`, and head size `D`, each active sequence requires
+`L * C * (4 * D + 4)` bytes for FP32 WKV state and the two BF16 shift states.
+Model warmup must also accommodate CUDA Graphs, activations, and workspaces
+within the configured memory budget. Data-parallel replicas each hold the full
+model and their own state pool.
+
+Stage the new release before switching services. The deployment script
+snapshots the current release, unit files, enabled services, and active services
+before activation; failed health checks restore that snapshot. Keep the old
+release and its `.venv` intact for rollback. A push to `rwkv` triggers the
+workflow. Its `models` target updates both model hosts, and a deployment-script
+change also selects the router component. Deployment activates the small-model
+host, the large-model host, then the frontend router. The router retains the
+backends' g1l model IDs and the existing tunnel ports 28001 through 28004.
 
 ## Decoding defaults
 
@@ -85,7 +123,7 @@ stage per GPU:
 
 ```bash
 vllm serve <model> \
-  --dtype float16 \
+  --dtype bfloat16 \
   --pipeline-parallel-size 2 \
   --enable-chunked-prefill
 ```
@@ -101,7 +139,7 @@ JSON. Load that template directly from the artifact and select the RWKV parser:
 
 ```bash
 vllm serve <model> \
-  --dtype float16 \
+  --dtype bfloat16 \
   --enable-chunked-prefill \
   --enable-auto-tool-choice \
   --tool-call-parser rwkv

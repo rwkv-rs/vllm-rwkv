@@ -43,7 +43,7 @@ from .utils import (
     maybe_prefix,
 )
 
-_FLASHRWKV2_VERSION = "0.1.0a15"
+_FLASHRWKV2_VERSION = "0.1.0a16"
 
 
 class _FlashRWKVStateHandle(Protocol):
@@ -65,6 +65,7 @@ class _FlashRWKVStateHandle(Protocol):
 _FLASHRWKV2_APIS = (
     "infer_cmix_forward_varlen",
     "infer_embedding_ln0_forward_varlen",
+    "infer_head_linear_all_forward_varlen",
     "infer_post_norm_output_forward_varlen",
     "infer_sampling_six_parameter_forward_varlen",
     "infer_tmix_postnorm_tokenshift_forward_varlen",
@@ -72,8 +73,8 @@ _FLASHRWKV2_APIS = (
     "infer_tmix_wkv7_recurrent_fp16_forward_varlen",
     "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
     "infer_tmix_wkv_prepare_forward_varlen",
-    "prepare_tmix_wkv7_recurrent_fp16_state",
     "prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor",
+    "prepare_tmix_wkv7_recurrent_fp16_state_from_tensor",
     "prepare_tmix_wkv7_recurrent_metadata",
     "setup_sampling_states",
 )
@@ -136,11 +137,10 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         self.hidden_size = config.hidden_size
         self.head_size = config.head_size
         self.num_heads = config.num_attention_heads
-        self.sequence_capacity = vllm_config.scheduler_config.max_num_seqs
         self.state_dtype = (
-            torch.float32
-            if vllm_config.cache_config.mamba_ssm_cache_dtype == "float32"
-            else torch.float16
+            torch.float16
+            if vllm_config.cache_config.mamba_ssm_cache_dtype == "float16"
+            else torch.float32
         )
         self._vllm_config = vllm_config
         self._spec: RwkvStateSpec | None = None
@@ -157,82 +157,20 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         static_context[prefix] = self
 
-    def _prepare_wkv_state(
-        self,
-        state_pool_size: int,
-        device: torch.device,
-    ) -> _FlashRWKVStateHandle:
-        flashrwkv2 = _load_flashrwkv2()
-        if self.state_dtype == torch.float32:
-            state = torch.zeros(
-                (
-                    state_pool_size,
-                    self.num_heads,
-                    self.head_size,
-                    self.head_size,
-                ),
-                dtype=torch.float32,
-                device=device,
-            )
-            return flashrwkv2.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(
-                state
-            )
-        return flashrwkv2.prepare_tmix_wkv7_recurrent_fp16_state(
-            state_pool_size,
-            self.hidden_size,
-            sequence_capacity=self.sequence_capacity,
-            head_size=self.head_size,
-            device=device,
-        )
-
-    def _probe_wkv_state_layout(self, device: torch.device) -> dict[str, int]:
-        handle = self._prepare_wkv_state(1, device)
-        try:
-            return handle.memory_layout
-        finally:
-            del handle
-            if device.type == "cuda":
-                torch.accelerator.empty_cache()
-
     def _build_spec(self, vllm_config: VllmConfig) -> RwkvStateSpec:
-        device = torch.device(vllm_config.device_config.device)
-        layout = self._probe_wkv_state_layout(device)
         layer_count = self.num_local_layers
-        shapes: list[tuple[int, ...]] = [
-            (layer_count, self.hidden_size),
-            (layer_count, self.hidden_size),
-        ]
-        dtypes = [torch.float16, torch.float16]
-        if self.state_dtype == torch.float32:
-            shapes.append(
-                (
-                    layer_count,
-                    self.num_heads,
-                    self.head_size,
-                    self.head_size,
-                )
-            )
-            dtypes.append(torch.float32)
-
         block_size = vllm_config.cache_config.mamba_block_size
         assert block_size is not None
-        cache_mode = vllm_config.cache_config.mamba_cache_mode
         return RwkvStateSpec(
             block_size=block_size,
-            shapes=tuple(shapes),
-            dtypes=tuple(dtypes),
-            mamba_cache_mode=cache_mode,
+            shapes=(
+                (layer_count, self.hidden_size),
+                (layer_count, self.hidden_size),
+                (layer_count, self.num_heads, self.head_size, self.head_size),
+            ),
+            dtypes=(torch.bfloat16, torch.bfloat16, self.state_dtype),
+            mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
             num_prefill_checkpoint_blocks=0,
-            provider_state_bytes_per_page=(
-                layer_count * layout["bytes_per_slot"]
-                if self.state_dtype == torch.float16
-                else 0
-            ),
-            provider_fixed_workspace_bytes=(
-                layer_count * layout["fixed_workspace_nbytes"]
-                if self.state_dtype == torch.float16
-                else 0
-            ),
         )
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> RwkvStateSpec:
@@ -274,52 +212,39 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
             raw,
             offset,
             (layer_count, slot_count, self.hidden_size),
-            torch.float16,
+            torch.bfloat16,
         )
         self._cmix_shift_pool, offset = self._typed_view(
             raw,
             offset,
             (layer_count, slot_count, self.hidden_size),
-            torch.float16,
+            torch.bfloat16,
         )
-        if self.state_dtype == torch.float32:
-            self._wkv_state_pool, offset = self._typed_view(
-                raw,
-                offset,
-                (
-                    layer_count,
-                    slot_count,
-                    self.num_heads,
-                    self.head_size,
-                    self.head_size,
-                ),
-                torch.float32,
-            )
+        self._wkv_state_pool, offset = self._typed_view(
+            raw,
+            offset,
+            (layer_count, slot_count, self.num_heads, self.head_size, self.head_size),
+            self.state_dtype,
+        )
         if offset != total_bytes:
             raise ValueError("RWKV state pool layout does not fill its allocation")
 
         flashrwkv2 = _load_flashrwkv2()
+        prepare_state = (
+            flashrwkv2.prepare_tmix_wkv7_recurrent_fp16_state_from_tensor
+            if self.state_dtype == torch.float16
+            else flashrwkv2.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor
+        )
         self._wkv_handles = []
         for layer_idx in range(layer_count):
-            if self._wkv_state_pool is None:
-                handle = self._prepare_wkv_state(slot_count, kv_cache.device)
-                expected_state_bytes = spec.provider_state_bytes_per_page // layer_count
-                expected_fixed_bytes = (
-                    spec.provider_fixed_workspace_bytes // layer_count
-                )
-            else:
-                handle = (
-                    flashrwkv2.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(
-                        self._wkv_state_pool[layer_idx]
-                    )
-                )
-                expected_state_bytes = (
-                    self.num_heads
-                    * self.head_size
-                    * self.head_size
-                    * torch.empty((), dtype=torch.float32).element_size()
-                )
-                expected_fixed_bytes = 0
+            handle = prepare_state(self._wkv_state_pool[layer_idx])
+            expected_state_bytes = (
+                self.num_heads
+                * self.head_size
+                * self.head_size
+                * self._wkv_state_pool.element_size()
+            )
+            expected_fixed_bytes = 0
             handle_layout = handle.memory_layout
             if (
                 handle_layout["bytes_per_slot"] != expected_state_bytes
@@ -454,7 +379,7 @@ class RwkvAttention(nn.Module):
     def __init__(self, config: Any, layer_idx: int, prefix: str) -> None:
         super().__init__()
         channels = config.hidden_size
-        dtype = torch.float16
+        dtype = torch.bfloat16
         self.config = config
         self.layer_idx = layer_idx
         self.hidden_size = channels
@@ -685,19 +610,19 @@ class RwkvFeedForward(nn.Module):
     def __init__(self, config: Any, prefix: str) -> None:
         super().__init__()
         self.config = config
-        self.x_k = nn.Parameter(torch.empty(config.hidden_size, dtype=torch.float16))
+        self.x_k = nn.Parameter(torch.empty(config.hidden_size, dtype=torch.bfloat16))
         self.key = ReplicatedLinear(
             config.hidden_size,
             config.intermediate_size,
             bias=False,
-            params_dtype=torch.float16,
+            params_dtype=torch.bfloat16,
             prefix=f"{prefix}.key",
         )
         self.value = ReplicatedLinear(
             config.intermediate_size,
             config.hidden_size,
             bias=False,
-            params_dtype=torch.float16,
+            params_dtype=torch.bfloat16,
             prefix=f"{prefix}.value",
         )
 
@@ -740,12 +665,12 @@ class RwkvDecoderLayer(nn.Module):
         self.input_layernorm = nn.LayerNorm(
             config.hidden_size,
             eps=config.layer_norm_epsilon,
-            dtype=torch.float16,
+            dtype=torch.bfloat16,
         )
         self.post_attention_layernorm = nn.LayerNorm(
             config.hidden_size,
             eps=config.layer_norm_epsilon,
-            dtype=torch.float16,
+            dtype=torch.bfloat16,
         )
 
     def forward(
@@ -828,7 +753,7 @@ class RwkvModel(nn.Module):
             self.norm = nn.LayerNorm(
                 config.hidden_size,
                 eps=config.layer_norm_epsilon,
-                dtype=torch.float16,
+                dtype=torch.bfloat16,
             )
         else:
             self.norm = PPMissingLayer()
@@ -843,7 +768,7 @@ class RwkvModel(nn.Module):
         if get_pp_group().is_first_rank:
             flashrwkv2 = _load_flashrwkv2()
             embedding = self.embed_tokens.weight
-            folded = torch.empty_like(embedding, dtype=torch.float16)
+            folded = torch.empty_like(embedding, dtype=torch.bfloat16)
             for start in range(0, embedding.shape[0], 4096):
                 end = min(start + 4096, embedding.shape[0])
                 folded[start:end].copy_(
@@ -881,7 +806,7 @@ class RwkvModel(nn.Module):
                     self.embedding_norm.weight,
                     self.embedding_norm.bias,
                     eps=self.config.layer_norm_epsilon,
-                ).to(torch.float16)
+                )
             residual = torch.zeros_like(hidden_states)
             v_first = None
         else:
@@ -951,12 +876,12 @@ class RwkvForCausalLM(
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
-                params_dtype=torch.float16,
+                params_dtype=torch.bfloat16,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
         else:
             self.lm_head = PPMissingLayer()
-        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.logits_processor = LogitsProcessor(config.vocab_size, logits_as_input=True)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
@@ -985,7 +910,12 @@ class RwkvForCausalLM(
         return self.model(input_ids, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        logits = _load_flashrwkv2().infer_head_linear_all_forward_varlen(
+            hidden_states, self.lm_head.weight
+        )
+        return self.logits_processor(
+            self.lm_head, logits[..., : self.config.vocab_size]
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return AutoWeightsLoader(self).load_weights(weights)

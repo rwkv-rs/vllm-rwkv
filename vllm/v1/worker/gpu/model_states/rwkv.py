@@ -37,7 +37,7 @@ class _RwkvSamplingGraph:
         device = penalties.device
         hidden_size = model.lm_head.weight.shape[1]
         self.hidden_states = torch.empty(
-            capacity, hidden_size, dtype=torch.float16, device=device
+            capacity, hidden_size, dtype=torch.bfloat16, device=device
         )
         self.slot_indices = torch.arange(capacity, dtype=torch.int32, device=device)
         self.presence_penalty = torch.zeros(capacity, device=device)
