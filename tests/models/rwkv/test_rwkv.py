@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import sys
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -883,3 +884,42 @@ def test_config_accepts_async_scheduling() -> None:
     vllm_config.scheduler_config.async_scheduling = True
     RwkvForCausalLMConfig.verify_and_update_config(vllm_config)
     assert vllm_config.scheduler_config.async_scheduling
+
+
+@pytest.mark.skipif(
+    not os.environ.get("VLLM_RWKV_TEST_MODEL"),
+    reason="VLLM_RWKV_TEST_MODEL must point to a local RWKV checkpoint",
+)
+def test_real_model_batching_preserves_greedy_tokens_and_logprobs(vllm_runner) -> None:
+    """Chunked prefill and mixed requests retain the BF16/FP32 contract."""
+    model_path = os.environ["VLLM_RWKV_TEST_MODEL"]
+    params = SamplingParams(
+        temperature=0,
+        top_k=1,
+        max_tokens=4,
+        ignore_eos=True,
+        logprobs=3,
+        presence_penalty=0,
+        frequency_penalty=0,
+        penalty_decay=1,
+        detokenize=False,
+    )
+    prompt = {"prompt_token_ids": list(range(1, 66))}
+    with vllm_runner(
+        model_path,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_batched_tokens=32,
+        max_num_seqs=4,
+        mamba_ssm_cache_dtype="float32",
+        enable_chunked_prefill=True,
+        enable_prefix_caching=True,
+        compilation_config={"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]},
+    ) as runner:
+        single = runner.llm.generate([prompt], params)[0].outputs[0]
+        mixed = runner.llm.generate([{"prompt_token_ids": [7, 8, 9]}, prompt], params)[
+            1
+        ].outputs[0]
+    assert len(single.token_ids) == 4
+    assert mixed.token_ids == single.token_ids
+    assert mixed.logprobs == single.logprobs
