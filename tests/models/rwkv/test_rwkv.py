@@ -13,6 +13,7 @@ import torch
 
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.config.model import ModelConfig
+from vllm.engine.arg_utils import EngineArgs
 from vllm.exceptions import VLLMValidationError
 from vllm.model_executor.models.config import RwkvForCausalLMConfig
 from vllm.model_executor.models.rwkv import (
@@ -460,7 +461,7 @@ def _config() -> SimpleNamespace:
         quantization_config=None,
     )
     cache_config = SimpleNamespace(
-        enable_prefix_caching=True,
+        enable_prefix_caching=False,
         mamba_cache_mode="none",
         mamba_block_size=None,
         block_size=16,
@@ -505,8 +506,9 @@ def test_config_uses_bf16_shift_fp32_wkv_and_full_graph_defaults() -> None:
 
     assert vllm_config.cache_config.mamba_cache_dtype == "bfloat16"
     assert vllm_config.cache_config.mamba_ssm_cache_dtype == "float32"
-    assert vllm_config.cache_config.mamba_cache_mode == "align"
-    assert vllm_config.cache_config.mamba_block_size == 16
+    assert not vllm_config.cache_config.enable_prefix_caching
+    assert vllm_config.cache_config.mamba_cache_mode == "none"
+    assert vllm_config.cache_config.mamba_block_size == 1024
     assert vllm_config.scheduler_config.async_scheduling is None
     assert vllm_config.compilation_config.mode == CompilationMode.NONE
     assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL
@@ -515,6 +517,30 @@ def test_config_uses_bf16_shift_fp32_wkv_and_full_graph_defaults() -> None:
     assert 1024 in vllm_config.compilation_config.cudagraph_capture_sizes
     assert 5120 in vllm_config.compilation_config.cudagraph_capture_sizes
     assert 8192 in vllm_config.compilation_config.cudagraph_capture_sizes
+
+
+@pytest.mark.parametrize("architecture", ["RwkvForCausalLM", "LlamaForCausalLM"])
+@pytest.mark.parametrize("explicit", [None, True, False])
+def test_rwkv_prefix_cache_default_preserves_explicit_choice(architecture, explicit):
+    args = EngineArgs(enable_prefix_caching=explicit)
+    config = SimpleNamespace(
+        architecture=architecture,
+        is_chunked_prefill_supported=True,
+        is_prefix_caching_supported=True,
+        runner_type="generate",
+    )
+    args._set_default_chunked_prefill_and_prefix_caching_args(config)
+    expected = architecture != "RwkvForCausalLM" if explicit is None else explicit
+    assert args.enable_prefix_caching is expected
+
+
+def test_config_accepts_explicit_rwkv_prefix_cache() -> None:
+    vllm_config = _config()
+    vllm_config.cache_config.enable_prefix_caching = True
+    RwkvForCausalLMConfig.verify_and_update_config(vllm_config)
+    assert vllm_config.cache_config.enable_prefix_caching
+    assert vllm_config.cache_config.mamba_cache_mode == "align"
+    assert vllm_config.cache_config.mamba_block_size == 16
 
 
 @pytest.mark.parametrize(
@@ -890,7 +916,10 @@ def test_config_accepts_async_scheduling() -> None:
     not os.environ.get("VLLM_RWKV_TEST_MODEL"),
     reason="VLLM_RWKV_TEST_MODEL must point to a local RWKV checkpoint",
 )
-def test_real_model_batching_preserves_greedy_tokens_and_logprobs(vllm_runner) -> None:
+@pytest.mark.parametrize("prefix_caching", [False, True])
+def test_real_model_batching_preserves_greedy_tokens_and_logprobs(
+    vllm_runner, prefix_caching
+) -> None:
     """Chunked prefill and mixed requests retain the BF16/FP32 contract."""
     model_path = os.environ["VLLM_RWKV_TEST_MODEL"]
     params = SamplingParams(
@@ -913,7 +942,7 @@ def test_real_model_batching_preserves_greedy_tokens_and_logprobs(vllm_runner) -
         max_num_seqs=4,
         mamba_ssm_cache_dtype="float32",
         enable_chunked_prefill=True,
-        enable_prefix_caching=True,
+        enable_prefix_caching=prefix_caching,
         compilation_config={"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]},
     ) as runner:
         single = runner.llm.generate([prompt], params)[0].outputs[0]

@@ -196,6 +196,7 @@ ExecStart=$release/.venv/bin/vllm serve $models_dir/$model \\
   --gpu-memory-utilization 0.90 \\
   --data-parallel-size $data_parallel_size \\
   --enable-chunked-prefill \\
+  --no-enable-prefix-caching \\
   --async-scheduling \\
   --structured-outputs-config.backend xgrammar \\
   --enable-auto-tool-choice \\
