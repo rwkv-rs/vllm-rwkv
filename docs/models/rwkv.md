@@ -46,6 +46,38 @@ boundaries.
 Continuous batching, asynchronous scheduling, structured outputs, and the
 OpenAI-compatible Chat and Responses APIs use the standard vLLM paths.
 
+## Production deployment
+
+The `RWKV production` workflow uses `tools/deploy_rwkv_production.sh` to build
+each source revision in its own release directory and `.venv`. The small-model
+host retains its existing g1l artifacts and served model names. No weight
+conversion or download is required for the a16 upgrade.
+
+The deployment commands use BF16 weights, FP32 WKV state, prefix caching off,
+and a 1024-token batch budget. Full CUDA Graphs use that token budget as their
+maximum capture size. The per-GPU sequence limits account for the larger WKV
+state:
+
+| Model | GPUs | Max sequences per GPU | BF16 weights + active state (GiB) |
+| --- | ---: | ---: | ---: |
+| g1l 1.5B | 1 | 1024 | 15.03 |
+| g1l 2.9B | 1 | 512 | 15.65 |
+| g1l 7.2B | 2, data parallel | 128 | 17.47 |
+
+The memory column is a lower bound from the installed artifacts. For `L`
+layers, hidden size `C`, and head size `D`, each active sequence requires
+`L * C * (4 * D + 4)` bytes for FP32 WKV state and the two BF16 shift states.
+Model warmup must also accommodate CUDA Graphs, activations, and workspaces
+within the configured memory budget. Data-parallel replicas each hold the full
+model and their own state pool.
+
+Stage the new release before switching services. The deployment script
+snapshots the current release, unit files, enabled services, and active services
+before activation; failed health checks restore that snapshot. Keep the old
+release and its `.venv` intact for rollback. The workflow's `models` target
+updates both model hosts, and a deployment-script change also selects the
+router component.
+
 ## Decoding defaults
 
 RWKV samples through FlashRWKV2 Rapid-Sampling. The model artifact must publish
