@@ -149,7 +149,7 @@ check_model() {
 check_models() {
   [[ $deployment_role != frontend ]] || return 0
   if [[ $deployment_role == large ]]; then
-    check_model rwkv7-g1k-13.3b-20260930-ctx25600 11
+    check_model rwkv-g1l-13b-temp-5497 22
   else
     check_model rwkv-g1l-1b-temp-6331 3
     check_model rwkv-g1l-3b-temp-5764 5
@@ -219,9 +219,9 @@ install_units() {
     write_unit \
       "$release" \
       vllm-rwkv-13_3b.service \
-      "RWKV7 g1k 13.3B vLLM DP4 service" \
-      0,1,2,3 rwkv7-g1k-13.3b-20260930-ctx25600 rwkv7-g1k-13.3b \
-      18004 320 4 || return 1
+      "RWKV7 g1l 13.3B vLLM DP4 service" \
+      0,1,2,3 rwkv-g1l-13b-temp-5497 rwkv7-g1l-13.3b \
+      18004 256 4 || return 1
   else
     write_unit \
       "$release" \
