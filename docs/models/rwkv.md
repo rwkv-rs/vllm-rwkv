@@ -24,24 +24,27 @@ The requirements file fixes the validated `transformers-rwkv` and
 ## Serve a model
 
 RWKV uses BF16 weights, activations, and shift state with FP32 accumulation,
-WKV recurrent state, and head logits. Chunked prefill is required, and prefix
-caching uses vLLM's state-aligned cache blocks.
+WKV recurrent state, and head logits. Chunked prefill is required. Prefix
+caching is disabled by default, so each request updates one recurrent state.
 
 ```bash
 vllm serve <model> \
   --dtype bfloat16 \
   --mamba-ssm-cache-dtype float32 \
   --enable-chunked-prefill \
-  --enable-prefix-caching
+  --no-enable-prefix-caching
 ```
 
 RWKV defaults to `CompilationMode.NONE` and full CUDA Graph capture so that
 TorchDynamo does not decompose the external fused operators. Use
 `--enforce-eager` only for diagnostics.
 
-Continuous batching, asynchronous scheduling, prefix sharing and copy-on-write,
-structured outputs, and the OpenAI-compatible Chat and Responses APIs use the
-standard vLLM paths.
+To opt into prefix sharing and copy-on-write, pass `--enable-prefix-caching`.
+This uses vLLM's state-aligned cache blocks and copies recurrent state at block
+boundaries.
+
+Continuous batching, asynchronous scheduling, structured outputs, and the
+OpenAI-compatible Chat and Responses APIs use the standard vLLM paths.
 
 ## Decoding defaults
 
