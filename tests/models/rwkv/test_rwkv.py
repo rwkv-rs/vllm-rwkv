@@ -16,6 +16,7 @@ from vllm.exceptions import VLLMValidationError
 from vllm.model_executor.models.config import RwkvForCausalLMConfig
 from vllm.model_executor.models.rwkv import (
     RwkvFeedForward,
+    RwkvForCausalLM,
     RwkvModel,
     RwkvStateLayer,
     _load_flashrwkv2,
@@ -30,40 +31,21 @@ from vllm.v1.worker.gpu.model_states.rwkv import RwkvModelState, RwkvSampler
 
 
 class _FakeStateHandle:
-    def __init__(
-        self,
-        state_pool_size: int,
-        channels: int,
-        state_dtype: torch.dtype,
-        has_elapsed: bool,
-        *,
-        bytes_per_slot: int = 18,
-        fixed_workspace_nbytes: int = 13,
-    ) -> None:
-        self.state = torch.zeros((state_pool_size, channels), dtype=state_dtype)
-        self.elapsed = (
-            torch.zeros(state_pool_size, dtype=torch.int32) if has_elapsed else None
-        )
+    def __init__(self, state: torch.Tensor) -> None:
+        self.state = state
         self.materialized: list[torch.Tensor] = []
-        self.bytes_per_slot = bytes_per_slot
-        self.fixed_workspace_nbytes = fixed_workspace_nbytes
 
     @property
     def memory_layout(self) -> dict[str, int]:
+        per_slot = self.state[0].numel() * self.state.element_size()
         return {
-            "base_bytes_per_slot": 1,
-            "private_bytes_per_slot": self.bytes_per_slot - 1,
-            "bytes_per_slot": self.bytes_per_slot,
-            "fixed_workspace_nbytes": self.fixed_workspace_nbytes,
-            "total_nbytes": (
-                self.state.shape[0] * self.bytes_per_slot + self.fixed_workspace_nbytes
-            ),
+            "bytes_per_slot": per_slot,
+            "fixed_workspace_nbytes": 0,
+            "total_nbytes": self.state.numel() * self.state.element_size(),
         }
 
     def reset_slots_(self, indices: torch.Tensor) -> None:
         self.state.index_fill_(0, indices.long(), 0)
-        if self.elapsed is not None:
-            self.elapsed.index_fill_(0, indices.long(), 0)
 
     def copy_slots_(
         self,
@@ -76,13 +58,6 @@ class _FakeStateHandle:
         self.state.index_copy_(
             0, destination_indices, source.state.index_select(0, source_indices)
         )
-        if self.elapsed is not None:
-            assert source.elapsed is not None
-            self.elapsed.index_copy_(
-                0,
-                destination_indices,
-                source.elapsed.index_select(0, source_indices),
-            )
 
     def materialize_slots_(self, indices: torch.Tensor) -> None:
         self.materialized.append(indices.clone())
@@ -90,44 +65,18 @@ class _FakeStateHandle:
 
 def _fake_flashrwkv2() -> ModuleType:
     module: Any = ModuleType("flashrwkv2")
-    module.__version__ = "0.1.0a15"
+    module.__version__ = "0.1.0a16"
 
-    def prepare_fp16(
-        state_pool_size,
-        channels,
-        *,
-        sequence_capacity,
-        head_size=64,
-        device=None,
-    ):
-        del sequence_capacity, head_size, device
-        return _FakeStateHandle(state_pool_size, channels, torch.float16, True)
-
-    def prepare_fp32_from_tensor(state):
-        handle = _FakeStateHandle(
-            state.shape[0],
-            state[0].numel(),
-            torch.float32,
-            False,
-            bytes_per_slot=state[0].numel() * state.element_size(),
-            fixed_workspace_nbytes=0,
-        )
-        handle.state = state
-        return handle
-
-    module.prepare_tmix_wkv7_recurrent_fp16_state = prepare_fp16
-    module.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor = (
-        prepare_fp32_from_tensor
-    )
+    module.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor = _FakeStateHandle
     module.prepare_tmix_wkv7_recurrent_metadata = lambda *args, **kwargs: (args, kwargs)
     for name in (
         "infer_cmix_forward_varlen",
         "infer_embedding_ln0_forward_varlen",
+        "infer_head_linear_all_forward_varlen",
         "infer_post_norm_output_forward_varlen",
         "infer_sampling_six_parameter_forward_varlen",
         "infer_tmix_postnorm_tokenshift_forward_varlen",
         "infer_tmix_readout_forward_varlen",
-        "infer_tmix_wkv7_recurrent_fp16_forward_varlen",
         "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
         "infer_tmix_wkv_prepare_forward_varlen",
         "setup_sampling_states",
@@ -143,7 +92,7 @@ def _clear_flashrwkv2_cache():
     _load_flashrwkv2.cache_clear()
 
 
-def _state_vllm_config(state_dtype: str = "float16") -> SimpleNamespace:
+def _state_vllm_config() -> SimpleNamespace:
     hf_config = SimpleNamespace(
         hidden_size=128,
         head_size=64,
@@ -153,7 +102,7 @@ def _state_vllm_config(state_dtype: str = "float16") -> SimpleNamespace:
         model_config=SimpleNamespace(hf_config=hf_config),
         scheduler_config=SimpleNamespace(max_num_seqs=4),
         cache_config=SimpleNamespace(
-            mamba_ssm_cache_dtype=state_dtype,
+            mamba_ssm_cache_dtype="float32",
             mamba_block_size=16,
             mamba_cache_mode="align",
         ),
@@ -172,19 +121,20 @@ def test_state_spec_accounts_provider_memory_and_slot_lifecycle(monkeypatch) -> 
         RwkvAttentionMetadataBuilder.get_cudagraph_support(vllm_config, spec)
         is AttentionCGSupport.ALWAYS
     )
-    assert spec.provider_state_bytes_per_page == 36
-    assert spec.provider_fixed_workspace_bytes == 26
+    assert spec.provider_state_bytes_per_page == 0
+    assert spec.provider_fixed_workspace_bytes == 0
     assert spec.num_prefill_checkpoint_blocks == 0
 
     num_slots = 3
     raw = torch.zeros((num_slots, 1, 1, spec.page_size_bytes), dtype=torch.int8)
     state_layer.bind_kv_cache(raw)
     tmix, handle, cmix = state_layer.get_layer_state(0)
-    assert handle.state.untyped_storage().data_ptr() != raw.untyped_storage().data_ptr()
+    assert handle.state.shape == (num_slots, 2, 64, 64)
+    assert handle.state.dtype == torch.float32
+    assert tmix.dtype == cmix.dtype == torch.bfloat16
+    assert handle.state.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
     tmix[1].fill_(1)
     handle.state[1].fill_(2)
-    assert handle.elapsed is not None
-    handle.elapsed[1].fill_(3)
     cmix[1].fill_(4)
 
     source = torch.tensor([1], dtype=torch.int32)
@@ -192,21 +142,17 @@ def test_state_spec_accounts_provider_memory_and_slot_lifecycle(monkeypatch) -> 
     state_layer.copy_state_slots(source, destination)
     assert torch.all(tmix[2] == 1)
     assert torch.all(handle.state[2] == 2)
-    assert torch.all(handle.elapsed[2] == 3)
     assert torch.all(cmix[2] == 4)
 
     state_layer.reset_state_slots(destination)
     assert torch.count_nonzero(tmix[2]) == 0
     assert torch.count_nonzero(handle.state[2]) == 0
-    assert torch.count_nonzero(handle.elapsed[2]) == 0
     assert torch.count_nonzero(cmix[2]) == 0
 
     tmix[0].fill_(5)
     tmix[1].fill_(1)
     handle.state[0].fill_(6)
     handle.state[1].fill_(2)
-    handle.elapsed[0].fill_(7)
-    handle.elapsed[1].fill_(3)
     cmix[0].fill_(8)
     cmix[1].fill_(4)
     state_layer.copy_state_slots(
@@ -215,7 +161,6 @@ def test_state_spec_accounts_provider_memory_and_slot_lifecycle(monkeypatch) -> 
     )
     assert torch.all(tmix[0] == 1) and torch.all(tmix[1] == 5)
     assert torch.all(handle.state[0] == 2) and torch.all(handle.state[1] == 6)
-    assert torch.all(handle.elapsed[0] == 3) and torch.all(handle.elapsed[1] == 7)
     assert torch.all(cmix[0] == 4) and torch.all(cmix[1] == 8)
 
     state_layer.materialize_state_slots(source)
@@ -229,24 +174,6 @@ def test_state_spec_accounts_provider_memory_and_slot_lifecycle(monkeypatch) -> 
         and torch.equal(layer_handle.materialized[0], source)
         for layer_handle in handles
     )
-
-
-def test_fp32_state_uses_caller_backed_cache_tensor(monkeypatch) -> None:
-    monkeypatch.setitem(sys.modules, "flashrwkv2", _fake_flashrwkv2())
-    vllm_config = _state_vllm_config("float32")
-    state_layer = RwkvStateLayer(vllm_config, 2, "model.layers.0.rwkv_state")
-    spec = state_layer.get_kv_cache_spec(vllm_config)
-
-    assert spec.provider_state_bytes_per_page == 0
-    assert spec.provider_fixed_workspace_bytes == 0
-
-    num_slots = 3
-    raw = torch.zeros((num_slots, 1, 1, spec.page_size_bytes), dtype=torch.int8)
-    state_layer.bind_kv_cache(raw)
-    _, handle, _ = state_layer.get_layer_state(0)
-
-    assert handle.state.shape == (num_slots, 2, 64, 64)
-    assert handle.state.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
 
 
 def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:
@@ -391,7 +318,7 @@ def test_live_metadata_prepares_and_retains_each_capture_ticket(monkeypatch) -> 
 def test_feed_forward_prepares_value_weight_for_provider() -> None:
     feed_forward = object.__new__(RwkvFeedForward)
     torch.nn.Module.__init__(feed_forward)
-    checkpoint_weight = torch.arange(16, dtype=torch.float16).view(2, 8)
+    checkpoint_weight = torch.arange(16, dtype=torch.bfloat16).view(2, 8)
     feed_forward.value = SimpleNamespace(
         weight=torch.nn.Parameter(checkpoint_weight.clone())
     )
@@ -406,7 +333,7 @@ def test_model_folds_embedding_norm_after_loading(monkeypatch) -> None:
     module.infer_embedding_ln0_forward_varlen = (
         lambda embedding, weight, bias, eps: torch.nn.functional.layer_norm(
             embedding, (embedding.shape[-1],), weight, bias, eps
-        ).to(torch.float16)
+        ).to(torch.bfloat16)
     )
     monkeypatch.setitem(sys.modules, "flashrwkv2", module)
     monkeypatch.setattr(
@@ -429,12 +356,12 @@ def test_model_folds_embedding_norm_after_loading(monkeypatch) -> None:
         model.embedding_norm.weight,
         model.embedding_norm.bias,
         model.config.layer_norm_epsilon,
-    ).to(torch.float16)
+    ).to(torch.bfloat16)
 
     model.process_weights_after_loading()
 
     assert model._embedding_norm_folded
-    assert model.embed_tokens.weight.dtype == torch.float16
+    assert model.embed_tokens.weight.dtype == torch.bfloat16
     assert torch.equal(model.embed_tokens.weight, expected)
 
 
@@ -520,7 +447,7 @@ def test_align_state_advance_resets_new_request_destination() -> None:
 def _config() -> SimpleNamespace:
     model_config = SimpleNamespace(
         hf_config=SimpleNamespace(),
-        dtype=torch.float16,
+        dtype=torch.bfloat16,
         architecture="RwkvForCausalLM",
         supports_mamba_prefix_caching=True,
         max_model_len=1024,
@@ -571,12 +498,12 @@ def _config() -> SimpleNamespace:
     )
 
 
-def test_config_uses_fp16_state_and_full_graph_defaults() -> None:
+def test_config_uses_bf16_shift_fp32_wkv_and_full_graph_defaults() -> None:
     vllm_config = _config()
     RwkvForCausalLMConfig.verify_and_update_config(vllm_config)
 
-    assert vllm_config.cache_config.mamba_cache_dtype == "float16"
-    assert vllm_config.cache_config.mamba_ssm_cache_dtype == "float16"
+    assert vllm_config.cache_config.mamba_cache_dtype == "bfloat16"
+    assert vllm_config.cache_config.mamba_ssm_cache_dtype == "float32"
     assert vllm_config.cache_config.mamba_cache_mode == "align"
     assert vllm_config.cache_config.mamba_block_size == 16
     assert vllm_config.scheduler_config.async_scheduling is None
@@ -589,11 +516,38 @@ def test_config_uses_fp16_state_and_full_graph_defaults() -> None:
     assert 8192 in vllm_config.compilation_config.cudagraph_capture_sizes
 
 
-def test_config_accepts_fp32_wkv_state() -> None:
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("dtype", torch.float16, "--dtype bfloat16"),
+        ("mamba_cache_dtype", "float16", "shift state requires bfloat16"),
+        ("mamba_ssm_cache_dtype", "float16", "WKV state requires float32"),
+    ],
+)
+def test_config_requires_flashrwkv2_numerical_contract(field, value, message) -> None:
     vllm_config = _config()
-    vllm_config.cache_config.mamba_ssm_cache_dtype = "float32"
-    RwkvForCausalLMConfig.verify_and_update_config(vllm_config)
-    assert vllm_config.cache_config.mamba_ssm_cache_dtype == "float32"
+    target = vllm_config.model_config if field == "dtype" else vllm_config.cache_config
+    setattr(target, field, value)
+    with pytest.raises(ValueError, match=message):
+        RwkvForCausalLMConfig.verify_and_update_config(vllm_config)
+
+
+def test_head_preserves_provider_fp32_logits_and_trims_padding(monkeypatch) -> None:
+    module: Any = _fake_flashrwkv2()
+    logits = torch.tensor([[1.0001, 1.0002, -4.0]], dtype=torch.float32)
+    module.infer_head_linear_all_forward_varlen = lambda hidden, weight: logits
+    monkeypatch.setitem(sys.modules, "flashrwkv2", module)
+    model = SimpleNamespace(
+        config=SimpleNamespace(vocab_size=2),
+        lm_head=SimpleNamespace(weight=torch.empty(3, 4, dtype=torch.bfloat16)),
+        logits_processor=lambda head, values: values,
+    )
+    result = RwkvForCausalLM.compute_logits(
+        model, torch.zeros(1, 4, dtype=torch.bfloat16)
+    )
+    assert result.dtype == torch.float32
+    assert torch.equal(result, logits[:, :2])
+    assert result[0, 1] > result[0, 0]
 
 
 def test_config_accepts_pipeline_parallel_size_two() -> None:
@@ -820,7 +774,7 @@ def test_rapid_sampler_graph_compacts_completed_prefills(monkeypatch) -> None:
         seq_lens=torch.tensor([2, 4, 4, 1]),
         cu_num_logits=torch.tensor([0, 1, 2, 3, 4]),
     )
-    hidden_states = torch.arange(12, dtype=torch.float16).view(4, 3)
+    hidden_states = torch.arange(12, dtype=torch.bfloat16).view(4, 3)
 
     output = sampler.sample_hidden_states(hidden_states, input_batch, None)
 

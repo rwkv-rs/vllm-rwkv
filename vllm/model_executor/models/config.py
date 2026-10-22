@@ -1064,8 +1064,8 @@ class RwkvForCausalLMConfig(VerifyAndUpdateConfig):
 
         if not vllm_config.use_v2_model_runner:
             raise ValueError("RWKV requires the V2 model runner")
-        if model_config.dtype != torch.float16:
-            raise ValueError("RWKV inference requires --dtype float16")
+        if model_config.dtype != torch.bfloat16:
+            raise ValueError("RWKV inference requires --dtype bfloat16")
         if parallel_config.tensor_parallel_size != 1:
             raise ValueError("RWKV does not support tensor parallelism")
         if parallel_config.pipeline_parallel_size not in (1, 2):
@@ -1112,14 +1112,14 @@ class RwkvForCausalLMConfig(VerifyAndUpdateConfig):
         model_config.hf_config.head_dtype = "float32"
 
         if cache_config.mamba_cache_dtype == "auto":
-            cache_config.mamba_cache_dtype = "float16"
-        elif cache_config.mamba_cache_dtype != "float16":
-            raise ValueError("RWKV shift state requires float16 cache dtype")
+            cache_config.mamba_cache_dtype = "bfloat16"
+        elif cache_config.mamba_cache_dtype != "bfloat16":
+            raise ValueError("RWKV shift state requires bfloat16 cache dtype")
 
         if cache_config.mamba_ssm_cache_dtype == "auto":
-            cache_config.mamba_ssm_cache_dtype = "float16"
-        elif cache_config.mamba_ssm_cache_dtype not in ("float16", "float32"):
-            raise ValueError("RWKV WKV state supports float16 or float32")
+            cache_config.mamba_ssm_cache_dtype = "float32"
+        elif cache_config.mamba_ssm_cache_dtype != "float32":
+            raise ValueError("RWKV WKV state requires float32")
 
         MambaModelConfig.verify_and_update_config(vllm_config)
 
