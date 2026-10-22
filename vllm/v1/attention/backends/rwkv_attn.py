@@ -20,7 +20,7 @@ from vllm.v1.kv_cache_interface import KVCacheLayout, MambaSpec
 
 @dataclass(frozen=True)
 class RwkvStateSpec(MambaSpec):
-    """Scheduler-owned BF16 shifts and FP32 recurrent state."""
+    """Scheduler-owned BF16 shifts and configurable recurrent state."""
 
     @property
     def requires_block_zeroing(self) -> bool:
