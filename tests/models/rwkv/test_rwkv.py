@@ -112,7 +112,7 @@ def _state_vllm_config() -> SimpleNamespace:
     )
 
 
-def test_state_spec_accounts_provider_memory_and_slot_lifecycle(monkeypatch) -> None:
+def test_state_spec_and_caller_backed_slot_lifecycle(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "flashrwkv2", _fake_flashrwkv2())
     vllm_config = _state_vllm_config()
     state_layer = RwkvStateLayer(vllm_config, 2, "model.layers.0.rwkv_state")
@@ -122,8 +122,8 @@ def test_state_spec_accounts_provider_memory_and_slot_lifecycle(monkeypatch) -> 
         RwkvAttentionMetadataBuilder.get_cudagraph_support(vllm_config, spec)
         is AttentionCGSupport.ALWAYS
     )
-    assert spec.provider_state_bytes_per_page == 0
-    assert spec.provider_fixed_workspace_bytes == 0
+    assert spec.external_bytes_per_page == 0
+    assert spec.external_fixed_memory_bytes == 0
     assert spec.num_prefill_checkpoint_blocks == 0
 
     num_slots = 3
