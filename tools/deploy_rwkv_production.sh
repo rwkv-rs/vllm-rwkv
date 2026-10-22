@@ -221,7 +221,7 @@ install_units() {
       vllm-rwkv-13_3b.service \
       "RWKV7 g1l 13.3B vLLM DP4 service" \
       0,1,2,3 rwkv-g1l-13b-temp-5497 rwkv7-g1l-13.3b \
-      18004 256 4 || return 1
+      18004 255 4 || return 1
   else
     write_unit \
       "$release" \
