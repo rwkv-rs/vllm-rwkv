@@ -1118,8 +1118,8 @@ class RwkvForCausalLMConfig(VerifyAndUpdateConfig):
 
         if cache_config.mamba_ssm_cache_dtype == "auto":
             cache_config.mamba_ssm_cache_dtype = "float32"
-        elif cache_config.mamba_ssm_cache_dtype != "float32":
-            raise ValueError("RWKV WKV state requires float32")
+        elif cache_config.mamba_ssm_cache_dtype not in ("float16", "float32"):
+            raise ValueError("RWKV WKV state supports float16 or float32")
 
         MambaModelConfig.verify_and_update_config(vllm_config)
 

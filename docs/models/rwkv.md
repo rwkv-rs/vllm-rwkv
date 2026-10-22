@@ -26,6 +26,7 @@ The requirements file fixes the validated `transformers-rwkv` and
 RWKV uses BF16 weights, activations, and shift state with FP32 accumulation,
 WKV recurrent state, and head logits. Chunked prefill is required. Prefix
 caching is disabled by default, so each request updates one recurrent state.
+The default FP32 recurrence follows the training precision contract.
 
 ```bash
 vllm serve <model> \
@@ -34,6 +35,14 @@ vllm serve <model> \
   --enable-chunked-prefill \
   --no-enable-prefix-caching
 ```
+
+For optional lower-memory inference, explicitly pass
+`--mamba-ssm-cache-dtype float16`. This retains BF16 token inputs/outputs and
+shift state, FP32 arithmetic and head logits, and rounds the WKV state to FP16
+after every token. It follows a different numerical trajectory from FP32
+training and can change logits and generated tokens. Prefill and decode use
+the same per-token state rounding. This option does not change training
+precision or the default FP32 deployment capacity plan below.
 
 RWKV defaults to `CompilationMode.NONE` and full CUDA Graph capture so that
 TorchDynamo does not decompose the external fused operators. Use

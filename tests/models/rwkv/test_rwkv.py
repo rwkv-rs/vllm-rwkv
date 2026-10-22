@@ -70,6 +70,7 @@ def _fake_flashrwkv2() -> ModuleType:
     module.__version__ = "0.1.0a16"
 
     module.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor = _FakeStateHandle
+    module.prepare_tmix_wkv7_recurrent_fp16_state_from_tensor = _FakeStateHandle
     module.prepare_tmix_wkv7_recurrent_metadata = lambda *args, **kwargs: (args, kwargs)
     for name in (
         "infer_cmix_forward_varlen",
@@ -79,6 +80,7 @@ def _fake_flashrwkv2() -> ModuleType:
         "infer_sampling_six_parameter_forward_varlen",
         "infer_tmix_postnorm_tokenshift_forward_varlen",
         "infer_tmix_readout_forward_varlen",
+        "infer_tmix_wkv7_recurrent_fp16_forward_varlen",
         "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
         "infer_tmix_wkv_prepare_forward_varlen",
         "setup_sampling_states",
@@ -94,7 +96,7 @@ def _clear_flashrwkv2_cache():
     _load_flashrwkv2.cache_clear()
 
 
-def _state_vllm_config() -> SimpleNamespace:
+def _state_vllm_config(state_dtype: str = "float32") -> SimpleNamespace:
     hf_config = SimpleNamespace(
         hidden_size=128,
         head_size=64,
@@ -104,7 +106,7 @@ def _state_vllm_config() -> SimpleNamespace:
         model_config=SimpleNamespace(hf_config=hf_config),
         scheduler_config=SimpleNamespace(max_num_seqs=4),
         cache_config=SimpleNamespace(
-            mamba_ssm_cache_dtype="float32",
+            mamba_ssm_cache_dtype=state_dtype,
             mamba_block_size=16,
             mamba_cache_mode="align",
         ),
@@ -113,9 +115,10 @@ def _state_vllm_config() -> SimpleNamespace:
     )
 
 
-def test_state_spec_and_caller_backed_slot_lifecycle(monkeypatch) -> None:
+@pytest.mark.parametrize("state_dtype", ["float32", "float16"])
+def test_state_spec_and_caller_backed_slot_lifecycle(monkeypatch, state_dtype) -> None:
     monkeypatch.setitem(sys.modules, "flashrwkv2", _fake_flashrwkv2())
-    vllm_config = _state_vllm_config()
+    vllm_config = _state_vllm_config(state_dtype)
     state_layer = RwkvStateLayer(vllm_config, 2, "model.layers.0.rwkv_state")
     spec = state_layer.get_kv_cache_spec(vllm_config)
 
@@ -132,7 +135,11 @@ def test_state_spec_and_caller_backed_slot_lifecycle(monkeypatch) -> None:
     state_layer.bind_kv_cache(raw)
     tmix, handle, cmix = state_layer.get_layer_state(0)
     assert handle.state.shape == (num_slots, 2, 64, 64)
-    assert handle.state.dtype == torch.float32
+    assert handle.state.dtype == getattr(torch, state_dtype)
+    assert spec.page_size_bytes == 2 * (
+        2 * 128 * torch.empty((), dtype=torch.bfloat16).element_size()
+        + 2 * 64 * 64 * handle.state.element_size()
+    )
     assert tmix.dtype == cmix.dtype == torch.bfloat16
     assert handle.state.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
     tmix[1].fill_(1)
@@ -534,10 +541,13 @@ def test_rwkv_prefix_cache_default_preserves_explicit_choice(architecture, expli
     assert args.enable_prefix_caching is expected
 
 
-def test_config_accepts_explicit_rwkv_prefix_cache() -> None:
+@pytest.mark.parametrize("state_dtype", ["float32", "float16"])
+def test_config_accepts_explicit_rwkv_prefix_cache(state_dtype) -> None:
     vllm_config = _config()
     vllm_config.cache_config.enable_prefix_caching = True
+    vllm_config.cache_config.mamba_ssm_cache_dtype = state_dtype
     RwkvForCausalLMConfig.verify_and_update_config(vllm_config)
+    assert vllm_config.cache_config.mamba_ssm_cache_dtype == state_dtype
     assert vllm_config.cache_config.enable_prefix_caching
     assert vllm_config.cache_config.mamba_cache_mode == "align"
     assert vllm_config.cache_config.mamba_block_size == 16
@@ -548,7 +558,7 @@ def test_config_accepts_explicit_rwkv_prefix_cache() -> None:
     [
         ("dtype", torch.float16, "--dtype bfloat16"),
         ("mamba_cache_dtype", "float16", "shift state requires bfloat16"),
-        ("mamba_ssm_cache_dtype", "float16", "WKV state requires float32"),
+        ("mamba_ssm_cache_dtype", "bfloat16", "WKV state supports float16 or float32"),
     ],
 )
 def test_config_requires_flashrwkv2_numerical_contract(field, value, message) -> None:
@@ -917,10 +927,11 @@ def test_config_accepts_async_scheduling() -> None:
     reason="VLLM_RWKV_TEST_MODEL must point to a local RWKV checkpoint",
 )
 @pytest.mark.parametrize("prefix_caching", [False, True])
+@pytest.mark.parametrize("state_dtype", ["float32", "float16"])
 def test_real_model_batching_preserves_greedy_tokens_and_logprobs(
-    vllm_runner, prefix_caching
+    vllm_runner, prefix_caching, state_dtype
 ) -> None:
-    """Chunked prefill and mixed requests retain the BF16/FP32 contract."""
+    """Each state mode agrees across prefill, batching and graph execution."""
     model_path = os.environ["VLLM_RWKV_TEST_MODEL"]
     params = SamplingParams(
         temperature=0,
@@ -934,21 +945,28 @@ def test_real_model_batching_preserves_greedy_tokens_and_logprobs(
         detokenize=False,
     )
     prompt = {"prompt_token_ids": list(range(1, 66))}
-    with vllm_runner(
-        model_path,
-        dtype="bfloat16",
-        max_model_len=128,
-        max_num_batched_tokens=32,
-        max_num_seqs=4,
-        mamba_ssm_cache_dtype="float32",
-        enable_chunked_prefill=True,
-        enable_prefix_caching=prefix_caching,
-        compilation_config={"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]},
-    ) as runner:
-        single = runner.llm.generate([prompt], params)[0].outputs[0]
-        mixed = runner.llm.generate([{"prompt_token_ids": [7, 8, 9]}, prompt], params)[
-            1
-        ].outputs[0]
-    assert len(single.token_ids) == 4
-    assert mixed.token_ids == single.token_ids
-    assert mixed.logprobs == single.logprobs
+    reference = None
+    for enforce_eager, token_budget in ((True, 128), (False, 32)):
+        with vllm_runner(
+            model_path,
+            dtype="bfloat16",
+            max_model_len=128,
+            max_num_batched_tokens=token_budget,
+            max_num_seqs=4,
+            mamba_ssm_cache_dtype=state_dtype,
+            enable_chunked_prefill=True,
+            enable_prefix_caching=prefix_caching,
+            enforce_eager=enforce_eager,
+            compilation_config={"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]},
+        ) as runner:
+            single = runner.llm.generate([prompt], params)[0].outputs[0]
+            mixed = runner.llm.generate(
+                [{"prompt_token_ids": [7, 8, 9]}, prompt], params
+            )[1].outputs[0]
+        assert len(single.token_ids) == 4
+        assert mixed.token_ids == single.token_ids
+        assert mixed.logprobs == single.logprobs
+        if reference is not None:
+            assert single.token_ids == reference.token_ids
+            assert single.logprobs == reference.logprobs
+        reference = single

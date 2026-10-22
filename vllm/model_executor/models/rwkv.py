@@ -70,9 +70,11 @@ _FLASHRWKV2_APIS = (
     "infer_sampling_six_parameter_forward_varlen",
     "infer_tmix_postnorm_tokenshift_forward_varlen",
     "infer_tmix_readout_forward_varlen",
+    "infer_tmix_wkv7_recurrent_fp16_forward_varlen",
     "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
     "infer_tmix_wkv_prepare_forward_varlen",
     "prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor",
+    "prepare_tmix_wkv7_recurrent_fp16_state_from_tensor",
     "prepare_tmix_wkv7_recurrent_metadata",
     "setup_sampling_states",
 )
@@ -135,6 +137,11 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         self.hidden_size = config.hidden_size
         self.head_size = config.head_size
         self.num_heads = config.num_attention_heads
+        self.state_dtype = (
+            torch.float16
+            if vllm_config.cache_config.mamba_ssm_cache_dtype == "float16"
+            else torch.float32
+        )
         self._vllm_config = vllm_config
         self._spec: RwkvStateSpec | None = None
         self._num_slots = 0
@@ -161,7 +168,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
                 (layer_count, self.hidden_size),
                 (layer_count, self.num_heads, self.head_size, self.head_size),
             ),
-            dtypes=(torch.bfloat16, torch.bfloat16, torch.float32),
+            dtypes=(torch.bfloat16, torch.bfloat16, self.state_dtype),
             mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
             num_prefill_checkpoint_blocks=0,
         )
@@ -217,22 +224,25 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
             raw,
             offset,
             (layer_count, slot_count, self.num_heads, self.head_size, self.head_size),
-            torch.float32,
+            self.state_dtype,
         )
         if offset != total_bytes:
             raise ValueError("RWKV state pool layout does not fill its allocation")
 
         flashrwkv2 = _load_flashrwkv2()
+        prepare_state = (
+            flashrwkv2.prepare_tmix_wkv7_recurrent_fp16_state_from_tensor
+            if self.state_dtype == torch.float16
+            else flashrwkv2.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor
+        )
         self._wkv_handles = []
         for layer_idx in range(layer_count):
-            handle = flashrwkv2.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(
-                self._wkv_state_pool[layer_idx]
-            )
+            handle = prepare_state(self._wkv_state_pool[layer_idx])
             expected_state_bytes = (
                 self.num_heads
                 * self.head_size
                 * self.head_size
-                * torch.empty((), dtype=torch.float32).element_size()
+                * self._wkv_state_pool.element_size()
             )
             expected_fixed_bytes = 0
             handle_layout = handle.memory_layout
@@ -490,6 +500,7 @@ class RwkvAttention(nn.Module):
         attention_shift: torch.Tensor,
         wkv_state: object,
         metadata: RwkvAttentionMetadata,
+        state_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flashrwkv2 = _load_flashrwkv2()
         ticket = metadata.validated_metadata
@@ -559,7 +570,12 @@ class RwkvAttention(nn.Module):
                 max_seqlen=metadata.max_seqlen,
             )
         )
-        wkv_output = flashrwkv2.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+        recurrent = (
+            flashrwkv2.infer_tmix_wkv7_recurrent_fp16_forward_varlen
+            if state_dtype == torch.float16
+            else flashrwkv2.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen
+        )
+        wkv_output = recurrent(
             receptance.view(-1, self.num_heads, self.head_size),
             decay.view(-1, self.num_heads, self.head_size),
             key.view(-1, self.num_heads, self.head_size),
@@ -664,6 +680,7 @@ class RwkvDecoderLayer(nn.Module):
         v_first: torch.Tensor | None,
         state: tuple[torch.Tensor, object, torch.Tensor] | None,
         metadata: RwkvAttentionMetadata | None,
+        state_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if metadata is None:
             receptance, _ = self.linear_attn.r_proj(hidden_states)
@@ -683,6 +700,7 @@ class RwkvDecoderLayer(nn.Module):
             attention_shift,
             wkv_state,
             metadata,
+            state_dtype,
         )
         hidden_states, residual = self.mlp(
             residual,
@@ -815,6 +833,7 @@ class RwkvModel(nn.Module):
                 v_first,
                 state,
                 metadata,
+                self.rwkv_state.state_dtype,
             )
         if metadata is None:
             residual = torch.zeros_like(hidden_states)
