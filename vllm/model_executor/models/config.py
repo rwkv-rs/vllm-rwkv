@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import math
 from typing import TYPE_CHECKING
 
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
@@ -1052,6 +1053,41 @@ class LongcatFlashNgramForCausalLMConfig(VerifyAndUpdateConfig):
 
 
 class RwkvForCausalLMConfig(VerifyAndUpdateConfig):
+    LORA_KEYS = frozenset(("r", "lora_alpha", "use_nora", "target_modules"))
+    LORA_TARGET_MODULES = frozenset(
+        ("r_proj", "k_proj", "v_proj", "o_proj", "mlp.key", "mlp.value", "lm_head")
+    )
+
+    @staticmethod
+    def verify_lora_config(lora: object) -> None:
+        keys = RwkvForCausalLMConfig.LORA_KEYS
+        targets = RwkvForCausalLMConfig.LORA_TARGET_MODULES
+        if not isinstance(lora, dict) or lora.keys() != keys:
+            raise ValueError(f"rwkv_lora requires exactly the keys {sorted(keys)}")
+        rank = lora["r"]
+        if isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0:
+            raise ValueError("rwkv_lora.r must be a positive integer")
+        alpha = lora["lora_alpha"]
+        if (
+            isinstance(alpha, bool)
+            or not isinstance(alpha, (int, float))
+            or not math.isfinite(alpha)
+        ):
+            raise ValueError("rwkv_lora.lora_alpha must be a finite number")
+        if not isinstance(lora["use_nora"], bool):
+            raise ValueError("rwkv_lora.use_nora must be a bool")
+        modules = lora["target_modules"]
+        if (
+            not isinstance(modules, (list, tuple))
+            or not modules
+            or not all(isinstance(module, str) for module in modules)
+            or not set(modules) <= targets
+        ):
+            raise ValueError(
+                "rwkv_lora.target_modules must be a non-empty list drawn from "
+                f"{sorted(targets)}"
+            )
+
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         import torch
@@ -1084,6 +1120,9 @@ class RwkvForCausalLMConfig(VerifyAndUpdateConfig):
             raise ValueError("RWKV Rapid-Sampling does not support trace replay")
         if vllm_config.lora_config is not None:
             raise ValueError("RWKV does not support vLLM LoRA adapters")
+        lora = getattr(model_config.hf_config, "rwkv_lora", None)
+        if lora is not None:
+            RwkvForCausalLMConfig.verify_lora_config(lora)
         if (
             vllm_config.quant_config is not None
             or model_config.quantization is not None
