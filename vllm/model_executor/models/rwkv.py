@@ -118,6 +118,45 @@ def _validate_config(config: Any) -> None:
         raise ValueError("RWKV requires untied embedding and LM-head weights")
 
 
+def _add_lora(layer: nn.Module, config: Any, target: str, prefix: str) -> None:
+    """Register an unmerged FP32 PEFT LoRA/NoRA adapter on a bias-free layer."""
+    lora = getattr(config, "rwkv_lora", None)
+    if lora is None or target not in lora["target_modules"]:
+        return
+    rank = lora["r"]
+    out_features, in_features = layer.weight.shape
+    layer.lora_A = ReplicatedLinear(
+        in_features,
+        rank,
+        bias=False,
+        params_dtype=torch.float32,
+        prefix=f"{prefix}.lora_A",
+    )
+    layer.lora_B = ReplicatedLinear(
+        rank,
+        out_features,
+        bias=False,
+        params_dtype=torch.float32,
+        prefix=f"{prefix}.lora_B",
+    )
+    nn.init.zeros_(layer.lora_A.weight)
+    nn.init.zeros_(layer.lora_B.weight)
+    layer.lora_scale = lora["lora_alpha"] / rank
+    layer.use_nora = lora["use_nora"]
+
+
+def _lora_kwargs(layer: Any, prefix: str) -> dict[str, Any]:
+    """FlashRWKV2 keyword arguments for the raw adapter of one projection."""
+    if not hasattr(layer, "lora_A"):
+        return {}
+    return {
+        f"{prefix}lora_a": layer.lora_A.weight,
+        f"{prefix}lora_b": layer.lora_B.weight,
+        f"{prefix}lora_scale": layer.lora_scale,
+        f"{prefix}use_nora": layer.use_nora,
+    }
+
+
 class RwkvStateLayer(nn.Module, AttentionLayerBase):
     """One scheduler-visible state layer for all local RWKV decoder layers."""
 
@@ -450,6 +489,8 @@ class RwkvAttention(nn.Module):
             params_dtype=dtype,
             prefix=f"{prefix}.o_proj",
         )
+        for name in ("r_proj", "k_proj", "v_proj", "o_proj"):
+            _add_lora(getattr(self, name), config, name, f"{prefix}.{name}")
         self.g_norm = nn.GroupNorm(
             self.num_heads,
             channels,
@@ -565,6 +606,9 @@ class RwkvAttention(nn.Module):
                 a2_runtime=self.a2,
                 g2_runtime=self.g2,
                 v2_runtime=v2_runtime,
+                **_lora_kwargs(self.r_proj, "receptance_"),
+                **_lora_kwargs(self.k_proj, "key_"),
+                **_lora_kwargs(self.v_proj, "value_"),
                 head_size=self.head_size,
                 batch_size=metadata.batch_size,
                 max_seqlen=metadata.max_seqlen,
@@ -599,6 +643,7 @@ class RwkvAttention(nn.Module):
             self.g_norm.bias,
             gate,
             self.o_proj.weight,
+            **_lora_kwargs(self.o_proj, "output_"),
             head_size=self.head_size,
             batch_size=metadata.batch_size,
             max_seqlen=metadata.max_seqlen,
@@ -625,6 +670,8 @@ class RwkvFeedForward(nn.Module):
             params_dtype=torch.bfloat16,
             prefix=f"{prefix}.value",
         )
+        _add_lora(self.key, config, "mlp.key", f"{prefix}.key")
+        _add_lora(self.value, config, "mlp.value", f"{prefix}.value")
 
     def process_weights_after_loading(self) -> None:
         self.value.weight.data = self.value.weight.T.contiguous()
@@ -653,6 +700,8 @@ class RwkvFeedForward(nn.Module):
             eps=self.config.layer_norm_epsilon,
             validated_metadata=metadata.validated_metadata,
             deterministic=torch.are_deterministic_algorithms_enabled(),
+            **_lora_kwargs(self.key, "key_"),
+            **_lora_kwargs(self.value, "value_"),
         )
 
 
@@ -879,6 +928,7 @@ class RwkvForCausalLM(
                 params_dtype=torch.bfloat16,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
+            _add_lora(self.lm_head, config, "lm_head", maybe_prefix(prefix, "lm_head"))
         else:
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config.vocab_size, logits_as_input=True)
@@ -911,7 +961,7 @@ class RwkvForCausalLM(
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         logits = _load_flashrwkv2().infer_head_linear_all_forward_varlen(
-            hidden_states, self.lm_head.weight
+            hidden_states, self.lm_head.weight, **_lora_kwargs(self.lm_head, "")
         )
         return self.logits_processor(
             self.lm_head, logits[..., : self.config.vocab_size]
