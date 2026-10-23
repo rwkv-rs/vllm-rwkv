@@ -587,6 +587,196 @@ def test_head_preserves_provider_fp32_logits_and_trims_padding(monkeypatch) -> N
     assert result[0, 1] > result[0, 0]
 
 
+_LORA = {
+    "r": 4,
+    "lora_alpha": 8,
+    "use_nora": True,
+    "target_modules": ["r_proj", "o_proj", "mlp.value", "lm_head"],
+}
+
+
+def _tiny_model_vllm_config(rwkv_lora: dict | None) -> SimpleNamespace:
+    vllm_config = _state_vllm_config()
+    vllm_config.model_config.hf_config = SimpleNamespace(
+        architecture_version="rwkv7",
+        head_size=64,
+        hidden_size=128,
+        num_attention_heads=2,
+        intermediate_size=512,
+        num_hidden_layers=2,
+        decay_low_rank_dim=8,
+        a_low_rank_dim=8,
+        v_low_rank_dim=8,
+        gate_low_rank_dim=8,
+        group_norm_epsilon=64e-5,
+        layer_norm_epsilon=1e-5,
+        vocab_size=256,
+        tie_word_embeddings=False,
+        rwkv_lora=rwkv_lora,
+    )
+    return vllm_config
+
+
+@pytest.fixture
+def _single_rank(monkeypatch, default_vllm_config):
+    group = SimpleNamespace(
+        rank_in_group=0, world_size=1, is_first_rank=True, is_last_rank=True
+    )
+    monkeypatch.setattr("vllm.distributed.parallel_state._TP", group)
+    monkeypatch.setattr("vllm.distributed.parallel_state._PP", group)
+
+
+def test_config_accepts_rwkv_lora() -> None:
+    vllm_config = _config()
+    vllm_config.model_config.hf_config.rwkv_lora = dict(_LORA)
+    RwkvForCausalLMConfig.verify_and_update_config(vllm_config)
+
+
+@pytest.mark.parametrize(
+    ("rwkv_lora", "message"),
+    [
+        ({**_LORA, "lora_dropout": 0.0}, "exactly the keys"),
+        ({k: v for k, v in _LORA.items() if k != "use_nora"}, "exactly the keys"),
+        ({**_LORA, "r": 0}, "positive integer"),
+        ({**_LORA, "r": True}, "positive integer"),
+        ({**_LORA, "lora_alpha": "8"}, "finite number"),
+        ({**_LORA, "use_nora": 1}, "must be a bool"),
+        ({**_LORA, "target_modules": []}, "target_modules"),
+        ({**_LORA, "target_modules": ["q_proj"]}, "target_modules"),
+        ({**_LORA, "target_modules": "r_proj"}, "target_modules"),
+    ],
+)
+def test_config_rejects_invalid_rwkv_lora(rwkv_lora, message) -> None:
+    vllm_config = _config()
+    vllm_config.model_config.hf_config.rwkv_lora = rwkv_lora
+    with pytest.raises(ValueError, match=message):
+        RwkvForCausalLMConfig.verify_and_update_config(vllm_config)
+
+
+@pytest.mark.usefixtures("_single_rank")
+def test_lora_registers_fp32_peft_adapters_loaded_in_place() -> None:
+    base = RwkvForCausalLM(vllm_config=_tiny_model_vllm_config(None))
+    model = RwkvForCausalLM(vllm_config=_tiny_model_vllm_config(_LORA))
+    adapters = {
+        name: param for name, param in model.named_parameters() if ".lora_" in name
+    }
+    expected = {"lm_head.lora_A.weight": (4, 128), "lm_head.lora_B.weight": (256, 4)}
+    for layer in range(2):
+        for module, in_features in (
+            ("linear_attn.r_proj", 128),
+            ("linear_attn.o_proj", 128),
+            ("mlp.value", 512),
+        ):
+            prefix = f"model.layers.{layer}.{module}"
+            expected[f"{prefix}.lora_A.weight"] = (4, in_features)
+            expected[f"{prefix}.lora_B.weight"] = (128, 4)
+
+    assert {name for name, _ in base.named_parameters()} == {
+        name for name, _ in model.named_parameters()
+    } - set(adapters)
+    assert {name: tuple(param.shape) for name, param in adapters.items()} == expected
+    assert all(param.dtype == torch.float32 for param in adapters.values())
+    assert all(not param.any() for param in adapters.values())
+    assert model.lm_head.lora_scale == 2.0
+    assert model.lm_head.use_nora
+
+    weights = {name: torch.randn(shape) for name, shape in expected.items()}
+    storage = {name: param.data_ptr() for name, param in adapters.items()}
+    assert model.load_weights(weights.items()) == set(expected)
+    for name, param in adapters.items():
+        assert param.data_ptr() == storage[name]
+        assert param.dtype == torch.float32
+        assert torch.equal(param, weights[name])
+
+
+def _adapter_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: id(value) if isinstance(value, torch.Tensor) else value
+        for key, value in kwargs.items()
+        if "lora" in key or "nora" in key
+    }
+
+
+@pytest.mark.usefixtures("_single_rank")
+@pytest.mark.parametrize("rwkv_lora", [None, _LORA])
+def test_lora_passes_raw_adapters_to_flashrwkv2(monkeypatch, rwkv_lora) -> None:
+    calls: dict[str, dict[str, Any]] = {}
+    hidden = torch.zeros(1, 128, dtype=torch.bfloat16)
+
+    def record(name: str, result: object):
+        def operator(*args, **kwargs):
+            calls[name] = kwargs
+            return result
+
+        return operator
+
+    module: Any = _fake_flashrwkv2()
+    for name, result in (
+        ("infer_tmix_postnorm_tokenshift_forward_varlen", (hidden,) * 7),
+        ("infer_tmix_wkv_prepare_forward_varlen", (hidden,) * 8),
+        ("infer_tmix_wkv7_recurrent_fp32io16_forward_varlen", hidden),
+        ("infer_tmix_readout_forward_varlen", hidden),
+        ("infer_cmix_forward_varlen", (hidden, hidden)),
+        ("infer_head_linear_all_forward_varlen", torch.zeros(1, 256)),
+    ):
+        setattr(module, name, record(name, result))
+    monkeypatch.setitem(sys.modules, "flashrwkv2", module)
+
+    model = RwkvForCausalLM(vllm_config=_tiny_model_vllm_config(rwkv_lora))
+    layer = model.model.layers[1]
+    metadata = SimpleNamespace(
+        validated_metadata=None,
+        cu_seqlens=torch.tensor([0, 1], dtype=torch.int32),
+        state_indices=torch.tensor([0], dtype=torch.int32),
+        max_seqlen=1,
+        batch_size=1,
+    )
+    layer.linear_attn.process_weights_after_loading()
+    layer.linear_attn(
+        hidden,
+        hidden,
+        layer.input_layernorm,
+        hidden,
+        hidden,
+        object(),
+        metadata,
+        torch.float32,
+    )
+    layer.mlp(hidden, hidden, layer.post_attention_layernorm, hidden, metadata)
+    model.compute_logits(hidden)
+
+    adapter_calls = {name: _adapter_kwargs(kwargs) for name, kwargs in calls.items()}
+    assert len(adapter_calls) == 6
+    if rwkv_lora is None:
+        assert all(not kwargs for kwargs in adapter_calls.values())
+        return
+    attention, feed_forward = layer.linear_attn, layer.mlp
+    assert adapter_calls["infer_tmix_wkv_prepare_forward_varlen"] == {
+        "receptance_lora_a": id(attention.r_proj.lora_A.weight),
+        "receptance_lora_b": id(attention.r_proj.lora_B.weight),
+        "receptance_lora_scale": 2.0,
+        "receptance_use_nora": True,
+    }
+    assert adapter_calls["infer_tmix_readout_forward_varlen"] == {
+        "output_lora_a": id(attention.o_proj.lora_A.weight),
+        "output_lora_b": id(attention.o_proj.lora_B.weight),
+        "output_lora_scale": 2.0,
+        "output_use_nora": True,
+    }
+    assert adapter_calls["infer_cmix_forward_varlen"] == {
+        "value_lora_a": id(feed_forward.value.lora_A.weight),
+        "value_lora_b": id(feed_forward.value.lora_B.weight),
+        "value_lora_scale": 2.0,
+        "value_use_nora": True,
+    }
+    assert adapter_calls["infer_head_linear_all_forward_varlen"] == {
+        "lora_a": id(model.lm_head.lora_A.weight),
+        "lora_b": id(model.lm_head.lora_B.weight),
+        "lora_scale": 2.0,
+        "use_nora": True,
+    }
+
+
 def test_config_accepts_pipeline_parallel_size_two() -> None:
     vllm_config = _config()
     vllm_config.parallel_config.pipeline_parallel_size = 2
