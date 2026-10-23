@@ -148,11 +148,43 @@ vllm serve <model> \
 The parser supports streaming and non-streaming requests with automatic,
 required, or named tool choice. Do not pass a copied chat template.
 
+## Unmerged LoRA and NoRA adapters
+
+RL trainers that keep one PEFT LoRA or NoRA adapter unmerged can serve it
+directly. Enable it with the `rwkv_lora` config attribute:
+
+```bash
+vllm serve <model> \
+  --dtype bfloat16 \
+  --enable-chunked-prefill \
+  --hf-overrides '{"rwkv_lora": {"r": 256, "lora_alpha": 256, "use_nora": true, "target_modules": ["r_proj", "k_proj", "v_proj", "o_proj", "lm_head"]}}'
+```
+
+`r`, `lora_alpha`, `use_nora`, and `target_modules` are all required. The scale
+is `lora_alpha / r`. `target_modules` is a subset of `r_proj`, `k_proj`,
+`v_proj`, `o_proj`, `mlp.key`, `mlp.value`, and `lm_head`, with PEFT suffix
+matching. Each targeted projection gets zero-initialized FP32 parameters in
+PEFT layout, `lora_A.weight` `[r, in_features]` and `lora_B.weight`
+`[out_features, r]`, named after the base weight, for example
+`model.layers.3.linear_attn.r_proj.lora_A.weight`,
+`model.layers.3.mlp.value.lora_B.weight`, and `lm_head.lora_A.weight`.
+`mlp.value` keeps the checkpoint layout, `[r, intermediate_size]` and
+`[hidden_size, r]`, although its base weight is transposed after loading.
+Pipeline stages create adapters only for the projections they own.
+
+`load_weights` copies adapter tensors into the existing FP32 storage, so
+captured CUDA Graphs stay valid across updates. The raw adapters, scale, and
+NoRA flag are passed to the FlashRWKV2 projection operators, which apply NoRA
+normalization from the raw A matrix. These are the operators and arguments of
+the `transformers-rwkv` forward with an active unmerged PEFT adapter. Without
+`rwkv_lora`, the model has no adapter parameters and passes no adapter
+arguments.
+
 ## Unsupported features
 
 RWKV rejects tensor parallelism, decode or prefill context parallelism,
-speculative decoding, quantized weights, vLLM LoRA adapters, KV cache
-offloading/connectors, ReplaySSM, stochastic cache rounding, and Mamba cache
-mode `all`. Multiplicative `repetition_penalty`, `min_p`, processed logprobs,
+speculative decoding, quantized weights, vLLM LoRA adapters (`--enable-lora`),
+KV cache offloading/connectors, ReplaySSM, stochastic cache rounding, and Mamba
+cache mode `all`. Multiplicative `repetition_penalty`, `min_p`, processed logprobs,
 sampling masks, and trace replay are not supported by Rapid-Sampling. Pipeline
 parallel sizes other than one or two are also rejected.
