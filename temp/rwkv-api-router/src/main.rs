@@ -27,7 +27,7 @@ use clap::Parser;
 use futures::future::try_join_all;
 use http_body_util::{Full, LengthLimitError};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use hyper_util::rt::{TokioExecutor, TokioTimer};
+use hyper_util::rt::TokioExecutor;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -52,7 +52,7 @@ struct Config {
     port: u16,
     #[arg(long, default_value = "4")]
     worker_threads: NonZeroUsize,
-    /// Override a model's HTTP upstream; repeat for multiple models.
+    /// Configure model names and HTTP upstreams; repeat for multiple models.
     #[arg(long, value_name = "MODEL=URL")]
     upstream: Vec<String>,
 }
@@ -60,18 +60,16 @@ struct Config {
 struct AppState {
     client: Client<HttpConnector, Full<Bytes>>,
     api_key_sha256: [u8; 32],
-    upstreams: Vec<(&'static str, Uri)>,
+    upstreams: Vec<(String, Uri)>,
 }
 
 impl AppState {
-    fn new(api_key_sha256: [u8; 32], upstreams: Vec<(&'static str, Uri)>) -> Self {
+    fn new(api_key_sha256: [u8; 32], upstreams: Vec<(String, Uri)>) -> Self {
         let mut connector = HttpConnector::new();
         connector.set_connect_timeout(Some(Duration::from_secs(5)));
         connector.set_nodelay(true);
         let client = Client::builder(TokioExecutor::new())
-            .pool_timer(TokioTimer::new())
-            .pool_idle_timeout(Duration::from_secs(60))
-            .pool_max_idle_per_host(4096)
+            .pool_max_idle_per_host(0)
             .build(connector);
         Self {
             client,
@@ -222,7 +220,7 @@ async fn forward(
     request.headers_mut().remove(AUTHORIZATION);
     request.headers_mut().remove(HOST);
     let mut response = state.client.request(request).await.map_err(|err| {
-        eprintln!("upstream request failed: {err:?}");
+        eprintln!("upstream request to {upstream} failed: {err:?}");
         error(StatusCode::BAD_GATEWAY, "Upstream request failed")
     })?;
     strip_hop_by_hop(response.headers_mut());
@@ -335,19 +333,21 @@ async fn proxy(State(state): State<Arc<AppState>>, request: Request) -> Result<R
     .await
 }
 
-fn configured_upstreams(overrides: &[String]) -> anyhow::Result<Vec<(&'static str, Uri)>> {
-    let mut upstreams: Vec<_> = MODEL_UPSTREAMS
-        .iter()
-        .map(|&(model, url)| (model, url.parse::<Uri>().expect("static upstream URI")))
-        .collect();
-    for value in overrides {
+fn configured_upstreams(configured: &[String]) -> anyhow::Result<Vec<(String, Uri)>> {
+    if configured.is_empty() {
+        return Ok(MODEL_UPSTREAMS
+            .iter()
+            .map(|&(model, url)| (model.to_owned(), url.parse().expect("static upstream URI")))
+            .collect());
+    }
+    let mut upstreams = Vec::new();
+    for value in configured {
         let (model, url) = value
             .split_once('=')
             .context("upstream must be MODEL=URL")?;
-        let entry = upstreams
-            .iter_mut()
-            .find(|(name, _)| *name == model)
-            .with_context(|| format!("Unknown model: {model}"))?;
+        if model.is_empty() {
+            bail!("upstream model name must not be empty");
+        }
         let uri: Uri = url.parse().context("invalid upstream URI")?;
         if uri.scheme_str() != Some("http")
             || uri.authority().is_none()
@@ -359,7 +359,7 @@ fn configured_upstreams(overrides: &[String]) -> anyhow::Result<Vec<(&'static st
         {
             bail!("upstream must be an HTTP origin without credentials, path, or query");
         }
-        entry.1 = uri;
+        upstreams.push((model.to_owned(), uri));
     }
     Ok(upstreams)
 }
@@ -451,7 +451,7 @@ mod tests {
         fn app(&self) -> Router {
             build_router(Arc::new(AppState::new(
                 Sha256::digest(TOKEN.as_bytes()).into(),
-                vec![(MODEL, self.uri.clone())],
+                vec![(MODEL.to_owned(), self.uri.clone())],
             )))
         }
     }
@@ -791,7 +791,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_requests_reuse_the_upstream_tcp_connection() {
+    async fn completed_requests_do_not_reuse_the_upstream_tcp_connection() {
         let upstream = TestServer::start(Router::new().route(
             "/v1/chat/completions",
             post(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.to_string() }),
@@ -807,7 +807,28 @@ mod tests {
                     .unwrap(),
             );
         }
-        assert_eq!(peers[0], peers[1]);
+        assert_ne!(peers[0], peers[1]);
+    }
+
+    #[tokio::test]
+    async fn non_streaming_responses_can_wait_for_generation() {
+        let upstream = TestServer::start(Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                Json(json!({"choices": [{"message": {"content": "complete"}}]}))
+            }),
+        ))
+        .await;
+        let response = timeout(TEST_TIMEOUT, upstream.app().oneshot(completion_request()))
+            .await
+            .expect("active request was interrupted")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await["choices"][0]["message"]["content"],
+            "complete"
+        );
     }
 
     #[tokio::test]
@@ -828,7 +849,7 @@ mod tests {
                 }),
             ))
             .await;
-            upstreams.push((name, server.uri.clone()));
+            upstreams.push((name.to_owned(), server.uri.clone()));
             servers.push(server);
         }
         let app = build_router(Arc::new(AppState::new(
@@ -885,7 +906,7 @@ mod tests {
         drop(listener);
         let app = build_router(Arc::new(AppState::new(
             Sha256::digest(TOKEN.as_bytes()).into(),
-            vec![(MODEL, uri)],
+            vec![(MODEL.to_owned(), uri)],
         )));
         let response = timeout(TEST_TIMEOUT, app.oneshot(completion_request()))
             .await
@@ -899,14 +920,18 @@ mod tests {
     }
 
     #[test]
-    fn upstream_overrides_accept_only_known_models_and_http_origins() {
-        let upstreams = configured_upstreams(&[format!("{MODEL}=http://127.0.0.1:8000")]).unwrap();
-        assert_eq!(
-            upstreams.iter().find(|(name, _)| *name == MODEL).unwrap().1,
-            "http://127.0.0.1:8000"
-        );
+    fn configured_upstreams_use_model_names_from_configuration() {
+        let model = "rwkv7-g1l-7.2b";
+        let upstreams = configured_upstreams(&[format!("{model}=http://127.0.0.1:8000")]).unwrap();
+        assert_eq!(upstreams.len(), 1);
+        assert_eq!(upstreams[0].0, model);
+        assert_eq!(upstreams[0].1, "http://127.0.0.1:8000");
+    }
+
+    #[test]
+    fn configured_upstreams_require_model_names_and_http_origins() {
         for value in [
-            "unknown=http://127.0.0.1:8000".to_owned(),
+            "=http://127.0.0.1:8000".to_owned(),
             format!("{MODEL}=https://127.0.0.1:8000"),
             format!("{MODEL}=http://user@127.0.0.1:8000"),
             format!("{MODEL}=http://127.0.0.1:8000/base"),
