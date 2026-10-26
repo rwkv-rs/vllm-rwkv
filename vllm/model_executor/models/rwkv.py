@@ -996,8 +996,7 @@ class RwkvForCausalLM(
                 batch = metadata.sequence_capacity
                 tokens = metadata.token_capacity
                 slots = torch.arange(
-                    1,
-                    batch + 1,
+                    batch,
                     dtype=torch.int32,
                     device=metadata.state_indices.device,
                 )
@@ -1018,7 +1017,7 @@ class RwkvForCausalLM(
                     validated_metadata=None,
                     retain_ticket=False,
                 )
-                # Startup owns these free slots; restore them before capture.
+                # Restore startup scratch slots before capture.
                 state.reset_state_slots(slots)
                 try:
                     with set_forward_context(active_metadata, self.vllm_config):

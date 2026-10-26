@@ -666,7 +666,7 @@ def test_tuning_restores_startup_slots_after_active_preparation(monkeypatch, fai
         num_active_sequences=torch.zeros(1, dtype=torch.int32),
         retain_ticket=True,
     )
-    pool = torch.zeros(3, dtype=torch.float32)
+    pool = torch.zeros(2, dtype=torch.float32)
     modes = []
     context = metadata
 
@@ -681,7 +681,7 @@ def test_tuning_restores_startup_slots_after_active_preparation(monkeypatch, fai
         if context is not metadata:
             assert context.num_active_tokens.item() == 4
             assert context.num_active_sequences.item() == 2
-            assert context.state_indices.tolist() == [1, 2]
+            assert context.state_indices.tolist() == [0, 1]
             assert context.cu_seqlens.tolist() == [0, 2, 4]
             assert not context.retain_ticket
             pool.index_fill_(0, context.state_indices.long(), 1)
