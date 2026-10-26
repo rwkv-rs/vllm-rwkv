@@ -68,8 +68,9 @@ FlashRWKV2 tuning profiles are published under
 and verifies profiles for the installed source, CUDA/TileLang environment, and
 GPU through FlashRWKV2's profile reader. Shape, dtype, and stride matching
 remain part of the operator's lookup key. Publish newly validated profiles
-before deploying a revision that changes that cache key. The extension,
-TileLang, and vLLM compilation caches remain local to each release.
+before deploying a revision that changes that cache key. The extension and
+vLLM compilation caches remain local to each release. TileLang retains its
+default `~/.tilelang/cache` directory.
 
 The deployment commands use BF16 weights, FP16 WKV state, prefix caching off,
 and a 1024-token batch budget. Full CUDA Graphs use that token budget as their
@@ -91,8 +92,9 @@ Data-parallel replicas each hold the full model and their own state pool.
 The scheduler allocates its state pool from the profiled GPU memory budget,
 so `--max-num-seqs` limits active sequences rather than total allocated slots.
 
-The 2026-10-26 serving sweep used the installed g1l checkpoints, FlashRWKV2 a16,
-128 random input tokens, greedy sampling, and streaming completions. Request
+Before publishing tuning profiles, the 2026-10-26 serving sweep used the installed
+g1l checkpoints, FlashRWKV2 a16, 128 random input tokens, greedy sampling, and
+streaming completions. Request
 count and client concurrency both equaled the per-GPU batch size times the
 number of data-parallel replicas. Output throughput includes prefill and decode.
 
@@ -113,7 +115,25 @@ reduced long-output throughput for 1.5B, 7.2B, and 13.3B. The 2.9B result remain
 slightly higher at 1024 than at 512. The 13.3B allocation supplied approximately
 476 FP16 state slots per GPU, including the scheduler's reserved slot.
 
-Reproduce a row on the model host with its local tokenizer and port:
+The profile deployment comparison used 128 input and 1024 output tokens for all
+four models, with the same sampling settings and seed 20261026. Each model ran
+once before and once after deployment. All requests completed successfully.
+The deployed profiles cover the per-GPU decode batch and 1024-token prefill:
+
+| Model | Batch per GPU | Requests/concurrency | Before output tokens/s | After output tokens/s | Change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1.5B | 256 | 256 | 13,248 | 14,477 | +9.3% |
+| 2.9B | 1024 | 1024 | 9,444 | 10,681 | +13.1% |
+| 7.2B DP2 | 256 | 512 | 4,599 | 10,753 | +133.8% |
+| 13.3B DP4 | 256 | 1024 | 4,335 | 7,359 | +69.8% |
+
+[PR #80](https://github.com/rwkv-rs/vllm-rwkv/pull/80) records the baseline and
+deployed revisions, raw artifact locations, latency measurements, and
+production validation. New processes using the production installations
+verified actual dispatch hits for all 50 published profiles: 36 on the
+small-model host and 14 on the 13.3B host.
+
+Reproduce the 7.2B DP2 profile comparison on its model host:
 
 ```bash
 ulimit -n 65536
@@ -121,7 +141,7 @@ timeout 600s .venv/bin/vllm bench serve \
   --backend openai --base-url http://127.0.0.1:18003 \
   --endpoint /v1/completions --model rwkv7-g1l-7.2b \
   --tokenizer /srv/rwkv/models/rwkv-g1l-7b-temp-3797 \
-  --dataset-name random --random-input-len 128 --random-output-len 512 \
+  --dataset-name random --random-input-len 128 --random-output-len 1024 \
   --num-prompts 512 --max-concurrency 512 --ignore-eos \
   --temperature 0 --seed 20261026 --disable-tqdm \
   --extra-body '{"top_k":1,"presence_penalty":0,"frequency_penalty":0,"penalty_decay":1}'
