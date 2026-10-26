@@ -1255,14 +1255,16 @@ def test_config_accepts_async_scheduling() -> None:
 )
 @pytest.mark.parametrize("prefix_caching", [False, True])
 @pytest.mark.parametrize("state_dtype", ["float32", "float16"])
-def test_real_model_batching_preserves_greedy_tokens_and_logprobs(
-    vllm_runner, prefix_caching, state_dtype
+@pytest.mark.parametrize("temperature", [0.0, 0.8])
+def test_real_model_batching_preserves_tokens_and_logprobs(
+    vllm_runner, prefix_caching, state_dtype, temperature
 ) -> None:
     """Each state mode agrees across prefill, batching and graph execution."""
     model_path = os.environ["VLLM_RWKV_TEST_MODEL"]
     params = SamplingParams(
-        temperature=0,
-        top_k=1,
+        temperature=temperature,
+        top_k=1 if temperature == 0 else 20,
+        seed=20261026,
         max_tokens=4,
         ignore_eos=True,
         logprobs=3,
