@@ -51,11 +51,11 @@ class TestDefaultPrefixes:
 class TestDefaultExtraVars:
     """Individual vars listed in VLLM_RAY_EXTRA_ENV_VARS_TO_COPY's default."""
 
-    def test_pythonhashseed_in_result(self):
-        """PYTHONHASHSEED should always be in the result set (as a name to
-        copy) regardless of whether it is actually set in os.environ."""
+    def test_cache_and_seed_names_in_result(self):
+        """Shared cache and seed names are copied when present in the driver."""
         result = get_env_vars_to_copy()
         assert "PYTHONHASHSEED" in result
+        assert "FLASHRWKV2_CACHE_DIR" in result
 
 
 # ---------------------------------------------------------------------------

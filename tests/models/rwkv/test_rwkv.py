@@ -3,6 +3,7 @@
 
 import os
 import sys
+from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -67,7 +68,9 @@ class _FakeStateHandle:
 
 def _fake_flashrwkv2() -> ModuleType:
     module: Any = ModuleType("flashrwkv2")
-    module.__version__ = "0.1.0a16"
+    module.__version__ = "0.1.0a17"
+    module.get_tuning_cache_dir = lambda: None
+    module.prepare_tuning = lambda calls, **kwargs: [call() for call in calls]
 
     module.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor = _FakeStateHandle
     module.prepare_tmix_wkv7_recurrent_fp16_state_from_tensor = _FakeStateHandle
@@ -585,6 +588,140 @@ def test_head_preserves_provider_fp32_logits_and_trims_padding(monkeypatch) -> N
     assert result.dtype == torch.float32
     assert torch.equal(result, logits[:, :2])
     assert result[0, 1] > result[0, 0]
+
+
+@pytest.mark.parametrize("capturing", [False, True])
+def test_graph_warmup_checks_coverage_without_repeating_state_updates(
+    monkeypatch, capturing
+) -> None:
+    """Coverage executes the existing warmup once and stays outside capture."""
+    module: Any = _fake_flashrwkv2()
+    modes = []
+    updates = []
+    output = torch.ones(2, 4)
+
+    def prepare(calls, *, mode, legacy_dir):
+        modes.append(mode)
+        for call in calls:
+            call()
+        return {"complete": True}
+
+    def forward(*args):
+        updates.append(args)
+        return output
+
+    module.prepare_tuning = prepare
+    monkeypatch.setitem(sys.modules, "flashrwkv2", module)
+    monkeypatch.setenv("VLLM_RWKV_TUNING_MODE", "require")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    monkeypatch.setattr(
+        "vllm.model_executor.models.rwkv.get_rwkv_metadata",
+        lambda: SimpleNamespace(retain_ticket=True),
+    )
+    result = RwkvForCausalLM.forward(
+        SimpleNamespace(model=forward), torch.tensor([1, 2]), torch.arange(2)
+    )
+    assert result is output
+    assert len(updates) == 1
+    assert modes == ([] if capturing else ["require"])
+
+
+def test_graph_warmup_propagates_missing_profile_diagnostic(monkeypatch) -> None:
+    module: Any = _fake_flashrwkv2()
+
+    def prepare(calls, *, mode, legacy_dir):
+        assert mode == "require"
+        raise RuntimeError("missing verified tuning profile: tmix/wkv7")
+
+    module.prepare_tuning = prepare
+    monkeypatch.setitem(sys.modules, "flashrwkv2", module)
+    monkeypatch.setenv("VLLM_RWKV_TUNING_MODE", "require")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        "vllm.model_executor.models.rwkv.get_rwkv_metadata",
+        lambda: SimpleNamespace(retain_ticket=True),
+    )
+    with pytest.raises(
+        RuntimeError, match="missing verified tuning profile: tmix/wkv7"
+    ):
+        RwkvForCausalLM.forward(
+            SimpleNamespace(model=lambda *args: None),
+            torch.tensor([1]),
+            torch.tensor([0]),
+        )
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_tuning_restores_startup_slots_after_active_preparation(monkeypatch, fails):
+    module: Any = _fake_flashrwkv2()
+    metadata = RwkvAttentionMetadata(
+        cu_seqlens=torch.tensor([0, 2, 4], dtype=torch.int32),
+        state_indices=torch.zeros(2, dtype=torch.int32),
+        batch_size=2,
+        max_seqlen=4,
+        token_capacity=4,
+        sequence_capacity=2,
+        max_seqlen_capacity=4,
+        num_active_tokens=torch.zeros(1, dtype=torch.int32),
+        num_active_sequences=torch.zeros(1, dtype=torch.int32),
+        retain_ticket=True,
+    )
+    pool = torch.zeros(2, dtype=torch.float32)
+    modes = []
+    context = metadata
+
+    @contextmanager
+    def forward_context(active, config):
+        nonlocal context
+        context = active
+        yield
+        context = metadata
+
+    def forward(*args):
+        if context is not metadata:
+            assert context.num_active_tokens.item() == 4
+            assert context.num_active_sequences.item() == 2
+            assert context.state_indices.tolist() == [0, 1]
+            assert context.cu_seqlens.tolist() == [0, 2, 4]
+            assert not context.retain_ticket
+            pool.index_fill_(0, context.state_indices.long(), 1)
+        return torch.ones(4, 2)
+
+    def prepare(calls, *, mode, legacy_dir):
+        modes.append(mode)
+        for call in calls:
+            call()
+        if fails:
+            raise RuntimeError("verification failed")
+        return {"complete": True}
+
+    module.prepare_tuning = prepare
+    monkeypatch.setitem(sys.modules, "flashrwkv2", module)
+    monkeypatch.setenv("VLLM_RWKV_TUNING_MODE", "tune")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        "vllm.model_executor.models.rwkv.get_rwkv_metadata", lambda: metadata
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.rwkv.set_forward_context", forward_context
+    )
+    state = SimpleNamespace(
+        reset_state_slots=lambda slots: pool.index_fill_(0, slots.long(), 0)
+    )
+    model = SimpleNamespace(
+        model=forward, get_rwkv_state_layer=lambda: state, vllm_config=None
+    )
+    if fails:
+        with pytest.raises(RuntimeError, match="verification failed"):
+            RwkvForCausalLM.forward(model, torch.arange(4), torch.arange(4))
+    else:
+        assert RwkvForCausalLM.forward(
+            model, torch.arange(4), torch.arange(4)
+        ).shape == (4, 2)
+    assert modes == (["tune"] if fails else ["tune", "require"])
+    assert torch.equal(pool, torch.zeros_like(pool))
+    assert metadata.num_active_tokens.item() == 0
+    assert metadata.state_indices.tolist() == [0, 0]
 
 
 _LORA = {
@@ -1118,14 +1255,16 @@ def test_config_accepts_async_scheduling() -> None:
 )
 @pytest.mark.parametrize("prefix_caching", [False, True])
 @pytest.mark.parametrize("state_dtype", ["float32", "float16"])
-def test_real_model_batching_preserves_greedy_tokens_and_logprobs(
-    vllm_runner, prefix_caching, state_dtype
+@pytest.mark.parametrize("temperature", [0.0, 0.8])
+def test_real_model_batching_preserves_tokens_and_logprobs(
+    vllm_runner, prefix_caching, state_dtype, temperature
 ) -> None:
     """Each state mode agrees across prefill, batching and graph execution."""
     model_path = os.environ["VLLM_RWKV_TEST_MODEL"]
     params = SamplingParams(
-        temperature=0,
-        top_k=1,
+        temperature=temperature,
+        top_k=1 if temperature == 0 else 20,
+        seed=20261026,
         max_tokens=4,
         ignore_eos=True,
         logprobs=3,
@@ -1143,6 +1282,8 @@ def test_real_model_batching_preserves_greedy_tokens_and_logprobs(
             max_model_len=128,
             max_num_batched_tokens=token_budget,
             max_num_seqs=4,
+            gpu_memory_utilization=0.8,
+            num_gpu_blocks_override=64,
             mamba_ssm_cache_dtype=state_dtype,
             enable_chunked_prefill=True,
             enable_prefix_caching=prefix_caching,

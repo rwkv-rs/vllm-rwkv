@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Native RWKV-7 inference backed exclusively by FlashRWKV2."""
 
-from collections.abc import Iterable, Sequence
+import json
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import replace
 from functools import cache
 from itertools import islice
 from typing import Any, Protocol
@@ -10,8 +12,11 @@ from typing import Any, Protocol
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_pp_group
+from vllm.forward_context import set_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -43,7 +48,8 @@ from .utils import (
     maybe_prefix,
 )
 
-_FLASHRWKV2_VERSION = "0.1.0a16"
+_FLASHRWKV2_VERSION = "0.1.0a17"
+logger = init_logger(__name__)
 
 
 class _FlashRWKVStateHandle(Protocol):
@@ -63,6 +69,8 @@ class _FlashRWKVStateHandle(Protocol):
 
 
 _FLASHRWKV2_APIS = (
+    "get_tuning_cache_dir",
+    "prepare_tuning",
     "infer_cmix_forward_varlen",
     "infer_embedding_ln0_forward_varlen",
     "infer_head_linear_all_forward_varlen",
@@ -101,6 +109,23 @@ def _load_flashrwkv2() -> Any:
             "FlashRWKV2 is missing required public APIs: " + ", ".join(missing)
         )
     return flashrwkv2
+
+
+def _prepare_tuning(call: Callable[[], Any], *, mode: str | None = None) -> Any:
+    mode = envs.VLLM_RWKV_TUNING_MODE if mode is None else mode
+    result = None
+
+    def forward() -> None:
+        nonlocal result
+        result = call()
+
+    report = _load_flashrwkv2().prepare_tuning(
+        [forward],
+        mode=mode,
+        legacy_dir=envs.VLLM_RWKV_TUNING_LEGACY_DIR if mode == "tune" else None,
+    )
+    logger.info("FlashRWKV2 dispatch coverage: %s", json.dumps(report))
+    return result
 
 
 def _validate_config(config: Any) -> None:
@@ -957,6 +982,57 @@ class RwkvForCausalLM(
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
         del positions, kwargs
+        metadata = get_rwkv_metadata()
+        if (
+            metadata is not None
+            and metadata.retain_ticket
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            mode = envs.VLLM_RWKV_TUNING_MODE
+            if mode == "tune":
+                assert metadata.num_active_tokens is not None
+                assert metadata.num_active_sequences is not None
+                state = self.get_rwkv_state_layer()
+                batch = metadata.sequence_capacity
+                tokens = metadata.token_capacity
+                slots = torch.arange(
+                    batch,
+                    dtype=torch.int32,
+                    device=metadata.state_indices.device,
+                )
+                active_metadata = replace(
+                    metadata,
+                    cu_seqlens=torch.arange(
+                        batch + 1, dtype=torch.int32, device=slots.device
+                    )
+                    * tokens
+                    // batch,
+                    state_indices=slots,
+                    num_active_tokens=torch.full_like(
+                        metadata.num_active_tokens, tokens
+                    ),
+                    num_active_sequences=torch.full_like(
+                        metadata.num_active_sequences, batch
+                    ),
+                    validated_metadata=None,
+                    retain_ticket=False,
+                )
+                # Restore startup scratch slots before capture.
+                state.reset_state_slots(slots)
+                try:
+                    with set_forward_context(active_metadata, self.vllm_config):
+                        _prepare_tuning(
+                            lambda: self.model(
+                                input_ids, intermediate_tensors, inputs_embeds
+                            )
+                        )
+                finally:
+                    state.reset_state_slots(slots)
+                mode = "require"
+            return _prepare_tuning(
+                lambda: self.model(input_ids, intermediate_tensors, inputs_embeds),
+                mode=mode,
+            )
         return self.model(input_ids, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:

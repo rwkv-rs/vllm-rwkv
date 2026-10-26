@@ -4,7 +4,7 @@
 torch==2.13.0
 transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@f163615d2a7c60aa1df5c292874d56cbe878219f
 tokenizers @ git+https://github.com/rwkv-rs/tokenizers-rwkv.git@c5d8dde5ff49c70e4656199d5033a84e03c21b2b#subdirectory=bindings/python
-FlashRWKV2==0.1.0a16
+FlashRWKV2==0.1.0a17
 ninja
 setuptools>=77.0.3,<81.0.0
 
