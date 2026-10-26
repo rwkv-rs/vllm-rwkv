@@ -74,7 +74,7 @@ environment, release directory, `TORCH_HOME`, and `XDG_CACHE_HOME`. TileLang
 
 Preparation uses the loaded model weights, configured state dtype, and each
 actual graph shape, including the separate head/sampling graphs. Model tuning
-uses fully active metadata and free startup state slots, which are reset before
+uses fully active metadata and startup state slots, which are reset before
 capture. The report records each selected configuration, fingerprint, device
 class, profile path, and hit/missing/tuned/revalidated status. Same-class GPUs
 and new worker processes reuse profiles through FlashRWKV2's locking and
