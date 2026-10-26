@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
-from vllm.model_executor.models.rwkv import _load_flashrwkv2
+from vllm.model_executor.models.rwkv import _load_flashrwkv2, _prepare_tuning
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -36,7 +36,7 @@ class _RwkvSamplingGraph:
     ) -> None:
         device = penalties.device
         hidden_size = model.lm_head.weight.shape[1]
-        self.hidden_states = torch.empty(
+        self.hidden_states = torch.randn(
             capacity, hidden_size, dtype=torch.bfloat16, device=device
         )
         self.slot_indices = torch.arange(capacity, dtype=torch.int32, device=device)
@@ -69,7 +69,8 @@ class _RwkvSamplingGraph:
         capture_stream = torch.cuda.Stream(device=device)
         capture_stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(capture_stream):
-            for _ in range(3):
+            self.logits, self.sampled = _prepare_tuning(forward)
+            for _ in range(2):
                 self.logits, self.sampled = forward()
         torch.cuda.current_stream(device).wait_stream(capture_stream)
         self.graph = torch.cuda.CUDAGraph()

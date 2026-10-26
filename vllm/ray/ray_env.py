@@ -44,6 +44,7 @@ DEFAULT_ENV_VAR_PREFIXES: set[str] = {
 }
 
 DEFAULT_EXTRA_ENV_VARS: set[str] = {
+    "FLASHRWKV2_CACHE_DIR",
     "PYTHONHASHSEED",
 }
 
