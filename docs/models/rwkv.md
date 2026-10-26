@@ -62,6 +62,15 @@ each source revision in its own release directory and `.venv`. Both model
 hosts retain their existing g1l artifacts and served model names. No weight
 conversion or download is required for the a16 upgrade.
 
+FlashRWKV2 tuning profiles are published under
+`/opt/rwkv/vllm/cache/flashrwkv2/tuning` on each model host. Before activation,
+`prepare_flashrwkv2` links the release's tuning cache to that shared directory
+and verifies profiles for the installed source, CUDA/TileLang environment, and
+GPU through FlashRWKV2's profile reader. Shape, dtype, and stride matching
+remain part of the operator's lookup key. Publish newly validated profiles
+before deploying a revision that changes that cache key. The extension,
+TileLang, and vLLM compilation caches remain local to each release.
+
 The deployment commands use BF16 weights, FP16 WKV state, prefix caching off,
 and a 1024-token batch budget. Full CUDA Graphs use that token budget as their
 maximum capture size. The per-GPU sequence limits are selected from serving
