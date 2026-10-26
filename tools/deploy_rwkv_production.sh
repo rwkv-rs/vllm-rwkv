@@ -499,7 +499,7 @@ prepare_flashrwkv2() (
   local temporary_result
 
   install -d -o caizus -g caizus -m 0755 \
-    "$cache_root" "$tuning_cache" "$tuning_dir"
+    "$cache_root" "$cache_root/torch" "$tuning_cache" "$tuning_dir"
   ln -sfnT "$tuning_dir" "$tuning_cache/tuning"
   temporary_result=$(mktemp "$incoming_dir/flashrwkv2-sm89.XXXXXX")
   if ! runuser -u caizus -- env \
