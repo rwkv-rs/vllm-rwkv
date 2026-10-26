@@ -184,6 +184,8 @@ Environment=CUDA_VISIBLE_DEVICES=$devices
 Environment=PYTHONUNBUFFERED=1
 Environment=VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 Environment=XDG_CACHE_HOME=$release/.cache
+Environment=FLASHRWKV2_CACHE_DIR=$root_dir/cache/flashrwkv2
+Environment=VLLM_RWKV_TUNING_MODE=require
 Environment=PATH=$release/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=$release/.venv/bin/vllm serve $models_dir/$model \\
   --served-model-name $served_name \\
@@ -492,15 +494,12 @@ prepare_flashrwkv2() (
   cd /home/caizus
   local release=$1
   local cache_root="$release/.cache"
-  local cache_dir="$cache_root/torch_extensions"
-  local tuning_dir="$root_dir/cache/flashrwkv2/tuning"
-  local tuning_cache="$cache_root/torch/flashrwkv2"
+  local cache_dir="$root_dir/cache/flashrwkv2"
   local result="$release/flashrwkv2-sm89.json"
   local temporary_result
 
   install -d -o caizus -g caizus -m 0755 \
-    "$cache_root" "$cache_root/torch" "$tuning_cache" "$tuning_dir"
-  ln -sfnT "$tuning_dir" "$tuning_cache/tuning"
+    "$cache_root" "$cache_dir"
   temporary_result=$(mktemp "$incoming_dir/flashrwkv2-sm89.XXXXXX")
   if ! runuser -u caizus -- env \
     HOME=/home/caizus \
@@ -508,12 +507,14 @@ prepare_flashrwkv2() (
     CUDA_PATH=/usr/local/cuda \
     CUDA_VISIBLE_DEVICES=0 \
     XDG_CACHE_HOME="$cache_root" \
+    FLASHRWKV2_CACHE_DIR="$cache_dir" \
     PATH="$release/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     "$release/.venv/bin/python" -m flashrwkv2.compile >"$temporary_result"; then
     rm -f "$temporary_result"
     return 1
   fi
   XDG_CACHE_HOME="$cache_root" \
+    FLASHRWKV2_CACHE_DIR="$cache_dir" \
     "$release/.venv/bin/python" - "$temporary_result" "$cache_dir" <<'PY'
 import json
 import sys
@@ -521,30 +522,18 @@ from pathlib import Path
 
 import flashrwkv2
 import torch
-from flashrwkv2._internal.tuning import _profile_root, _read_profile
 
 result = json.loads(Path(sys.argv[1]).read_text())
-cache = Path(sys.argv[2]).resolve()
+cache = flashrwkv2.get_tuning_cache_dir()
+assert cache == Path(sys.argv[2]).resolve(), cache
 library = Path(result["library"]).resolve()
 assert flashrwkv2.__version__ == "0.1.0a16"
 assert torch.cuda.get_device_capability() == (8, 9)
 assert result["status"] in {"compiled", "cached"}, result
 assert result["target"] == "sm89", result
-assert library.is_relative_to(cache), (library, cache)
+assert library.is_relative_to(cache / "native"), (library, cache)
 assert library.is_file(), library
-profiles = 0
-root = _profile_root()
-for path in root.rglob("*.json"):
-    record = json.loads(path.read_text())
-    if record["key"][0] != torch.cuda.get_device_name():
-        continue
-    owner = path.parent.relative_to(root).as_posix()
-    key = json.dumps(record["key"], separators=(",", ":"))
-    assert _read_profile(owner, key) is not None, path
-    profiles += 1
-assert profiles, f"no verified tuning profiles for {root}"
-result["tuning_root"] = str(root)
-result["tuning_profiles"] = profiles
+result["cache_root"] = str(cache)
 Path(sys.argv[1]).write_text(json.dumps(result) + "\n")
 PY
   install -o root -g root -m 0644 "$temporary_result" "$result"
