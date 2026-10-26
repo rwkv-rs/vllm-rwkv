@@ -190,7 +190,7 @@ ExecStart=$release/.venv/bin/vllm serve $models_dir/$model \\
   --host $listen_host \\
   --port $port \\
   --dtype bfloat16 \\
-  --mamba-ssm-cache-dtype float32 \\
+  --mamba-ssm-cache-dtype float16 \\
   --max-model-len 32768 \\
   --max-num-batched-tokens 1024 \\
   --max-num-seqs $max_num_seqs \\
@@ -221,26 +221,26 @@ install_units() {
       vllm-rwkv-13_3b.service \
       "RWKV7 g1l 13.3B vLLM DP4 service" \
       0,1,2,3 rwkv-g1l-13b-temp-5497 rwkv7-g1l-13.3b \
-      18004 255 4 || return 1
+      18004 256 4 || return 1
   else
     write_unit \
       "$release" \
       vllm-rwkv-1_5b.service \
       "RWKV7 g1l 1.5B vLLM service" \
       0 rwkv-g1l-1b-temp-6331 rwkv7-g1l-1.5b \
-      18001 1024 1 || return 1
+      18001 256 1 || return 1
     write_unit \
       "$release" \
       vllm-rwkv-2_9b.service \
       "RWKV7 g1l 2.9B vLLM service" \
       1 rwkv-g1l-3b-temp-5764 rwkv7-g1l-2.9b \
-      18002 512 1 || return 1
+      18002 1024 1 || return 1
     write_unit \
       "$release" \
       vllm-rwkv-7_2b.service \
       "RWKV7 g1l 7.2B vLLM DP2 service" \
       2,3 rwkv-g1l-7b-temp-3797 rwkv7-g1l-7.2b \
-      18003 128 2 || return 1
+      18003 256 2 || return 1
   fi
   systemctl daemon-reload || return 1
   systemctl disable "${all_services[@]}" >/dev/null 2>&1 || true

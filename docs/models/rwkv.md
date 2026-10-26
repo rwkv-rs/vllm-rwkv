@@ -42,7 +42,7 @@ shift state, FP32 arithmetic and head logits, and rounds the WKV state to FP16
 after every token. It follows a different numerical trajectory from FP32
 training and can change logits and generated tokens. Prefill and decode use
 the same per-token state rounding. This option does not change training
-precision or the default FP32 deployment capacity plan below.
+precision. Production uses this FP16 state option for higher throughput.
 
 RWKV defaults to `CompilationMode.NONE` and full CUDA Graph capture so that
 TorchDynamo does not decompose the external fused operators. Use
@@ -62,25 +62,61 @@ each source revision in its own release directory and `.venv`. Both model
 hosts retain their existing g1l artifacts and served model names. No weight
 conversion or download is required for the a16 upgrade.
 
-The deployment commands use BF16 weights, FP32 WKV state, prefix caching off,
+The deployment commands use BF16 weights, FP16 WKV state, prefix caching off,
 and a 1024-token batch budget. Full CUDA Graphs use that token budget as their
-maximum capture size. The per-GPU sequence limits account for the larger WKV
-state. The small-model host has 24 GB GPUs and the large-model host has 48 GB
-GPUs:
+maximum capture size. The per-GPU sequence limits are selected from serving
+throughput measurements and the available recurrent-state slots. The small-model
+host has 24 GB GPUs and the large-model host has 48 GB GPUs:
 
-| Model | GPUs | Max sequences per GPU | BF16 weights + active state (GiB) |
+| Model | GPUs | Max sequences per GPU | Active state per sequence (MiB) |
 | --- | ---: | ---: | ---: |
-| g1l 1.5B | 1 | 1024 | 15.03 |
-| g1l 2.9B | 1 | 512 | 15.65 |
-| g1l 7.2B | 2, data parallel | 128 | 17.47 |
-| g1l 13.3B | 4, data parallel | 256 | 40.20 |
+| g1l 1.5B | 1 | 256 | 6.19 |
+| g1l 2.9B | 1 | 1024 | 10.31 |
+| g1l 7.2B | 2, data parallel | 256 | 16.50 |
+| g1l 13.3B | 4, data parallel | 256 | 31.45 |
 
-The memory column is a lower bound from the installed artifacts. For `L`
-layers, hidden size `C`, and head size `D`, each active sequence requires
-`L * C * (4 * D + 4)` bytes for FP32 WKV state and the two BF16 shift states.
-Model warmup must also accommodate CUDA Graphs, activations, and workspaces
-within the configured memory budget. Data-parallel replicas each hold the full
-model and their own state pool.
+For `L` layers, hidden size `C`, and head size `D`, each active sequence requires
+`L * C * (2 * D + 4)` bytes for FP16 WKV state and the two BF16 shift states.
+Model warmup must also accommodate CUDA Graphs, activations, and workspaces.
+Data-parallel replicas each hold the full model and their own state pool.
+The scheduler allocates its state pool from the profiled GPU memory budget,
+so `--max-num-seqs` limits active sequences rather than total allocated slots.
+
+The 2026-10-26 serving sweep used the installed g1l checkpoints, FlashRWKV2 a16,
+128 random input tokens, greedy sampling, and streaming completions. Request
+count and client concurrency both equaled the per-GPU batch size times the
+number of data-parallel replicas. Output throughput includes prefill and decode.
+
+| Model | Output tokens/request | Batch per GPU | Output tokens/s | Runs |
+| --- | ---: | ---: | ---: | ---: |
+| 1.5B | 1024 | 256 | 15,514 [14,774–16,319] | 3 |
+| 1.5B | 1024 | 512 | 13,457 [12,011–14,463] | 3 |
+| 2.9B | 1024 | 512 | 9,324 [9,324–9,337] | 3 |
+| 2.9B | 1024 | 1024 | 9,453 [9,453–9,453] | 2 |
+| 7.2B DP2 | 512 | 256 | 5,019 [5,017–5,021] | 2 |
+| 7.2B DP2 | 512 | 320 | 4,887 [4,884–4,890] | 2 |
+| 13.3B DP4 | 512 | 256 | 4,617 [4,617–4,618] | 2 |
+| 13.3B DP4 | 512 | 448 | 4,402 | 1 |
+
+Repeated results show the median and [minimum–maximum]. Every measured request
+completed successfully. The selected limits favor throughput: larger batches
+reduced long-output throughput for 1.5B, 7.2B, and 13.3B. The 2.9B result remained
+slightly higher at 1024 than at 512. The 13.3B allocation supplied approximately
+476 FP16 state slots per GPU, including the scheduler's reserved slot.
+
+Reproduce a row on the model host with its local tokenizer and port:
+
+```bash
+ulimit -n 65536
+timeout 600s .venv/bin/vllm bench serve \
+  --backend openai --base-url http://127.0.0.1:18003 \
+  --endpoint /v1/completions --model rwkv7-g1l-7.2b \
+  --tokenizer /srv/rwkv/models/rwkv-g1l-7b-temp-3797 \
+  --dataset-name random --random-input-len 128 --random-output-len 512 \
+  --num-prompts 512 --max-concurrency 512 --ignore-eos \
+  --temperature 0 --seed 20261026 --disable-tqdm \
+  --extra-body '{"top_k":1,"presence_penalty":0,"frequency_penalty":0,"penalty_decay":1}'
+```
 
 Stage the new release before switching services. The deployment script
 snapshots the current release, unit files, enabled services, and active services
@@ -118,8 +154,14 @@ token state. `--generation-config vllm` explicitly disables artifact profiles.
 
 ## Pipeline parallelism
 
-Single GPU and two-stage pipeline parallelism are supported. For PP2, run one
-stage per GPU:
+Single GPU and two-stage pipeline parallelism are supported. On the production
+RTX 4090 host, the 7.2B model with FP16 WKV state measured 2,268 tokens/s on one
+GPU at batch 128 and 4,507 tokens/s with DP2 at batch 128 per GPU. At batch 256
+per GPU, one GPU measured 2,519 tokens/s and DP2 measured 5,019 tokens/s.
+Both comparisons used 128 input / 512 output tokens and the serving benchmark
+above; DP2 achieved approximately 1.99 times single-GPU aggregate throughput.
+
+For PP2, run one stage per GPU:
 
 ```bash
 vllm serve <model> \
