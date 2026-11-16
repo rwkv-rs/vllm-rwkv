@@ -68,9 +68,9 @@ class _FakeStateHandle:
 
 def _fake_flashrwkv2() -> ModuleType:
     module: Any = ModuleType("flashrwkv2")
-    module.__version__ = "0.1.0a17"
+    module.__version__ = "0.1.0a19"
     module.get_tuning_cache_dir = lambda: None
-    module.prepare_tuning = lambda calls, **kwargs: [call() for call in calls]
+    module.prepare_tuning = lambda calls, *, mode: [call() for call in calls]
 
     module.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor = _FakeStateHandle
     module.prepare_tmix_wkv7_recurrent_fp16_state_from_tensor = _FakeStateHandle
@@ -598,7 +598,7 @@ def test_graph_warmup_checks_coverage_without_repeating_state_updates(
     updates = []
     output = torch.ones(2, 4)
 
-    def prepare(calls, *, mode, legacy_dir):
+    def prepare(calls, *, mode):
         modes.append(mode)
         for call in calls:
             call()
@@ -627,7 +627,7 @@ def test_graph_warmup_checks_coverage_without_repeating_state_updates(
 def test_graph_warmup_propagates_missing_profile_diagnostic(monkeypatch) -> None:
     module: Any = _fake_flashrwkv2()
 
-    def prepare(calls, *, mode, legacy_dir):
+    def prepare(calls, *, mode):
         assert mode == "require"
         raise RuntimeError("missing verified tuning profile: tmix/wkv7")
 
@@ -685,7 +685,7 @@ def test_tuning_restores_startup_slots_after_active_preparation(monkeypatch, fai
             pool.index_fill_(0, context.state_indices.long(), 1)
         return torch.ones(4, 2)
 
-    def prepare(calls, *, mode, legacy_dir):
+    def prepare(calls, *, mode):
         modes.append(mode)
         for call in calls:
             call()
