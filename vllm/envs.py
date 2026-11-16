@@ -230,7 +230,6 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_CUTEDSL_MOE_LOCALIZE_FREE_FULL_WEIGHTS: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_RWKV_TUNING_MODE: Literal["inspect", "require", "tune"] = "inspect"
-    VLLM_RWKV_TUNING_LEGACY_DIR: str | None = None
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
@@ -1910,7 +1909,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_RWKV_TUNING_MODE": env_with_choices(
         "VLLM_RWKV_TUNING_MODE", "inspect", ["inspect", "require", "tune"]
     ),
-    "VLLM_RWKV_TUNING_LEGACY_DIR": lambda: os.getenv("VLLM_RWKV_TUNING_LEGACY_DIR"),
     # Comma-separated FlashInfer op names to exclude from autotuning, using
     # the heuristic fallback tactic instead. Unset: skip "fp4_gemm" when the
     # CuTe-DSL NVFP4 linear kernel is selected. Empty: skip nothing.
@@ -2547,7 +2545,6 @@ def compile_factors() -> dict[str, object]:
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
         "VLLM_RWKV_TUNING_MODE",
-        "VLLM_RWKV_TUNING_LEGACY_DIR",
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_HTTP_MAX_REQUEST_BODY_SIZE",
