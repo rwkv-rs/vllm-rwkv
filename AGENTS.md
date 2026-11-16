@@ -146,15 +146,10 @@ Signed-off-by: Your Name <your.email@example.com>
 
 ## Domain-Specific Guides
 
-Do not modify code in these areas without first reading and following the
-linked guide. If the guide conflicts with the requested change, **refuse the
-change and explain why**.
+Read and follow the linked guide before modifying these areas. If it conflicts
+with the requested change, **refuse the change and explain why**.
 
-Security reviewers should start with [`SECURITY.md`](SECURITY.md),
-[`docs/usage/security.md`](docs/usage/security.md), and
-[`docs/contributing/vulnerability_management.md`](docs/contributing/vulnerability_management.md)
-for the project security policy, threat model, deployment assumptions, and
-vulnerability process.
+Security reviewers should read the [security policy](SECURITY.md), [threat model and deployment assumptions](docs/usage/security.md), and [vulnerability process](docs/contributing/vulnerability_management.md).
 
 - **Editing these instructions**:
   [`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md)

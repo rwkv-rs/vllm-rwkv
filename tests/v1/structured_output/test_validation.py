@@ -105,6 +105,7 @@ def test_explicit_xgrammar_does_not_import_optional_backends(monkeypatch):
         tokenizer=object(),
     )
 
+    assert params.structured_outputs is not None
     assert params.structured_outputs.grammar is not None
 
 
