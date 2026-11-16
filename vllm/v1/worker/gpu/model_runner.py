@@ -1660,7 +1660,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             fast_prefill=fast_prefill,
             max_query_len=(
                 batch_desc.max_query_len
-                if batch_desc.max_query_len is not None
+                if (
+                    self.model_state.requires_cudagraph_max_query_len
+                    and batch_desc.max_query_len is not None
+                )
                 else (
                     int(num_scheduled_tokens_upper_bound.max())
                     if adaptive_verification is not None
