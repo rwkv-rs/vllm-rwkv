@@ -166,6 +166,7 @@ def test_query_sensitive_full_graphs_separate_decode_and_prefill(monkeypatch):
 
 @pytest.mark.parametrize("num_reqs,num_tokens", [(1, 2), (2, 3)])
 def test_rwkv_runner_preserves_prefill_query_bound(monkeypatch, num_reqs, num_tokens):
+    from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.worker.gpu import model_runner
 
     runner = MagicMock(spec=model_runner.GPUModelRunner)
@@ -185,13 +186,15 @@ def test_rwkv_runner_preserves_prefill_query_bound(monkeypatch, num_reqs, num_to
         raise RuntimeError("stop after graph dispatch")
 
     monkeypatch.setattr(model_runner, "dispatch_cg_and_sync_dp", dispatch)
-    scheduled = {str(i): 2 if i == 0 else 1 for i in range(num_reqs)}
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {
+        str(i): 2 if i == 0 else 1 for i in range(num_reqs)
+    }
+    scheduler_output.total_num_scheduled_tokens = num_tokens
     with pytest.raises(RuntimeError, match="stop after graph dispatch"):
         model_runner.GPUModelRunner.execute_model(
             runner,
-            SimpleNamespace(
-                num_scheduled_tokens=scheduled, total_num_scheduled_tokens=num_tokens
-            ),
+            scheduler_output,
             dummy_run=True,
         )
     assert observed == [2]
