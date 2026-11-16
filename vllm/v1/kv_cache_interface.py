@@ -244,16 +244,6 @@ class KVCacheSpec:
         return 0
 
     @property
-    def external_bytes_per_page(self) -> int:
-        """Bytes per cache page allocated outside vLLM's backing tensor."""
-        return 0
-
-    @property
-    def external_fixed_memory_bytes(self) -> int:
-        """Fixed memory allocated outside vLLM's backing tensor."""
-        return 0
-
-    @property
     def requires_block_zeroing(self) -> bool:
         """Whether newly allocated scheduler blocks must be reset."""
         return False
@@ -1333,18 +1323,6 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     def first_spec(self) -> KVCacheSpec:
         """Return the first spec in the group."""
         return next(iter(self.kv_cache_specs.values()))
-
-    @property
-    def external_bytes_per_page(self) -> int:
-        return sum(
-            spec.external_bytes_per_page for spec in self.kv_cache_specs.values()
-        )
-
-    @property
-    def external_fixed_memory_bytes(self) -> int:
-        return sum(
-            spec.external_fixed_memory_bytes for spec in self.kv_cache_specs.values()
-        )
 
     @property
     def requires_block_zeroing(self) -> bool:

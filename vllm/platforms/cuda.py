@@ -26,8 +26,7 @@ from vllm.version import is_reduced_rwkv_build
 if is_reduced_rwkv_build():
     import vllm.rwkv7_ops  # noqa: F401
 else:
-    with contextlib.suppress(ImportError):
-        import vllm._C_stable_libtorch  # noqa
+    import vllm._C_stable_libtorch  # noqa: F401
 
 with contextlib.suppress(ImportError):
     import vllm._qutlass_C  # noqa

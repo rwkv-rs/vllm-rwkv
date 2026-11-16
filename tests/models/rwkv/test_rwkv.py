@@ -129,8 +129,6 @@ def test_state_spec_and_caller_backed_slot_lifecycle(monkeypatch, state_dtype) -
         RwkvAttentionMetadataBuilder.get_cudagraph_support(vllm_config, spec)
         is AttentionCGSupport.ALWAYS
     )
-    assert spec.external_bytes_per_page == 0
-    assert spec.external_fixed_memory_bytes == 0
     assert spec.num_prefill_checkpoint_blocks == 0
 
     num_slots = 3

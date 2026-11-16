@@ -278,12 +278,11 @@ def _pool_bytes_per_block_from_builder(
     """
     if not kv_cache_groups:
         return 0
-    external_bytes = _get_external_kv_cache_bytes_per_block(kv_cache_groups)
     if vllm_config.attention_config.hisparse_config is not None:
-        return _pool_bytes_per_block(vllm_config, kv_cache_groups) + external_bytes
+        return _pool_bytes_per_block(vllm_config, kv_cache_groups)
     pool_bytes = builder._get_pool_bytes_per_block(vllm_config, kv_cache_groups)
     if pool_bytes is not None:
-        return pool_bytes + external_bytes
+        return pool_bytes
     saved_override = vllm_config.cache_config.num_gpu_blocks_override
     vllm_config.cache_config.num_gpu_blocks_override = None
     try:
@@ -302,27 +301,7 @@ def _pool_bytes_per_block_from_builder(
             "KVCacheConfigBuilder._get_pool_bytes_per_block() for placements "
             "with several device allocations."
         )
-    return backing_sizes.pop() + external_bytes
-
-
-def _get_external_kv_cache_bytes_per_block(
-    kv_cache_groups: list[KVCacheGroupSpec],
-) -> int:
-    return sum(
-        _get_per_layer_spec(group, layer_name).external_bytes_per_page
-        for group in kv_cache_groups
-        if not group.host_resident
-        for layer_name in group.layer_names
-    )
-
-
-def _pool_fixed_memory_bytes(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
-    return sum(
-        _get_per_layer_spec(group, layer_name).external_fixed_memory_bytes
-        for group in kv_cache_groups
-        if not group.host_resident
-        for layer_name in group.layer_names
-    )
+    return backing_sizes.pop()
 
 
 def get_uniform_page_size(kv_cache_specs: Iterable[KVCacheSpec]) -> int:
@@ -699,13 +678,7 @@ def get_kv_cache_config_from_groups(
     bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups, layout)
     interleaved_block_stride = bytes_per_block if layout.is_block_outermost else None
 
-    pool_bytes_per_block = bytes_per_block + _get_external_kv_cache_bytes_per_block(
-        kv_cache_groups
-    )
-    allocatable_memory = max(
-        available_memory - _pool_fixed_memory_bytes(kv_cache_groups), 0
-    )
-    num_blocks = allocatable_memory // pool_bytes_per_block
+    num_blocks = available_memory // bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
     size = bytes_per_block * num_blocks
 
@@ -1309,7 +1282,7 @@ def _max_memory_usage_bytes_from_groups(
                 spec.page_size_bytes,
             )
 
-    return _pool_fixed_memory_bytes(kv_cache_groups) + bytes_per_block * total_blocks
+    return bytes_per_block * total_blocks
 
 
 def _estimate_max_model_len_from_groups(
@@ -1549,13 +1522,12 @@ def get_kv_cache_configs(
             bytes_per_block = _pool_bytes_per_block_from_builder(
                 builder, vllm_config, groups
             )
-            fixed_memory_bytes = _pool_fixed_memory_bytes(groups)
             logger.info(
                 "Overriding num_gpu_blocks=%d with num_gpu_blocks_override=%d",
-                max(avail_mem - fixed_memory_bytes, 0) // bytes_per_block,
+                avail_mem // bytes_per_block,
                 override,
             )
-            adjusted_memory.append(fixed_memory_bytes + override * bytes_per_block)
+            adjusted_memory.append(override * bytes_per_block)
         available_memory = adjusted_memory
 
     # Reserve the null block BlockPool permanently holds back, so auto-fit and
@@ -1596,10 +1568,9 @@ def get_kv_cache_configs(
         bytes_per_block = _pool_bytes_per_block_from_builder(
             builder, vllm_config, projected_groups
         )
-        allocatable_memory = max(
-            available_memory_one_worker - _pool_fixed_memory_bytes(projected_groups), 0
+        num_blocks = (
+            available_memory_one_worker // bytes_per_block if projected_groups else 1
         )
-        num_blocks = allocatable_memory // bytes_per_block if projected_groups else 1
         kv_cache_configs.append(
             builder.get_kv_cache_config_from_groups(
                 vllm_config, projected_groups, num_blocks
@@ -1741,11 +1712,7 @@ class DefaultKVCacheConfigBuilder(KVCacheConfigBuilder):
                     vllm_config.cache_config.prefix_cache_retention_interval
                 ),
             )
-        bytes_per_block = _pool_bytes_per_block(
-            vllm_config, kv_cache_groups
-        ) + _get_external_kv_cache_bytes_per_block(kv_cache_groups)
+        bytes_per_block = _pool_bytes_per_block(vllm_config, kv_cache_groups)
         return get_kv_cache_config_from_groups(
-            vllm_config,
-            kv_cache_groups,
-            _pool_fixed_memory_bytes(kv_cache_groups) + num_blocks * bytes_per_block,
+            vllm_config, kv_cache_groups, num_blocks * bytes_per_block
         )
