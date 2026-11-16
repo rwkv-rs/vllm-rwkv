@@ -1,7 +1,7 @@
 # Dense RWKV7 inference and OpenAI-compatible serving. FlashRWKV2 compiles its
 # pinned native extension lazily for the visible CUDA architecture.
 
-torch==2.13.0
+torch==2.14.0
 transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@f163615d2a7c60aa1df5c292874d56cbe878219f
 tokenizers @ git+https://github.com/rwkv-rs/tokenizers-rwkv.git@c5d8dde5ff49c70e4656199d5033a84e03c21b2b#subdirectory=bindings/python
 FlashRWKV2==0.1.0a17
@@ -40,6 +40,7 @@ prometheus_client>=0.18.0
 prometheus-fastapi-instrumentator>=8.0.0
 pyzmq>=25.0.0
 msgspec
+orjson>=3.11.6
 model-hosting-container-standards>=0.1.14,<1.0.0
 watchfiles
 python-json-logger

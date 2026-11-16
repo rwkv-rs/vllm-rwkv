@@ -1,7 +1,7 @@
 #include "core/registration.h"
 
 #ifdef VLLM_RWKV_RUNTIME_OPS
-  #include "../ops.h"
+  #include "../../ops.h"
 
   #include <torch/csrc/stable/library.h>
 

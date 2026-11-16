@@ -374,7 +374,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
 endif()
 
 if(VLLM_BUILD_PROFILE STREQUAL "rwkv")
-  set(RWKV7_RUNTIME_CUDA_SRC "csrc/libtorch_stable/cuda_view.cu")
+  set(RWKV7_RUNTIME_CUDA_SRC "csrc/cuda_view.cu")
   set(RWKV7_RUNTIME_SRC
     ${RWKV7_RUNTIME_CUDA_SRC}
     "csrc/libtorch_stable/rwkv7/rwkv7_registration.cpp")
