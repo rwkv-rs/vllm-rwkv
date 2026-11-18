@@ -22,6 +22,8 @@ from vllm.v1.kv_cache_interface import KVCacheLayout, MambaSpec
 class RwkvStateSpec(MambaSpec):
     """Scheduler-owned BF16 shifts and configurable recurrent state."""
 
+    external_bytes_per_page: int = 0
+
     @property
     def requires_block_zeroing(self) -> bool:
         return True

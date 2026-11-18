@@ -40,11 +40,18 @@ class _FakeStateHandle:
 
     @property
     def memory_layout(self) -> dict[str, int]:
-        per_slot = self.state[0].numel() * self.state.element_size()
+        _, heads, size, _ = self.state.shape
+        private = (
+            heads * 1284
+            if self.state.dtype == torch.float16 and heads in (40, 64) and size == 64
+            else 0
+        )
+        per_slot = self.state[0].nbytes + private
         return {
+            "private_bytes_per_slot": private,
             "bytes_per_slot": per_slot,
             "fixed_workspace_nbytes": 0,
-            "total_nbytes": self.state.numel() * self.state.element_size(),
+            "total_nbytes": len(self.state) * per_slot,
         }
 
     def reset_slots_(self, indices: torch.Tensor) -> None:
@@ -99,11 +106,11 @@ def _clear_flashrwkv2_cache():
     _load_flashrwkv2.cache_clear()
 
 
-def _state_vllm_config(state_dtype: str = "float32") -> SimpleNamespace:
+def _state_vllm_config(state_dtype: str = "float32", heads: int = 2) -> SimpleNamespace:
     hf_config = SimpleNamespace(
-        hidden_size=128,
+        hidden_size=heads * 64,
         head_size=64,
-        num_attention_heads=2,
+        num_attention_heads=heads,
     )
     return SimpleNamespace(
         model_config=SimpleNamespace(hf_config=hf_config),
@@ -118,10 +125,15 @@ def _state_vllm_config(state_dtype: str = "float32") -> SimpleNamespace:
     )
 
 
-@pytest.mark.parametrize("state_dtype", ["float32", "float16"])
-def test_state_spec_and_caller_backed_slot_lifecycle(monkeypatch, state_dtype) -> None:
+@pytest.mark.parametrize(
+    ("state_dtype", "heads", "private_bytes"),
+    [("float32", 40, 0), ("float16", 2, 0), ("float16", 64, 64 * 1284)],
+)
+def test_state_spec_and_caller_backed_slot_lifecycle(
+    monkeypatch, state_dtype, heads, private_bytes
+) -> None:
     monkeypatch.setitem(sys.modules, "flashrwkv2", _fake_flashrwkv2())
-    vllm_config = _state_vllm_config(state_dtype)
+    vllm_config = _state_vllm_config(state_dtype, heads)
     state_layer = RwkvStateLayer(vllm_config, 2, "model.layers.0.rwkv_state")
     spec = state_layer.get_kv_cache_spec(vllm_config)
 
@@ -130,16 +142,17 @@ def test_state_spec_and_caller_backed_slot_lifecycle(monkeypatch, state_dtype) -
         is AttentionCGSupport.ALWAYS
     )
     assert spec.num_prefill_checkpoint_blocks == 0
+    assert spec.external_bytes_per_page == 2 * private_bytes
 
     num_slots = 3
     raw = torch.zeros((num_slots, 1, 1, spec.page_size_bytes), dtype=torch.int8)
     state_layer.bind_kv_cache(raw)
     tmix, handle, cmix = state_layer.get_layer_state(0)
-    assert handle.state.shape == (num_slots, 2, 64, 64)
+    assert handle.state.shape == (num_slots, heads, 64, 64)
     assert handle.state.dtype == getattr(torch, state_dtype)
     assert spec.page_size_bytes == 2 * (
-        2 * 128 * torch.empty((), dtype=torch.bfloat16).element_size()
-        + 2 * 64 * 64 * handle.state.element_size()
+        2 * heads * 64 * torch.bfloat16.itemsize
+        + heads * 64 * 64 * handle.state.element_size()
     )
     assert tmix.dtype == cmix.dtype == torch.bfloat16
     assert handle.state.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
@@ -184,6 +197,82 @@ def test_state_spec_and_caller_backed_slot_lifecycle(monkeypatch, state_dtype) -
         and torch.equal(layer_handle.materialized[0], source)
         for layer_handle in handles
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fp16_graph_prefix_copy_and_raw_slot_read() -> None:
+    provider = pytest.importorskip("flashrwkv2")
+    batch, heads, dim = 16, 40, 64
+    config = _state_vllm_config("float16", heads)
+    config.device_config.device = torch.device("cuda")
+    layer = RwkvStateLayer(config, 1, "model.layers.0.rwkv_state")
+    spec = layer.get_kv_cache_spec(config)
+    assert spec.external_bytes_per_page == heads * 1284
+    backing = torch.zeros(
+        (batch + 1, spec.page_size_bytes), device="cuda", dtype=torch.uint8
+    )
+    layer.bind_kv_cache(backing)
+    _, state, _ = layer.get_layer_state(0)
+    slots = torch.arange(batch, device="cuda", dtype=torch.int32)
+    count = torch.zeros(1, device="cuda", dtype=torch.int32)
+    metadata = RwkvAttentionMetadata(
+        cu_seqlens=torch.arange(batch + 1, device="cuda", dtype=torch.int32),
+        state_indices=slots.clone(),
+        batch_size=batch,
+        max_seqlen=1,
+        token_capacity=batch,
+        sequence_capacity=batch,
+        max_seqlen_capacity=1,
+        num_active_tokens=count,
+        num_active_sequences=count,
+        retain_ticket=True,
+    )
+    ones = torch.ones(batch, heads, dim, device="cuda", dtype=torch.bfloat16)
+    zeros = torch.zeros_like(ones)
+
+    def decode():
+        return provider.infer_tmix_wkv7_recurrent_fp16_forward_varlen(
+            ones,
+            zeros,
+            ones,
+            ones,
+            zeros,
+            zeros,
+            state=state,
+            cu_seqlens=metadata.cu_seqlens,
+            state_indices=metadata.state_indices,
+            validated_metadata=layer.prepare_metadata_ticket(metadata),
+            max_seqlen=1,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        decode()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        output = decode()
+
+    count.fill_(batch)
+    graph.replay()
+    base = (
+        backing.view(-1)[2 * (batch + 1) * heads * dim * 2 :]
+        .view(torch.float16)
+        .view(batch + 1, heads, dim, dim)
+    )
+    layer.materialize_state_slots([2])
+    assert torch.all(base[2] == 1)
+    # Fork a prefix after an odd decode step and reuse its source slot.
+    layer.copy_state_block_pairs([(0, batch)])
+    layer.reset_state_slots([0])
+    metadata.state_indices[0] = batch
+    graph.replay()
+    assert torch.equal(output[0], output[1])
+    layer.materialize_state_slots([batch, 1, 0])
+    assert torch.equal(base[batch], base[1])
+    assert torch.all(base[batch] > 1)
+    assert torch.count_nonzero(base[0]) == 0
 
 
 def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:
@@ -1284,7 +1373,9 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
             max_model_len=128,
             max_num_batched_tokens=token_budget,
             max_num_seqs=4,
-            gpu_memory_utilization=0.8,
+            gpu_memory_utilization=float(
+                os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.8")
+            ),
             num_gpu_blocks_override=64,
             mamba_ssm_cache_dtype=state_dtype,
             enable_chunked_prefill=True,

@@ -207,7 +207,6 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         self._num_slots = 0
         self._tmix_shift_pool: torch.Tensor | None = None
         self._cmix_shift_pool: torch.Tensor | None = None
-        self._wkv_state_pool: torch.Tensor | None = None
         self._wkv_handles: list[_FlashRWKVStateHandle] = []
         self._live_graph_tickets: list[object] = []
         self.kv_cache = torch.tensor([])
@@ -221,6 +220,17 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         layer_count = self.num_local_layers
         block_size = vllm_config.cache_config.mamba_block_size
         assert block_size is not None
+        private_bytes = 0
+        if self.state_dtype == torch.float16:
+            # The provider reports the same per-slot layout for every pool capacity.
+            probe = torch.empty(
+                (1, self.num_heads, self.head_size, self.head_size),
+                dtype=self.state_dtype,
+                device=vllm_config.device_config.device,
+            )
+            private_bytes = self._state_from_tensor(probe).memory_layout[
+                "private_bytes_per_slot"
+            ]
         return RwkvStateSpec(
             block_size=block_size,
             shapes=(
@@ -231,6 +241,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
             dtypes=(torch.bfloat16, torch.bfloat16, self.state_dtype),
             mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
             num_prefill_checkpoint_blocks=0,
+            external_bytes_per_page=layer_count * private_bytes,
         )
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> RwkvStateSpec:
@@ -254,6 +265,12 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         byte_count = elements * torch.empty((), dtype=dtype).element_size()
         view = raw[offset : offset + byte_count].view(dtype).view(shape)
         return view, offset + byte_count
+
+    def _state_from_tensor(self, pool: torch.Tensor) -> _FlashRWKVStateHandle:
+        provider = _load_flashrwkv2()
+        if pool.dtype == torch.float16:
+            return provider.prepare_tmix_wkv7_recurrent_fp16_state_from_tensor(pool)
+        return provider.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(pool)
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         spec = self.get_kv_cache_spec(self._vllm_config)
@@ -280,7 +297,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
             (layer_count, slot_count, self.hidden_size),
             torch.bfloat16,
         )
-        self._wkv_state_pool, offset = self._typed_view(
+        wkv_state_pool, offset = self._typed_view(
             raw,
             offset,
             (layer_count, slot_count, self.num_heads, self.head_size, self.head_size),
@@ -289,29 +306,17 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         if offset != total_bytes:
             raise ValueError("RWKV state pool layout does not fill its allocation")
 
-        flashrwkv2 = _load_flashrwkv2()
-        prepare_state = (
-            flashrwkv2.prepare_tmix_wkv7_recurrent_fp16_state_from_tensor
-            if self.state_dtype == torch.float16
-            else flashrwkv2.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor
-        )
+        expected_private_bytes = spec.external_bytes_per_page // layer_count
         self._wkv_handles = []
-        for layer_idx in range(layer_count):
-            handle = prepare_state(self._wkv_state_pool[layer_idx])
-            expected_state_bytes = (
-                self.num_heads
-                * self.head_size
-                * self.head_size
-                * self._wkv_state_pool.element_size()
-            )
-            expected_fixed_bytes = 0
+        for pool in wkv_state_pool.unbind():
+            handle = self._state_from_tensor(pool)
+            expected_bytes = pool[0].nbytes + expected_private_bytes
             handle_layout = handle.memory_layout
             if (
-                handle_layout["bytes_per_slot"] != expected_state_bytes
-                or handle_layout["fixed_workspace_nbytes"] != expected_fixed_bytes
-                or handle_layout["total_nbytes"]
-                != slot_count * handle_layout["bytes_per_slot"]
-                + handle_layout["fixed_workspace_nbytes"]
+                handle_layout["private_bytes_per_slot"] != expected_private_bytes
+                or handle_layout["bytes_per_slot"] != expected_bytes
+                or handle_layout["fixed_workspace_nbytes"] != 0
+                or handle_layout["total_nbytes"] != slot_count * expected_bytes
             ):
                 raise RuntimeError(
                     "FlashRWKV2 allocated a different recurrent state layout "
@@ -324,7 +329,6 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         self._wkv_handles.clear()
         self._tmix_shift_pool = None
         self._cmix_shift_pool = None
-        self._wkv_state_pool = None
         self._num_slots = 0
         self._live_graph_tickets.clear()
         self.kv_cache = torch.tensor([])
@@ -395,6 +399,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         self.copy_state_slots(source, destination)
 
     def materialize_state_slots(self, slot_ids: Sequence[int] | torch.Tensor) -> None:
+        """Flush pending updates before reading these slots from the bound tensor."""
         indices = self._slot_tensor(slot_ids)
         for handle in self._wkv_handles:
             handle.materialize_slots_(indices)
