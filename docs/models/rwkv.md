@@ -18,8 +18,8 @@ pinned RWKV dependencies:
 uv pip install -r requirements/rwkv.txt
 ```
 
-The requirements file fixes the `transformers-rwkv` and `tokenizers-rwkv`
-commits and `FlashRWKV2==0.2.0a1`. FlashRWKV2 exposes the public
+The requirements file pins the source commits for `transformers-rwkv`,
+`tokenizers-rwkv` and FlashRWKV2 0.2.0a1. FlashRWKV2 exposes the public
 `prepare_tuning` and `get_tuning_cache_dir` APIs in addition to its
 recurrent-state provider.
 
@@ -38,10 +38,10 @@ vllm serve <model> \
   --no-enable-prefix-caching
 ```
 
-For RL rollouts, pass `--mamba-ssm-cache-dtype float32` or set
-`mamba_ssm_cache_dtype="float32"` in `LLM` to match the WKV state precision
-used when recomputing training logprobs. FP16 recurrence can produce
-different logits and generated tokens.
+For RL rollouts, rollout evaluation and sampling search, pass
+`--mamba-ssm-cache-dtype float32` or set `mamba_ssm_cache_dtype="float32"` in
+`LLM` to match the WKV state precision used when recomputing training logprobs.
+FP16 recurrence can produce different logits and generated tokens.
 
 RWKV defaults to `CompilationMode.NONE` and full CUDA Graph capture so that
 TorchDynamo does not decompose the external fused operators. Use
