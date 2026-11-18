@@ -39,6 +39,7 @@ class _ToolCallMatch:
 class RwkvToolParser(ToolParser):
     structural_tag_model = "rwkv"
     supports_required_and_named = False
+    engine_based_streaming = True
 
     def __init__(
         self,
@@ -46,7 +47,10 @@ class RwkvToolParser(ToolParser):
         tools: list[Tool] | None = None,
     ) -> None:
         super().__init__(tokenizer, tools)
-        self._sent_content_idx = 0
+        self._buffer = ""
+        self._saw_tool_marker = False
+        self._tool_parsing_blocked = False
+        self._finished = False
 
     def _allowed_tool_names(self) -> set[str]:
         names: set[str] = set()
@@ -119,6 +123,8 @@ class RwkvToolParser(ToolParser):
             if payload is None:
                 return matches
             matches.append(_ToolCallMatch(marker_start, payload))
+            if request.parallel_tool_calls is False:
+                return matches
             cursor = fence_end + len(_JSON_FENCE_END)
         return matches
 
@@ -127,6 +133,12 @@ class RwkvToolParser(ToolParser):
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
+        if request.tool_choice == "none":
+            return ExtractedToolCallInformation(
+                tools_called=False,
+                tool_calls=[],
+                content=model_output or None,
+            )
         matches = self._tool_call_matches(model_output, request)
         if not matches:
             return ExtractedToolCallInformation(
@@ -155,20 +167,11 @@ class RwkvToolParser(ToolParser):
             content=content or None,
         )
 
-    def _content_delta(self, current_text: str) -> str | None:
-        marker_start = current_text.find(_TOOL_CALL_MARKER)
-        if marker_start == -1:
-            sendable_idx = len(current_text) - partial_tag_overlap(
-                current_text,
-                _TOOL_CALL_MARKER,
-            )
-        else:
-            sendable_idx = marker_start
-        if sendable_idx <= self._sent_content_idx:
-            return None
-        content = current_text[self._sent_content_idx : sendable_idx]
-        self._sent_content_idx = sendable_idx
-        return content
+    def _block_further_tool_calls(self, content_parts: list[str]) -> None:
+        self._tool_parsing_blocked = True
+        if not self.prev_tool_call_arr and self._buffer:
+            content_parts.append(self._buffer)
+        self._buffer = ""
 
     def extract_tool_calls_streaming(
         self,
@@ -180,17 +183,71 @@ class RwkvToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
-        del previous_text, delta_text, previous_token_ids, current_token_ids
+        del previous_text, current_text, previous_token_ids, current_token_ids
         del delta_token_ids
 
-        content = self._content_delta(current_text)
+        if request.tool_choice == "none":
+            return DeltaMessage(content=delta_text) if delta_text else None
+        if not delta_text:
+            return None
+        if self._tool_parsing_blocked:
+            if not self.prev_tool_call_arr:
+                return DeltaMessage(content=delta_text)
+            return None
+
+        self._buffer += delta_text
+        content_parts: list[str] = []
         tool_deltas: list[DeltaToolCall] = []
-        for index, match in enumerate(self._tool_call_matches(current_text, request)):
-            if index < len(self.prev_tool_call_arr):
-                continue
-            arguments = json.dumps(match.payload["arguments"], ensure_ascii=False)
+
+        while self._buffer:
+            marker_start = self._buffer.find(_TOOL_CALL_MARKER)
+            if marker_start == -1:
+                sendable_end = len(self._buffer) - partial_tag_overlap(
+                    self._buffer,
+                    _TOOL_CALL_MARKER,
+                )
+                if sendable_end > 0:
+                    if not self._saw_tool_marker:
+                        content_parts.append(self._buffer[:sendable_end])
+                    self._buffer = self._buffer[sendable_end:]
+                break
+
+            if marker_start > 0:
+                if not self._saw_tool_marker:
+                    content_parts.append(self._buffer[:marker_start])
+                self._buffer = self._buffer[marker_start:]
+
+            self._saw_tool_marker = True
+            rest = self._buffer[len(_TOOL_CALL_MARKER) :]
+            stripped = rest.lstrip()
+            if not stripped:
+                break
+            if not stripped.startswith(_JSON_FENCE_START):
+                if _JSON_FENCE_START.startswith(stripped):
+                    break
+                self._block_further_tool_calls(content_parts)
+                break
+
+            fence_offset = len(rest) - len(stripped)
+            payload_start = (
+                len(_TOOL_CALL_MARKER) + fence_offset + len(_JSON_FENCE_START)
+            )
+            fence_end = self._buffer.find(_JSON_FENCE_END, payload_start)
+            if fence_end == -1:
+                break
+
+            payload = self._parse_payload(
+                self._buffer[payload_start:fence_end].strip(),
+                request,
+            )
+            if payload is None:
+                self._block_further_tool_calls(content_parts)
+                break
+
+            index = len(self.prev_tool_call_arr)
+            arguments = json.dumps(payload["arguments"], ensure_ascii=False)
             self.prev_tool_call_arr.append(
-                {"name": match.payload["name"], "arguments": arguments}
+                {"name": payload["name"], "arguments": arguments}
             )
             self.streamed_args_for_tool.append(arguments)
             tool_deltas.append(
@@ -199,12 +256,29 @@ class RwkvToolParser(ToolParser):
                     type="function",
                     id=make_tool_call_id(),
                     function=DeltaFunctionCall(
-                        name=match.payload["name"],
+                        name=payload["name"],
                         arguments=arguments,
                     ),
                 )
             )
+            self._buffer = self._buffer[fence_end + len(_JSON_FENCE_END) :]
+            if request.parallel_tool_calls is False:
+                self._tool_parsing_blocked = True
+                self._buffer = ""
+                break
 
+        content = "".join(content_parts) or None
         if content or tool_deltas:
             return DeltaMessage(content=content, tool_calls=tool_deltas)
+        return None
+
+    def finish_streaming(self) -> DeltaMessage | None:
+        if self._finished:
+            return None
+        self._finished = True
+        if not self.prev_tool_call_arr and self._buffer:
+            content = self._buffer
+            self._buffer = ""
+            return DeltaMessage(content=content)
+        self._buffer = ""
         return None
