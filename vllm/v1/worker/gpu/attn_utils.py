@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, nullcontext
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -415,7 +415,8 @@ def init_kv_cache(
     allocate: Callable[[int], torch.Tensor] | None = None,
 ) -> dict[str, Any]:
     allocation_context = kv_cache_allocation_context or nullcontext()
-    with allocation_context:
+    with ExitStack() as pool:
+        pool.enter_context(allocation_context)
         if vllm_config.attention_config.hisparse_config is not None:
             assert block_tables is not None
             kv_caches = init_hisparse_kv_cache(
@@ -435,9 +436,14 @@ def init_kv_cache(
                 kernel_block_sizes,
                 allocate=allocate,
             )
-    return bind_kv_caches(
-        kv_caches, forward_context, kv_cache_config, vllm_config, attn_groups
-    )
+        if not any(
+            group.kv_cache_spec.external_bytes_per_page
+            for group in kv_cache_config.kv_cache_groups
+        ):
+            pool.close()
+        return bind_kv_caches(
+            kv_caches, forward_context, kv_cache_config, vllm_config, attn_groups
+        )
 
 
 def bind_kv_caches(
