@@ -68,7 +68,7 @@ class _FakeStateHandle:
 
 def _fake_flashrwkv2() -> ModuleType:
     module: Any = ModuleType("flashrwkv2")
-    module.__version__ = "0.1.0a19"
+    module.__version__ = "0.2.0a1"
     module.get_tuning_cache_dir = lambda: None
     module.prepare_tuning = lambda calls, *, mode: [call() for call in calls]
 
@@ -1262,16 +1262,20 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
     params = SamplingParams(
         temperature=temperature,
         top_k=1 if temperature == 0 else 20,
+        top_p=0.9,
         seed=20261026,
         max_tokens=4,
         ignore_eos=True,
         logprobs=3,
-        presence_penalty=0,
-        frequency_penalty=0,
-        penalty_decay=1,
+        presence_penalty=0.3,
+        frequency_penalty=0.2,
+        penalty_decay=0.95,
         detokenize=False,
     )
+    tokens_only = params.clone()
+    tokens_only.logprobs = None
     prompt = {"prompt_token_ids": list(range(1, 66))}
+    mixed_prompts = [{"prompt_token_ids": [7, 8, 9]}, prompt]
     reference = None
     for enforce_eager, token_budget in ((True, 128), (False, 32)):
         with vllm_runner(
@@ -1289,9 +1293,11 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
             compilation_config={"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]},
         ) as runner:
             single = runner.llm.generate([prompt], params)[0].outputs[0]
-            mixed = runner.llm.generate(
-                [{"prompt_token_ids": [7, 8, 9]}, prompt], params
-            )[1].outputs[0]
+            mixed = runner.llm.generate(mixed_prompts, params)[1].outputs[0]
+            if not enforce_eager:
+                # Requests without logprobs use the head/sampling CUDA Graph.
+                replay = runner.llm.generate(mixed_prompts, tokens_only)[1].outputs[0]
+                assert replay.token_ids == mixed.token_ids
         assert len(single.token_ids) == 4
         assert mixed.token_ids == single.token_ids
         assert mixed.logprobs == single.logprobs
