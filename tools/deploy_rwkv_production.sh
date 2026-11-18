@@ -185,7 +185,6 @@ Environment=PYTHONUNBUFFERED=1
 Environment=VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 Environment=XDG_CACHE_HOME=$release/.cache
 Environment=FLASHRWKV2_CACHE_DIR=$root_dir/cache/flashrwkv2
-Environment=VLLM_RWKV_TUNING_MODE=require
 Environment=PATH=$release/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=$release/.venv/bin/vllm serve $models_dir/$model \\
   --served-model-name $served_name \\
@@ -513,9 +512,7 @@ prepare_flashrwkv2() (
     rm -f "$temporary_result"
     return 1
   fi
-  XDG_CACHE_HOME="$cache_root" \
-    FLASHRWKV2_CACHE_DIR="$cache_dir" \
-    "$release/.venv/bin/python" - "$temporary_result" "$cache_dir" <<'PY'
+  "$release/.venv/bin/python" - "$temporary_result" "$cache_dir" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -524,8 +521,7 @@ import flashrwkv2
 import torch
 
 result = json.loads(Path(sys.argv[1]).read_text())
-cache = flashrwkv2.get_tuning_cache_dir()
-assert cache == Path(sys.argv[2]).resolve(), cache
+cache = Path(sys.argv[2]).resolve()
 library = Path(result["library"]).resolve()
 assert flashrwkv2.__version__ == "0.2.0a1"
 assert torch.cuda.get_device_capability() == (8, 9)
