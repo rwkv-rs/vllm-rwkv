@@ -3,6 +3,7 @@
 
 import os
 import sys
+from functools import partial
 from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -33,21 +34,16 @@ from vllm.v1.worker.gpu.model_states.rwkv import RwkvModelState, RwkvSampler
 
 
 class _FakeStateHandle:
-    def __init__(self, state: torch.Tensor) -> None:
+    def __init__(self, state: torch.Tensor, private_bytes_per_slot: int = 0) -> None:
         self.state = state
+        self.private_bytes_per_slot = private_bytes_per_slot
         self.materialized: list[torch.Tensor] = []
 
     @property
     def memory_layout(self) -> dict[str, int]:
-        _, heads, size, _ = self.state.shape
-        private = (
-            heads * 1284
-            if self.state.dtype == torch.float16 and heads in (40, 64) and size == 64
-            else 0
-        )
-        per_slot = self.state[0].nbytes + private
+        per_slot = self.state[0].nbytes + self.private_bytes_per_slot
         return {
-            "private_bytes_per_slot": private,
+            "private_bytes_per_slot": self.private_bytes_per_slot,
             "bytes_per_slot": per_slot,
             "fixed_workspace_nbytes": 0,
             "total_nbytes": len(self.state) * per_slot,
@@ -72,12 +68,14 @@ class _FakeStateHandle:
         self.materialized.append(indices.clone())
 
 
-def _fake_flashrwkv2() -> ModuleType:
+def _fake_flashrwkv2(fp16_private_bytes_per_slot: int = 0) -> ModuleType:
     module: Any = ModuleType("flashrwkv2")
     module.__version__ = "0.2.0a1"
 
     module.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor = _FakeStateHandle
-    module.prepare_tmix_wkv7_recurrent_fp16_state_from_tensor = _FakeStateHandle
+    module.prepare_tmix_wkv7_recurrent_fp16_state_from_tensor = partial(
+        _FakeStateHandle, private_bytes_per_slot=fp16_private_bytes_per_slot
+    )
     module.prepare_tmix_wkv7_recurrent_metadata = lambda *args, **kwargs: (args, kwargs)
     for name in (
         "infer_cmix_forward_varlen",
@@ -124,12 +122,17 @@ def _state_vllm_config(state_dtype: str = "float32", heads: int = 2) -> SimpleNa
 
 @pytest.mark.parametrize(
     ("state_dtype", "heads", "private_bytes"),
-    [("float32", 40, 0), ("float16", 2, 0), ("float16", 64, 64 * 1284)],
+    [
+        ("float32", 40, 0),
+        ("float16", 2, 0),
+        ("float16", 64, 64 * 772),
+        ("float16", 64, 64 * 1284),
+    ],
 )
 def test_state_spec_and_caller_backed_slot_lifecycle(
     monkeypatch, state_dtype, heads, private_bytes
 ) -> None:
-    monkeypatch.setitem(sys.modules, "flashrwkv2", _fake_flashrwkv2())
+    monkeypatch.setitem(sys.modules, "flashrwkv2", _fake_flashrwkv2(private_bytes))
     vllm_config = _state_vllm_config(state_dtype, heads)
     state_layer = RwkvStateLayer(vllm_config, 2, "model.layers.0.rwkv_state")
     spec = state_layer.get_kv_cache_spec(vllm_config)
@@ -197,19 +200,21 @@ def test_state_spec_and_caller_backed_slot_lifecycle(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_fp16_graph_prefix_copy_and_raw_slot_read() -> None:
+@pytest.mark.parametrize("heads", [40, 64])
+def test_fp16_graph_prefix_copy_and_raw_slot_read(heads: int) -> None:
     provider = pytest.importorskip("flashrwkv2")
-    batch, heads, dim = 16, 40, 64
+    batch, dim = 16, 64
     config = _state_vllm_config("float16", heads)
     config.device_config.device = torch.device("cuda")
     layer = RwkvStateLayer(config, 1, "model.layers.0.rwkv_state")
     spec = layer.get_kv_cache_spec(config)
-    assert spec.external_bytes_per_page == heads * 1284
     backing = torch.zeros(
         (batch + 1, spec.page_size_bytes), device="cuda", dtype=torch.uint8
     )
     layer.bind_kv_cache(backing)
     _, state, _ = layer.get_layer_state(0)
+    assert spec.external_bytes_per_page == state.memory_layout["private_bytes_per_slot"]
+    assert spec.external_bytes_per_page > 0
     slots = torch.arange(batch, device="cuda", dtype=torch.int32)
     count = torch.zeros(1, device="cuda", dtype=torch.int32)
     metadata = RwkvAttentionMetadata(
