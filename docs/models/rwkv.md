@@ -51,8 +51,10 @@ TorchDynamo does not decompose the external fused operators. Use
 `--enforce-eager` only for diagnostics.
 
 To opt into prefix sharing and copy-on-write, pass `--enable-prefix-caching`.
-This uses vLLM's state-aligned cache blocks and copies recurrent state at block
-boundaries.
+At block boundaries vLLM copies the recurrent state through its provider handle,
+including any pending FP16 updates. Before reading or exporting a bound raw
+state tensor, call `RwkvStateLayer.materialize_state_slots` for the slots to
+read. CUDA Graph replay updates the slots selected by its live metadata.
 
 Continuous batching, asynchronous scheduling, structured outputs, and the
 OpenAI-compatible Chat and Responses APIs use the standard vLLM paths.
@@ -78,12 +80,16 @@ host has 24 GB GPUs and the large-model host has 48 GB GPUs:
 | Model | GPUs | Max sequences per GPU | Active state per sequence (MiB) |
 | --- | ---: | ---: | ---: |
 | g1l 1.5B | 1 | 256 | 6.19 |
-| g1l 2.9B | 1 | 1024 | 10.31 |
-| g1l 7.2B | 2, data parallel | 256 | 16.50 |
+| g1l 2.9B | 1 | 1024 | 11.88 |
+| g1l 7.2B | 2, data parallel | 256 | 19.01 |
 | g1l 13.3B | 4, data parallel | 256 | 31.45 |
 
-For `L` layers, hidden size `C`, and head size `D`, each active sequence requires
-`L * C * (2 * D + 4)` bytes for FP16 WKV state and the two BF16 shift states.
+For `L` layers, hidden size `C`, and head size `D`, each slot uses
+`L * C * (2 * D + 4)` bytes for the FP16 WKV base and two BF16 shifts.
+With `D=64` and 40 or 64 heads, FlashRWKV2 also owns 1,284 bytes per head
+per layer per slot for five FP32 vectors and an int32 phase. The scheduler
+includes these bytes in the slot budget. FP32 state and other head geometries
+use zero log bytes.
 Model warmup must also accommodate CUDA Graphs, activations, and workspaces.
 Data-parallel replicas each hold the full model and their own state pool.
 The scheduler allocates its state pool from the profiled GPU memory budget,

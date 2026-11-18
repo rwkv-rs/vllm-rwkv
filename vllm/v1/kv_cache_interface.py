@@ -249,6 +249,11 @@ class KVCacheSpec:
         return False
 
     @property
+    def external_bytes_per_page(self) -> int:
+        """Bytes per block allocated by the layer outside the shared KV backing."""
+        return 0
+
+    @property
     def num_heads(self) -> int:
         raise NotImplementedError
 
@@ -1331,6 +1336,12 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     @property
     def page_size_bytes(self) -> int:
         return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
+
+    @property
+    def external_bytes_per_page(self) -> int:
+        return sum(
+            spec.external_bytes_per_page for spec in self.kv_cache_specs.values()
+        )
 
     @property
     def block_table_token_alignment(self) -> int | None:
