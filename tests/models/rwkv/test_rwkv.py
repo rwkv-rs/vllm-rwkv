@@ -606,12 +606,12 @@ def _config() -> SimpleNamespace:
     )
 
 
-def test_config_uses_bf16_shift_fp32_wkv_and_full_graph_defaults() -> None:
+def test_config_uses_bf16_shift_fp16_wkv_and_full_graph_defaults() -> None:
     vllm_config = _config()
     RwkvForCausalLMConfig.verify_and_update_config(vllm_config)
 
     assert vllm_config.cache_config.mamba_cache_dtype == "bfloat16"
-    assert vllm_config.cache_config.mamba_ssm_cache_dtype == "float32"
+    assert vllm_config.cache_config.mamba_ssm_cache_dtype == "float16"
     assert not vllm_config.cache_config.enable_prefix_caching
     assert vllm_config.cache_config.mamba_cache_mode == "none"
     assert vllm_config.cache_config.mamba_block_size == 1024
@@ -1242,6 +1242,10 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
     mixed_prompts = [{"prompt_token_ids": [7, 8, 9]}, prompt]
     reference = None
     for enforce_eager, token_budget in ((True, 128), (False, 32)):
+        # Compare default graph execution with the explicit FP16 eager reference.
+        state_options = {}
+        if enforce_eager or state_dtype == "float32":
+            state_options["mamba_ssm_cache_dtype"] = state_dtype
         with vllm_runner(
             model_path,
             dtype="bfloat16",
@@ -1252,12 +1256,14 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
                 os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.8")
             ),
             num_gpu_blocks_override=64,
-            mamba_ssm_cache_dtype=state_dtype,
             enable_chunked_prefill=True,
             enable_prefix_caching=prefix_caching,
             enforce_eager=enforce_eager,
             compilation_config={"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]},
+            **state_options,
         ) as runner:
+            cache_config = runner.llm.llm_engine.vllm_config.cache_config
+            assert cache_config.mamba_ssm_cache_dtype == state_dtype
             single = runner.llm.generate([prompt], params)[0].outputs[0]
             mixed = runner.llm.generate(mixed_prompts, params)[1].outputs[0]
             if not enforce_eager:

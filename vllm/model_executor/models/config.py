@@ -1646,7 +1646,7 @@ class RwkvForCausalLMConfig(VerifyAndUpdateConfig):
             raise ValueError("RWKV shift state requires bfloat16 cache dtype")
 
         if cache_config.mamba_ssm_cache_dtype == "auto":
-            cache_config.mamba_ssm_cache_dtype = "float32"
+            cache_config.mamba_ssm_cache_dtype = "float16"
         elif cache_config.mamba_ssm_cache_dtype not in ("float16", "float32"):
             raise ValueError("RWKV WKV state supports float16 or float32")
 
