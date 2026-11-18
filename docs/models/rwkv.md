@@ -83,19 +83,19 @@ host has 24 GB GPUs and the large-model host has 48 GB GPUs:
 | --- | ---: | ---: | ---: |
 | g1l 1.5B | 1 | 256 | 6.19 |
 | g1l 2.9B | 1 | 1024 | 11.88 |
-| g1l 7.2B | 2, data parallel | 256 | 18.01 or 19.01 |
+| g1l 7.2B | 2, data parallel | 256 | 19.01 or 19.51 |
 | g1l 13.3B | 4, data parallel | 256 | 31.45 |
 
 For `L` layers, hidden size `C`, and head size `D`, each slot uses
 `L * C * (2 * D + 4)` bytes for the FP16 WKV base and two BF16 shifts.
 For FP16, vLLM adds the device-local handle's
 `memory_layout["private_bytes_per_slot"]` for each local layer. For the
-32-layer 7.2B model (64 heads, `D=64`), the compact FlashRWKV2 layout on a
-128-SM RTX 4090 adds 772 bytes per head per layer, bringing the total to
-18.01 MiB per slot. Provider revisions using the 1,284-byte layout on that
-GPU, and SM120 devices with the same layout, use 19.01 MiB. At 40 heads and
-`D=64`, both devices use 1,284 bytes per head per layer. FP32 state and other
-head geometries use zero log bytes.
+32-layer 7.2B model (64 heads, `D=64`), the two-record FlashRWKV2 layout on
+a 128-SM RTX 4090 adds 1,540 bytes per head per layer, bringing the total to
+19.51 MiB per slot. The 1,284-byte layout used on SM120 and by earlier
+provider revisions on the RTX 4090 totals 19.01 MiB per slot. At 40 heads
+and `D=64`, the provider uses 1,284 bytes per head per layer on both
+devices. FP32 state and other head geometries use zero log bytes.
 Model warmup must also accommodate CUDA Graphs, activations, and workspaces.
 Data-parallel replicas each hold the full model and their own state pool.
 The scheduler allocates its state pool from the profiled GPU memory budget,
