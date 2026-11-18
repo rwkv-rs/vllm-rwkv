@@ -19,9 +19,7 @@ uv pip install -r requirements/rwkv.txt
 ```
 
 The requirements file fixes the `transformers-rwkv` and `tokenizers-rwkv`
-commits and `FlashRWKV2==0.2.0a1`. FlashRWKV2 exposes the public
-`prepare_tuning` and `get_tuning_cache_dir` APIs in addition to its
-recurrent-state provider.
+commits and `FlashRWKV2==0.2.0a1`.
 
 ## Serve a model
 
@@ -59,64 +57,17 @@ boundaries.
 Continuous batching, asynchronous scheduling, structured outputs, and the
 OpenAI-compatible Chat and Responses APIs use the standard vLLM paths.
 
-## Kernel preparation
-
-FlashRWKV2 stores verified tuning profiles and native builds under
-`~/.cache/flashrwkv2`. Set `FLASHRWKV2_CACHE_DIR` before starting the process to
-choose another persistent root. The tuning root is independent of the virtual
-environment, release directory, `TORCH_HOME`, and `XDG_CACHE_HOME`. TileLang
-0.1.15 keeps its separate JIT cache at `~/.tilelang/cache`.
-
-`VLLM_RWKV_TUNING_MODE` controls preparation before CUDA Graph capture:
-
-- `inspect` (default) logs actual dispatch coverage and permits untuned defaults.
-- `require` loads verified selections and fails on the first missing profile,
-  with the operator, full key, and cache root in the diagnostic.
-- `tune` calls FlashRWKV2 to verify and tune only missing keys, then requires
-  complete coverage before capture. Use this explicitly during preparation.
-
-Preparation uses the loaded model weights, configured state dtype, and each
-actual graph shape, including the separate head/sampling graphs. Model tuning
-uses fully active metadata and startup state slots, which are reset before
-capture. The report records each selected configuration, fingerprint, device
-class, profile path, and fixed/hit/missing/tuned status. Same-class GPUs
-and new worker processes reuse profiles through FlashRWKV2's locking and
-compatibility checks.
-
-Run a preparation process with the same model and serving arguments as the
-target service, including its sequence limit, token budget, and capture sizes:
-
-```bash
-FLASHRWKV2_CACHE_DIR=/path/to/persistent/flashrwkv2 \
-VLLM_RWKV_TUNING_MODE=tune \
-timeout 7200s .venv/bin/vllm serve <model> <serving-arguments>
-```
-
-After preparation, restart with `VLLM_RWKV_TUNING_MODE=require` to verify loading
-and capture in a fresh process. Eager workloads can use FlashRWKV2's public
-`prepare_tuning` with representative forward calls and disposable state.
-
-On RTX 4090 and PRO 6000 GPUs, supported BF16 projections and
-head-size-64 WKV with FP32 state report `fixed`. Preparation compiles the
-reachable variants for these dispatches. FP16 recurrent state still uses
-verified profiles where tuning applies. Run preparation for the new
-version before starting a service in `require` mode.
-
 ## Production deployment
 
 The `RWKV production` workflow uses `tools/deploy_rwkv_production.sh` to build
 each source revision in its own release directory and `.venv`. Both model
-hosts retain their existing g1l artifacts and served model names. No weight
-conversion or download is required for the tuning cache update.
+hosts retain their existing g1l artifacts and served model names.
 
-Model services set `FLASHRWKV2_CACHE_DIR=/opt/rwkv/vllm/cache/flashrwkv2` and
-`VLLM_RWKV_TUNING_MODE=require`. `prepare_flashrwkv2` checks the native extension
-under that root through the public cache API. Each service checks actual model
-and sampling dispatch coverage before capturing its graphs, and deployment
-health probes must pass before activation succeeds. Prepare or revalidate
-profiles for the new revision before deployment. Native builds retain their
-own ABI/toolchain compatibility keys; vLLM compilation caches remain local to
-each release. TileLang retains its default `~/.tilelang/cache` directory.
+Model services use `FLASHRWKV2_CACHE_DIR=/opt/rwkv/vllm/cache/flashrwkv2`
+for native builds. The deployment script compiles the sampling extension for
+SM89 and checks its version, target and library path before activating a
+release. The worker warms the model and sampling kernels before CUDA Graph
+capture. TileLang uses its default `~/.tilelang/cache` directory.
 
 The deployment commands use BF16 weights, FP16 WKV state, prefix caching off,
 and a 1024-token batch budget. Full CUDA Graphs use that token budget as their
@@ -164,7 +115,7 @@ slightly higher at 1024 than at 512. The 13.3B allocation supplied approximately
 The profile deployment comparison used 128 input and 1024 output tokens for all
 four models, with the same sampling settings and seed 20261026. Each model ran
 once before and once after deployment. All requests completed successfully.
-The deployed profiles cover the per-GPU decode batch and 1024-token prefill:
+These profiles covered the per-GPU decode batch and 1024-token prefill:
 
 | Model | Batch per GPU | Requests/concurrency | Before output tokens/s | After output tokens/s | Change |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -179,7 +130,7 @@ production validation. New processes using the production installations
 verified actual dispatch hits for all 50 published profiles: 36 on the
 small-model host and 14 on the 13.3B host.
 
-Reproduce the 7.2B DP2 profile comparison on its model host:
+The 7.2B DP2 comparison used this command on its model host:
 
 ```bash
 ulimit -n 65536
