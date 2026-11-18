@@ -18,8 +18,10 @@ pinned RWKV dependencies:
 uv pip install -r requirements/rwkv.txt
 ```
 
-The requirements file fixes the `transformers-rwkv` and `tokenizers-rwkv`
-commits and `FlashRWKV2==0.2.0a1`.
+The requirements file pins the source commits for `transformers-rwkv`,
+`tokenizers-rwkv` and FlashRWKV2 0.2.0a1. FlashRWKV2 exposes the public
+`prepare_tuning` and `get_tuning_cache_dir` APIs in addition to its
+recurrent-state provider.
 
 ## Serve a model
 
