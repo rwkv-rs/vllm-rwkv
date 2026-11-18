@@ -125,7 +125,7 @@ def _state_vllm_config(state_dtype: str = "float32", heads: int = 2) -> SimpleNa
     [
         ("float32", 40, 0),
         ("float16", 2, 0),
-        ("float16", 64, 64 * 772),
+        ("float16", 64, 64 * 1540),
         ("float16", 64, 64 * 1284),
     ],
 )
@@ -200,8 +200,10 @@ def test_state_spec_and_caller_backed_slot_lifecycle(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("heads", [40, 64])
-def test_fp16_graph_prefix_copy_and_raw_slot_read(heads: int) -> None:
+@pytest.mark.parametrize(("heads", "prefix_steps"), [(40, 1), (64, 1), (64, 2)])
+def test_fp16_graph_prefix_copy_and_raw_slot_read(
+    heads: int, prefix_steps: int
+) -> None:
     provider = pytest.importorskip("flashrwkv2")
     batch, dim = 16, 64
     config = _state_vllm_config("float16", heads)
@@ -265,7 +267,12 @@ def test_fp16_graph_prefix_copy_and_raw_slot_read(heads: int) -> None:
     )
     layer.materialize_state_slots([2])
     assert torch.all(base[2] == 1)
-    # Fork a prefix after an odd decode step and reuse its source slot.
+    if prefix_steps == 2:
+        graph.replay()
+        # Slot 1 accumulates both updates. Slot 2 was materialized between them.
+        layer.materialize_state_slots([1, 2])
+        assert torch.equal(base[1], base[2])
+        assert torch.all(base[2] > 1)
     layer.copy_state_block_pairs([(0, batch)])
     layer.reset_state_slots([0])
     metadata.state_indices[0] = batch
