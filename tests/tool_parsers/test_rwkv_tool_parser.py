@@ -12,7 +12,9 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionToolsParam,
 )
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+from vllm.parser.parser_manager import ParserManager
 from vllm.tool_parsers import ToolParser, ToolParserManager
+from vllm.tool_parsers.rwkv_tool_parser import RwkvToolParser
 
 
 class FakeTokenizer:
@@ -38,6 +40,7 @@ def _tool(name: str) -> ChatCompletionToolsParam:
 def _request(
     tools: list[ChatCompletionToolsParam] | None = None,
     tool_choice: Any = "auto",
+    parallel_tool_calls: bool | None = None,
 ) -> ChatCompletionRequest:
     kwargs: dict[str, Any] = {}
     if tools is not None:
@@ -45,6 +48,8 @@ def _request(
             tools=[tool.model_dump() for tool in tools],
             tool_choice=tool_choice,
         )
+    if parallel_tool_calls is not None:
+        kwargs["parallel_tool_calls"] = parallel_tool_calls
     return ChatCompletionRequest(
         model="rwkv-test",
         messages=[{"role": "user", "content": "hi"}],
@@ -88,6 +93,9 @@ def _stream(
         previous_text = current_text
         if delta is not None:
             deltas.append(delta)
+    finish = getattr(parser, "finish_streaming", None)
+    if finish is not None and (delta := finish()) is not None:
+        deltas.append(delta)
     return deltas
 
 
@@ -200,6 +208,156 @@ def test_streams_content_and_complete_tool_calls(chunk_size: int) -> None:
     assert len(tool_calls) == 1
     assert tool_calls[0].function is not None
     assert tool_calls[0].function.name == "get_weather"
+    assert json.loads(tool_calls[0].function.arguments or "") == {"city": "Paris"}
+
+
+@pytest.mark.parametrize("chunk_size", [1, 11, 10_000])
+def test_streams_each_parallel_call_once(chunk_size: int) -> None:
+    tools = [_tool("get_weather")]
+    request = _request(tools)
+    text = "\n".join(
+        [
+            _tool_call("get_weather", {"city": "Paris"}),
+            _tool_call("get_weather", {"city": "Berlin"}),
+        ]
+    )
+    parser = _parser(tools)
+
+    deltas = _stream(parser, text, request, chunk_size)
+    replay = parser.extract_tool_calls_streaming(
+        previous_text=text,
+        current_text=text,
+        delta_text="",
+        previous_token_ids=[],
+        current_token_ids=[],
+        delta_token_ids=[],
+        request=request,
+    )
+
+    tool_calls = [call for delta in deltas for call in (delta.tool_calls or [])]
+    assert [call.index for call in tool_calls] == [0, 1]
+    assert [call.function.name for call in tool_calls if call.function] == [
+        "get_weather",
+        "get_weather",
+    ]
+    assert [
+        json.loads(call.function.arguments or "")
+        for call in tool_calls
+        if call.function
+    ] == [{"city": "Paris"}, {"city": "Berlin"}]
+    assert replay is None
+
+
+def test_stream_payloads_are_parsed_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    tools = [_tool("get_weather")]
+    request = _request(tools)
+    parser_cls = ParserManager.get_parser(
+        tool_parser_name="rwkv",
+        enable_auto_tools=True,
+    )
+    assert parser_cls is not None
+    parser = parser_cls(FakeTokenizer(), tools=tools)
+    call_count = 64
+    text = "\n".join(
+        _tool_call("get_weather", {"city": str(index)}) for index in range(call_count)
+    )
+    parse_payload = RwkvToolParser._parse_payload
+    payload_parse_count = 0
+
+    def counted_parse_payload(self: RwkvToolParser, payload: str, req: Any):
+        nonlocal payload_parse_count
+        payload_parse_count += 1
+        return parse_payload(self, payload, req)
+
+    monkeypatch.setattr(RwkvToolParser, "_parse_payload", counted_parse_payload)
+
+    deltas: list[DeltaMessage] = []
+    for index, ch in enumerate(text):
+        delta = parser.parse_delta(
+            delta_text=ch,
+            delta_token_ids=[],
+            request=request,
+            prompt_token_ids=[] if index == 0 else None,
+            finished=index == len(text) - 1,
+        )
+        if delta is not None:
+            deltas.append(delta)
+
+    tool_calls = [call for delta in deltas for call in (delta.tool_calls or [])]
+    assert len(tool_calls) == call_count
+    assert payload_parse_count == call_count
+
+
+@pytest.mark.parametrize("suffix", ["", "\n", "\n``"])
+def test_stream_ignores_unclosed_fence_after_complete_json_payload(
+    suffix: str,
+) -> None:
+    tools = [_tool("get_weather")]
+    request = _request(tools)
+    unclosed = (
+        "**Tool Call:**\n"
+        "```json\n"
+        '{"name": "get_weather", "arguments": {"city": "Berlin"}}'
+        f"{suffix}"
+    )
+
+    single_deltas = _stream(_parser(tools), unclosed, request, 1)
+    single_calls = [
+        call for delta in single_deltas for call in (delta.tool_calls or [])
+    ]
+    single_content = "".join(delta.content or "" for delta in single_deltas)
+    assert single_calls == []
+    assert single_content == unclosed
+
+    after_valid = _tool_call("get_weather", {"city": "Paris"}) + "\n" + unclosed
+    mixed_deltas = _stream(_parser(tools), after_valid, request, 1)
+    mixed_calls = [call for delta in mixed_deltas for call in (delta.tool_calls or [])]
+    mixed_content = "".join(delta.content or "" for delta in mixed_deltas)
+    assert len(mixed_calls) == 1
+    assert mixed_calls[0].function is not None
+    assert json.loads(mixed_calls[0].function.arguments or "") == {"city": "Paris"}
+    assert mixed_content == ""
+
+
+def test_stream_stops_after_first_complete_invalid_call() -> None:
+    tools = [_tool("get_weather")]
+    request = _request(tools)
+    parser = _parser(tools)
+    text = "\n".join(
+        [
+            _tool_call("get_weather", {"city": "Paris"}),
+            _tool_call("unknown", {"city": "London"}),
+            _tool_call("get_weather", {"city": "Berlin"}),
+        ]
+    )
+
+    deltas = _stream(parser, text, request, 7)
+
+    tool_calls = [call for delta in deltas for call in (delta.tool_calls or [])]
+    assert len(tool_calls) == 1
+    assert tool_calls[0].function is not None
+    assert json.loads(tool_calls[0].function.arguments or "") == {"city": "Paris"}
+
+
+def test_honors_parallel_tool_calls_false() -> None:
+    tools = [_tool("get_weather")]
+    request = _request(tools, parallel_tool_calls=False)
+    text = "\n".join(
+        [
+            _tool_call("get_weather", {"city": "Paris"}),
+            _tool_call("get_weather", {"city": "Berlin"}),
+        ]
+    )
+
+    extracted = _parser(tools).extract_tool_calls(text, request)
+    assert len(extracted.tool_calls) == 1
+    assert json.loads(extracted.tool_calls[0].function.arguments) == {"city": "Paris"}
+
+    deltas = _stream(_parser(tools), text, request, 5)
+    tool_calls = [call for delta in deltas for call in (delta.tool_calls or [])]
+    assert len(tool_calls) == 1
+    assert tool_calls[0].index == 0
+    assert tool_calls[0].function is not None
     assert json.loads(tool_calls[0].function.arguments or "") == {"city": "Paris"}
 
 
