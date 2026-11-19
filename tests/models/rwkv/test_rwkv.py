@@ -3,7 +3,7 @@
 
 import os
 import sys
-from contextlib import contextmanager
+from functools import partial
 from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -34,17 +34,19 @@ from vllm.v1.worker.gpu.model_states.rwkv import RwkvModelState, RwkvSampler
 
 
 class _FakeStateHandle:
-    def __init__(self, state: torch.Tensor) -> None:
+    def __init__(self, state: torch.Tensor, private_bytes_per_slot: int = 0) -> None:
         self.state = state
+        self.private_bytes_per_slot = private_bytes_per_slot
         self.materialized: list[torch.Tensor] = []
 
     @property
     def memory_layout(self) -> dict[str, int]:
-        per_slot = self.state[0].numel() * self.state.element_size()
+        per_slot = self.state[0].nbytes + self.private_bytes_per_slot
         return {
+            "private_bytes_per_slot": self.private_bytes_per_slot,
             "bytes_per_slot": per_slot,
             "fixed_workspace_nbytes": 0,
-            "total_nbytes": self.state.numel() * self.state.element_size(),
+            "total_nbytes": len(self.state) * per_slot,
         }
 
     def reset_slots_(self, indices: torch.Tensor) -> None:
@@ -66,14 +68,14 @@ class _FakeStateHandle:
         self.materialized.append(indices.clone())
 
 
-def _fake_flashrwkv2() -> ModuleType:
+def _fake_flashrwkv2(fp16_private_bytes_per_slot: int = 0) -> ModuleType:
     module: Any = ModuleType("flashrwkv2")
-    module.__version__ = "0.1.0a19"
-    module.get_tuning_cache_dir = lambda: None
-    module.prepare_tuning = lambda calls, *, mode: [call() for call in calls]
+    module.__version__ = "0.2.0a1"
 
     module.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor = _FakeStateHandle
-    module.prepare_tmix_wkv7_recurrent_fp16_state_from_tensor = _FakeStateHandle
+    module.prepare_tmix_wkv7_recurrent_fp16_state_from_tensor = partial(
+        _FakeStateHandle, private_bytes_per_slot=fp16_private_bytes_per_slot
+    )
     module.prepare_tmix_wkv7_recurrent_metadata = lambda *args, **kwargs: (args, kwargs)
     for name in (
         "infer_cmix_forward_varlen",
@@ -99,11 +101,11 @@ def _clear_flashrwkv2_cache():
     _load_flashrwkv2.cache_clear()
 
 
-def _state_vllm_config(state_dtype: str = "float32") -> SimpleNamespace:
+def _state_vllm_config(state_dtype: str = "float32", heads: int = 2) -> SimpleNamespace:
     hf_config = SimpleNamespace(
-        hidden_size=128,
+        hidden_size=heads * 64,
         head_size=64,
-        num_attention_heads=2,
+        num_attention_heads=heads,
     )
     return SimpleNamespace(
         model_config=SimpleNamespace(hf_config=hf_config),
@@ -118,10 +120,20 @@ def _state_vllm_config(state_dtype: str = "float32") -> SimpleNamespace:
     )
 
 
-@pytest.mark.parametrize("state_dtype", ["float32", "float16"])
-def test_state_spec_and_caller_backed_slot_lifecycle(monkeypatch, state_dtype) -> None:
-    monkeypatch.setitem(sys.modules, "flashrwkv2", _fake_flashrwkv2())
-    vllm_config = _state_vllm_config(state_dtype)
+@pytest.mark.parametrize(
+    ("state_dtype", "heads", "private_bytes"),
+    [
+        ("float32", 40, 0),
+        ("float16", 2, 0),
+        ("float16", 64, 64 * 1540),
+        ("float16", 64, 64 * 1284),
+    ],
+)
+def test_state_spec_and_caller_backed_slot_lifecycle(
+    monkeypatch, state_dtype, heads, private_bytes
+) -> None:
+    monkeypatch.setitem(sys.modules, "flashrwkv2", _fake_flashrwkv2(private_bytes))
+    vllm_config = _state_vllm_config(state_dtype, heads)
     state_layer = RwkvStateLayer(vllm_config, 2, "model.layers.0.rwkv_state")
     spec = state_layer.get_kv_cache_spec(vllm_config)
 
@@ -130,16 +142,17 @@ def test_state_spec_and_caller_backed_slot_lifecycle(monkeypatch, state_dtype) -
         is AttentionCGSupport.ALWAYS
     )
     assert spec.num_prefill_checkpoint_blocks == 0
+    assert spec.external_bytes_per_page == 2 * private_bytes
 
     num_slots = 3
     raw = torch.zeros((num_slots, 1, 1, spec.page_size_bytes), dtype=torch.int8)
     state_layer.bind_kv_cache(raw)
     tmix, handle, cmix = state_layer.get_layer_state(0)
-    assert handle.state.shape == (num_slots, 2, 64, 64)
+    assert handle.state.shape == (num_slots, heads, 64, 64)
     assert handle.state.dtype == getattr(torch, state_dtype)
     assert spec.page_size_bytes == 2 * (
-        2 * 128 * torch.empty((), dtype=torch.bfloat16).element_size()
-        + 2 * 64 * 64 * handle.state.element_size()
+        2 * heads * 64 * torch.bfloat16.itemsize
+        + heads * 64 * 64 * handle.state.element_size()
     )
     assert tmix.dtype == cmix.dtype == torch.bfloat16
     assert handle.state.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
@@ -184,6 +197,91 @@ def test_state_spec_and_caller_backed_slot_lifecycle(monkeypatch, state_dtype) -
         and torch.equal(layer_handle.materialized[0], source)
         for layer_handle in handles
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(("heads", "prefix_steps"), [(40, 1), (64, 1), (64, 2)])
+def test_fp16_graph_prefix_copy_and_raw_slot_read(
+    heads: int, prefix_steps: int
+) -> None:
+    provider = pytest.importorskip("flashrwkv2")
+    batch, dim = 16, 64
+    config = _state_vllm_config("float16", heads)
+    config.device_config.device = torch.device("cuda")
+    layer = RwkvStateLayer(config, 1, "model.layers.0.rwkv_state")
+    spec = layer.get_kv_cache_spec(config)
+    backing = torch.zeros(
+        (batch + 1, spec.page_size_bytes), device="cuda", dtype=torch.uint8
+    )
+    layer.bind_kv_cache(backing)
+    _, state, _ = layer.get_layer_state(0)
+    assert spec.external_bytes_per_page == state.memory_layout["private_bytes_per_slot"]
+    assert spec.external_bytes_per_page > 0
+    slots = torch.arange(batch, device="cuda", dtype=torch.int32)
+    count = torch.zeros(1, device="cuda", dtype=torch.int32)
+    metadata = RwkvAttentionMetadata(
+        cu_seqlens=torch.arange(batch + 1, device="cuda", dtype=torch.int32),
+        state_indices=slots.clone(),
+        batch_size=batch,
+        max_seqlen=1,
+        token_capacity=batch,
+        sequence_capacity=batch,
+        max_seqlen_capacity=1,
+        num_active_tokens=count,
+        num_active_sequences=count,
+        retain_ticket=True,
+    )
+    ones = torch.ones(batch, heads, dim, device="cuda", dtype=torch.bfloat16)
+    zeros = torch.zeros_like(ones)
+
+    def decode():
+        return provider.infer_tmix_wkv7_recurrent_fp16_forward_varlen(
+            ones,
+            zeros,
+            ones,
+            ones,
+            zeros,
+            zeros,
+            state=state,
+            cu_seqlens=metadata.cu_seqlens,
+            state_indices=metadata.state_indices,
+            validated_metadata=layer.prepare_metadata_ticket(metadata),
+            max_seqlen=1,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        decode()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        output = decode()
+
+    count.fill_(batch)
+    graph.replay()
+    base = (
+        backing.view(-1)[2 * (batch + 1) * heads * dim * 2 :]
+        .view(torch.float16)
+        .view(batch + 1, heads, dim, dim)
+    )
+    layer.materialize_state_slots([2])
+    assert torch.all(base[2] == 1)
+    if prefix_steps == 2:
+        graph.replay()
+        # Slot 1 accumulates both updates. Slot 2 was materialized between them.
+        layer.materialize_state_slots([1, 2])
+        assert torch.equal(base[1], base[2])
+        assert torch.all(base[2] > 1)
+    layer.copy_state_block_pairs([(0, batch)])
+    layer.reset_state_slots([0])
+    metadata.state_indices[0] = batch
+    graph.replay()
+    assert torch.equal(output[0], output[1])
+    layer.materialize_state_slots([batch, 1, 0])
+    assert torch.equal(base[batch], base[1])
+    assert torch.all(base[batch] > 1)
+    assert torch.count_nonzero(base[0]) == 0
 
 
 def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:
@@ -586,140 +684,6 @@ def test_head_preserves_provider_fp32_logits_and_trims_padding(monkeypatch) -> N
     assert result.dtype == torch.float32
     assert torch.equal(result, logits[:, :2])
     assert result[0, 1] > result[0, 0]
-
-
-@pytest.mark.parametrize("capturing", [False, True])
-def test_graph_warmup_checks_coverage_without_repeating_state_updates(
-    monkeypatch, capturing
-) -> None:
-    """Coverage executes the existing warmup once and stays outside capture."""
-    module: Any = _fake_flashrwkv2()
-    modes = []
-    updates = []
-    output = torch.ones(2, 4)
-
-    def prepare(calls, *, mode):
-        modes.append(mode)
-        for call in calls:
-            call()
-        return {"complete": True}
-
-    def forward(*args):
-        updates.append(args)
-        return output
-
-    module.prepare_tuning = prepare
-    monkeypatch.setitem(sys.modules, "flashrwkv2", module)
-    monkeypatch.setenv("VLLM_RWKV_TUNING_MODE", "require")
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
-    monkeypatch.setattr(
-        "vllm.model_executor.models.rwkv.get_rwkv_metadata",
-        lambda: SimpleNamespace(retain_ticket=True),
-    )
-    result = RwkvForCausalLM.forward(
-        SimpleNamespace(model=forward), torch.tensor([1, 2]), torch.arange(2)
-    )
-    assert result is output
-    assert len(updates) == 1
-    assert modes == ([] if capturing else ["require"])
-
-
-def test_graph_warmup_propagates_missing_profile_diagnostic(monkeypatch) -> None:
-    module: Any = _fake_flashrwkv2()
-
-    def prepare(calls, *, mode):
-        assert mode == "require"
-        raise RuntimeError("missing verified tuning profile: tmix/wkv7")
-
-    module.prepare_tuning = prepare
-    monkeypatch.setitem(sys.modules, "flashrwkv2", module)
-    monkeypatch.setenv("VLLM_RWKV_TUNING_MODE", "require")
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    monkeypatch.setattr(
-        "vllm.model_executor.models.rwkv.get_rwkv_metadata",
-        lambda: SimpleNamespace(retain_ticket=True),
-    )
-    with pytest.raises(
-        RuntimeError, match="missing verified tuning profile: tmix/wkv7"
-    ):
-        RwkvForCausalLM.forward(
-            SimpleNamespace(model=lambda *args: None),
-            torch.tensor([1]),
-            torch.tensor([0]),
-        )
-
-
-@pytest.mark.parametrize("fails", [False, True])
-def test_tuning_restores_startup_slots_after_active_preparation(monkeypatch, fails):
-    module: Any = _fake_flashrwkv2()
-    metadata = RwkvAttentionMetadata(
-        cu_seqlens=torch.tensor([0, 2, 4], dtype=torch.int32),
-        state_indices=torch.zeros(2, dtype=torch.int32),
-        batch_size=2,
-        max_seqlen=4,
-        token_capacity=4,
-        sequence_capacity=2,
-        max_seqlen_capacity=4,
-        num_active_tokens=torch.zeros(1, dtype=torch.int32),
-        num_active_sequences=torch.zeros(1, dtype=torch.int32),
-        retain_ticket=True,
-    )
-    pool = torch.zeros(2, dtype=torch.float32)
-    modes = []
-    context = metadata
-
-    @contextmanager
-    def forward_context(active, config):
-        nonlocal context
-        context = active
-        yield
-        context = metadata
-
-    def forward(*args):
-        if context is not metadata:
-            assert context.num_active_tokens.item() == 4
-            assert context.num_active_sequences.item() == 2
-            assert context.state_indices.tolist() == [0, 1]
-            assert context.cu_seqlens.tolist() == [0, 2, 4]
-            assert not context.retain_ticket
-            pool.index_fill_(0, context.state_indices.long(), 1)
-        return torch.ones(4, 2)
-
-    def prepare(calls, *, mode):
-        modes.append(mode)
-        for call in calls:
-            call()
-        if fails:
-            raise RuntimeError("verification failed")
-        return {"complete": True}
-
-    module.prepare_tuning = prepare
-    monkeypatch.setitem(sys.modules, "flashrwkv2", module)
-    monkeypatch.setenv("VLLM_RWKV_TUNING_MODE", "tune")
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    monkeypatch.setattr(
-        "vllm.model_executor.models.rwkv.get_rwkv_metadata", lambda: metadata
-    )
-    monkeypatch.setattr(
-        "vllm.model_executor.models.rwkv.set_forward_context", forward_context
-    )
-    state = SimpleNamespace(
-        reset_state_slots=lambda slots: pool.index_fill_(0, slots.long(), 0)
-    )
-    model = SimpleNamespace(
-        model=forward, get_rwkv_state_layer=lambda: state, vllm_config=None
-    )
-    if fails:
-        with pytest.raises(RuntimeError, match="verification failed"):
-            RwkvForCausalLM.forward(model, torch.arange(4), torch.arange(4))
-    else:
-        assert RwkvForCausalLM.forward(
-            model, torch.arange(4), torch.arange(4)
-        ).shape == (4, 2)
-    assert modes == (["tune"] if fails else ["tune", "require"])
-    assert torch.equal(pool, torch.zeros_like(pool))
-    assert metadata.num_active_tokens.item() == 0
-    assert metadata.state_indices.tolist() == [0, 0]
 
 
 _LORA = {
@@ -1262,16 +1226,20 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
     params = SamplingParams(
         temperature=temperature,
         top_k=1 if temperature == 0 else 20,
+        top_p=0.9,
         seed=20261026,
         max_tokens=4,
         ignore_eos=True,
         logprobs=3,
-        presence_penalty=0,
-        frequency_penalty=0,
-        penalty_decay=1,
+        presence_penalty=0.3,
+        frequency_penalty=0.2,
+        penalty_decay=0.95,
         detokenize=False,
     )
+    tokens_only = params.clone()
+    tokens_only.logprobs = None
     prompt = {"prompt_token_ids": list(range(1, 66))}
+    mixed_prompts = [{"prompt_token_ids": [7, 8, 9]}, prompt]
     reference = None
     for enforce_eager, token_budget in ((True, 128), (False, 32)):
         with vllm_runner(
@@ -1280,7 +1248,9 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
             max_model_len=128,
             max_num_batched_tokens=token_budget,
             max_num_seqs=4,
-            gpu_memory_utilization=0.8,
+            gpu_memory_utilization=float(
+                os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.8")
+            ),
             num_gpu_blocks_override=64,
             mamba_ssm_cache_dtype=state_dtype,
             enable_chunked_prefill=True,
@@ -1289,9 +1259,11 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
             compilation_config={"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]},
         ) as runner:
             single = runner.llm.generate([prompt], params)[0].outputs[0]
-            mixed = runner.llm.generate(
-                [{"prompt_token_ids": [7, 8, 9]}, prompt], params
-            )[1].outputs[0]
+            mixed = runner.llm.generate(mixed_prompts, params)[1].outputs[0]
+            if not enforce_eager:
+                # Requests without logprobs use the head/sampling CUDA Graph.
+                replay = runner.llm.generate(mixed_prompts, tokens_only)[1].outputs[0]
+                assert replay.token_ids == mixed.token_ids
         assert len(single.token_ids) == 4
         assert mixed.token_ids == single.token_ids
         assert mixed.logprobs == single.logprobs

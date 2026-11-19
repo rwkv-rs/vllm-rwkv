@@ -1944,6 +1944,25 @@ def test_check_enough_kv_cache_memory_reserves_null_block():
     )
 
 
+def test_provider_state_counts_toward_capacity_without_enlarging_backing():
+    from vllm.v1.attention.backends.rwkv_attn import RwkvStateSpec
+
+    config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    config.cache_config.kv_cache_layout = "LBNHC"
+    spec = RwkvStateSpec(
+        block_size=16,
+        shapes=((64,),),
+        dtypes=(torch.float16,),
+        external_bytes_per_page=32,
+    )
+    slot_bytes = spec.page_size_bytes + spec.external_bytes_per_page
+    with pytest.raises(ValueError, match="max seq len"):
+        check_enough_kv_cache_memory(config, {"state": spec}, 2 * slot_bytes - 1)
+    (cache,) = get_kv_cache_configs(config, [{"state": spec}], [9 * slot_bytes - 1])
+    assert cache.num_blocks == 8
+    assert cache.kv_cache_tensors[0].size == 8 * spec.page_size_bytes
+
+
 def _spec_decode_kv_cache_groups(worker_specs, use_eagle_block_drop=True):
     config = VllmConfig(model_config=ModelConfig(max_model_len=64))
     config.cache_config.kv_cache_layout = "BLHNC"

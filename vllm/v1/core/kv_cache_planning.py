@@ -91,7 +91,13 @@ def max_memory_usage_bytes(
     vllm_config: VllmConfig, kv_cache_specs: Iterable[KVCacheSpec]
 ) -> int:
     """Get the maximum memory usage in bytes for the given KV cache specs."""
-    return sum(spec.max_memory_usage_bytes(vllm_config) for spec in kv_cache_specs)
+    total = 0
+    for spec in kv_cache_specs:
+        size = spec.max_memory_usage_bytes(vllm_config)
+        total += size
+        if spec.external_bytes_per_page:
+            total += cdiv(size, spec.page_size_bytes) * spec.external_bytes_per_page
+    return total
 
 
 def estimate_max_model_len(
@@ -256,10 +262,10 @@ def _pool_bytes_per_block(
     `available_memory` into `num_blocks`. Used to compute the effective KV cache
     capacity once `num_gpu_blocks_override` is applied.
     """
+    gpu_groups = [group for group in kv_cache_groups if not group.host_resident]
     return _get_kv_cache_bytes_per_block(
-        [group for group in kv_cache_groups if not group.host_resident],
-        vllm_config.cache_config.get_resolved_kv_cache_layout(),
-    )
+        gpu_groups, vllm_config.cache_config.get_resolved_kv_cache_layout()
+    ) + _get_external_kv_cache_bytes_per_block(gpu_groups)
 
 
 def _pool_bytes_per_block_from_builder(
@@ -301,7 +307,7 @@ def _pool_bytes_per_block_from_builder(
             "KVCacheConfigBuilder._get_pool_bytes_per_block() for placements "
             "with several device allocations."
         )
-    return backing_sizes.pop()
+    return backing_sizes.pop() + _get_external_kv_cache_bytes_per_block(kv_cache_groups)
 
 
 def get_uniform_page_size(kv_cache_specs: Iterable[KVCacheSpec]) -> int:
@@ -571,6 +577,16 @@ def _get_layer_block_stride(spec: KVCacheSpec) -> int:
     return round_up(spec.page_size_bytes, spec.get_block_stride_alignment())
 
 
+def _get_external_kv_cache_bytes_per_block(groups: list[KVCacheGroupSpec]) -> int:
+    # Each layer owns its private allocation even when groups share a backing.
+    return sum(
+        _get_per_layer_spec(group, name).external_bytes_per_page
+        for group in groups
+        if not group.host_resident
+        for name in group.layer_names
+    )
+
+
 def _get_kv_cache_bytes_per_block(
     kv_cache_groups: list[KVCacheGroupSpec], layout: KVCacheLayout
 ) -> int:
@@ -678,7 +694,9 @@ def get_kv_cache_config_from_groups(
     bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups, layout)
     interleaved_block_stride = bytes_per_block if layout.is_block_outermost else None
 
-    num_blocks = available_memory // bytes_per_block
+    num_blocks = available_memory // (
+        bytes_per_block + _get_external_kv_cache_bytes_per_block(kv_cache_groups)
+    )
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
     size = bytes_per_block * num_blocks
 
