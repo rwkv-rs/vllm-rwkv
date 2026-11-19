@@ -8,7 +8,6 @@ from http import HTTPStatus
 
 from fastapi import Request
 
-from vllm.entrypoints.chat_utils import ConversationMessage
 from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
 from vllm.entrypoints.openai.chat_completion.protocol import (
     BatchChatCompletionRequest,
@@ -24,6 +23,7 @@ from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
 from vllm.parser.abstract_parser import Parser
+from vllm.renderers.chat_utils import ConversationMessage
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.async_utils import merge_async_iterators
 from vllm.utils.collection_utils import as_list
@@ -136,7 +136,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
         if raw_request:
             raw_request.state.request_metadata = request_metadata
 
-        lora_request = self._maybe_get_adapters(request, supports_default_mm_loras=True)
+        lora_request = self._maybe_get_adapters(request)
         model_name = self.models.model_name(lora_request)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
         max_model_len = self.model_config.max_model_len
@@ -157,6 +157,9 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                 self._extract_prompt_len(engine_prompt),
                 request_sampling_defaults,
                 self.override_max_tokens,
+            )
+            lora_request = self._maybe_get_adapters(
+                single_request, supports_default_mm_loras=True
             )
             sampling_params = single_request.to_sampling_params(
                 max_tokens, request_sampling_defaults

@@ -48,7 +48,7 @@ from .utils import (
     maybe_prefix,
 )
 
-_FLASHRWKV2_VERSION = "0.1.0a17"
+_FLASHRWKV2_VERSION = "0.1.0a19"
 logger = init_logger(__name__)
 
 
@@ -119,11 +119,7 @@ def _prepare_tuning(call: Callable[[], Any], *, mode: str | None = None) -> Any:
         nonlocal result
         result = call()
 
-    report = _load_flashrwkv2().prepare_tuning(
-        [forward],
-        mode=mode,
-        legacy_dir=envs.VLLM_RWKV_TUNING_LEGACY_DIR if mode == "tune" else None,
-    )
+    report = _load_flashrwkv2().prepare_tuning([forward], mode=mode)
     logger.info("FlashRWKV2 dispatch coverage: %s", json.dumps(report))
     return result
 
