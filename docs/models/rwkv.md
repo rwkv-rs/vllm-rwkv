@@ -36,7 +36,8 @@ vllm serve <model> \
   --no-enable-prefix-caching
 ```
 
-For RL rollouts, pass `--mamba-ssm-cache-dtype float32` or set
+For RL rollouts, evaluation and sampling-parameter search, pass
+`--mamba-ssm-cache-dtype float32` or set
 `mamba_ssm_cache_dtype="float32"` in `LLM` to match the WKV state precision
 used when recomputing training logprobs. FP16 recurrence can produce
 different logits and generated tokens.
