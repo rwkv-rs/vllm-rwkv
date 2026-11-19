@@ -18,10 +18,8 @@ pinned RWKV dependencies:
 uv pip install -r requirements/rwkv.txt
 ```
 
-The requirements file pins the source commits for `transformers-rwkv`,
-`tokenizers-rwkv` and FlashRWKV2 0.2.0a1. FlashRWKV2 exposes the public
-`prepare_tuning` and `get_tuning_cache_dir` APIs in addition to its
-recurrent-state provider.
+The requirements file pins the source commits for `transformers-rwkv` and
+`tokenizers-rwkv` and installs FlashRWKV2 0.2.0a1 from PyPI.
 
 ## Serve a model
 
@@ -71,7 +69,9 @@ Model services use `FLASHRWKV2_CACHE_DIR=/opt/rwkv/vllm/cache/flashrwkv2`
 for native builds. The deployment script compiles the sampling extension for
 SM89 and checks its version, target and library path before activating a
 release. The worker warms the model and sampling kernels before CUDA Graph
-capture. TileLang uses its default `~/.tilelang/cache` directory.
+capture. TileLang uses its default `~/.tilelang/cache` directory. Remove
+`VLLM_RWKV_TUNING_MODE` from custom launchers and service units when upgrading.
+Launches with `--fail-on-environ-validation` reject the retired variable.
 
 The deployment commands use BF16 weights, FP16 WKV state, prefix caching off,
 and a 1024-token batch budget. Full CUDA Graphs use that token budget as their
