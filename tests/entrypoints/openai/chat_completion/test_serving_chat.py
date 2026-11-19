@@ -51,6 +51,7 @@ from vllm.logprobs import Logprob
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser import HarmonyParser
+from vllm.parser.parser_manager import ParserManager
 from vllm.renderers.hf import HfRenderer
 from vllm.renderers.mistral import MistralRenderer
 from vllm.renderers.online_renderer import OnlineRenderer
@@ -1428,6 +1429,52 @@ async def test_streaming_reasoning_usage_lifecycle_edges(
         assert call_count == 0
     else:
         assert call_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_rwkv_stream_keeps_unclosed_tool_payload_at_length_limit():
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    serving.model_config = None
+    serving.return_tokens_as_token_ids = False
+    serving.enable_auto_tools = True
+    serving.parser_cls = ParserManager.get_parser(
+        tool_parser_name="rwkv", enable_auto_tools=True
+    )
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "Use lookup"}],
+        tools=[{"type": "function", "function": {"name": "lookup"}}],
+        tool_choice="auto",
+        stream=True,
+    )
+    text = '**Tool Call:**\n```json\n{"name":"lookup","arguments":{}}\n``'
+    partial = _make_metrics_request_output(metrics=None)
+    partial.outputs[0].text = text
+    partial.outputs[0].finish_reason = None
+    partial.finished = False
+    terminal = _make_metrics_request_output(metrics=None, token_ids=())
+    terminal.outputs[0].text = ""
+    terminal.outputs[0].finish_reason = "length"
+
+    choices = []
+    async for line in serving.chat_completion_stream_generator(
+        request,
+        _stream_request_outputs(partial, terminal),
+        "chatcmpl-test-id",
+        "test-model",
+        conversation=[],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+    ):
+        payload = line.removeprefix("data: ").strip()
+        if payload != "[DONE]":
+            choices.extend(json.loads(payload)["choices"])
+
+    assert "".join(chunk["delta"].get("content") or "" for chunk in choices) == text
+    assert not any(chunk["delta"].get("tool_calls") for chunk in choices)
+    assert [chunk["finish_reason"] for chunk in choices if chunk["finish_reason"]] == [
+        "length"
+    ]
 
 
 @pytest.mark.asyncio
