@@ -564,6 +564,9 @@ def _rwkv_grammar(tool_choice, tools=None):
         tools=tools if tools is not None else _k3_tools_by_name(),
         tool_choice=tool_choice,
         reasoning=False,
+        strict_level=(
+            ToolStrictLevel.AUTO if tools is not None else ToolStrictLevel.PARAMETER
+        ),
     )
     assert isinstance(tag, StructuralTag)
     return Grammar.from_structural_tag(tag)
@@ -594,6 +597,22 @@ def test_rwkv_required_accepts_reasoning_and_parallel_calls():
     assert _is_grammar_accept_string(_rwkv_grammar("required"), body)
 
 
+@pytest.mark.parametrize("turn_stop", ["✿", "\nUser:", "\n### User"])
+def test_rwkv_parallel_calls_allow_native_turn_stop_after_call(turn_stop):
+    body = _rwkv_tool_call("get_weather", '{"city": "Paris"}')
+
+    assert _is_grammar_accept_string(_rwkv_grammar("required"), body + turn_stop)
+
+
+@pytest.mark.parametrize("turn_stop", ["✿", "\nUser:", "\n### User"])
+def test_rwkv_required_rejects_native_turn_stop_before_call(turn_stop):
+    assert not _is_grammar_accept_string(
+        _rwkv_grammar("required"),
+        "reasoning" + turn_stop,
+        require_termination=False,
+    )
+
+
 @pytest.mark.parametrize("tool_choice", ["auto", "required"])
 def test_rwkv_non_parallel_choice_stops_after_one_call(
     tool_choice,
@@ -607,8 +626,10 @@ def test_rwkv_non_parallel_choice_stops_after_one_call(
     )
     assert isinstance(tag, StructuralTag)
     limit_to_single_tool_call(tag)
-    output = tag.format if tool_choice == "auto" else tag.format.elements[1]
-    assert output.stop_after_first is True
+    grammar = Grammar.from_structural_tag(tag)
+    call = _rwkv_tool_call("get_weather", '{"city": "Paris"}')
+    assert _is_grammar_accept_string(grammar, call)
+    assert not _is_grammar_accept_string(grammar, call + "\n" + call)
 
 
 @pytest.mark.parametrize(
@@ -624,7 +645,8 @@ def test_rwkv_required_rejects_invalid_calls(body: str):
     assert not _is_grammar_accept_string(_rwkv_grammar("required"), body)
 
 
-def test_rwkv_named_choice_accepts_only_the_selected_tool():
+@pytest.mark.parametrize("turn_stop", ["✿", "\nUser:", "\n### User"])
+def test_rwkv_named_choice_accepts_only_the_selected_tool(turn_stop):
     choice = ChatCompletionNamedToolChoiceParam(
         function=ChatCompletionNamedFunction(name="get_weather")
     )
@@ -632,7 +654,7 @@ def test_rwkv_named_choice_accepts_only_the_selected_tool():
 
     assert _is_grammar_accept_string(
         grammar,
-        _rwkv_tool_call("get_weather", '{"city": "Paris"}'),
+        _rwkv_tool_call("get_weather", '{"city": "Paris"}') + turn_stop,
     )
     assert not _is_grammar_accept_string(
         grammar,
