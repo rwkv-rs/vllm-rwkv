@@ -11,6 +11,8 @@ import torch
 import vllm.v1.hisparse.binding as hisparse_binding
 import vllm.v1.worker.gpu.attn_utils as attn_utils
 import vllm.v1.worker.gpu_model_runner as gpu_model_runner
+from vllm.v1.attention.backends.rwkv_attn import RwkvStateSpec
+from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 from vllm.v1.worker.gpu_worker import Worker
 
 
@@ -28,17 +30,22 @@ class _AllocationScope(AbstractContextManager):
         self.active = False
 
 
-@pytest.mark.parametrize("hisparse", [False, True])
-def test_mrv2_kv_pool_only_wraps_backing_allocation(monkeypatch, hisparse) -> None:
+@pytest.mark.parametrize(
+    ("hisparse", "private_state"), [(False, False), (True, False), (False, True)]
+)
+def test_mrv2_kv_pool_wraps_provider_state_allocation(
+    monkeypatch, hisparse, private_state
+) -> None:
     scope = _AllocationScope()
     kv_caches = {"layer": torch.empty(0)}
+    binding_scopes = []
 
     def allocate(*args, **kwargs):
         assert scope.active
         return kv_caches
 
     def bind(*args, **kwargs):
-        assert not scope.active
+        binding_scopes.append(scope.active)
 
     monkeypatch.setattr(attn_utils, "allocate_kv_cache", allocate)
     monkeypatch.setattr(attn_utils, "bind_kv_cache_to_layers", bind)
@@ -76,9 +83,18 @@ def test_mrv2_kv_pool_only_wraps_backing_allocation(monkeypatch, hisparse) -> No
         cache_config=SimpleNamespace(get_resolved_kv_cache_layout=lambda: None),
         model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="test")),
     )
+    groups = []
+    if private_state:
+        spec = RwkvStateSpec(
+            block_size=16,
+            shapes=((64,),),
+            dtypes=(torch.float16,),
+            external_bytes_per_page=32,
+        )
+        groups.append(KVCacheGroupSpec(layer_names=["layer"], kv_cache_spec=spec))
     result = attn_utils.init_kv_cache(
         {},
-        SimpleNamespace(kv_cache_groups=[]),
+        SimpleNamespace(kv_cache_groups=groups),
         torch.device("cpu"),
         [],
         config,
@@ -87,6 +103,7 @@ def test_mrv2_kv_pool_only_wraps_backing_allocation(monkeypatch, hisparse) -> No
     )
 
     assert len(hisparse_bindings) == int(hisparse)
+    assert binding_scopes == [private_state]
     assert result is kv_caches
     assert not scope.active
 
