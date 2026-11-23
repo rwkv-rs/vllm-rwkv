@@ -438,8 +438,8 @@ def test_feed_forward_prepares_value_weight_for_provider() -> None:
 
 def test_model_folds_embedding_norm_after_loading(monkeypatch) -> None:
     module: Any = _fake_flashrwkv2()
-    module.infer_embedding_ln0_forward_varlen = (
-        lambda embedding, weight, bias, eps: torch.nn.functional.layer_norm(
+    module.infer_embedding_ln0_forward_varlen = lambda embedding, weight, bias, eps: (
+        torch.nn.functional.layer_norm(
             embedding, (embedding.shape[-1],), weight, bias, eps
         ).to(torch.bfloat16)
     )
@@ -577,7 +577,6 @@ def _config() -> SimpleNamespace:
         use_replayssm=False,
     )
     return SimpleNamespace(
-        use_v2_model_runner=True,
         model_config=model_config,
         cache_config=cache_config,
         parallel_config=SimpleNamespace(
@@ -998,7 +997,12 @@ def test_rapid_sampler_preserves_preempted_request_state() -> None:
     runner.sampler = None
     runner.block_tables = runner.lora_state = MagicMock()
     runner.is_last_pp_rank = False
-    for name in ("adaptive_verification", "pooling_runner", "encoder_cache"):
+    for name in (
+        "adaptive_verification",
+        "pooling_runner",
+        "encoder_cache",
+        "speculator",
+    ):
         setattr(runner, name, None)
     request = SimpleNamespace(
         req_id="request",

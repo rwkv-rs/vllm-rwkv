@@ -376,6 +376,7 @@ class RwkvModelState(DefaultModelState):
     """Route scheduler block lifecycle events through FlashRWKV2 state handles."""
 
     requires_cudagraph_max_query_len = True
+    requires_unique_dummy_state_slots = True
 
     def __init__(
         self,

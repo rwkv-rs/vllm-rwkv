@@ -116,7 +116,6 @@
 /vllm/v1/executor @njhill @Cai-z-us
 /vllm/v1/worker @njhill @Cai-z-us
 /vllm/v1/worker/mamba_utils.py @njhill @ZJY0516 @Cai-z-us
-/vllm/v1/worker/kv_connector_model_runner_mixin.py @orozery @NickLucche @ivanium @Cai-z-us
 /vllm/v1/worker/encoder_cudagraph.py @shen-shanshan @Cai-z-us
 /vllm/v1/worker/encoder_cudagraph_defs.py @shen-shanshan @Cai-z-us
 
@@ -174,6 +173,7 @@ mkdocs.yaml @hmellor @Cai-z-us
 /tools/pre_commit/.markdownlint.yaml @hmellor @Cai-z-us
 .pre-commit-config.yaml @hmellor @Cai-z-us
 /tools/pre_commit @hmellor @Cai-z-us
+/tools/pre_commit/*_allowlist.txt @Cai-z-us
 
 # CPU
 /vllm/v1/worker/cpu* @bigPYJ1151 @xuechendi @Cai-z-us
@@ -220,7 +220,8 @@ mkdocs.yaml @hmellor @Cai-z-us
 /vllm/v1/attention/ops/triton_unified_attention.py @tdoublep @Cai-z-us
 /vllm/third_party/flash_linear_attention @ZJY0516 @vadiklyutiy @Cai-z-us
 /vllm/model_executor/layers/mamba/ops/gdn_chunk_cutedsl @gau-nernst @Cai-z-us
-/vllm/model_executor/layers/fused_moe/router/bf16x3_router_gemm_cutedsl.py @gau-nernst @Cai-z-us
+/vllm/model_executor/layers/fused_moe/router/bf16x3_router_gemm_sm100.py @gau-nernst @Cai-z-us
+/vllm/model_executor/layers/fused_moe/router/bf16x3_router_gemm_sm90.py @gau-nernst @Cai-z-us
 /vllm/model_executor/kernels/linear/cute_dsl/gemm_rs_ar.py @gau-nernst @Cai-z-us
 /vllm/cute_utils @gau-nernst @Cai-z-us
 
