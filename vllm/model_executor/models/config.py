@@ -1588,8 +1588,6 @@ class RwkvForCausalLMConfig(VerifyAndUpdateConfig):
         parallel_config = vllm_config.parallel_config
         cache_config = vllm_config.cache_config
 
-        if not vllm_config.use_v2_model_runner:
-            raise ValueError("RWKV requires the V2 model runner")
         if model_config.dtype != torch.bfloat16:
             raise ValueError("RWKV inference requires --dtype bfloat16")
         if parallel_config.tensor_parallel_size != 1:

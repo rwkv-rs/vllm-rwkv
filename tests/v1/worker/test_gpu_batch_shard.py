@@ -674,7 +674,9 @@ def test_finish_requests_frees_slots_in_sorted_order():
     removed: list[str] = []
     preempted: list[str] = []
     fake_runner = SimpleNamespace(
-        _remove_request=removed.append, pooling_runner=None, speculator=None,
+        _remove_request=removed.append,
+        pooling_runner=None,
+        speculator=None,
         model_state=SimpleNamespace(preempt_request=preempted.append),
     )
     scheduler_output = SimpleNamespace(

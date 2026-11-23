@@ -311,7 +311,9 @@ class CudaGraphManager:
         decode_descs: list[BatchExecutionDescriptor] = []
         token_keyed_descs: list[BatchExecutionDescriptor] = []
         # With one routine for every batch, decode batches take token-keyed graphs.
-        capture_decode = separate_decode_routine and decode_mode != CUDAGraphMode.NONE
+        capture_decode = (
+            separate_decode_routine or self.requires_max_query_len
+        ) and decode_mode != CUDAGraphMode.NONE
         if capture_decode and self.varlen_decode:
             # Varlen decode graphs take any mix of 1..decode_query_len tokens per
             # request, worst case 1 token per request (or max_num_reqs).
@@ -327,42 +329,6 @@ class CudaGraphManager:
                         num_tokens=num_tokens,
                         num_reqs=min(num_tokens, self.max_num_reqs),
                         max_query_len=self.decode_query_len,
-            # request, worst case 1 token per request (or max_num_reqs)
-            if capture_varlen_decode and num_tokens <= max_decode_tokens:
-                desc = BatchExecutionDescriptor(
-                    cg_mode=decode_mode,
-                    num_tokens=num_tokens,
-                    num_reqs=min(num_tokens, self.max_num_reqs),
-                    max_query_len=self.decode_query_len,
-                    num_active_loras=num_active_loras,
-                )
-                descs_by_mode[decode_mode].append(desc)
-            # Capture uniform decode specfifc graphs if required
-            #  (i.e. separate decode routine)
-            elif (
-                (separate_decode_routine or self.requires_max_query_len)
-                and decode_mode
-                and not self.varlen_decode
-            ):
-                for decode_query_len in decode_query_lens:
-                    rounded_num_tokens = round_up(num_tokens, decode_query_len)
-                    rounded_num_reqs = rounded_num_tokens // decode_query_len
-
-                    if (
-                        rounded_num_tokens > max_decode_tokens
-                        or rounded_num_tokens > max_cg_capture_size
-                        or rounded_num_reqs > self.max_num_reqs
-                    ):
-                        continue
-
-                    desc = BatchExecutionDescriptor(
-                        cg_mode=decode_mode,
-                        num_tokens=rounded_num_tokens,
-                        num_reqs=rounded_num_reqs,
-                        uniform_token_count=decode_query_len,
-                        max_query_len=(
-                            decode_query_len if self.requires_max_query_len else None
-                        ),
                         num_active_loras=num_active_loras,
                     )
                 )
@@ -385,6 +351,7 @@ class CudaGraphManager:
                     num_tokens=n * q,
                     num_reqs=n,
                     uniform_token_count=q,
+                    max_query_len=q if self.requires_max_query_len else None,
                     num_active_loras=num_active_loras,
                 )
                 decode_descs.append(desc)
@@ -410,14 +377,14 @@ class CudaGraphManager:
                     num_reqs = min(num_tokens, self.max_num_reqs)
                 desc = BatchExecutionDescriptor(
                     cg_mode=mixed_mode,
-                    num_tokens=num_tokens,
-                    num_reqs=num_reqs,
                     max_query_len=(
                         num_tokens
                         if self.requires_max_query_len
                         and mixed_mode == CUDAGraphMode.FULL
                         else None
                     ),
+                    num_tokens=num_tokens,
+                    num_reqs=num_reqs,
                     num_active_loras=num_active_loras,
                 )
                 token_keyed_descs.append(desc)
@@ -464,10 +431,6 @@ class CudaGraphManager:
                 current_range_start = 0
                 for num_tokens, group in groupby(lora_descs, lambda d: d.num_tokens):
                     matching = list(group)
-                    if self.requires_max_query_len:
-                        matching.sort(
-                            key=lambda desc: desc.max_query_len or desc.num_tokens
-                        )
                     for i in range(current_range_start, num_tokens + 1):
                         key = (i, num_active_loras)
                         self._candidates.setdefault(key, []).extend(matching)

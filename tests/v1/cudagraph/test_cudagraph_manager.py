@@ -51,6 +51,8 @@ def _create_vllm_config() -> MagicMock:
     )
     compilation_config.max_cudagraph_capture_size = 4
     compilation_config.post_init_cudagraph_sizes()
+    compilation_config.prefill_cudagraph_capture_token_sizes = [4]
+    compilation_config.decode_cudagraph_capture_request_sizes = [4]
 
     vllm_config = MagicMock(spec=VllmConfig)
     vllm_config.compilation_config = compilation_config
@@ -58,6 +60,8 @@ def _create_vllm_config() -> MagicMock:
     vllm_config.parallel_config = ParallelConfig()
     vllm_config.speculative_config = None
     vllm_config.num_speculative_tokens = 0
+    vllm_config.uniform_decode_query_len = 1
+    vllm_config.cache_config = SimpleNamespace(use_kda_recoverssm=False)
     vllm_config.use_cumem_cudagraph_pool = False
     return vllm_config
 
@@ -143,7 +147,7 @@ def test_query_sensitive_full_graphs_separate_decode_and_prefill(monkeypatch):
         vllm_config=_create_vllm_config(),
         device=torch.device("cpu"),
         cudagraph_mode=CUDAGraphMode.FULL,
-        decode_query_len=1,
+        decode_query_lens={1: 4},
         requires_max_query_len=True,
     )
     manager._graphs_captured = True
@@ -177,7 +181,9 @@ def test_rwkv_runner_preserves_prefill_query_bound(monkeypatch, num_reqs, num_to
     runner = MagicMock(spec=model_runner.GPUModelRunner)
     runner.model_state = SimpleNamespace(requires_cudagraph_max_query_len=True)
     runner.gather_batch_req_state.return_value = (
-        SimpleNamespace(num_tokens=num_tokens, has_prefill=True),
+        SimpleNamespace(
+            num_tokens=num_tokens, has_prefill=True, decode_graph_eligible=False
+        ),
         None,
     )
     runner.pcp_manager = runner.lora_config = runner.ubatch_runner = None

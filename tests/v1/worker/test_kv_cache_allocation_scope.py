@@ -10,9 +10,8 @@ import torch
 
 import vllm.v1.hisparse.binding as hisparse_binding
 import vllm.v1.worker.gpu.attn_utils as attn_utils
-from vllm.v1.hisparse.backend import CUDAHiSparseBackend
-import vllm.v1.worker.gpu_model_runner as gpu_model_runner
 from vllm.v1.attention.backends.rwkv_attn import RwkvStateSpec
+from vllm.v1.hisparse.backend import CUDAHiSparseBackend
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 from vllm.v1.worker.gpu_worker import Worker
 

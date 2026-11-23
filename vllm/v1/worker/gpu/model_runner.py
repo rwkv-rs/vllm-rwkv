@@ -1893,7 +1893,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         if batch_req_state is not None:
             num_toks = batch_req_state.num_tokens
-            if not batch_req_state.decode_graph_eligible:
+            if (
+                not batch_req_state.decode_graph_eligible
+                and not self.model_state.requires_cudagraph_max_query_len
+            ):
                 # A query-length bound alone would admit a short prefill.
                 max_query_len = None
             if self.pcp_manager is not None:
