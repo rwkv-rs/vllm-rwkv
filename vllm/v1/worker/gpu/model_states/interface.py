@@ -42,6 +42,7 @@ class ModelSpecificAttnMetadata:
 
 class ModelState(ABC):
     requires_cudagraph_max_query_len: ClassVar[bool] = False
+    requires_unique_dummy_state_slots: ClassVar[bool] = False
     supports_prompt_embeds: ClassVar[bool] = False
     """Whether this state implements user-provided prompt embeddings."""
 

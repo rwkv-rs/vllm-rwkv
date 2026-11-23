@@ -96,7 +96,9 @@ from vllm.v1.watermarking.spec_decode import (
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.extensible_kv_cache import (
     ExtensibleKVCache,
+    ensure_kv_cache_blocks,
     kv_cache_export_handle_types,
+    num_committable_kv_blocks,
 )
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import (
@@ -924,6 +926,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.max_num_tokens
                 - num_reqs * self.speculative_config.max_num_new_slots_for_drafting,
             )
+
+        if valid_dummy_state_slots:
+            num_reqs = min(num_reqs, num_committable_kv_blocks(self) - 1)
+            ensure_kv_cache_blocks(self, num_reqs + 1)
 
         assert num_tokens <= self.max_num_tokens, (
             f"Dummy run with {num_tokens} tokens exceeds max_num_batched_tokens "

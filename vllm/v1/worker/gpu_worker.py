@@ -1069,6 +1069,9 @@ class Worker(WorkerBase):
                 size,
                 skip_eplb=True,
                 remove_lora=False,
+                valid_dummy_state_slots=(
+                    self.model_runner.model_state.requires_unique_dummy_state_slots
+                ),
                 randomize_inputs=self.randomize_dummy_inputs,
             )
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
@@ -1196,7 +1199,11 @@ class Worker(WorkerBase):
             # Take the hidden states from a dummy forward pass so they have
             # the LM head's input size (e.g. OPT projects to a smaller size).
             _, sample_hidden_states = self.model_runner._dummy_run(
-                num_tokens=max_num_reqs, skip_eplb=True
+                num_tokens=max_num_reqs,
+                skip_eplb=True,
+                valid_dummy_state_slots=(
+                    self.model_runner.model_state.requires_unique_dummy_state_slots
+                ),
             )
             self.model_runner._dummy_sampler_run(hidden_states=sample_hidden_states)
             del sample_hidden_states
