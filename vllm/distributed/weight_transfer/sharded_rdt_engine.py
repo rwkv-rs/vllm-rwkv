@@ -700,6 +700,9 @@ class ShardedRDTWeightTransferEngine(
                 "be supplied at init_transfer_engine()."
             )
         self._run_chunk_pipeline(self._cached_plan)
+        record_loaded = getattr(self.model, "record_checkpoint_weights_loaded", None)
+        if record_loaded is not None:
+            record_loaded(self._live_names)
 
     def _build_fake_weights(
         self,

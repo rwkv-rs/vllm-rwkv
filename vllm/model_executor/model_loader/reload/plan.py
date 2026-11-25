@@ -103,6 +103,11 @@ def plan_loads(model: torch.nn.Module, metadata: "Iterable[ParamMeta]") -> LoadP
     rewrites them. Module, parameter and buffer state a loader sets stays,
     as it would after ``load_weights``.
 
+    A model can designate independently loaded
+    ``checkpoint_weights_requiring_full_load`` that must use its loader for
+    each actual update. These names skip tracing and receive the full
+    checkpoint tensor as fallbacks.
+
     Raises:
         ValueError: a name is declared twice.
         RuntimeError: the model cannot be planned.
@@ -125,7 +130,17 @@ def plan_loads(model: torch.nn.Module, metadata: "Iterable[ParamMeta]") -> LoadP
 
     t0 = time.perf_counter()
     targets = Targets(model)
-    traced = trace_loads(model, metas, targets)
+    explicit_fallbacks = metas.keys() & getattr(
+        model, "checkpoint_weights_requiring_full_load", ()
+    )
+    trace_metas = (
+        {name: meta for name, meta in metas.items() if name not in explicit_fallbacks}
+        if explicit_fallbacks
+        else metas
+    )
+    traced = trace_loads(model, trace_metas, targets)
+    for name in explicit_fallbacks:
+        traced.reasons[name] = "model requires its weight loader"
     if traced.lonely:
         lonely = traced.lonely
         raise RuntimeError(

@@ -262,6 +262,11 @@ the `transformers-rwkv` forward with an active unmerged PEFT adapter. Without
 `rwkv_lora`, the model has no adapter parameters and passes no adapter
 arguments.
 
+RWKV supports vLLM's layerwise and direct checkpoint weight reload modes.
+Include the unfolded embedding weight in the same update as its normalization
+weights so vLLM can fold the new normalization into the embedding. Send these
+weights as full checkpoint tensors.
+
 ## Unsupported features
 
 RWKV rejects tensor parallelism, decode or prefill context parallelism,

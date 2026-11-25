@@ -14,8 +14,21 @@ import torch
 
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.config.model import ModelConfig
+from vllm.distributed.weight_transfer.base import ParamMeta
 from vllm.engine.arg_utils import EngineArgs
 from vllm.exceptions import VLLMValidationError
+from vllm.model_executor.model_loader.checkpoint_weight_patch import (
+    CheckpointWeightPatch,
+    load_checkpoint_weight_patches,
+)
+from vllm.model_executor.model_loader.reload import (
+    finish_reload,
+    load_planned,
+    plan_loads,
+    record_metadata_for_reloading,
+    start_reload,
+)
+from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.models.config import RwkvForCausalLMConfig
 from vllm.model_executor.models.rwkv import (
     RwkvFeedForward,
@@ -24,6 +37,7 @@ from vllm.model_executor.models.rwkv import (
     RwkvStateLayer,
     _load_flashrwkv2,
 )
+from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sampling_params import SamplingParams
 from vllm.transformers_utils.config import get_config
 from vllm.v1.attention.backend import AttentionCGSupport
@@ -460,16 +474,18 @@ def test_live_metadata_prepares_and_retains_each_capture_ticket(monkeypatch) -> 
     assert state_layer._live_graph_tickets[2] is next_capture_ticket
 
 
-def test_feed_forward_prepares_value_weight_for_provider() -> None:
-    feed_forward = object.__new__(RwkvFeedForward)
-    torch.nn.Module.__init__(feed_forward)
-    checkpoint_weight = torch.arange(16, dtype=torch.bfloat16).view(2, 8)
-    feed_forward.value = SimpleNamespace(
-        weight=torch.nn.Parameter(checkpoint_weight.clone())
+@pytest.mark.usefixtures("_single_rank")
+def test_feed_forward_loads_value_weight_in_provider_layout() -> None:
+    feed_forward = RwkvFeedForward(
+        SimpleNamespace(hidden_size=2, intermediate_size=8), "test.mlp"
     )
-
-    feed_forward.process_weights_after_loading()
-
+    checkpoint_weight = torch.arange(16, dtype=torch.bfloat16).view(2, 8)
+    storage = feed_forward.value.weight.data_ptr()
+    loaded = AutoWeightsLoader(feed_forward).load_weights(
+        [("value.weight", checkpoint_weight)]
+    )
+    assert loaded == {"value.weight"}
+    assert feed_forward.value.weight.data_ptr() == storage
     assert torch.equal(feed_forward.value.weight, checkpoint_weight.T.contiguous())
 
 
@@ -481,20 +497,14 @@ def test_model_folds_embedding_norm_after_loading(monkeypatch) -> None:
         ).to(torch.bfloat16)
     )
     monkeypatch.setitem(sys.modules, "flashrwkv2", module)
-    monkeypatch.setattr(
-        "vllm.model_executor.models.rwkv.get_pp_group",
-        lambda: SimpleNamespace(is_first_rank=True),
-    )
     model = object.__new__(RwkvModel)
     torch.nn.Module.__init__(model)
     embedding = torch.arange(32, dtype=torch.bfloat16).view(8, 4)
     model.embed_tokens = SimpleNamespace(weight=torch.nn.Parameter(embedding.clone()))
     model.embedding_norm = torch.nn.LayerNorm(4, dtype=torch.bfloat16)
     model.config = SimpleNamespace(layer_norm_epsilon=1e-5)
-    model.layers = torch.nn.ModuleList()
-    model.start_layer = 0
-    model.end_layer = 0
     model._embedding_norm_folded = False
+    storage = model.embed_tokens.weight.data_ptr()
     expected = torch.nn.functional.layer_norm(
         embedding,
         (4,),
@@ -503,11 +513,127 @@ def test_model_folds_embedding_norm_after_loading(monkeypatch) -> None:
         model.config.layer_norm_epsilon,
     ).to(torch.bfloat16)
 
-    model.process_weights_after_loading()
+    model._fold_embedding_norm()
 
     assert model._embedding_norm_folded
+    assert model.embed_tokens.weight.data_ptr() == storage
     assert model.embed_tokens.weight.dtype == torch.bfloat16
     assert torch.equal(model.embed_tokens.weight, expected)
+
+
+@pytest.fixture
+def _rwkv_reload_model(monkeypatch, _single_rank):
+    provider: Any = _fake_flashrwkv2()
+    provider.infer_embedding_ln0_forward_varlen = lambda embedding, weight, bias, eps: (
+        torch.nn.functional.layer_norm(
+            embedding, (embedding.shape[-1],), weight, bias, eps
+        )
+    )
+    monkeypatch.setitem(sys.modules, "flashrwkv2", provider)
+    config = SimpleNamespace(
+        word_embeddings_untied_by_checkpoint=False,
+        quantization=None,
+        dtype=torch.bfloat16,
+    )
+    model = RwkvForCausalLM(vllm_config=_tiny_model_vllm_config(None))
+    return model, config
+
+
+def test_reused_rwkv_weight_plan_folds_each_new_embedding(
+    monkeypatch, _rwkv_reload_model
+) -> None:
+    monkeypatch.setenv("VLLM_RELOAD_MODE", "direct")
+    model, config = _rwkv_reload_model
+    cpu = torch.device("cpu")
+    embedding = model.model.embed_tokens.weight
+    norm = model.model.embedding_norm
+    name = "model.embed_tokens.weight"
+    generator = torch.Generator().manual_seed(0)
+
+    def checkpoint() -> torch.Tensor:
+        return torch.rand(embedding.shape, generator=generator, dtype=embedding.dtype)
+
+    model.load_weights([(name, checkpoint())])
+    process_weights_after_loading(model, config, cpu)
+    storage = embedding.data_ptr()
+    initial = embedding.clone()
+    other_name = "model.norm.weight"
+    other = model.model.norm.weight
+
+    start_reload(model)
+    plan = plan_loads(
+        model,
+        [
+            ParamMeta(name, embedding.dtype, tuple(embedding.shape)),
+            ParamMeta(other_name, other.dtype, tuple(other.shape)),
+        ],
+    )
+    load_planned(model, plan, [(other_name, torch.ones_like(other))])
+    finish_reload(model, config, cpu)
+    assert torch.equal(embedding, initial)
+
+    for _ in range(2):
+        start_reload(model)
+        raw = checkpoint()
+        load_planned(model, plan, [(name, raw)])
+        finish_reload(model, config, cpu)
+        expected = torch.nn.functional.layer_norm(
+            raw, (embedding.shape[-1],), norm.weight, norm.bias, norm.eps
+        )
+        assert torch.equal(embedding, expected)
+        assert embedding.data_ptr() == storage
+
+
+def test_rwkv_rejects_incomplete_embedding_reload_until_repaired(
+    monkeypatch, _rwkv_reload_model
+) -> None:
+    monkeypatch.setenv("VLLM_RELOAD_MODE", "layerwise")
+    model, config = _rwkv_reload_model
+    cpu = torch.device("cpu")
+    embedding = model.model.embed_tokens.weight
+    norm = model.model.embedding_norm
+    raw = torch.rand(
+        embedding.shape,
+        generator=torch.Generator().manual_seed(1),
+        dtype=embedding.dtype,
+    )
+    embedding_name = "model.embed_tokens.weight"
+    record_metadata_for_reloading(model)
+    model.load_weights([(embedding_name, raw)])
+    process_weights_after_loading(model, config, cpu)
+    replacement_norm = torch.full_like(norm.weight, 2)
+
+    start_reload(model)
+    model.load_weights([("model.embedding_norm.weight", replacement_norm)])
+    for _ in range(2):
+        with pytest.raises(ValueError, match="unfolded embedding weight"):
+            finish_reload(model, config, cpu)
+
+    model.load_weights([(embedding_name, raw)])
+    finish_reload(model, config, cpu)
+    expected = torch.nn.functional.layer_norm(
+        raw, (embedding.shape[-1],), norm.weight, norm.bias, norm.eps
+    )
+    assert torch.equal(embedding, expected)
+
+
+def test_rwkv_sparse_embedding_patch_requires_complete_checkpoint(_rwkv_reload_model):
+    model, config = _rwkv_reload_model
+    embedding = model.model.embed_tokens.weight
+    name = "model.embed_tokens.weight"
+    model.load_weights([(name, torch.rand_like(embedding))])
+    process_weights_after_loading(model, config, torch.device("cpu"))
+    folded = embedding.clone()
+    patch = CheckpointWeightPatch(
+        name=name,
+        shape=tuple(embedding.shape),
+        dtype=embedding.dtype,
+        values=torch.zeros(1, dtype=embedding.dtype),
+        indices=torch.zeros(1, dtype=torch.int64),
+    )
+    with pytest.raises(ValueError, match="require a full load"):
+        load_checkpoint_weight_patches(model, [patch])
+    assert torch.equal(embedding, folded)
 
 
 def test_align_state_advance_uses_execution_owned_token_counts() -> None:
@@ -1260,6 +1386,40 @@ def test_rapid_sampler_min_p_preserves_raw_logits(mixed_prefill) -> None:
     assert torch.equal(sampled, torch.tensor([1, 0 if mixed_prefill else 1]))
     torch.testing.assert_close(logits, raw, equal_nan=True)
     torch.testing.assert_close(returned, raw, equal_nan=True)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("VLLM_RWKV_TEST_MODEL"),
+    reason="VLLM_RWKV_TEST_MODEL must point to a local RWKV checkpoint",
+)
+@pytest.mark.parametrize("reload_mode", ["layerwise", "direct"])
+def test_real_model_checkpoint_reload_preserves_tokens_and_logprobs(
+    vllm_runner, monkeypatch, reload_mode
+) -> None:
+    monkeypatch.setenv("VLLM_RELOAD_MODE", reload_mode)
+    model_path = os.environ["VLLM_RWKV_TEST_MODEL"]
+    prompt = {"prompt_token_ids": list(range(1, 66))}
+    params = SamplingParams(
+        temperature=0.0, max_tokens=4, ignore_eos=True, logprobs=3, detokenize=False
+    )
+    with vllm_runner(
+        model_path,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_batched_tokens=128,
+        max_num_seqs=4,
+        num_gpu_blocks_override=64,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        gpu_memory_utilization=0.7,
+        compilation_config={"cudagraph_capture_sizes": [1, 2, 4]},
+    ) as runner:
+        before = runner.llm.generate([prompt], params)[0].outputs[0]
+        runner.llm.collective_rpc("reload_weights", kwargs={"weights_path": model_path})
+        after = runner.llm.generate([prompt], params)[0].outputs[0]
+    assert len(after.token_ids) == 4
+    assert after.token_ids == before.token_ids
+    assert after.logprobs == before.logprobs
 
 
 def test_config_accepts_async_scheduling() -> None:
