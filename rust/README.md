@@ -130,6 +130,10 @@ vllm-rs serve <moe-model> \
 
 For external load balancing, start one `vllm-rs serve` per rank with `--data-parallel-rank <rank>`. A request can be pinned to one of a frontend's ranks with the `X-data-parallel-rank` header, which takes the global rank. Unlike `vllm serve`, `--data-parallel-rpc-port` has no default here and ranks are not inferred from `--nnodes`/`--node-rank`.
 
+With `--trust-request-chat-template` enabled, the Rust chat completions and
+tokenization endpoints return HTTP 400 for request-supplied templates that fail
+to compile or render.
+
 ### Engine-free renderer
 
 `vllm-rs render` serves text-only request preprocessing without starting or

@@ -1995,6 +1995,50 @@ async fn render_chat_accepts_assistant_turn_without_content() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn chat_completions_rejects_invalid_request_templates() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("config.json"), r#"{"model_type":"llama"}"#).unwrap();
+    fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+    let files = vllm_text::backend::hf::ResolvedModelFiles::new(dir.path().to_str().unwrap(), None)
+        .await
+        .unwrap();
+    let backend = Arc::new(
+        vllm_chat::HfChatBackend::from_resolved_model_files(
+            files,
+            "test-model".to_string(),
+            vllm_chat::LoadModelBackendsOptions {
+                renderer: vllm_chat::RendererSelection::Hf,
+                trust_request_chat_template: true,
+                ..Default::default()
+            },
+            Arc::new(fake_chat_tokenizer()),
+        )
+        .unwrap(),
+    );
+    let (mut app, _engine_task) = test_app_with_chat_and_engine_request_check(
+        |llm| ChatLlm::new(TextLlm::new(llm, Arc::new(FakeChatBackend::new())), backend),
+        |_| panic!("invalid templates must be rejected before submitting to the engine"),
+    )
+    .await;
+
+    for template in ["{% if %}", "{{ missing_function() }}"] {
+        let (status, json) = post_json(
+            &mut app,
+            "/v1/chat/completions",
+            json!({
+                "model": "Qwen/Qwen1.5-0.5B-Chat",
+                "messages": [{"role": "user", "content": "hello"}],
+                "chat_template": template,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["error"]["type"], "BadRequestError");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn render_glm_tools_for_none_follow_server_exclusion_setting() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
