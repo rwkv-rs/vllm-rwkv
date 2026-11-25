@@ -30,6 +30,7 @@ from vllm.config import (
 from vllm.config.attention import HiSparseConfig
 from vllm.platforms import current_platform
 from vllm.utils.mem_constants import GiB_bytes
+from vllm.v1.attention.backends.rwkv_attn import RwkvStateSpec
 from vllm.v1.core.kv_cache_planning import (
     check_enough_kv_cache_memory,
     estimate_max_model_len,
@@ -641,6 +642,39 @@ def test_get_kv_cache_configs_pp_sharding(asymmetric_memory):
             kv_cache_groups=[KVCacheGroupSpec(["layer2"], ref_kv_cache_spec)],
         ),
     ]
+
+
+def test_uneven_rwkv_pipeline_stages_share_cache_block_ids():
+    config = VllmConfig(model_config=ModelConfig(max_model_len=512))
+    config.cache_config.kv_cache_layout = "LBNHC"
+    config.cache_config.mamba_cache_mode = "align"
+    specs = [
+        RwkvStateSpec(
+            block_size=64,
+            shapes=((layers, 2560), (layers, 2560), (layers, 40, 64, 64)),
+            dtypes=(torch.bfloat16, torch.bfloat16, torch.float16),
+            mamba_cache_mode="align",
+            external_bytes_per_page=layers * 40 * 1540,
+        )
+        for layers in (11, 13)
+    ]
+    workers = [
+        {f"model.layers.{offset}.rwkv_state": spec}
+        for offset, spec in zip((0, 11), specs, strict=True)
+    ]
+    configs = get_kv_cache_configs(
+        config,
+        workers,
+        [
+            (spec.page_size_bytes + spec.external_bytes_per_page) * blocks
+            for spec, blocks in zip(specs, (9, 13), strict=True)
+        ],
+    )
+    assert len(generate_scheduler_kv_cache_config(configs).kv_cache_groups) == 1
+    for worker, spec in zip(configs, specs, strict=True):
+        assert worker.num_blocks == 9
+        assert worker.kv_cache_tensors[0].block_stride == spec.page_size_bytes
+        assert worker.kv_cache_tensors[0].size == 9 * spec.page_size_bytes
 
 
 def test_project_kv_cache_groups_to_worker():

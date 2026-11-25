@@ -211,7 +211,8 @@ vllm serve <model> \
 
 The first stage owns embedding and LN0. The second stage owns the final norm and
 LM head. `hidden_states`, `residual`, and `v_first` are transferred between the
-stages.
+stages. The stages can have different layer counts with
+`VLLM_PP_LAYER_PARTITION`, for example `11,13` for a 24-layer model.
 
 ## Tool calling
 
