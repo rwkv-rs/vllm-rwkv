@@ -186,6 +186,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         self._num_slots = 0
         self._tmix_shift_pool: torch.Tensor | None = None
         self._cmix_shift_pool: torch.Tensor | None = None
+        self._wkv_state_pool: torch.Tensor | None = None
         self._wkv_handles: list[_FlashRWKVStateHandle] = []
         self._live_graph_tickets: list[object] = []
         self.kv_cache = torch.tensor([])
@@ -302,12 +303,16 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
                     "than it reported during cache planning"
                 )
             self._wkv_handles.append(handle)
+        self._wkv_state_pool = (
+            wkv_state_pool if spec.external_bytes_per_page == 0 else None
+        )
         self.kv_cache = kv_cache
 
     def clear_kv_cache(self) -> None:
         self._wkv_handles.clear()
         self._tmix_shift_pool = None
         self._cmix_shift_pool = None
+        self._wkv_state_pool = None
         self._num_slots = 0
         self._live_graph_tickets.clear()
         self.kv_cache = torch.tensor([])
@@ -333,9 +338,15 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         if self._tmix_shift_pool is None:
             raise RuntimeError("RWKV state pool has not been bound")
         device = self._tmix_shift_pool.device
-        if isinstance(slot_ids, torch.Tensor):
-            return slot_ids.to(device=device, dtype=torch.int32).contiguous()
-        return async_tensor_h2d(slot_ids, dtype=torch.int32, device=device)
+        if device.type == "cpu":
+            return torch.as_tensor(
+                slot_ids, dtype=torch.int32, device=device
+            ).contiguous()
+        if isinstance(slot_ids, torch.Tensor) and not slot_ids.is_cpu:
+            return slot_ids.to(
+                device=device, dtype=torch.int32, non_blocking=True
+            ).contiguous()
+        return async_tensor_h2d(slot_ids, dtype=torch.int32, device=device).contiguous()
 
     def reset_state_slots(self, slot_ids: Sequence[int] | torch.Tensor) -> None:
         indices = self._slot_tensor(slot_ids)
@@ -346,8 +357,11 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         assert self._cmix_shift_pool is not None
         self._tmix_shift_pool.index_fill_(1, long_indices, 0)
         self._cmix_shift_pool.index_fill_(1, long_indices, 0)
-        for handle in self._wkv_handles:
-            handle.reset_slots_(indices)
+        if self._wkv_state_pool is not None:
+            self._wkv_state_pool.index_fill_(1, long_indices, 0)
+        else:
+            for handle in self._wkv_handles:
+                handle.reset_slots_(indices)
 
     def copy_state_slots(
         self,
@@ -368,8 +382,15 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         cmix_values = self._cmix_shift_pool.index_select(1, source_long)
         self._tmix_shift_pool.index_copy_(1, destination_long, tmix_values)
         self._cmix_shift_pool.index_copy_(1, destination_long, cmix_values)
-        for handle in self._wkv_handles:
-            handle.copy_slots_(handle, source, destination)
+        if self._wkv_state_pool is not None:
+            # Snapshot one layer at a time to bound workspace for overlapping slots.
+            for layer_pool in self._wkv_state_pool:
+                values = layer_pool.index_select(0, source_long)
+                layer_pool.index_copy_(0, destination_long, values)
+                del values
+        else:
+            for handle in self._wkv_handles:
+                handle.copy_slots_(handle, source, destination)
 
     def copy_state_block_pairs(self, block_copies: Sequence[tuple[int, int]]) -> None:
         if not block_copies:
