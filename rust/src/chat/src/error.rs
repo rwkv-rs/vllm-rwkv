@@ -19,6 +19,8 @@ pub enum Error {
     MissingChatTemplate,
     #[error("chat template error: {0}")]
     ChatTemplate(String),
+    #[error("chat template error: {message}")]
+    InvalidRequestChatTemplate { message: String },
     #[error("{message}")]
     ChatTemplateThrown { message: String },
     #[error("{0}")]
@@ -122,6 +124,7 @@ impl Error {
     pub fn is_request_validation_error(&self) -> bool {
         match self {
             Self::ChatTemplateThrown { .. }
+            | Self::InvalidRequestChatTemplate { .. }
             | Self::InvalidReasoningEffort(_)
             | Self::InvalidReasoningControl { .. }
             | Self::DuplicateToolName { .. }

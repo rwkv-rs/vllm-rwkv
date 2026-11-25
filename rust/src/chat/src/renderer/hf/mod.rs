@@ -12,6 +12,7 @@ use vllm_text::backend::hf::{
     HfChatTemplate, HfSpecialTokens, HfTokenizerConfig, ResolvedModelFiles, load_tokenizer_config,
 };
 
+use self::error::TemplateError;
 use self::format::{
     ChatTemplateContentFormat, ChatTemplateContentFormatOption as ContentFormatOption, ProbeContext,
 };
@@ -112,16 +113,20 @@ impl HfChatRenderer {
             )
             .map_err(|error| Error::ChatTemplate(error.to_report_string()))?,
         };
-        renderer.default_template =
-            template.map(|template| renderer.compile_template(template, None)).transpose()?;
+        renderer.default_template = template
+            .map(|template| renderer.compile_template(template, None))
+            .transpose()
+            .map_err(|error| Error::ChatTemplate(error.to_report_string()))?;
         Ok(renderer)
     }
 
     /// Use a separate model template for requests with tools, as Transformers
     /// selects a `tool_use` template when tools are passed.
     pub fn with_tool_use_template(mut self, template: Option<String>) -> Result<Self> {
-        self.tool_use_template =
-            template.map(|template| self.compile_template(template, None)).transpose()?;
+        self.tool_use_template = template
+            .map(|template| self.compile_template(template, None))
+            .transpose()
+            .map_err(|error| Error::ChatTemplate(error.to_report_string()))?;
         Ok(self)
     }
 
@@ -131,13 +136,12 @@ impl HfChatRenderer {
         &self,
         template: String,
         fuel: Option<u64>,
-    ) -> Result<CompiledChatTemplate> {
+    ) -> std::result::Result<CompiledChatTemplate, TemplateError> {
         let probe = ProbeContext {
             special_tokens: self.special_tokens.as_ref(),
             template_kwargs: Some(&self.default_template_kwargs),
         };
         CompiledChatTemplate::new(template, self.content_format, fuel, &probe)
-            .map_err(|error| Error::ChatTemplate(error.to_report_string()))
     }
 
     pub fn with_multimodal(mut self, multimodal: Option<MultimodalRenderInfo>) -> Self {
@@ -233,7 +237,10 @@ impl HfChatRenderer {
             .chat_template
             .as_ref()
             .map(|template| self.compile_template(template.clone(), self.request_template_fuel))
-            .transpose()?;
+            .transpose()
+            .map_err(|error| Error::InvalidRequestChatTemplate {
+                message: error.to_report_string(),
+            })?;
         let model_template = if request.tools().is_empty() {
             None
         } else {
@@ -294,6 +301,11 @@ impl HfChatRenderer {
                 Some(message) => Error::ChatTemplateThrown {
                     message: message.to_owned(),
                 },
+                None if request.chat_options.chat_template.is_some() => {
+                    Error::InvalidRequestChatTemplate {
+                        message: error.to_report_string(),
+                    }
+                }
                 None => Error::ChatTemplate(error.to_report_string()),
             })?;
 
@@ -1474,7 +1486,7 @@ mod tests {
         assert!(render(Some(template), &request).is_ok());
 
         request.chat_options.chat_template = Some(template.to_string());
-        let Err(Error::ChatTemplate(message)) = render(None, &request) else {
+        let Err(Error::InvalidRequestChatTemplate { message }) = render(None, &request) else {
             panic!("expected the request template to run out of fuel");
         };
         expect!["chat template exceeded its fuel budget; adjust VLLM_CHAT_TEMPLATE_FUEL to override: engine ran out of fuel (in chat:1)"].assert_eq(&message);
