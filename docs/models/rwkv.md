@@ -186,6 +186,11 @@ All six controls are executed by
 Rapid-Sampling additive increment and `penalty_decay` decays its per-request
 token state. `--generation-config vllm` explicitly disables artifact profiles.
 
+`min_p` defaults to `0` (disabled). A positive value keeps tokens whose
+probability is at least `min_p` times the highest token probability, after
+penalties and temperature and before top-k and top-p. Batches with active
+`min_p` requests use the eager sampling path.
+
 ## Pipeline parallelism
 
 Single GPU and two-stage pipeline parallelism are supported. On the production
@@ -261,6 +266,6 @@ arguments.
 RWKV rejects tensor parallelism, decode or prefill context parallelism,
 speculative decoding, quantized weights, vLLM LoRA adapters (`--enable-lora`),
 KV cache offloading/connectors, ReplaySSM, stochastic cache rounding, and Mamba
-cache mode `all`. Multiplicative `repetition_penalty`, `min_p`, processed logprobs,
+cache mode `all`. Multiplicative `repetition_penalty`, processed logprobs,
 sampling masks, and trace replay are not supported by Rapid-Sampling. Pipeline
 parallel sizes other than one or two are also rejected.

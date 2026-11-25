@@ -168,9 +168,11 @@ class RwkvSampler(Sampler):
         num_active = len(active_rows_np)
         if num_active == 0:
             return None
+        active_slots_np = idx_mapping_np[active_rows_np]
+        if np.any(self.sampling_states.min_p.np[active_slots_np]):
+            return None
         capacity = next(size for size in self._sampling_graphs if size >= num_active)
         sampling_graph = self._sampling_graphs[capacity]
-        active_slots_np = idx_mapping_np[active_rows_np]
         self._active_rows.np[:num_active] = active_rows_np
         self._active_slots.np[:num_active] = active_slots_np
         active_rows = self._active_rows.copy_to_uva(num_active)
@@ -310,6 +312,18 @@ class RwkvSampler(Sampler):
         self.thinking_budget_state.apply(logits, ctx)
         return logits
 
+    def _apply_min_p(
+        self, logits: torch.Tensor, slots: torch.Tensor, temperature: torch.Tensor
+    ) -> None:
+        # Match the provider's NaN handling and effective temperature.
+        logits.nan_to_num_(nan=0.0, posinf=torch.inf, neginf=-torch.inf)
+        scores = self._rapid_penalties.index_select(0, slots)
+        torch.sub(logits, scores, out=scores)
+        min_p = self.sampling_states.min_p.gpu[slots]
+        cutoff = temperature.clamp(0.001, 1000.0) * min_p.log()
+        threshold = scores.amax(dim=-1) + cutoff
+        logits.masked_fill_(scores < threshold[:, None], -torch.inf)
+
     def sample(
         self,
         logits: torch.Tensor,
@@ -356,6 +370,11 @@ class RwkvSampler(Sampler):
             expanded_local_pos[active_rows],
             seq_lens_upper_bound_np[active_rows_np],
         )
+        temperature = self.sampling_states.temperature.gpu[active_slots_i64]
+        if np.any(self.sampling_states.min_p.np[active_slots_np]):
+            if active_logits is logits:
+                active_logits = active_logits.clone()
+            self._apply_min_p(active_logits, active_slots_i64, temperature)
         sampled_active = self._sample(
             active_logits,
             self._rapid_penalties,
@@ -364,7 +383,7 @@ class RwkvSampler(Sampler):
             presence_penalty=self._presence_penalty.gpu[active_slots_i64],
             frequency_penalty=self._frequency_penalty.gpu[active_slots_i64],
             penalty_decay=self._penalty_decay.gpu[active_slots_i64],
-            temperature=self.sampling_states.temperature.gpu[active_slots_i64],
+            temperature=temperature,
             top_k=self.sampling_states.top_k.gpu[active_slots_i64],
             top_p=self.sampling_states.top_p.gpu[active_slots_i64],
         )
