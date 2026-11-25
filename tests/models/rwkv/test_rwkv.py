@@ -25,6 +25,7 @@ from vllm.model_executor.models.rwkv import (
     _load_flashrwkv2,
 )
 from vllm.sampling_params import SamplingParams
+from vllm.transformers_utils.config import get_config
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.rwkv_attn import (
     RwkvAttentionMetadata,
@@ -1266,6 +1267,47 @@ def test_config_accepts_async_scheduling() -> None:
     vllm_config.scheduler_config.async_scheduling = True
     RwkvForCausalLMConfig.verify_and_update_config(vllm_config)
     assert vllm_config.scheduler_config.async_scheduling
+
+
+@pytest.mark.skipif(
+    not os.environ.get("VLLM_RWKV_TEST_MODEL"),
+    reason="VLLM_RWKV_TEST_MODEL must point to a local RWKV checkpoint",
+)
+@pytest.mark.skipif(torch.accelerator.device_count() < 2, reason="requires two GPUs")
+def test_real_model_uneven_pipeline_preserves_tokens(vllm_runner, monkeypatch) -> None:
+    model_path = os.environ["VLLM_RWKV_TEST_MODEL"]
+    num_layers = get_config(model_path, trust_remote_code=False).num_hidden_layers
+    split = num_layers // 2 - 1
+    prompt = {"prompt_token_ids": list(range(1, 66))}
+    params = SamplingParams(
+        temperature=0.0, max_tokens=4, ignore_eos=True, detokenize=False
+    )
+    options = dict(
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_batched_tokens=128,
+        max_num_seqs=4,
+        num_gpu_blocks_override=64,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=True,
+        gpu_memory_utilization=0.7,
+        compilation_config={"cudagraph_capture_sizes": [1, 2, 4]},
+    )
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    with vllm_runner(model_path, **options) as runner:
+        expected = runner.llm.generate([prompt], params)[0].outputs[0].token_ids
+
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", f"{split},{num_layers - split}")
+    with vllm_runner(
+        model_path,
+        pipeline_parallel_size=2,
+        distributed_executor_backend="mp",
+        **options,
+    ) as runner:
+        actual = runner.llm.generate([prompt], params)[0].outputs[0].token_ids
+
+    assert len(actual) == 4
+    assert actual == expected
 
 
 @pytest.mark.skipif(
