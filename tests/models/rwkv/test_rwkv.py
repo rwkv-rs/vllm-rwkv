@@ -941,7 +941,6 @@ def test_config_rejects_unsupported_rapid_sampling_modes() -> None:
 def test_sampling_params_verify_rejects_unsupported_rwkv_controls() -> None:
     for model_type, sampling_params, message in (
         ("rwkv", SamplingParams(repetition_penalty=1.1), "repetition_penalty"),
-        ("rwkv", SamplingParams(min_p=0.1), "min_p"),
         ("qwen2", SamplingParams(penalty_decay=0.9), "penalty_decay"),
     ):
         model_config = SimpleNamespace(
@@ -1087,6 +1086,7 @@ def test_rapid_sampler_graph_compacts_completed_prefills(monkeypatch) -> None:
     sampler._frequency_penalty = SimpleNamespace(gpu=torch.arange(4).float() + 4)
     sampler._penalty_decay = SimpleNamespace(gpu=torch.arange(4).float() + 8)
     sampler.sampling_states = SimpleNamespace(
+        min_p=SimpleNamespace(np=np.zeros(4)),
         temperature=SimpleNamespace(gpu=torch.arange(4).float() + 12),
         top_k=SimpleNamespace(gpu=torch.arange(4, dtype=torch.int32) + 16),
         top_p=SimpleNamespace(gpu=torch.arange(4).float() + 20),
@@ -1157,9 +1157,9 @@ def test_rapid_sampler_rejects_loaded_custom_processors() -> None:
 
 
 @pytest.mark.parametrize("mixed_prefill", [False, True])
-def test_rapid_sampler_processing_preserves_raw_logits(mixed_prefill) -> None:
+def test_rapid_sampler_min_p_preserves_raw_logits(mixed_prefill) -> None:
     sampler = object.__new__(RwkvSampler)
-    slots = np.arange(2)
+    slots = np.array([1, 0])
     for name, dtype in (("_active_rows", np.int64), ("_active_slots", np.int32)):
         buffer = np.empty(2, dtype=dtype)
         setattr(
@@ -1171,27 +1171,44 @@ def test_rapid_sampler_processing_preserves_raw_logits(mixed_prefill) -> None:
             ),
         )
     values = SimpleNamespace(gpu=torch.ones(2))
+    min_p = torch.tensor([0.0, 0.5])
     sampler._presence_penalty = sampler._frequency_penalty = values
     sampler._penalty_decay = values
     sampler.sampling_states = SimpleNamespace(
-        temperature=values, top_k=values, top_p=values
+        min_p=SimpleNamespace(np=min_p.numpy(), gpu=min_p),
+        temperature=SimpleNamespace(gpu=torch.tensor([1.0, 0.5])),
+        top_k=values,
+        top_p=values,
     )
     sampler.needs_logits_processing = np.ones(2, dtype=bool)
     sampler._logit_bias_state = SimpleNamespace(
-        apply=lambda logits, ctx: logits.add_(torch.tensor([0.0, 10.0]))
+        apply=lambda logits, ctx: logits.add_(torch.tensor([0.0, 0.125, 0.0, 0.0]))
     )
     sampler._bad_words_state = SimpleNamespace(apply=lambda logits, ctx: logits)
     sampler.thinking_budget_state = SimpleNamespace(apply=lambda logits, ctx: None)
-    sampler._sample = lambda logits, *args, **kwargs: logits.argmax(dim=-1)
-    sampler._rapid_penalties = sampler._rapid_sampling_states = torch.zeros(2, 2)
+    sampler._rapid_penalties = torch.tensor(
+        [[0.0, 0.0, 0.0, 0.0], [1.5, 0.0, 1.0, 0.0]]
+    )
+    sampler._rapid_sampling_states = torch.zeros(2, 2)
     sampler._input_batch = SimpleNamespace(
         num_reqs=2,
         num_computed_prefill_tokens_np=np.zeros(2),
         num_scheduled_tokens=np.ones(2),
         prefill_len_np=np.array([1, 2 if mixed_prefill else 1]),
     )
-    logits = torch.tensor([[3.0, 1.0], [4.0, 2.0]])
+    logits = torch.tensor(
+        [[1.0, -0.25, torch.nan, -torch.inf], [2.0, 4.0, 1.0, -torch.inf]]
+    )
     raw = logits.clone()
+    expected = torch.tensor(
+        [[-torch.inf, -0.125, -torch.inf, -torch.inf], [2.0, 4.125, 1.0, -torch.inf]]
+    )
+
+    def sample(active_logits, *args, **kwargs):
+        torch.testing.assert_close(active_logits, expected[: 1 if mixed_prefill else 2])
+        return active_logits.argmax(dim=-1)
+
+    sampler._sample = sample
     sampled, returned = sampler.sample(
         logits,
         torch.from_numpy(slots),
@@ -1204,8 +1221,8 @@ def test_rapid_sampler_processing_preserves_raw_logits(mixed_prefill) -> None:
         return_logprobs=True,
     )
     assert torch.equal(sampled, torch.tensor([1, 0 if mixed_prefill else 1]))
-    assert torch.equal(logits, raw)
-    assert torch.equal(returned, raw)
+    torch.testing.assert_close(logits, raw, equal_nan=True)
+    torch.testing.assert_close(returned, raw, equal_nan=True)
 
 
 def test_config_accepts_async_scheduling() -> None:
@@ -1281,3 +1298,43 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
             assert single.token_ids == reference.token_ids
             assert single.logprobs == reference.logprobs
         reference = single
+
+
+@pytest.mark.skipif(
+    not os.environ.get("VLLM_RWKV_TEST_MODEL"),
+    reason="VLLM_RWKV_TEST_MODEL must point to a local RWKV checkpoint",
+)
+def test_real_model_rapid_sampling_applies_min_p(vllm_runner) -> None:
+    """At min_p=1, only the highest-scoring token can be sampled."""
+    prompt = {"prompt_token_ids": list(range(1, 66))}
+    with vllm_runner(
+        os.environ["VLLM_RWKV_TEST_MODEL"],
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_batched_tokens=128,
+        max_num_seqs=4,
+        num_gpu_blocks_override=64,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        compilation_config={"cudagraph_capture_sizes": [1, 2, 4]},
+    ) as runner:
+        params = SamplingParams(
+            temperature=1.0,
+            min_p=1.0,
+            seed=20261026,
+            max_tokens=4,
+            ignore_eos=True,
+            detokenize=False,
+        )
+        tokens = runner.llm.generate([prompt], params)[0].outputs[0].token_ids
+        params.logprobs = 2
+        scored = runner.llm.generate([prompt], params)[0].outputs[0]
+
+    assert len(tokens) == 4
+    assert scored.token_ids == tokens
+    assert scored.logprobs is not None
+    for token, logprobs in zip(tokens, scored.logprobs, strict=True):
+        assert logprobs[token].logprob == max(
+            entry.logprob for entry in logprobs.values()
+        )
+        assert sum(np.isfinite(entry.logprob) for entry in logprobs.values()) >= 2

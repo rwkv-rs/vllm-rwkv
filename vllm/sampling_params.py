@@ -953,12 +953,6 @@ class SamplingParams(
                 parameter="repetition_penalty",
                 value=self.repetition_penalty,
             )
-        if self.min_p != 0.0:
-            raise VLLMValidationError(
-                "RWKV Rapid-Sampling does not support min_p",
-                parameter="min_p",
-                value=self.min_p,
-            )
 
     def _validate_logprobs(self, model_config: ModelConfig) -> None:
         max_logprobs = model_config.max_logprobs
