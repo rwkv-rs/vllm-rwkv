@@ -200,6 +200,42 @@ def test_state_spec_and_caller_backed_slot_lifecycle(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_public_rwkv_state_pool_transfers_on_model_stream() -> None:
+    pytest.importorskip("flashrwkv2")
+    config = _state_vllm_config("float32", 32)
+    config.device_config.device = torch.device("cuda")
+    layer = RwkvStateLayer(config, 2, "model.layers.0.rwkv_state")
+    spec = layer.get_kv_cache_spec(config)
+    backing = torch.zeros((3, spec.page_size_bytes), device="cuda", dtype=torch.uint8)
+    layer.bind_kv_cache(backing)
+    src = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    dst = torch.tensor([1, 0], dtype=torch.int32, device="cuda")
+    tmix, _, cmix = layer.get_layer_state(0)
+    tmix[0].fill_(1)
+    cmix[0].fill_(2)
+    shift_bytes = (tmix.nbytes + cmix.nbytes) * 2
+    wkv = backing.view(-1)[shift_bytes:].view(torch.float32).view(2, 3, 32, 64, 64)
+    wkv[:, 0].fill_(3)
+    wkv[:, 1].fill_(4)
+    wkv[:, 2].fill_(5)
+    reset = torch.tensor([2], dtype=torch.int32, device="cuda")
+
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        layer.copy_state_slots(src, dst)
+        layer.reset_state_slots(reset)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+
+    assert torch.equal(tmix[1], torch.ones_like(tmix[1]))
+    assert torch.equal(cmix[1], torch.full_like(cmix[1], 2))
+    assert torch.equal(wkv[:, 0], torch.full_like(wkv[:, 0], 4))
+    assert torch.equal(wkv[:, 1], torch.full_like(wkv[:, 1], 3))
+    assert torch.count_nonzero(wkv[:, 2]) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(("heads", "prefix_steps"), [(40, 1), (64, 1), (64, 2)])
 def test_fp16_graph_prefix_copy_and_raw_slot_read(
     heads: int, prefix_steps: int
