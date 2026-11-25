@@ -262,6 +262,13 @@ def load_checkpoint_weight_patches(
     sparse = sparse_flags == {True}
 
     if sparse:
+        full_load_names = getattr(model, "checkpoint_weights_requiring_full_load", ())
+        if full_load_names and (
+            unsupported := sorted(
+                {p.name for p in patch_list}.intersection(full_load_names)
+            )
+        ):
+            raise ValueError(f"Checkpoint weights require a full load: {unsupported}")
         _validate_sparse_patches(patch_list, max_chunk_bytes, validate_unique_indices)
 
     loaded_names: set[str] = set()
