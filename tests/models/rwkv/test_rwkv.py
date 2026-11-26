@@ -85,7 +85,7 @@ class _FakeStateHandle:
 
 def _fake_flashrwkv2(fp16_private_bytes_per_slot: int = 0) -> ModuleType:
     module: Any = ModuleType("flashrwkv2")
-    module.__version__ = "0.2.0a1"
+    module.__version__ = "0.2.0a4"
 
     module.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor = _FakeStateHandle
     module.prepare_tmix_wkv7_recurrent_fp16_state_from_tensor = partial(

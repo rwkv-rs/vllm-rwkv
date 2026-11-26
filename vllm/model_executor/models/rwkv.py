@@ -46,7 +46,7 @@ from .utils import (
     maybe_prefix,
 )
 
-_FLASHRWKV2_VERSION = "0.2.0a1"
+_FLASHRWKV2_VERSION = "0.2.0a4"
 _EMBEDDING_WEIGHT = "model.embed_tokens.weight"
 _EMBEDDING_NORM_WEIGHTS = frozenset(
     {"model.embedding_norm.weight", "model.embedding_norm.bias"}
