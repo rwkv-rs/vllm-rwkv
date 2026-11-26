@@ -19,7 +19,7 @@ uv pip install -r requirements/rwkv.txt
 ```
 
 The requirements file pins the source commits for `transformers-rwkv` and
-`tokenizers-rwkv` and installs FlashRWKV2 0.2.0a1 from PyPI.
+`tokenizers-rwkv` and installs FlashRWKV2 0.2.0a4 from PyPI.
 
 ## Serve a model
 
